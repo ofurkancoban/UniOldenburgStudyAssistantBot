@@ -1152,7 +1152,15 @@ async def create_recursive_zip(page, cid, base_url, browser_context, root_name: 
 # ── new and updated file detection ─────────────────────────────────────────────
 
 def _parse_file_date_v2(modified_text: str | None, modified_iso: str | None):
-    # ISO değeri geldiyse onu baz al
+    """
+    Parses file modification date from ISO string or text.
+    Supports:
+    - ISO format (from datetime attribute)
+    - German/English standard dates (dd.mm.yyyy, etc.)
+    - Relative times (x min ago, vor x Min)
+    - Time only (HH:MM -> assumes today)
+    """
+    # 1. ISO format priority
     if modified_iso:
         for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S%z",
                     "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
@@ -1162,22 +1170,58 @@ def _parse_file_date_v2(modified_text: str | None, modified_iso: str | None):
             except Exception:
                 pass
 
-    # ISO yoksa metinden dene
+    # 2. Text fallback
     s = (modified_text or "").strip()
     if not s:
         return datetime.min
+
+    now = datetime.now()
+
+    # A) Relative times (German & English)
+    # "vor 5 Minuten", "vor 2 Std.", "10 minutes ago", "just now", "gerade eben"
+    
+    # Simple regex for "x unit ago" pattern
+    # Matches: "vor 10 Min", "10 min ago", "vor 1 Std", "1 hour ago"
+    m_rel = re.search(r'(?:vor|ago)?\s*(\d+)\s*(?:Min|min|Std|hour|Stunde|M|h)', s, re.IGNORECASE)
+    if m_rel:
+        try:
+            val = int(m_rel.group(1))
+            unit = m_rel.group(0).lower()
+            if 'h' in unit or 'std' in unit or 'stunde' in unit:
+                return now - timedelta(hours=val)
+            else:
+                return now - timedelta(minutes=val)
+        except:
+            pass
+            
+    # "Just now" / "Gerade eben"
+    if any(k in s.lower() for k in ["gerade", "just now", "now", "soeben"]):
+        return now
+
+    # B) Time only (HH:MM) -> Assume today
+    # e.g. "14:30"
+    if re.match(r'^\d{1,2}:\d{2}$', s):
+        try:
+            t = datetime.strptime(s, "%H:%M").time()
+            return datetime.combine(now.date(), t)
+        except:
+            pass
+
+    # C) Standard Date Formats
     fmts = (
         "%d.%m.%Y %H:%M", "%d.%m.%y %H:%M",
         "%d/%m/%Y %H:%M", "%d/%m/%y %H:%M",
         "%d.%m.%Y", "%d.%m.%y",
         "%d/%m/%Y", "%d/%m/%y",
         "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%d. %b %Y", "%d %b %Y", # 12. Jan 2025
     )
     for f in fmts:
         try:
             return datetime.strptime(s, f)
         except Exception:
             pass
+            
     return datetime.min
 
 async def watch_loop(chat_id, context):
