@@ -1697,7 +1697,7 @@ async def check_new_files_parallel(page, bot, chat_id, silent: bool = False):
                     # New files
                     new_files = [f for name, f in current_files.items() if name not in old_files]
 
-                    # Changed files by stable timestamp or size
+                    # Changed files detection
                     changed_files = []
                     for name, f in current_files.items():
                         if name not in old_files:
@@ -1706,16 +1706,41 @@ async def check_new_files_parallel(page, bot, chat_id, silent: bool = False):
                         
                         old_ts = old.get("modified_ts")
                         cur_ts = f.get("modified_ts")
+                        
+                        old_size = str(old.get("size", "-")).strip()
+                        cur_size = str(f.get("size", "-")).strip()
 
-                        size_changed = str(f.get("size", "")) != str(old.get("size", ""))
-                        # Timestamp change logic
+                        # 1. Size Check
+                        size_changed = (old_size != cur_size)
+
+                        # 2. Timestamp logic
                         ts_changed = False
-                        if cur_ts is not None and old_ts is None:
+                        
+                        if size_changed:
+                            # If size changed, we trust the update
                             ts_changed = True
-                        elif cur_ts is not None and old_ts is not None and cur_ts != old_ts:
-                            ts_changed = True
+                        else:
+                            # Size is SAME. Be strict about timestamp changes.
+                            # Case A: One is None, other is Value -> Ignore (likely format resolution)
+                            if (old_ts is None and cur_ts is not None) or (old_ts is not None and cur_ts is None):
+                                ts_changed = False
+                            
+                            # Case B: Both meaningful
+                            elif old_ts is not None and cur_ts is not None:
+                                diff = abs(cur_ts - old_ts)
+                                # If difference is small (e.g. < 24h), and size is same, assume same file (re-upload or date fix)
+                                # Actually, < 60s is jitter. < 24h might be the daily date resolution we struggle with.
+                                # Let's say: If size is SAME, we only alert if TS changed by > 24 hours.
+                                if diff > 86400: 
+                                    ts_changed = True
+                                else:
+                                    ts_changed = False
+                            
+                            # Case C: Both None -> No change
+                            else:
+                                ts_changed = False
 
-                        if ts_changed or size_changed:
+                        if ts_changed:
                             changed_files.append(f)
 
                     # Collect results
@@ -1736,7 +1761,9 @@ async def check_new_files_parallel(page, bot, chat_id, silent: bool = False):
                             })
 
                     # Update cache if anything new or changed
-                    if new_files or changed_files:
+                    # IMPORTANT: Always update cache with fresh values, even if we didn't trigger a notification!
+                    # This ensures we have the latest timestamp for future comparisons.
+                    if current_files != old_files:
                          new_snapshot = {}
                          for name, info in current_files.items():
                              new_snapshot[name] = {
@@ -1745,6 +1772,8 @@ async def check_new_files_parallel(page, bot, chat_id, silent: bool = False):
                                  "modified_ts": info.get("modified_ts"),
                              }
                          cache[cid] = new_snapshot
+                         
+                         # Only return 'needs_update=True' (notification) if we actually collected items
                          return course_name, cid, collected, True
 
                     return course_name, cid, collected, False
