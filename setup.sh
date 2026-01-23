@@ -62,3 +62,4 @@ fi
 echo "🚀 Starting Stud.IP Telegram Bot..."
 echo "──────────────────────────────────────────────"
 python studip_bot.py
+# Verified content update
