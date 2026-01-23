@@ -1,0 +1,12 @@
+asyncio
+nest_asyncio
+aiohttp
+playwright
+pyotp
+beautifulsoup4
+html5lib
+lxml
+python-telegram-bot
+python-dotenv
+psutil
+uuid
