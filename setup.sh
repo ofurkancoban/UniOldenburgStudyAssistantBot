@@ -53,13 +53,20 @@ playwright install chromium >/dev/null
 # ── 7️⃣ .env kontrolü ─────────────────────────────────────────────────
 if [ ! -f ".env" ]; then
   echo "⚠️  .env file not found!"
-  echo "Please create one with your Stud.IP and Telegram credentials before running."
-  deactivate
-  exit 1
+  if [ -f ".env.example" ]; then
+      echo "📄 Creating .env from .env.example..."
+      cp .env.example .env
+      echo "✅ .env created. Please edit it with your credentials:"
+      echo "   nano .env"
+      exit 1
+  else
+      echo "❌ .env.example not found! Please create .env manually."
+      deactivate
+      exit 1
+  fi
 fi
 
 # ── 8️⃣ Başlatma ──────────────────────────────────────────────────────
 echo "🚀 Starting Stud.IP Telegram Bot..."
 echo "──────────────────────────────────────────────"
 python studip_bot.py
-# Verified content update

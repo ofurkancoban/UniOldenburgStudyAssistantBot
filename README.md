@@ -31,13 +31,30 @@ Built for reliability. The bot handles login sessions, 2FA/TOTP authentication, 
 
 ## 📦 Installation
 
+**Quick Start (Mac/Linux):**
+
+```bash
+git clone https://github.com/ofurkancoban/UniOldenburgStudyAssistantBot.git
+cd UniOldenburgStudyAssistantBot
+chmod +x setup.sh
+./setup.sh
+```
+
+The script will automatically:
+1. Check/Install Python requirements.
+2. Create a virtual environment.
+3. Install dependencies and browser drivers.
+4. Help you create your `.env` configuration file.
+
+**Manual Installation (Windows/Alternative):**
+
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/yourusername/UniOldenburgCourseManager.git
-    cd UniOldenburgCourseManager
+    git clone https://github.com/ofurkancoban/UniOldenburgStudyAssistantBot.git
+    cd UniOldenburgStudyAssistantBot
     ```
 
-2.  **Create a virtual environment (recommended):**
+2.  **Create a virtual environment:**
     ```bash
     python3 -m venv .venv
     source .venv/bin/activate  # Mac/Linux
@@ -52,12 +69,12 @@ Built for reliability. The bot handles login sessions, 2FA/TOTP authentication, 
 
 ## ⚙️ Configuration
 
-1.  Copy `.env.example` to `.env`:
+1.  The `setup.sh` script creates `.env` automatically.
+2.  If doing manually, copy `.env.example`:
     ```bash
     cp .env.example .env
     ```
-
-2.  Edit `.env` and fill in your details:
+3.  Edit `.env` and fill in your details:
     ```ini
     USERNAME=your_studip_username
     PASSWORD=your_studip_password
