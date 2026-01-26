@@ -713,9 +713,17 @@ async def get_todays_menu_enhanced(page):
                             menu_text += f"  *({allergens_text})*\n"
 
                         # FİYAT FORMATI
-                        clean_price = price.replace("&euro;", "€").strip()
-                        clean_price = clean_price.replace('.', ',')
-                        menu_text += f"  💶 **{clean_price}**\n\n"
+                        clean_price = price.replace("&euro;", "€").replace("€", "€").strip()
+                        # Fiyatı düzgün formatlayalım (örn: 2.50 -> 2,50€)
+                        if clean_price and clean_price != "€":
+                            # Nokta varsa virgüle çevir
+                            clean_price = clean_price.replace('.', ',')
+                            # € işareti yoksa ekle
+                            if "€" not in clean_price:
+                                clean_price = clean_price + "€"
+                            menu_text += f"  💶 {clean_price}\n\n"
+                        else:
+                            menu_text += "\n"
 
             menu_text += "\n"
 
