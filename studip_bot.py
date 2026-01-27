@@ -807,7 +807,7 @@ async def get_todays_menu_enhanced(page):
             if allergen_code in allergen_guide:
                 emoji = translate_food_codes(allergen_code)
                 # EMOJİ + KOD + AÇIKLAMA formatında ekle
-                used_guide_lines.append(f"{emoji} {allergen_code} : {allergen_guide[allergen_code]}")
+                used_guide_lines.append(f"{emoji} **{allergen_code}** - {allergen_guide[allergen_code]}")
 
         # Add the used allergens to the menu
         if used_guide_lines:
