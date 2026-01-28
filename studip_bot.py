@@ -581,8 +581,9 @@ async def get_todays_menu_enhanced(page):
     try:
         menu_url = "https://elearning.uni-oldenburg.de/plugins.php/mensawidget/menu/2/"
 
+        # Fetch menu page with increased timeout for reliability
         async with page_lock:
-            await page.goto(menu_url, wait_until="domcontentloaded", timeout=10000)
+            await page.goto(menu_url, wait_until="domcontentloaded", timeout=15000)
             html_content = await page.content()
 
         soup = BeautifulSoup(html_content, "html.parser")
