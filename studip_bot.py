@@ -577,21 +577,21 @@ def translate_food_codes(text):
 
 
 async def get_todays_menu_enhanced(page):
-    """Enhanced menu fetching with dynamic allergen guide"""
+    """Enhanced menu fetching with dynamic allergen guide - HTML format"""
     try:
         menu_url = "https://elearning.uni-oldenburg.de/plugins.php/mensawidget/menu/2/"
 
         async with page_lock:
             await page.goto(menu_url, wait_until="domcontentloaded", timeout=10000)
-            html = await page.content()
+            html_content = await page.content()
 
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html_content, "html.parser")
 
         # Date
         date_element = soup.find('h2')
         date_text = date_element.get_text(strip=True) if date_element else datetime.now().strftime("%d.%m.%Y")
 
-        menu_text = f"🍽️ **{date_text}** 🍽️\n"
+        menu_text = f"🍽️ <b>{html.escape(date_text)}</b> 🍽️\n"
         menu_text += "🏛️ Mensa Uni Oldenburg\n\n"
 
         # Process all categories and collect ALL allergens used today
@@ -695,7 +695,7 @@ async def get_todays_menu_enhanced(page):
 
                     # Format the menu item
                     if name_text:
-                        menu_text += f"• **{name_text}**"
+                        menu_text += f"• <b>{html.escape(name_text)}</b>"
 
                         # Add star for limited availability
                         if '⭐' in name_text or 'limited' in name_text.lower():
@@ -703,14 +703,14 @@ async def get_todays_menu_enhanced(page):
                         menu_text += "\n"
 
                         if description:
-                            menu_text += f"  {description}\n"
+                            menu_text += f"  {html.escape(description)}\n"
 
                         # Add allergen emojis and text
                         if allergens_text:
                             # Translate codes to emojis
                             emoji_codes = translate_food_codes(allergens_text)
                             menu_text += f"  {emoji_codes}\n"
-                            menu_text += f"  *({allergens_text})*\n"
+                            menu_text += f"  <i>({html.escape(allergens_text)})</i>\n"
 
                         # FİYAT FORMATI
                         clean_price = price.replace("&euro;", "€").replace("€", "€").strip()
@@ -729,7 +729,7 @@ async def get_todays_menu_enhanced(page):
 
         # Create COMPLETE allergen guide based on what's actually used today
         menu_text += "━━━━━━━━━━━━━━━━━━\n"
-        menu_text += "📋 **ALLERGEN GUIDE**\n"
+        menu_text += "📋 <b>ALLERGEN GUIDE</b>\n"
         menu_text += "━━━━━━━━━━━━━━━━━━\n"
 
         # Define COMPLETE allergen mappings
@@ -807,7 +807,7 @@ async def get_todays_menu_enhanced(page):
             if allergen_code in allergen_guide:
                 emoji = translate_food_codes(allergen_code)
                 # EMOJİ + KOD + AÇIKLAMA formatında ekle
-                used_guide_lines.append(f"{emoji} **{allergen_code}** - {allergen_guide[allergen_code]}")
+                used_guide_lines.append(f"{emoji} <b>{allergen_code}</b> - {allergen_guide[allergen_code]}")
 
         # Add the used allergens to the menu
         if used_guide_lines:
@@ -815,7 +815,7 @@ async def get_todays_menu_enhanced(page):
         else:
             menu_text += "No allergens listed in today's menu"
 
-        menu_text += "\n\n⭐ **Limited availability**"
+        menu_text += "\n\n⭐ <b>Limited availability</b>"
 
         return menu_text
 
@@ -854,7 +854,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Menu'yu gönder
         await update.message.reply_text(
             menu_text,
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=get_main_keyboard()
         )
 
@@ -889,7 +889,7 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await login_studip()
 
         menu_text = await get_todays_menu_enhanced(page)
-        await query.edit_message_text(menu_text, parse_mode="Markdown")
+        await query.edit_message_text(menu_text, parse_mode="HTML")
 
     except Exception as e:
         error_msg = f"❌ Error loading menu:\n{str(e)}"
