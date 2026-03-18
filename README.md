@@ -105,6 +105,7 @@ STUDIP_ICAL_URL=https://elearning.uni-oldenburg.de/dispatch.php/ical/index/...
 ## 🏗️ Technical Architecture
 
 ```mermaid
+%%{init: {'theme': 'dark'}}%%
 graph TD
     A[Telegram Bot] --> B{Engine Choice}
     B -->|Option 1| C[studip_bot.py / Browser-less]
