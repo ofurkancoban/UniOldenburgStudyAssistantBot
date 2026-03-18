@@ -2183,16 +2183,16 @@ async def send_morning_summary(bot, user_ids):
     try:
         menu_text = await get_todays_menu_enhanced(session)
         if "Mensa kapalı" in menu_text or not menu_text:
-            menu_text = "🍽️ *Mensa:* Bugün kapalı veya menü bulunamadı."
+            menu_text = "🍽️ *Mensa:* Closed today or menu not found."
     except Exception as e:
         logging.error(f"Summary menu fetch error: {e}")
-        menu_text = "🍽️ *Mensa:* Menü alınamadı."
+        menu_text = "🍽️ *Mensa:* Menu could not be retrieved."
 
     # 3. Format Schedule
     if not today_events:
-        schedule_text = "📅 <b>Bugün dersin yok!</b> Keyfini çıkar. ✨"
+        schedule_text = "📅 <b>No classes today!</b> Enjoy your day. ✨"
     else:
-        lines = ["📅 <b>Bugünkü Derslerin:</b>"]
+        lines = ["📅 <b>Today's Schedule:</b>"]
         course_blocks = []
         for ev in today_events:
             course_icon = _get_course_icon(ev.get("title", ""))
@@ -2211,8 +2211,8 @@ async def send_morning_summary(bot, user_ids):
 
     # 4. Final Message
     header = (
-        "☀️ <b>GÜNAYDIN!</b> ☀️\n"
-        f"🗓️ <b>Bugün:</b> {now:%d %B %Y, %A}\n"
+        "☀️ <b>GOOD MORNING!</b> ☀️\n"
+        f"🗓️ <b>Today:</b> {now:%d %B %Y, %A}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
     )
     
@@ -2262,10 +2262,10 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
             # Reminder window: 25-30 minutes before
             if 25 < minutes_left <= 31:
                 text = (
-                    "🔔 <b>DERS HATIRLATICI</b>\n"
+                    "🔔 <b>LECTURE REMINDER</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     f"📘 <b>{title}</b>\n"
-                    f"🕒 <b>{int(minutes_left)} dakika içinde</b> başlıyor\n"
+                    f"🕒 Starting in <b>{int(minutes_left)} minutes</b>\n"
                     f"📍 {location}\n"
                     "━━━━━━━━━━━━━━━━━━"
                 )

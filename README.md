@@ -4,52 +4,55 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-Bot-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)
-![Automation](https://img.shields.io/badge/Automation-High--Performance-brightgreen?style=for-the-badge)
+![Architecture](https://img.shields.io/badge/Architecture-Dual--Engine-blue?style=for-the-badge)
 
 </div>
 
-A premier Telegram assistant for **University of Oldenburg** students. This bot automates **Stud.IP** monitoring, delivering instant notifications for course updates, files, and messages directly to your pocket.
+The ultimate Telegram companion for students at the **University of Oldenburg**. This bot seamlessly bridges the gap between the **Stud.IP** portal and your daily messaging app, providing real-time intelligence on your academic life.
 
 ---
 
-## 🌗 Choose Your Version
+## 🌗 Choose Your Engine
 
-During the setup process via `setup.sh`, you can select between two specialized engines:
+This project offers two distinct ways to interact with Stud.IP. You can select your preferred engine during the initial setup via `setup.sh`.
 
-### 🚀 1. Browser-less (Standard) - `studip_bot.py`
-**Recommended** for most users and production servers.
-- **Ultra-Lightweight**: Uses direct JSON/HTTP requests. Runs smoothly even on 512MB RAM.
-- **High Speed**: Immediate synchronization without the overhead of a headless browser.
-- **Modern Features**: Built-in support for the latest Vue-based Stud.IP forum and message systems.
-
-### 🌐 2. Playwright (Legacy) - `studip_bot_playwright.py`
-**The original browser-mimicking engine.**
-- **Reliability**: Navigates the Stud.IP portal exactly like a human user.
-- **Resource Intensive**: Requires Playwright (Chromium) and significantly more CPU/RAM.
+| Feature | 🚀 Browser-less (Standard) | 🌐 Playwright (Legacy) |
+| :--- | :--- | :--- |
+| **Logic** | Direct JSON/HTML requests | Simulated Browser (Chromium) |
+| **Speed** | ⚡ Instant Sync | 🐢 Slower (Browser overhead) |
+| **RAM Usage** | ~50MB - 100MB | ~500MB - 1GB+ |
+| **Stability** | High (No browser crashes) | Medium (Requires display/driver) |
+| **Best For** | Production/Cloud Servers | Local Desktop / Debugging |
+| **File** | `studip_bot.py` | `studip_bot_playwright.py` |
 
 ---
 
-## ✨ Key Features
+## ✨ Power Features
 
 ### 📅 Smart Scheduling & Reminders
-- **Morning Summary (07:00 AM)**: Wake up to a perfect overview of your day. Includes your today's schedule and the current **Mensa Menu**.
-- **Lecture Alerts**: Never be late again. Receive a notification with the course name and room location **30 minutes before** every class.
-- **Interactive Calendar**: Check your "Today" or "Weekly" views directly within Telegram using simple commands.
+*   **Morning Summary (07:00 AM)**: Get a daily briefing delivered to your chat.
+    *   **Today's Schedule**: A clean list of your lectures and locations.
+    *   **Mensa Menu**: The full cafeteria menu with allergens and special labels (e.g., ⭐ Limited).
+*   **Lecture Reminders**: Automatically receive a notification **30 minutes before** each class starts. No more running late across campus!
 
-### 📢 Institutional Intelligence
-- **Real-time Announcements**: Instant forwarding of course updates, cancellations, and exam news.
-- **Advanced File Manager**: Detects new uploads and updates. Features **one-click downloads** directly to your Telegram chat.
-- **Unified Messaging**: Bridges your Stud.IP inbox to Telegram. Stay on top of direct communications without logging in.
-- **Forum Observer**: Tracks new posts in course forums, providing full conversation context and clean text previews.
+### 📊 Real-time Monitoring (Unified Watcher)
+The bot runs a state-of-the-art background loop that tracks:
+*   **📢 Announcements**: Instant forwarding of course updates and news.
+*   **📁 File Manager**: Detects new uploads. Download files **directly** with one click.
+*   **💬 Forum Discussions**: Stay in the loop with new posts and full conversation history.
+*   **📨 Direct Messages**: Never miss an important message from lecturers or peers.
 
-### 🍽️ Mensa Integration
-- Dynamic daily menu updates for the university cafeteria, including pricing, allergen filters, and emoji-coded ingredients.
+### 🍽️ Enhanced Mensa Menu
+A beautiful, emoji-rich menu with:
+- Pricing for students/guests.
+- Full allergen and additive guide.
+- **Smart Filtering**: Identification of Vegan (🌿 V+), Vegetarian (🥗 V), and meat types.
 
 ---
 
-## 🛠️ Installation & Setup
+## 🛠️ Installation & Deployment
 
-**The easiest way to get started is using the interactive setup script:**
+**Recommended Setup (Unix/Mac):**
 
 ```bash
 git clone https://github.com/ofurkancoban/UniOldenburgStudyAssistantBot.git
@@ -58,49 +61,65 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-The script will automatically:
-1. Create a Python virtual environment.
-2. Install all necessary dependencies (including ICS parsing and Telegram libraries).
-3. Let you choose between **Standard** or **Legacy** versions.
-4. Help you create your `.env` configuration file.
+**What the script does for you:**
+1.  **Environment Isolation**: Creates and activates a Python `.venv`.
+2.  **Dependency Resolution**: Installs all required libraries (`icalendar`, `aiohttp`, etc.).
+3.  **Engine Selection**: Lets you choose between the Browser-less and Playwright versions.
+4.  **Configuration**: Generates a `.env` template from your input.
 
 ---
 
 ## ⚙️ Configuration (`.env`)
 
-Fill in your credentials in the generated `.env` file:
-
 ```ini
+# --- Credentials ---
 USERNAME=your_studip_id
 PASSWORD=your_password
 TELEGRAM_TOKEN=your_bot_token
-ALLOWED_USER_IDS=12345678,87654321
+
+# --- Authentication ---
+ALLOWED_USER_IDS=123456,789012  # Comma separated list of authorized users
+TOTP_SECRET=YOUR_KEY            # Optional: If 2FA/App Authenticator is enabled
+
+# --- Calendar Integration ---
 STUDIP_ICAL_URL=https://elearning.uni-oldenburg.de/dispatch.php/ical/index/...
-TOTP_SECRET=YOUR_SECRET_KEY  # Required if 2FA is enabled
 ```
-> [!TIP]
-> You can find your **STUDIP_ICAL_URL** under **Planner > Export > iCalendar Copy Link** on the Stud.IP portal.
+
+> [!IMPORTANT]
+> To get your **STUDIP_ICAL_URL**, go to Stud.IP:
+> **Planner** -> **Export** -> **iCalendar** -> Copy the link. This link is essential for the schedule and reminders to work!
 
 ---
 
-## 🤖 Telegram Commands
+## 🤖 Available Commands
 
-| Command | Action |
+| Command | Description |
 | :--- | :--- |
-| `/start` | Initializes the session and opens the main menu. |
-| `/menu` | Opens the interactive dashboard (Courses, Calendar, Mensa). |
-| `/check` | Triggers a manual synchronization of all watchers. |
-| `/status` | Displays system health, last check times, and active configuration. |
+| `/start` | Start the bot and login. |
+| `/menu` | The main hub. Access Courses, Files, and Calendar. |
+| `/check` | Manual sync of all watchers (Files, News, Posts). |
+| `/status` | View system health, uptime, and last sync timestamps. |
 
 ---
 
-## 🔒 Security & Performance
-- **Private Access**: Restricted via `ALLOWED_USER_IDS` to prevent unauthorized use.
-- **Persistent State**: Uses a lightweight JSON cache system to ensure you never receive duplicate notifications.
-- **Encryption**: Uses TLS for all communications between your server, Stud.IP, and Telegram.
+## 🏗️ Technical Architecture
+
+```mermaid
+graph TD
+    A[Telegram Bot] --> B{Engine Choice}
+    B -->|Option 1| C[studip_bot.py / Browser-less]
+    B -->|Option 2| D[studip_bot_playwright.py / Legacy]
+    C --> E[aiohttp + BS4]
+    D --> F[Playwright / Chromium]
+    E --> G[Stud.IP JSON/HTML API]
+    F --> G
+    G --> H[(Persistent Cache)]
+```
+
+---
 
 ## ⚠️ Disclaimer
-This is an **unofficial** tool and not affiliated with the University of Oldenburg. Use responsibly and ensure compliance with the university's IT policies.
+This tool is **unofficial** and not affiliated with the University of Oldenburg. Please use responsibly and adhere to the university's IT usage policies.
 
 ---
-**Created for students who value their time.** 🎓✨
+**Efficiency meets Automation.** 🎓✨
