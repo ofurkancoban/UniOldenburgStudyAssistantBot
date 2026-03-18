@@ -3,21 +3,23 @@
 .venv/
 __pycache__/
 *.pyc
+.gitignore
 
 # Logs
 *.log
 watch_log.txt
 
-# Bot Cache
+# Bot Cache & Runtime
 announcement_cache.json
 files_cache.json
 messages_cache.json
+forum_cache.json
 link_cache.json
+.bot_instance.lock
 
 # IDE
 .idea/
 .DS_Store
 
 # Debug / Temp
-debug_calendar.py
-planner_dump.html
+*.html

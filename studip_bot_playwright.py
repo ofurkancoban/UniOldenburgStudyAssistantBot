@@ -1,17 +1,12 @@
 import asyncio
-import logging
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+from dotenv import load_dotenv
+from playwright.async_api import async_playwright
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import pyotp
 import uuid
 import hashlib
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote
 import errno
 from bs4 import BeautifulSoup
 import html
@@ -22,12 +17,12 @@ import logging
 import os
 import json
 import psutil
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+import nest_asyncio
 from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo
 from telegram.constants import ChatAction
 from asyncio import CancelledError
-from studip_session import StudIPSession
 
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -44,7 +39,10 @@ STUDIP_URL = "https://elearning.uni-oldenburg.de/dispatch.php/my_courses"
 last_full_check_time = None
 FILE_WATCHER_INTERVAL = 2 * 60 * 60
 # ── global runtime state ───────────────────────────────────────────────────────
-global_session = None
+playwright = None
+browser = None
+browser_context = None
+page = None
 global_watcher_paused = False
 unified_watcher_task = None
 watcher_controller_running = False
@@ -59,10 +57,12 @@ courses_map = {}  # cid -> course_name
 watch_tasks = {}  # chat_id -> asyncio.Task
 start_in_progress = set()  # chat_id currently running /start
 START_MENU_DEDUP_SECONDS = 30
+BROWSER_RESTART_INTERVAL = 4 * 60 * 60
 check_in_progress: set[int] = set()  # chat_id set to prevent concurrent checks
 
 # Concurrency locks
-cache_lock = asyncio.Lock()
+page_lock = asyncio.Lock()  # All Playwright navigations pass through this
+cache_lock = asyncio.Lock()  # course_cache.json read/write serialization
 
 
 # ── user permissions ──────────────────────────────────────────────────────────
@@ -283,7 +283,6 @@ def _get_day_emoji(day_name: str) -> str:
 
 FILES_CACHE_PATH = "files_cache.json"
 REMINDERS_CACHE_PATH = "reminders_cache.json"
-GENERAL_CACHE_PATH = "general_cache.json"
 
 
 def load_files_cache():
@@ -329,26 +328,6 @@ def save_reminders_cache(data):
         logging.error(f"Could not save reminders cache: {e}")
 
 
-def load_general_cache():
-    if os.path.exists(GENERAL_CACHE_PATH):
-        try:
-            with open(GENERAL_CACHE_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception as e:
-            logging.warning(f"Could not load general cache: {e}")
-    return {}
-
-
-def save_general_cache(data):
-    try:
-        tmp = GENERAL_CACHE_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, GENERAL_CACHE_PATH)
-    except Exception as e:
-        logging.error(f"Could not save general cache: {e}")
-
-
 # ── logging setup ──────────────────────────────────────────────────────────────
 LOG_FILE = "watch_log.txt"
 logging.basicConfig(
@@ -356,13 +335,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-try:
-    _file_handler = logging.FileHandler(LOG_FILE)
-except (PermissionError, OSError):
-    _temp_log = os.path.join("/tmp", LOG_FILE)
-    print(f"⚠️ Permission denied for {LOG_FILE}, logging to {_temp_log} instead.")
-    _file_handler = logging.FileHandler(_temp_log)
-
+_file_handler = logging.FileHandler(LOG_FILE)
 _file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 _console_handler = logging.StreamHandler()
 _console_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
@@ -377,29 +350,13 @@ LOCK_FILE = ".bot_instance.lock"
 def acquire_instance_lock():
     """Ensure only one process instance runs (prevents getUpdates 409)."""
     try:
-        # Check if lock exists and if the PID is still running
-        if os.path.exists(LOCK_FILE):
-            try:
-                with open(LOCK_FILE, "r") as f:
-                    pid = int(f.read().strip())
-                if psutil.pid_exists(pid):
-                    logging.error(f"❌ Another bot instance is actually running (PID {pid}). Exiting.")
-                    return False
-                else:
-                    logging.warning(f"⚠️ Stale lock file found (PID {pid} not running). Removing it.")
-                    os.remove(LOCK_FILE)
-            except Exception as e:
-                logging.warning(f"⚠️ Failed to read/validate lock file: {e}. Attempting to overwrite.")
-                try: os.remove(LOCK_FILE)
-                except: pass
-
         fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w") as f:
             f.write(str(os.getpid()))
         return True
     except OSError as e:
         if e.errno == errno.EEXIST:
-            logging.error("Another bot instance is already running (concurrency race).")
+            logging.error("Another bot instance is already running (lock file exists).")
             return False
         raise
 
@@ -434,13 +391,8 @@ def _normalize_url(u: str | None) -> str | None:
     """Ensure URLs from Stud.IP HTML/JSON are valid."""
     if not u:
         return None
-    u = u.strip()
-    # If it's just a 32-char hex ID, it's not a valid URL yet
-    if len(u) == 32 and re.match(r"^[a-f0-9]{32}$", u.lower()):
-        return None
-
     # normalize schema slashes
-    u = re.sub(r"^https:/*", "https://", u)
+    u = re.sub(r"^https:/*", "https://", u.strip())
     # fix double host concatenations
     if "https://elearning.uni-oldenburg.dehttps://" in u:
         u = u.split("https://elearning.uni-oldenburg.de")[-1]
@@ -448,8 +400,6 @@ def _normalize_url(u: str | None) -> str | None:
             u = "https://elearning.uni-oldenburg.de" + u
     # prefix host if relative
     if not u.startswith("http://") and not u.startswith("https://"):
-        if not u.startswith("/"):
-            u = "/" + u
         u = f"https://elearning.uni-oldenburg.de{u}"
     return u
 
@@ -468,35 +418,77 @@ SELECTORS = {
 
 # ── Stud.IP login ──────────────────────────────────────────────────────────────
 async def login_studip(notify=None):
-    global global_session
-    
-    if global_session is None:
-        global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
-    
-    if await global_session.is_logged_in():
-        return global_session
+    global playwright, browser, browser_context, page
+    if page and not page.is_closed():
+        return page
+
+    # Validate env
+    for key, val in {"USERNAME": USERNAME, "PASSWORD": PASSWORD, "TOTP_SECRET": TOTP_SECRET}.items():
+        if not val:
+            raise RuntimeError(f"Missing required environment variable: {key}")
+
+    playwright = await async_playwright().start()
+    headless = os.getenv("HEADLESS", "false").lower() != "false"
+    browser = await playwright.chromium.launch(headless=headless)
+    browser_context = await browser.new_context()
+    page = await browser_context.new_page()
+
+    async def _retry(step_name, coro, retries=3):
+        last_err = None
+        for attempt in range(retries):
+            try:
+                return await coro()
+            except Exception as e:
+                last_err = e
+                logging.warning(f"Retry {step_name} ({attempt + 1}/{retries}): {e}")
+                await asyncio.sleep(1.5 * (attempt + 1))
+        raise last_err or RuntimeError(f"Failed at step: {step_name}")
 
     if notify:
         await notify("Starting login...")
-    
-    success = await global_session.login()
-    
-    if success:
+    async with page_lock:
+        await _retry("goto", lambda: page.goto(STUDIP_URL, wait_until="domcontentloaded"))
+
+        # 1. Click Start Login
+        await _retry("click_start_wait", lambda: page.wait_for_selector(SELECTORS['start'], timeout=15000))
         if notify:
-            await notify("Login successful.")
-        logging.info("Logged in successfully (browser-less session).")
-        return global_session
-    else:
+            await notify("Opening IdP...")
+        await page.locator(SELECTORS['start']).first.click()
+
+        # 2. Username Step
+        await _retry("user_field", lambda: page.wait_for_selector(SELECTORS['user'], timeout=15000))
         if notify:
-            await notify("Login failed.")
-        raise RuntimeError("Failed to log in to Stud.IP.")
+            await notify("Submitting username...")
+        await page.locator(SELECTORS['user']).fill(USERNAME)
+        await page.locator(SELECTORS['user_btn']).click()
+
+        # 3. Password Step
+        await _retry("pass_field", lambda: page.wait_for_selector(SELECTORS['pass'], timeout=15000))
+        if notify:
+            await notify("Submitting password...")
+        # Use first matching element for pass (might be dynamic ID)
+        await page.locator(SELECTORS['pass']).first.fill(PASSWORD)
+        await page.locator(SELECTORS['pass_btn']).click()
+
+        # 4. OTP Step
+        await _retry("otp_field", lambda: page.wait_for_selector(SELECTORS['otp'], timeout=15000))
+        if notify:
+            await notify("Submitting one-time code...")
+        await page.locator(SELECTORS['otp']).first.fill(pyotp.TOTP(TOTP_SECRET).now())
+        await page.locator(SELECTORS['otp_btn']).click()
+
+        await page.wait_for_load_state("networkidle")
+    if notify:
+        await notify("Login successful.")
+    logging.info("Logged in successfully (persistent session).")
+    return page
 
 
 # ── unified watcher controller ─────────────────────────────────────────────────
 
 async def unified_watcher_controller(app):
     """Centrally manage all watchers - with a single task"""
-    global watcher_controller_running, global_watcher_paused, global_session
+    global watcher_controller_running, global_watcher_paused, page
 
     logging.info("🟢 Unified Watcher Controller STARTED")
     watcher_controller_running = True
@@ -519,84 +511,64 @@ async def unified_watcher_controller(app):
                 await asyncio.sleep(30)
                 continue
 
-            # Ensure session and login
-            try:
-                session = await login_studip()
-                if not session:
-                    logging.warning("🔑 Failed to acquire logged-in session, retrying...")
-                    await asyncio.sleep(60)
-                    continue
-            except Exception as e:
-                logging.error(f"❌ Login error in watcher: {e}")
+            # Page check
+            if not page or page.is_closed():
+                logging.warning("📄 Page not available, waiting...")
                 await asyncio.sleep(60)
                 continue
 
             cycle_count += 1
             logging.info(f"🔄 Watcher cycle #{cycle_count} started")
 
-            # 0️⃣ CALENDAR REMINDERS & MORNING SUMMARY
-            now = datetime.now(TZ_BERLIN)
-            
-            # Check for morning summary (Daily at 07:00)
-            if now.hour >= 7:
-                cache = load_general_cache()
-                today_str = now.strftime("%Y-%m-%d")
-                if cache.get("last_morning_summary") != today_str:
-                    try:
-                        logging.info("🌞 Sending morning summary...")
-                        await send_morning_summary(app.bot, ALLOWED_USER_IDS)
-                        cache["last_morning_summary"] = today_str
-                        save_general_cache(cache)
-                    except Exception as e:
-                        logging.error(f"❌ Morning summary failed: {e}")
-
-            # Regular calendar reminders
+            # 0️⃣ CALENDAR REMINDERS - her cycle'da
             try:
-                # Send to all allowed users
-                for uid in ALLOWED_USER_IDS:
-                    await check_calendar_reminders(app.bot, uid, silent=True)
+                await check_calendar_reminders(page, app.bot, admin_id, silent=True)
             except Exception as e:
                 logging.error(f"❌ Calendar reminder check failed: {e}")
 
-            # 1️⃣ MESSAGE CHECK
+            # 1️⃣ MESSAGE CHECK - every cycle (≈2.5 minutes)
             try:
                 logging.info("📨 Checking messages...")
-                await check_new_messages(app.bot, admin_id, silent=True)
+                await check_new_messages(page, app.bot, admin_id, silent=True)
             except Exception as e:
                 logging.error(f"❌ Message check failed: {e}")
 
-            await asyncio.sleep(30)
+            await asyncio.sleep(30)  # 30 saniye bekle
 
-            # 2️⃣ ANNOUNCEMENT CHECK
+            # 2️⃣ ANNOUNCEMENT CHECK - every cycle (≈3 minutes)
             try:
                 logging.info("📢 Checking announcements...")
-                await check_new_announcements_parallel(app.bot, admin_id, silent=True)
+                await check_new_announcements(page, app.bot, admin_id, silent=True)
             except Exception as e:
                 logging.error(f"❌ Announcement check failed: {e}")
 
-            await asyncio.sleep(30)
+            await asyncio.sleep(30)  # 30 saniye bekle
 
-            # 3️⃣ FILE CHECK
+            # 3️⃣ FILE CHECK - every 6th cycle (≈15 minutes)
             if cycle_count % 2 == 0:
                 try:
                     logging.info("📁 Checking files...")
-                    await check_new_files_parallel(app.bot, admin_id, silent=True)
+                    await check_new_files(page, app.bot, admin_id, silent=True)
                 except Exception as e:
                     logging.error(f"❌ File check failed: {e}")
+                cycle_count = 0  # Reset cycle counter
 
-            # 4️⃣ FORUM CHECK (Every cycle now)
-            try:
-                logging.info("💬 Checking forum posts...")
-                await check_new_forum_posts_parallel(app.bot, admin_id, silent=True)
-            except Exception as e:
-                logging.error(f"❌ Forum check failed: {e}")
+            # 4️⃣ FORUM CHECK - every 3rd cycle (≈7-8 minutes)
+            if cycle_count % 3 == 0:
+                try:
+                    logging.info("💬 Checking forum posts...")
+                    await check_new_forum_posts_parallel(page, app.bot, admin_id, silent=True)
+                except Exception as e:
+                    logging.error(f"❌ Forum check failed: {e}")
 
             logging.info(f"✅ Watcher cycle #{cycle_count} completed")
+
+            # Main wait - total cycle duration ≈2.5-3 minutes
             await asyncio.sleep(90)
 
         except Exception as e:
             logging.error(f"❌ Watcher controller error: {e}")
-            await asyncio.sleep(120)
+            await asyncio.sleep(120)  # Hata durumunda 2 dakika bekle
 
 
 async def start_unified_watcher(app):
@@ -634,125 +606,137 @@ async def stop_unified_watcher():
 
 
 # ── course listing ────────────────────────────────────────────────────────────
-async def list_courses():
-    """
-    Extract courses from the 'my_courses' page.
-    Uses multi-method strategy: Vuex Store analysis (modern) and DOM Scrapy (legacy).
-    """
-    session = await login_studip()
-    if session is None:
-        logging.error("❌ Failed to get session for list_courses")
-        return []
-
-    all_courses_dict = {}
-    
-    # Try multiple attempts or varying URLs if needed
-    urls = [
-        "https://elearning.uni-oldenburg.de/dispatch.php/my_courses",
-        "https://elearning.uni-oldenburg.de/dispatch.php/my_courses?semester_filter=all"
-    ]
-    
-    for url in urls:
-        logging.info(f"Attempting course extraction from: {url}")
-        try:
-            async with await session.get(url) as r:
-                html_text = await r.text()
-        except Exception as e:
-            logging.error(f"Failed to fetch {url}: {e}")
-            continue
+async def list_courses(page):
+    for attempt in range(1, 4):
+        url = page.url
+        title = await page.title()
+        logging.info(f"Course extraction attempt {attempt}/3 at {url} ('{title}')...")
+        
+        # Settle/Wait for content
+        if attempt == 1:
+            await asyncio.sleep(1.5)
+        else:
+            await asyncio.sleep(2.5)
             
-        # --- Method 1: JSON-based Vuex state (Comprehensive) ---
-        # Stud.IP often embeds a JSON payload for its Vue.js components
-        json_scripts = re.findall(r'<script\s+type="application/json"[^>]*>(.*?)</script>', html_text, re.S)
+        # Wait for potential table rendering
+        try:
+            await page.wait_for_selector("table.mycourses, .empty-courses-message", timeout=2000)
+        except:
+            pass
+            
+        html = await page.content()
+        courses = []
+        
+        # --- Method 1: JSON-based Vuex state ---
+        json_scripts = re.findall(r'<script\s+type="application/json"[^>]*>(.*?)</script>', html, re.S)
         for script_content in json_scripts:
             try:
                 content = script_content.strip()
-                # Sometimes it's wrapped in a JS call, sometimes raw
                 if 'JSON.parse(' in content:
-                    inner_match = re.search(r'JSON\.parse\(\s*(["\'])(.*?)\1\s*\)', content, re.S)
+                    inner_match = re.search(r'JSON\.parse\((.*)\)', content, re.S)
                     if inner_match:
-                        # Handle escaped JSON string
-                        json_str = inner_match.group(2).encode().decode('unicode_escape')
-                        full_data = json.loads(json_str)
-                    else: continue
+                        inner_content = inner_match.group(1).strip()
+                        if (inner_content.startswith('"') and inner_content.endswith('"')) or \
+                           (inner_content.startswith("'") and inner_content.endswith("'")):
+                            json_str = json.loads(inner_content)
+                            full_data = json.loads(json_str)
+                        else:
+                            full_data = json.loads(inner_content)
+                    else:
+                        continue
                 else:
                     full_data = json.loads(content)
 
-                # Direct deep-dive into known store paths
-                # Path 1: vuexStoreData -> mycourses
+                mycourses_state = None
                 if isinstance(full_data, dict):
-                    store_data = full_data.get("vuexStoreData", {})
-                    mycourses = store_data.get("mycourses", {})
-                    
-                    # setCourses contains the flat map of all courses
-                    courses_payload = mycourses.get("setCourses", {})
-                    if courses_payload:
-                        for cid, info in courses_payload.items():
-                            if isinstance(info, dict) and "name" in info:
+                    if "vuexStoreData" in full_data and "mycourses" in full_data["vuexStoreData"]:
+                        mycourses_state = full_data["vuexStoreData"]["mycourses"]
+                    elif "state" in full_data and "mycourses" in full_data["state"]:
+                        mycourses_state = full_data["state"]["mycourses"]
+                    elif "mycourses" in full_data:
+                        mycourses_state = full_data["mycourses"]
+
+                if mycourses_state and isinstance(mycourses_state, dict):
+                    courses_data = mycourses_state.get("setCourses", {})
+                    if courses_data:
+                        selected_semester = mycourses_state.get("selectedSemester")
+                        semester_courses = mycourses_state.get("semesterCourses", {})
+                        
+                        # Apply Filtering
+                        if selected_semester and selected_semester in semester_courses:
+                            ordered_cids = semester_courses[selected_semester]
+                            if isinstance(ordered_cids, list):
+                                for cid in ordered_cids:
+                                    info = courses_data.get(cid)
+                                    if info:
+                                        name = info.get("name", "").strip()
+                                        if name:
+                                            courses.append((name, cid))
+                        
+                        if not courses: # Fallback to all in state
+                            for cid, info in courses_data.items():
                                 name = info.get("name", "").strip()
                                 if name:
-                                    all_courses_dict[cid] = name
-                                    courses_map[cid] = name
-                                    
-                    # Fallback: Recursive search in this specific JSON block
-                    if not courses_payload:
-                        def find_courses_recursive(obj):
-                            if not isinstance(obj, (dict, list)): return
-                            if isinstance(obj, dict):
-                                if "setCourses" in obj and isinstance(obj["setCourses"], dict):
-                                    for k, v in obj["setCourses"].items():
-                                        if isinstance(v, dict) and "name" in v:
-                                            all_courses_dict[k] = v.get("name")
-                                elif "id" in obj and "name" in obj and len(str(obj["id"])) == 32:
-                                    all_courses_dict[str(obj["id"])] = obj["name"]
-                                for v in obj.values(): find_courses_recursive(v)
-                            elif isinstance(obj, list):
-                                for v in obj: find_courses_recursive(v)
-                        find_courses_recursive(full_data)
-            except Exception as e:
-                logging.debug(f"JSON extract failed for one script: {e}")
+                                    courses.append((name, cid))
+                        
+                        if courses:
+                            logging.info(f"Extracted {len(courses)} courses via JSON on attempt {attempt}.")
+                            for name, cid in courses:
+                                courses_map[cid] = name
+                            return courses
+            except Exception:
                 continue
 
-        # --- Method 2: BeautifulSoup Scraper (Legacy/Traditional) ---
-        soup = BeautifulSoup(html_text, "html.parser")
-        
-        # Pattern 1: Table rows with data-course-id (Common in desktop view)
-        for row in soup.find_all(["tr", "div", "li"], attrs={"data-course-id": True}):
-            cid = row.get("data-course-id")
-            # Try to find a name in the text contents or a title
-            name = row.get("title") or row.get_text(" ", strip=True)
-            if cid and name and len(name) > 3:
-                all_courses_dict[cid] = name
-                courses_map[cid] = name
-
-        # Pattern 2: Any link containing a course ID pattern
-        course_links = soup.find_all("a", href=re.compile(r"(?:course_id=|to=|details\.php\?id=)([a-f0-9]{32})"))
-        for a in course_links:
-            href = a.get("href", "")
-            match = re.search(r"(?:course_id=|to=|details\.php\?id=)([a-f0-9]{32})", href)
-            if match:
-                cid = match.group(1)
-                name = a.get_text(strip=True)
-                if name and len(name) > 3:
-                    if cid not in all_courses_dict:
-                        all_courses_dict[cid] = name
+        # --- Method 2: DOM-based Scraper (Reliable for visible content) ---
+        try:
+            course_rows = await page.query_selector_all("table.mycourses tr[data-course-id]")
+            if course_rows:
+                dom_courses = []
+                for row in course_rows:
+                    cid = await row.get_attribute("data-course-id")
+                    # Name is usually in the 4th column or has a specific class/link
+                    name_link = await row.query_selector("td:nth-child(4) a, td.name a, a[href*='course_id=']")
+                    if name_link:
+                        name = await name_link.inner_text()
+                        name = name.strip()
+                        if name and cid:
+                            dom_courses.append((name, cid))
+                
+                if dom_courses:
+                    logging.info(f"Extracted {len(dom_courses)} courses via DOM scraping on attempt {attempt}.")
+                    for name, cid in dom_courses:
                         courses_map[cid] = name
+                    return dom_courses
+        except Exception as e:
+            logging.debug(f"DOM scraping error: {e}")
+
+        # --- Method 3: window.STUDIP.MyCoursesData fallback ---
+        m = re.search(r"window\.STUDIP\.MyCoursesData\s*=\s*(\{.*?\});", html, re.S)
+        if m:
+            try:
+                data = json.loads(m.group(1))
+                fallback_courses = []
+                for cid, info in data.get("courses", {}).items():
+                    name = info.get("name", "").strip()
+                    if name:
+                        fallback_courses.append((name, cid))
+                if fallback_courses:
+                    logging.info(f"Extracted {len(fallback_courses)} courses via window fallback on attempt {attempt}.")
+                    for name, cid in fallback_courses:
+                        courses_map[cid] = name
+                    return fallback_courses
+            except Exception:
+                pass
+
+    logging.error("CRITICAL: Failed to extract courses after all attempts.")
+    # Diagnostic snippet of body
+    try:
+        body_text = await page.inner_text("body")
+        logging.debug(f"Page body snippet: {body_text[:500]}...")
+    except:
+        pass
         
-        # If we found courses on the first URL, we might still want to try the second 
-        # to ensure we get "all" if the first was restricted to one semester.
-    
-    if all_courses_dict:
-        logging.info(f"✅ Extracted {len(all_courses_dict)} unique courses.")
-        # Ensure the map is updated for other functions
-        for cid, name in all_courses_dict.items():
-            courses_map[cid] = name
-        # The bot expects (name, cid) tuples
-        return [(name, cid) for cid, name in all_courses_dict.items()]
-
-    logging.warning("⚠️ No courses found during extraction.")
     return []
-
-
 
 
 # ── menu functions ─────────────────────────────────────────────────
@@ -877,13 +861,15 @@ def translate_food_codes(text):
     return text
 
 
-async def get_todays_menu_enhanced(session):
+async def get_todays_menu_enhanced(page):
     """Enhanced menu fetching with dynamic allergen guide - HTML format"""
     try:
         menu_url = "https://elearning.uni-oldenburg.de/plugins.php/mensawidget/menu/2/"
 
-        async with await session.get(menu_url) as r:
-            html_content = await r.text()
+        # Fetch menu page with increased timeout for reliability
+        async with page_lock:
+            await page.goto(menu_url, wait_until="domcontentloaded", timeout=15000)
+            html_content = await page.content()
 
         soup = BeautifulSoup(html_content, "html.parser")
 
@@ -1142,11 +1128,13 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard()
         )
 
-        # Session check
-        session = await login_studip()
+        # Page check
+        if not page or page.is_closed():
+            await update.message.reply_text("🔄 Logging in...")
+            await login_studip()
 
         # Fetch menu
-        menu_text = await get_todays_menu_enhanced(global_session)
+        menu_text = await get_todays_menu_enhanced(page)
 
         # Send menu
         await update.message.reply_text(
@@ -1183,10 +1171,11 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     try:
         await query.edit_message_text("🍽️ Loading menu...")
 
-        # Session check
-        session = await login_studip()
+        if not page or page.is_closed():
+            await query.edit_message_text("🔄 Logging in...")
+            await login_studip()
 
-        menu_text = await get_todays_menu_enhanced(session)
+        menu_text = await get_todays_menu_enhanced(page)
         await query.edit_message_text(menu_text, parse_mode="HTML")
 
     except Exception as e:
@@ -1198,170 +1187,137 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ──────────────────────────────────────────────────────────────────────────────
 #  FILE LISTING + ZIP CREATION + WATCHER
 # ──────────────────────────────────────────────────────────────────────────────
+async def browser_auto_restart_loop(app):
+    """Browser restart loop with better error handling"""
+    global playwright, browser, browser_context, page
 
-
-async def list_files(cid, folder_url=None):
-    """Extract files/folders from Stud.IP file table browser-less."""
-    global global_session
-    url = _normalize_url(folder_url) if folder_url else f"{BASE_URL}/dispatch.php/course/files?cid={cid}"
-    logging.info(f">>> list_files called with cid={cid}, folder_url={folder_url} => {url}")
-    
-    try:
-        async with await global_session.get(url) as resp:
-            html_text = await resp.text()
-    except Exception as e:
-        logging.error(f"Failed to fetch files: {e}")
-        return []
-
-    soup = BeautifulSoup(html_text, "html.parser")
-    items = []
-    
-    # --- Method 1: JSON-based extraction (Robust) ---
-    form = soup.select_one("form#files_table_form")
-    if form:
+    while True:
         try:
-            data_files_raw = form.get("data-files")
-            data_folders_raw = form.get("data-folders")
-            
-            data_files = json.loads(data_files_raw) if data_files_raw else []
-            data_folders = json.loads(data_folders_raw) if data_folders_raw else []
-            
-            # Process folders
-            for folder in data_folders:
-                name = folder.get("name", "Unknown Folder")
-                furl = folder.get("url")
-                if furl: furl = urljoin(BASE_URL, furl)
-                
-                # Modified date
-                chdate = folder.get("chdate")
-                modified = "-"
-                modified_iso = None
-                if chdate:
-                    try:
-                        dt = datetime.fromtimestamp(int(chdate), tz=timezone.utc).astimezone(TZ_BERLIN)
-                        modified = dt.strftime("%d.%m.%Y %H:%M")
-                        modified_iso = dt.isoformat()
-                    except: pass
-                
-                items.append({
-                    "type": "folder",
-                    "name": name,
-                    "url": furl,
-                    "size": "-",
-                    "modified": modified,
-                    "modified_iso": modified_iso
-                })
-            
-            # Process files
-            for f in data_files:
-                name = f.get("name", "Unknown File")
-                durl = f.get("download_url")
-                if durl: durl = urljoin(BASE_URL, durl)
-                
-                # Size formatting
-                raw_size = f.get("size")
-                size_str = "-"
-                if raw_size:
-                    try:
-                        rs = int(raw_size)
-                        if rs > 1024*1024: size_str = f"{rs/(1024*1024):.1f} MB"
-                        elif rs > 1024: size_str = f"{rs/1024:.1f} KB"
-                        else: size_str = f"{rs} B"
-                    except: size_str = str(raw_size)
-                
-                # Modified date
-                chdate = f.get("chdate")
-                modified = "-"
-                modified_iso = None
-                if chdate:
-                    try:
-                        dt = datetime.fromtimestamp(int(chdate), tz=timezone.utc).astimezone(TZ_BERLIN)
-                        modified = dt.strftime("%d.%m.%Y %H:%M")
-                        modified_iso = dt.isoformat()
-                    except: pass
-                    
-                items.append({
-                    "type": "file",
-                    "name": name,
-                    "url": durl,
-                    "size": size_str,
-                    "modified": modified,
-                    "modified_iso": modified_iso
-                })
-                
-            if items:
-                logging.info(f"✅ Extracted {len(items)} items via JSON from {url}")
-                return items
-        except Exception as json_err:
-            logging.warning(f"JSON file extraction failed, falling back to BS4: {json_err}")
+            await asyncio.sleep(BROWSER_RESTART_INTERVAL)
 
-    # --- Method 2: BeautifulSoup Fallback (Legacy) ---
-    table = soup.select_one("table.documents")
-    if not table:
-        return []
+            if not browser or browser.is_connected():
+                continue
 
-    # Subfolders
-    for row in table.select("tbody.subfolders tr"):
-        link_tag = row.select_one("td:nth-child(3) a")
-        if not link_tag: continue
-        name = link_tag.get_text(strip=True)
-        href = link_tag.get("href")
-        if href:
-            href = urljoin(BASE_URL, href)
-        
-        time_tag = row.find("time")
-        modified = time_tag.get_text(strip=True) if time_tag else "-"
-        modified_iso = time_tag.get("datetime") if time_tag else None
-        
-        items.append({
-            "type": "folder",
-            "name": name,
-            "url": href,
-            "size": "-",
-            "modified": modified,
-            "modified_iso": modified_iso
-        })
+            logging.info("♻️ Browser restart triggered...")
 
-    # Files
-    for row in table.select("tbody.files tr"):
-        name_tag = row.select_one("td:nth-child(3) a span") or row.select_one("td:nth-child(3) a")
-        if not name_tag: continue
-        name = name_tag.get_text(strip=True)
-        
-        download_btn = row.select_one("a[title^='Download file'], a[href*='download/file']")
-        href = download_btn.get("href") if download_btn else None
-        if not href:
-            link_tag = row.select_one("td:nth-child(3) a")
-            href = link_tag.get("href") if link_tag else None
-            
-        if href:
-            href = urljoin(BASE_URL, href)
-            
-        time_tag = row.find("time")
-        modified = time_tag.get_text(strip=True) if time_tag else "-"
-        modified_iso = time_tag.get("datetime") if time_tag else None
-        size = row.select_one("td:nth-child(4) span").get_text(strip=True) if row.select_one("td:nth-child(4) span") else "-"
-        
-        items.append({
-            "type": "file",
-            "name": name,
-            "url": href,
-            "size": size,
-            "modified": modified,
-            "modified_iso": modified_iso
-        })
+            # Safely close existing browser
+            try:
+                if browser_context:
+                    await browser_context.close()
+                if browser:
+                    await browser.close()
+                if playwright:
+                    await playwright.stop()
+            except Exception as e:
+                logging.warning(f"Browser cleanup warning: {e}")
+
+            # Start new browser
+            playwright = await async_playwright().start()
+            browser = await playwright.chromium.launch(headless=True)
+            browser_context = await browser.new_context()
+            page = await browser_context.new_page()
+
+            # Re-login
+            await login_studip()
+
+        except Exception as e:
+            logging.error(f"Browser auto-restart failed: {e}")
+            await asyncio.sleep(300)  # Wait 5 minutes and retry
+
+
+async def list_files(page, cid, folder_url=None):
+    """Extract files/folders from Stud.IP file table preserving exact DOM order with proper URL handling."""
+    async with page_lock:
+        url = _normalize_url(
+            folder_url) if folder_url else f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=25000)
+            await page.wait_for_selector("table.documents tbody", timeout=15000)
+        except Exception as e:
+            logging.warning(f"Navigation error on list_files: {e}")
+            raise TimeoutError("Timed out while loading file list")
+
+        items = await page.evaluate(
+            """() => {
+                const res = [];
+                const table = document.querySelector("table.documents");
+                if (!table) return res;
+
+                const readRow = (row, type) => {
+                    const linkCell = row.querySelector("td:nth-child(3) a");
+                    const name = (type === "file"
+                                  ? row.querySelector("td:nth-child(3) a span")
+                                  : linkCell)?.textContent?.trim() || null;
+
+                    // GET FILE URL CORRECTLY - CRITICAL FIX
+                    let href = null;
+                    if (type === "file") {
+                        // First find the download button
+                        const downloadBtn = row.querySelector("a[title^='Download file']");
+                        if (downloadBtn) {
+                            href = downloadBtn.getAttribute("href");
+                        }
+                        // Fallback: first link
+                        if (!href) {
+                            href = linkCell?.getAttribute("href") || null;
+                        }
+                    } else {
+                        // FOLDER URL
+                        href = linkCell?.getAttribute("href") || null;
+                    }
+
+                    // Convert relative URLs to absolute
+                    if (href && !href.startsWith('http') && !href.startsWith('//')) {
+                        if (href.startsWith('/')) {
+                            href = window.location.origin + href;
+                        } else {
+                            href = window.location.origin + '/' + href;
+                        }
+                    }
+
+                    const timeEl = row.querySelector("time");
+                    const modifiedText = timeEl?.textContent?.trim() || "-";
+                    const modifiedISO  = timeEl?.getAttribute("datetime") || null;
+
+                    const size = (type === "file"
+                                  ? (row.querySelector("td:nth-child(4) span")?.textContent?.trim() || "-")
+                                  : "-");
+
+                    res.push({
+                        type,
+                        name,
+                        url: href,
+                        size,
+                        modified: modifiedText,
+                        modified_iso: modifiedISO,
+                    });
+                };
+
+                table.querySelectorAll("tbody.subfolders tr").forEach(tr => readRow(tr, "folder"));
+                table.querySelectorAll("tbody.files tr").forEach(tr => readRow(tr, "file"));
+
+                return res;
+            }"""
+        )
+
+    # Debug logging
+    for item in items:
+        if item["type"] == "file":
+            logging.info(f"📄 File found: {item['name']} -> URL: {item['url']}")
 
     return items
 
 
-async def get_fresh_file_url(cid, filename, current_url=None):
-    """Return a fresh, valid download URL for a given file name browser-less."""
+async def get_fresh_file_url(page, cid, filename, current_url=None):
+    """Return a fresh, valid download URL for a given file name with robust matching."""
     try:
         logging.info(f"🔄 Getting fresh URL for: {filename} in course {cid}")
-        if not current_url:
-            current_url = f"{BASE_URL}/dispatch.php/course/files?cid={cid}"
 
-        files = await list_files(cid, current_url)
+        # List files from current URL or root
+        if not current_url:
+            current_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
+
+        files = await list_files(page, cid, current_url)
 
         # Find file with exact match
         for f in files:
@@ -1375,9 +1331,9 @@ async def get_fresh_file_url(cid, filename, current_url=None):
 
         # If exact match not found, check root page
         logging.info(f"🔍 File not found in current location, checking root...")
-        root_url = f"{BASE_URL}/dispatch.php/course/files?cid={cid}"
+        root_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
         if current_url != root_url:
-            files = await list_files(cid, root_url)
+            files = await list_files(page, cid, root_url)
 
             for f in files:
                 if f["type"] == "file" and f["name"] == filename:
@@ -1396,16 +1352,20 @@ async def get_fresh_file_url(cid, filename, current_url=None):
 
 
 # ── recursive ZIP (downloads all files + subfolders) ───────────────────────────
-async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=None):
-    """Download all files (including subfolders) recursively browser-less."""
+async def create_recursive_zip(page, cid, base_url, browser_context, root_name: str, progress_callback=None):
+    """
+    Download all files (including subfolders) recursively into a ZIP file.
+    Each file's URL is refreshed live before downloading.
+    At the end, a ZIP summary card is returned.
+    """
     from io import BytesIO
     import zipfile
     import posixpath
-    global global_session
 
     async def _crawl(url, path_prefix, collected, empty_folders):
+        """Recursively traverse folders and collect all files with fresh URLs."""
         try:
-            items = await list_files(cid, url)
+            items = await list_files(page, cid, url)
         except Exception as e:
             logging.warning(f"Failed to list {path_prefix}: {e}")
             return
@@ -1427,43 +1387,57 @@ async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=
     total = len(all_files)
 
     if total == 0:
+        logging.info(f"No files found in {root_name}.")
         return BytesIO(), 0, root_name, 0, 0
 
+    cookies = await browser_context.cookies()
+    cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
     buf = BytesIO()
+    timeout = aiohttp.ClientTimeout(total=300)
     total_size = 0
     success_count = 0
 
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for folder in sorted(empty_folders):
-            if folder and not folder.endswith("/"):
-                zipf.writestr(folder + "/", "")
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zipf:
+            # Add empty folders
+            for folder in sorted(empty_folders):
+                if folder and not folder.endswith("/"):
+                    zipf.writestr(folder + "/", "")
 
-        for i, (f, folder_path) in enumerate(all_files, start=1):
-            filename = f.get("name") or "unnamed"
-            zip_path = f"{folder_path}/{filename}"
+            for i, (f, folder_path) in enumerate(all_files, start=1):
+                filename = f["name"] or "unnamed"
+                zip_path = f"{folder_path}/{filename}"
 
-            # Use URL already found during crawl
-            file_url = f.get("url")
-            if not file_url:
-                logging.warning(f"⚠️ No URL found for {filename}, skipping.")
-                continue
+                # Always refresh the URL before downloading
+                fresh_url = await get_fresh_file_url(page, cid, filename)
+                if not fresh_url:
+                    logging.warning(f"Skipping {filename}: no valid URL")
+                    continue
 
-            try:
-                # Normalize URL just in case
-                file_url = _normalize_url(file_url)
-                async with await global_session.get(file_url) as resp:
-                    if resp.status == 200:
-                        content = await resp.read()
-                        total_size += len(content)
-                        zipf.writestr(zip_path, content)
-                        success_count += 1
-                    else:
-                        logging.warning(f"⚠️ Failed to download {filename} (Status: {resp.status})")
-            except Exception as e:
-                logging.warning(f"❌ Failed to download {filename}: {e}")
+                attempt = 0
+                while attempt < 3:
+                    try:
+                        async with session.get(fresh_url, headers={"Cookie": cookie_header}) as resp:
+                            if resp.status == 200:
+                                content = await resp.read()
+                                total_size += len(content)
+                                zipf.writestr(zip_path, content)
+                                success_count += 1
+                                break
+                            else:
+                                logging.warning(f"HTTP {resp.status} for {filename}")
+                                attempt += 1
+                                await asyncio.sleep(2 ** attempt)
+                    except Exception as e:
+                        logging.warning(f"Retry {attempt + 1} for {filename}: {e}")
+                        attempt += 1
+                        await asyncio.sleep(2 ** attempt)
 
-            if progress_callback:
-                await progress_callback(total, i)
+                if progress_callback:
+                    try:
+                        await progress_callback(total, i)
+                    except Exception:
+                        pass
 
     buf.seek(0)
     return buf, total, root_name, success_count, total_size
@@ -1667,43 +1641,66 @@ def _parse_ann_date(s: str) -> datetime:
     return datetime.min
 
 
-async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
-    """Parallel announcement checking for new items"""
-    global global_session, courses_map
-    session = global_session
+async def check_new_announcements_parallel(page, bot, chat_id, silent: bool = False):
+    """Parallel announcement checking for better performance"""
+    global courses_map
+
     if not silent:
-        await bot.send_message(chat_id=chat_id, text="📢 Checking announcements...", disable_notification=True)
+        await bot.send_message(chat_id=chat_id, text="📢 Checking announcements...",
+                               disable_notification=True)
 
     try:
         CACHE_PATH = "announcement_cache.json"
+
+        # ── Load cache safely ────────────────────────────────────────────────
         cache = {"seen": [], "history": []}
         if os.path.exists(CACHE_PATH):
-            with open(CACHE_PATH, "r", encoding="utf-8") as f:
-                cache = json.load(f)
+            try:
+                with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+            except Exception:
+                logging.warning("⚠️ Failed to load announcement cache, using empty.")
+
         seen = set(cache.get("seen", []))
 
+        # ── Ensure courses are loaded ───────────────────────────────────────
         if not courses_map:
-            courses_list = await list_courses()
-            courses = courses_list
-        else:
-            courses = [(name, cid) for cid, name in courses_map.items()]
+            logging.warning("⚠️ courses_map is empty — reloading...")
+            # get_courses yerine list_courses kullan
+            courses_list = await list_courses(page)
+            courses_map = {cid: name for name, cid in courses_list}
 
+            if not courses_map:
+                logging.warning("🔐 Maybe session expired, trying re-login...")
+                await login_studip()
+                courses_list = await list_courses(page)
+                courses_map = {cid: name for name, cid in courses_list}
+                if not courses_map:
+                    logging.error("❌ Still no courses after re-login, aborting check.")
+                    return
+
+        courses = [(name, cid) for cid, name in courses_map.items()]
         all_found = []
-        semaphore = asyncio.Semaphore(3)
+
+        # ── Parallel scraping setup ─────────────────────────────────────────
+        semaphore = asyncio.Semaphore(5)
 
         async def check_single_course_announcements(course_name, cid):
             async with semaphore:
                 try:
                     url = f"{BASE_URL}/dispatch.php/course/overview?cid={cid}"
-                    async with await session.get(url) as r:
-                         html_text = await r.text()
+                    async with page_lock:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        html = await page.content()
 
-                    if "loginform" in html_text:
+                    # Check if redirected to login page
+                    if "loginform" in html:
                         logging.warning(f"🔐 Session expired while accessing {course_name}.")
-                        await session.login(force=True)
+                        await login_studip()
                         return course_name, cid, []
 
-                    soup = BeautifulSoup(html_text, "html.parser")
+                    soup = BeautifulSoup(html, "html.parser")
+
                     ann_container = None
                     for art in soup.select("article.studip"):
                         h = art.select_one("header h1")
@@ -1717,7 +1714,6 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
                     course_announcements = []
                     for art in ann_container.select("article.studip.toggle"):
                         ann_id = art.get("id") or ""
-                        # Adjust selectors for direct HTML
                         title_tag = art.select_one("header h1 a") or art.select_one("header h1")
                         sender_tag = art.select_one(".news_user")
                         date_tag = art.select_one(".news_date")
@@ -1732,26 +1728,41 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
                         dt = _parse_ann_date(date_s)
 
                         announcement = {
-                            "key": key, "cid": cid, "course": course_name, "subject": title,
-                            "sender": sender, "date": date_s, "dt": dt.isoformat() if dt else None, "body": body,
+                            "key": key,
+                            "cid": cid,
+                            "course": course_name,
+                            "subject": title,
+                            "sender": sender,
+                            "date": date_s,
+                            "dt": dt.isoformat() if dt else None,
+                            "body": body,
                         }
                         course_announcements.append(announcement)
+
                     return course_name, cid, course_announcements
+
                 except Exception as e:
                     logging.warning(f"Announcement parse error in {course_name}: {e}")
                     return course_name, cid, []
 
+        # ── Parallel execution ─────────────────────────────────────────────
         tasks = [check_single_course_announcements(name, cid) for name, cid in courses]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for result in results:
+            if isinstance(result, Exception):
+                logging.error(f"Course announcement check failed: {result}")
+                continue
             if isinstance(result, tuple) and len(result) == 3:
-                all_found.extend(result[2])
+                course_name, cid, course_anns = result
+                all_found.extend(course_anns)
 
+        # ── Sort and detect new items ───────────────────────────────────────
         if all_found:
             all_found.sort(key=lambda x: (x["dt"] or "", x["date"]))
         new_items = [a for a in all_found if a["key"] not in seen]
 
+        # ── Notifications ──────────────────────────────────────────────────
         if new_items:
             for ann in new_items:
                 text = (
@@ -1766,10 +1777,13 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
                 )
                 await broadcast(bot, text[:4000], parse_mode="HTML")
         elif not silent:
-            await bot.send_message(chat_id=chat_id, text="☑️ No new announcements found.", disable_notification=True)
+            await bot.send_message(chat_id=chat_id, text="☑️ No new announcements found.",
+                                   disable_notification=True)
 
+        # ── Update cache ───────────────────────────────────────────────────
         seen.update(a["key"] for a in all_found)
         cache["seen"] = list(seen)
+
         merged = cache.get("history", [])
         existing_keys = {h.get("key") for h in merged}
         for a in all_found:
@@ -1779,14 +1793,25 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
 
         with open(CACHE_PATH, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
+
+        logging.info(f"📢 Announcement check completed: {len(new_items)} new, {len(all_found)} total.")
+
     except Exception as e:
+        if not silent:
+            await bot.send_message(chat_id=chat_id, text=f"❌ Announcement check error:\n{e}")
         logging.error(f"check_new_announcements_parallel fatal: {e}")
+
+
+# Wrapper for parallel announcement checking
+async def check_new_announcements(page, bot, chat_id, silent: bool = False):
+    """Wrapper for parallel announcement checking"""
+    return await check_new_announcements_parallel(page, bot, chat_id, silent)
 
 
 async def fetch_message_body(session, message_url):
     """Fetch message body from detail page with improved parsing."""
     try:
-        async with await session.get(message_url) as resp:
+        async with session.get(message_url) as resp:
             if resp.status != 200:
                 return f"[HTTP Error: {resp.status}]"
             html = await resp.text()
@@ -1921,11 +1946,11 @@ async def show_last_forum_posts(update: Update, context: ContextTypes.DEFAULT_TY
         course = post.get('course', 'Unknown Course')
         thread = post.get('thread', 'Unknown Thread')
         author = post.get('author', 'Unknown')
-        date = post.get('date') or post.get('timestamp', '-')
+        date = post.get('date', '-')
         body = post.get('body', '')
 
-        # No blind truncation here because body contains HTML formatting.
-        # It's better to manage length dynamically within the scraper.
+        # Limit body
+        body_snippet = body if len(body) <= 200 else body[:200] + "..."
 
         text = (
             "━━━━━━━━━━━━━━━━━\n"
@@ -1936,7 +1961,7 @@ async def show_last_forum_posts(update: Update, context: ContextTypes.DEFAULT_TY
             f"👤 <b>By:</b> {html.escape(author)}\n"
             f"🕒 <b>Date:</b> {html.escape(date)}\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"{body}\n"
+            f"{html.escape(body_snippet)}\n"
             "━━━━━━━━━━━━━━━━━"
         )
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
@@ -1950,40 +1975,49 @@ async def show_last_forum_posts(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def check_new_files(bot, chat_id, silent: bool = False):
+async def check_new_files(page, bot, chat_id, silent: bool = False):
     """Wrapper for parallel file checking"""
-    return await check_new_files_parallel(bot, chat_id, silent)
+    return await check_new_files_parallel(page, bot, chat_id, silent)
 
 
-async def check_new_files_parallel(bot, chat_id, silent: bool = False):
+async def check_new_files_parallel(page, bot, chat_id, silent: bool = False):
     """Parallel file checking for better performance"""
-    global global_session, courses_map
-    session = global_session
+    global courses_map
     if not silent:
-        await bot.send_message(chat_id=chat_id, text="📁 Checking files...", disable_notification=True)
+        await bot.send_message(
+            chat_id=chat_id,
+            text="📁 Checking files...",
+            disable_notification=True
+        )
 
     try:
         cache = load_files_cache()
         updated = False
         all_collected = []
 
+        # Courses
         if not courses_map:
-            courses = await list_courses()
+            async with page_lock:
+                await page.goto(STUDIP_URL, wait_until="networkidle", timeout=30000)
+            courses = await list_courses(page)
         else:
             courses = [(name, cid) for cid, name in courses_map.items()]
 
         if not courses:
+            await bot.send_message(chat_id=chat_id, text="⚠️ No courses found.")
             return
 
+        # Semaphore for parallel scanning (max 3 courses at once)
         semaphore = asyncio.Semaphore(3)
 
         async def check_single_course(course_name, cid):
             async with semaphore:
                 try:
-                    files = await list_files(cid)
+                    files = await list_files(page, cid)
                     if not files:
                         return course_name, cid, [], []
 
+                    # Build current snapshot using stable timestamp
                     current_files = {}
                     for f in files:
                         if f.get("type") != "file":
@@ -2160,151 +2194,106 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False):
         logging.error(f"check_new_files_parallel fatal: {e}")
 
 
-async def send_morning_summary(bot, user_ids):
-    """Fetch today's schedule and menu, then send to users."""
-    global global_session
-    session = global_session
-    if not session:
-        return
-
-    now = datetime.now(TZ_BERLIN)
-    today_date = now.date()
-    
-    # 1. Get Schedule
-    try:
-        week_start = today_date - timedelta(days=today_date.weekday())
-        events = await get_calendar_events(session=session, week_start=week_start)
-        today_events = [ev for ev in events if ev["date_key"] == today_date]
-    except Exception as e:
-        logging.error(f"Summary schedule fetch error: {e}")
-        today_events = []
-
-    # 2. Get Menu
-    try:
-        menu_text = await get_todays_menu_enhanced(session)
-        if "Mensa kapalı" in menu_text or not menu_text:
-            menu_text = "🍽️ *Mensa:* Bugün kapalı veya menü bulunamadı."
-    except Exception as e:
-        logging.error(f"Summary menu fetch error: {e}")
-        menu_text = "🍽️ *Mensa:* Menü alınamadı."
-
-    # 3. Format Schedule
-    if not today_events:
-        schedule_text = "📅 <b>Bugün dersin yok!</b> Keyfini çıkar. ✨"
-    else:
-        lines = ["📅 <b>Bugünkü Derslerin:</b>"]
-        course_blocks = []
-        for ev in today_events:
-            course_icon = _get_course_icon(ev.get("title", ""))
-            display_title = clean_course_title(ev.get("title", ""))
-            duration = ev["time"]
-            loc_icon = _get_location_emoji(ev.get("location", ""))
-            
-            block = (
-                f"{course_icon} <b>{display_title}</b>\n"
-                f"   🕒 <code>{duration}</code>\n"
-                f"   {loc_icon} {_safe_loc(ev['location'])}"
-            )
-            course_blocks.append(block)
-        lines.append("\n\n".join(course_blocks))
-        schedule_text = "\n".join(lines)
-
-    # 4. Final Message
-    header = (
-        "☀️ <b>GÜNAYDIN!</b> ☀️\n"
-        f"🗓️ <b>Bugün:</b> {now:%d %B %Y, %A}\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-    )
-    
-    final_text = f"{header}{schedule_text}\n\n━━━━━━━━━━━━━━━━━━\n\n{menu_text}"
-    
-    for uid in user_ids:
-        try:
-            await bot.send_message(chat_id=uid, text=final_text, parse_mode="HTML")
-        except Exception as e:
-            logging.error(f"Failed to send summary to {uid}: {e}")
-
-
-async def check_calendar_reminders(bot, chat_id, silent: bool = False):
-    """Check for upcoming classes and send reminders. (Every 30 mins)"""
-    global global_session
-    session = global_session
+async def check_calendar_reminders(page, bot, chat_id, silent: bool = False):
+    """Check for upcoming classes and send reminders."""
     try:
         if not silent:
             logging.info("⏰ Checking calendar reminders...")
 
+        # Get cache
         reminders = load_reminders_cache()
         updated = False
 
-        today = datetime.now(TZ_BERLIN).date()
-        week_start = today - timedelta(days=today.weekday())
-        events = await get_calendar_events(session=session, week_start=week_start)
+        # Get today's events (force week view to ensure we have times)
+        events = await get_calendar_events(page, week_view=False)
         if not events:
             return
 
         now = datetime.now(TZ_BERLIN)
 
         for event in events:
+            # Skip invalid events
             if not event.get("start") or not event.get("title") or event["title"] == "Untitled":
                 continue
 
+            # Event details
             title = event["title"]
             start_dt = event["start"]
             location = event.get("location", "Unknown location")
+
+            # Key for cache: title + start time
+            # Using timestamp to manage recurring events properly
             event_key = f"{title}|{int(start_dt.timestamp())}"
 
+            # If already sent, skip
             if event_key in reminders:
                 continue
 
+            # Calculate time difference
             diff = start_dt - now
             minutes_left = diff.total_seconds() / 60
 
-            # Reminder window: 25-30 minutes before
-            if 25 < minutes_left <= 31:
+            # Logic: Send reminder if within 10-15 minutes range
+            # (10-15 ensures we catch it even if poll is every 2-3 mins)
+            if 10 < minutes_left <= 15:
+                # Send Reminder
                 text = (
-                    "🔔 <b>DERS HATIRLATICI</b>\n"
+                    "🔔 <b>UPCOMING CLASS REMINDER</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     f"📘 <b>{title}</b>\n"
-                    f"🕒 <b>{int(minutes_left)} dakika içinde</b> başlıyor\n"
+                    f"🕒 Starts in <b>{int(minutes_left)} mins</b>\n"
                     f"📍 {location}\n"
                     "━━━━━━━━━━━━━━━━━━"
                 )
+
                 try:
                     await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
                     logging.info(f"🔔 Sent reminder for {title}")
+
+                    # Store in cache
                     reminders[event_key] = int(now.timestamp())
                     updated = True
                 except Exception as e:
                     logging.error(f"Failed to send reminder for {title}: {e}")
 
+        # Cleanup old cache entries (keep last 24h)
         cutoff = now.timestamp() - 86400
         new_cache = {k: v for k, v in reminders.items() if v > cutoff}
         if len(new_cache) != len(reminders):
             updated = True
+
         if updated:
             save_reminders_cache(new_cache)
+
     except Exception as e:
         logging.error(f"❌ Error in check_calendar_reminders: {e}")
 
 
-async def check_new_messages(bot, chat_id, silent: bool = False):
+async def check_new_messages(page, bot, chat_id, silent: bool = False):
     """Fetch Stud.IP messages fully (content included) and send in order (newest last)."""
-    global global_session
-    session = global_session
+
     if not silent:
         await bot.send_message(chat_id=chat_id, text="📨 Checking messages...", disable_notification=True)
 
-    try:
-        url = f"{BASE_URL}/dispatch.php/messages/overview"
-        async with await session.get(url) as resp:
-            html_text = await resp.text()
+    # Get cookies from session
+    cookies = {cookie["name"]: cookie["value"] for cookie in await page.context.cookies()}
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-        soup = BeautifulSoup(html_text, "html.parser")
+    async with aiohttp.ClientSession(cookies=cookies, headers=headers) as session:
+        # Fetch message list page
+        url = f"{BASE_URL}/dispatch.php/messages/overview"
+        async with session.get(url) as resp:
+            html = await resp.text()
+
+        soup = BeautifulSoup(html, "html.parser")
         rows = soup.select("table#messages tbody tr[id^='message_']")
+
         all_messages = []
         for tr in rows:
             link_tag = tr.select_one("td.title a[href*='dispatch.php/messages/read/']")
-            if not link_tag: continue
+            if not link_tag:
+                continue
+
             href = link_tag["href"].strip()
             title = link_tag.get_text(strip=True)
             sender_tag = tr.select_one("td:nth-of-type(3)")
@@ -2312,41 +2301,71 @@ async def check_new_messages(bot, chat_id, silent: bool = False):
             date_tag = tr.select_one("td:nth-of-type(4)")
             date = date_tag.get_text(strip=True) if date_tag else "Unknown"
 
+            # URL'yi normalize et
             if not href.startswith('http'):
-                href = f"{BASE_URL}/{href.lstrip('/')}"
+                if href.startswith('/'):
+                    href = f"{BASE_URL}{href}"
+                else:
+                    href = f"{BASE_URL}/{href}"
 
-            all_messages.append({
-                "id": tr["id"].replace("message_", ""), "title": title, "sender": sender, "date": date, "url": href,
-            })
+            message_data = {
+                "id": tr["id"].replace("message_", ""),
+                "title": title,
+                "sender": sender,
+                "date": date,
+                "url": href,
+            }
+            all_messages.append(message_data)
 
+        # Load old cache
         old_messages = []
         if os.path.exists(CACHE_FILE):
             try:
                 with open(CACHE_FILE, "r", encoding="utf-8") as f:
                     old_messages = json.load(f)
-            except: pass
+            except Exception as e:
+                logging.warning(f"Could not load message cache: {e}")
 
+        # Find new messages
         old_ids = {m["id"] for m in old_messages}
         new_messages = [m for m in all_messages if m["id"] not in old_ids]
 
+        # Update content of ALL messages (not just new ones)
+        logging.info(f"📨 Updating content for {len(all_messages)} messages...")
+
+        # Fetch all message contents in parallel
+        tasks = [fetch_message_body(session, m["url"]) for m in all_messages]
+        bodies = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Add contents to messages
+        for msg, body in zip(all_messages, bodies):
+            if isinstance(body, str):
+                msg["body"] = body
+            else:
+                msg["body"] = f"[Error: {str(body)[:100]}]"
+
+        # Update cache - save ALL messages
+        try:
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(all_messages, f, indent=2, ensure_ascii=False)
+            logging.info(f"✅ Message cache updated with {len(all_messages)} messages")
+        except Exception as e:
+            logging.error(f"Failed to save message cache: {e}")
+
+        # Notify new messages
         if not new_messages:
             if not silent:
                 await bot.send_message(chat_id=chat_id, text="☑️ No new messages found.", disable_notification=True)
             return False
 
-        # Use the existing fetch_message_body with our instance
-        for msg in new_messages:
-            msg["body"] = await fetch_message_body(session, msg["url"])
-
-        # Update cache with new messages prepended or appended
-        # Best to just store all recent ones
-        all_messages_combined = (new_messages + old_messages)[:100]
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(all_messages_combined, f, indent=2, ensure_ascii=False)
-
+        # Sort new messages by date (oldest to newest)
         new_messages_sorted = sorted(new_messages, key=lambda m: parse_date_safe(m.get("date", "")))
+
         for msg in new_messages_sorted:
-            body_text = msg.get("body", "📭 Content error").strip()
+            body_text = msg.get("body", "").strip()
+            if not body_text or "[Error" in body_text:
+                body_text = "📭 Message content could not be loaded"
+
             text = (
                 "🔥 📩 <b>NEW MESSAGE</b> 🔥\n"
                 "━━━━━━━━━━━━━━━━━\n"
@@ -2358,18 +2377,15 @@ async def check_new_messages(bot, chat_id, silent: bool = False):
                 "━━━━━━━━━━━━━━━━━"
             )
             await broadcast(bot, text[:4000], parse_mode="HTML")
+
         return True
-    except Exception as e:
-        logging.error(f"check_new_messages failed: {e}")
-        return False
 
 
 # ── forum checking ─────────────────────────────────────────────────────────────
 
-async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
-    """Parallel forum checking for new posts browser-less"""
-    global global_session, courses_map
-    session = global_session
+async def check_new_forum_posts_parallel(page, bot, chat_id, silent: bool = False):
+    """Parallel forum checking for new posts"""
+    global courses_map
 
     if not silent:
         await bot.send_message(chat_id=chat_id, text="💬 Checking forum posts...",
@@ -2391,7 +2407,7 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
         # ── Ensure courses are loaded ───────────────────────────────────────
         if not courses_map:
             # Try to load courses if empty
-            courses_list = await list_courses()
+            courses_list = await list_courses(page)
             courses_map = {cid: name for name, cid in courses_list}
 
         courses = [(name, cid) for cid, name in courses_map.items()]
@@ -2403,138 +2419,582 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
         async def check_single_course_forum(course_name, cid):
             async with semaphore:
                 try:
-                    # Use the modern JSON API for Vue forums
-                    url = f"{BASE_URL}/jsonapi.php/v1/courses/{cid}/forum-discussions"
-                    async with await session.get(url, headers={"Accept": "application/vnd.api+json"}) as r:
-                        if r.status != 200:
-                            return []
-                        data = await r.json()
-                        
-                    discussions = data.get("data", [])
-                    course_posts = []
-                    
-                    # Limit to checking top 10 most recently updated discussions to save requests
-                    for disc in discussions[:10]:
-                        title = disc.get("attributes", {}).get("title", "Unknown")
-                        disc_id = disc.get("id")
-                        unread_count = disc.get("meta", {}).get("unread-postings-count", 0)
-                        
-                        # We consider it "new" if unread-postings-count > 0 
-                        is_new_ind = unread_count > 0
+                    # Navigate to Forum Overview
+                    url = f"{BASE_URL}/dispatch.php/course/forum/index?cid={cid}"
+                    async with page_lock:
+                        await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+                        html_content = await page.content()
 
-                        # Fetch the postings for this discussion
-                        posts_url = f"{BASE_URL}/jsonapi.php/v1/forum-discussions/{disc_id}/postings?include=author"
-                        async with await session.get(posts_url, headers={"Accept": "application/vnd.api+json"}) as r2:
-                            if r2.status != 200:
-                                continue
-                            posts_data = await r2.json()
-                            
-                        posts = posts_data.get("data", [])
-                        if not posts: continue
-                        
-                        # Helper to map author ID to name from included data
-                        def get_author_name(aid):
-                            if aid and "included" in posts_data:
-                                for inc in posts_data["included"]:
-                                    if inc.get("type") == "forum-members" and inc.get("id") == aid:
-                                        return inc.get("attributes", {}).get("name", "Unknown")
-                            return "Unknown"
-                            
-                        def friendly_date(iso_str):
-                            if not iso_str: return "Unknown date"
-                            try:
-                                dt = datetime.fromisoformat(iso_str)
-                                return dt.strftime("%Y-%m-%d %H:%M")
-                            except Exception:
-                                return str(iso_str)
-                            
-                        history_bodies = []
-                        # Take ALL posts to show full conversation context
-                        for post in posts:
-                            p_author_id = post.get("relationships", {}).get("author", {}).get("data", {}).get("id")
-                            p_author = get_author_name(p_author_id)
-                            p_html = post.get("attributes", {}).get("content-html", "")
-                            p_body = BeautifulSoup(p_html, "html.parser").get_text(separator=' ', strip=True)[:400] if p_html else "No content"
-                            p_date = friendly_date(post.get("attributes", {}).get("mkdate", ""))
-                            history_bodies.append(f"👤 <b>{html.escape(p_author)}</b> <i>({p_date})</i>:\n{html.escape(p_body)}")
-                            
-                        # If the thread is super long, just take the last 15 messages so Telegram won't reject it (4096 char limit)
-                        if len(history_bodies) > 15:
-                            history_bodies = ["<i>... (older messages omitted) ...</i>"] + history_bodies[-15:]
-                            
-                        last_post = posts[-1]
-                        main_author_id = last_post.get("relationships", {}).get("author", {}).get("data", {}).get("id")
-                        author = get_author_name(main_author_id)
-                        time_str = friendly_date(last_post.get("attributes", {}).get("mkdate", datetime.now().isoformat()))
-                        
-                        if len(history_bodies) > 1:
-                            final_body = f"💬 <b>Conversation History:</b>\n\n" + "\n\n".join(history_bodies)
+                    if "loginform" in html_content:
+                        logging.warning(f"🔐 Session expired during forum check for {course_name}.")
+                        # Let the next cycle handle re-login to avoid race conditions here
+                        return []
+
+                    soup = BeautifulSoup(html_content, "html.parser")
+
+                    # Find all threads/categories
+                    # Selector based on inspection: table.default.forum > tbody > tr
+                    rows = soup.select("table.default.forum > tbody > tr")
+
+                    # LOGGING: How many rows found?
+                    logging.info(f"🔎 {course_name}: Found {len(rows)} forum rows")
+
+                    course_new_posts = []
+
+                    for row in rows:
+                        # Check for "New" indicator
+                        # Browser inspection: img.icon-role-attention
+                        new_indicator = row.select_one(
+                            "img.icon-role-attention, img[title*='new'], img[title*='neu'], span.new-indicator")
+
+                        # LOGGING: Check specific row for debug (optional)
+                        if new_indicator:
+                            logging.info(f"✨ New indicator found in {course_name}")
+
+                        # Also check the "new" attribute on the row itself if Stud.IP uses it
+                        is_new = bool(new_indicator)
+
+                        # Extract basic info
+                        # Browser: Title is often in span.areaname inside the link
+                        link_el = row.select_one("td:nth-child(2) a")
+                        if not link_el:
+                            # Try finding span.areaname and its parent
+                            area_span = row.select_one("span.areaname")
+                            if area_span:
+                                link_el = area_span.find_parent("a")
+
+                        if not link_el:
+                            continue
+
+                        thread_title = link_el.get_text(strip=True)
+                        thread_href = link_el.get("href", "")
+
+                        # DEBUG: Removed force True
+                        # is_new = True
+
+                        # If finding "new" is hard, we can also check the "Last post" date vs our cache
+                        # but "new" indicator is most reliable for user-read status.
+
+                        # Let's try to get the thread ID from href
+                        # href usually looks like: .../index/index/[thread_id]?cid=...
+                        thread_id = ""
+                        m_id = re.search(r"/index/([a-f0-9]+)", thread_href)
+                        if m_id:
+                            thread_id = m_id.group(1)
                         else:
-                            content_html = last_post.get("attributes", {}).get("content-html", "")
-                            body = BeautifulSoup(content_html, "html.parser").get_text(separator=' ', strip=True)[:500] if content_html else "No content"
-                            final_body = f"📩 <b>Last message:</b>\n{html.escape(body)}"
-                        
-                        course_posts.append({
-                            "course": course_name,
-                            "thread": title,
-                            "author": author,
-                            "date": time_str,
-                            "body": final_body,
-                            "key": f"{cid}:{title}:{disc_id}",
-                            "is_new": is_new_ind,
-                            "timestamp": time_str
-                        })
-                        
-                    return course_posts
+                            # Fallback: hash of title
+                            thread_id = get_deterministic_hash(f"{cid}{thread_title}")
+
+                        # Verify if we really need to check this thread
+                        # If we have a cache entry for this thread, we can compare dates if available on the row
+                        # But row date parsing can be tricky.
+
+                        # Strategy: If "New" indicator is present OR simply check top threads if cache is empty
+                        # For now, let's rely on "New" indicator to avoid opening every thread every time.
+                        if is_new:
+                            # ── Fetch Thread Details ────────────────────────
+                            # We need to go into the thread to get the actual new post content
+                            thread_url = f"{BASE_URL}/{thread_href}" if not thread_href.startswith(
+                                "http") else thread_href
+
+                            # Use a separate page or just navigate back?
+                            # Navigating back and forth in a loop is slow.
+                            # Better: Collect these URLs and fetch them after the loop or use a fresh context?
+                            # Using the same page object means we must navigate.
+                            # Since we are in a semaphore loop for *courses*, we are using the *single shared page*.
+                            # Wait! `check_single_course_forum` runs in parallel but uses `page_lock`.
+                            # So `page.goto` is serialized.
+                            # We can just goto the thread, get content, then go back? No, `goto` history is linear.
+                            # We can just proceed to the next URL.
+
+                            async with page_lock:
+                                await page.goto(thread_url, wait_until="domcontentloaded", timeout=20000)
+                                thread_html = await page.content()
+
+                            thread_soup = BeautifulSoup(thread_html, "html.parser")
+
+                            # --- Logic to handle Categories vs Threads ---
+                            # Check if this page is a Thread List (Category) or a Single Thread (Posts)
+                            # Clues:
+                            # - Thread List has a table with class "forum" or "default" containing rows with thread titles
+                            # - Single Thread has "div.posting" or "article.forum_post"
+
+                            is_thread_list = False
+                            # Check for thread table
+                            # Browser confirmed 'table.forum' exists on category page.
+                            thread_table = thread_soup.select_one("table.forum, table.default")
+
+                            # Check for real postings (actual user messages in a thread)
+                            real_postings = thread_soup.select("div.real_posting")
+
+                            # Debug inputs
+                            logging.info(
+                                f"ℹ️ {course_name} [{thread_title}]: Table found? {bool(thread_table)}, RealPostings: {len(real_postings)}")
+
+                            # Decision logic
+                            # If we have a table AND no real postings, it's likely a list
+                            # Decision logic
+                            # If we have a table, it IS a list (unless it's a very weird legacy thread with a table in a post)
+                            # The presence of <div class="posting"> (singular) usually indicates the category description, not a user post
+                            if thread_table:
+                                is_thread_list = True
+                                logging.info(f"📂 {course_name}: Table detected, forcing Category Mode.")
+                            elif not real_postings:
+                                # No table, no postings -> Empty or unknown
+                                pass
+
+                            if is_thread_list:
+                                logging.info(f"📂 {course_name}: Processing as Category/Thread List.")
+
+                                # Scrape threads from the table
+                                # Selector: table.forum > tbody > tr
+                                sub_rows = thread_table.select("tbody > tr") if thread_table else []
+
+                                # Process top 5 threads even if not new (for debugging/manual check)
+                                for i, sub_row in enumerate(sub_rows):
+                                    # Limit to top 5 to avoid scraping archive
+                                    if i > 5: break
+
+                                    # Check for new (icon)
+                                    sub_new = sub_row.select_one(
+                                        "img.icon-role-attention, img[title*='new'], img[title*='neu']")
+
+                                    # During manual check, maybe we want to check recent ones regardless?
+                                    # Let's check if it's new OR if it's one of the top 3
+                                    if not sub_new and i >= 3:
+                                        continue
+
+                                    # Extract link
+                                    sub_link = sub_row.select_one("td:nth-child(2) a")
+                                    if not sub_link: continue
+
+                                    sub_href = sub_link.get("href", "")
+                                    sub_title = sub_link.get_text(strip=True)
+
+                                    logging.info(f"    ➡️ Checking thread: {sub_title}")
+
+                                    # Visit the thread
+                                    sub_url = f"{BASE_URL}/{sub_href}" if not sub_href.startswith("http") else sub_href
+
+                                    try:
+                                        async with page_lock:
+                                            await page.goto(sub_url, wait_until="domcontentloaded", timeout=20000)
+                                            sub_html = await page.content()
+
+                                        sub_soup = BeautifulSoup(sub_html, "html.parser")
+
+                                        # Now scrape posts from this SUB-thread
+                                        # EXCLUDE .bg2 (preview box) and hidden elements
+                                        sub_posts = sub_soup.select(
+                                            "div.real_posting, div.posting:not(.bg2), article.forum_post, div[id^='forumposting_']")
+
+                                        # Filter out hidden elements if possible (BS4 doesn't check style, so we do it manually)
+                                        sub_posts = [p for p in sub_posts if "display: none" not in p.get("style", "")]
+
+                                        if not sub_posts:
+                                            # Fallback for old style
+                                            sub_posting_divs = sub_soup.select("div.postbody")
+                                            if sub_posting_divs:
+                                                sub_posts = [d.find_parent() for d in sub_posting_divs if
+                                                             "bg2" not in d.find_parent().get("class", [])]
+
+                                        if sub_posts:
+                                            # Get ALL posts for full conversation context
+                                            context_posts = sub_posts
+                                            last_sub_post = sub_posts[-1]  # The newest one
+
+                                            # Extract info from the LAST post for cache checking
+                                            s_content_el = last_sub_post.select_one(
+                                                "div.postbody div.content, section.content, div.content")
+                                            if s_content_el:
+                                                for comment in s_content_el.find_all(
+                                                        string=lambda text: isinstance(text,
+                                                                                       str) and text.strip().startswith(
+                                                                '<!--')):
+                                                    comment.extract()
+                                                s_body = s_content_el.get_text("\n", strip=True)
+                                            else:
+                                                s_body = "(No content)"
+
+                                            # Author/Date from last post
+                                            s_title_div = last_sub_post.select_one("div.postbody div.title, div.title")
+                                            s_author = "Unknown"
+                                            s_date = "Unknown Date"
+
+                                            if s_title_div:
+                                                s_a_el = s_title_div.select_one("a[href*='profile']")
+                                                if s_a_el:
+                                                    s_author = s_a_el.get_text(strip=True)
+                                                else:
+                                                    full_text = s_title_div.get_text(" ", strip=True)
+                                                    full_text = ' '.join(full_text.split())
+                                                    if ',' in full_text:
+                                                        s_author = full_text.split(',')[0].strip()
+                                                    elif '-' in full_text:
+                                                        s_author = full_text.split('-')[0].strip()
+                                                    else:
+                                                        s_author = full_text.strip()
+
+                                                s_author = re.sub(r',?\s*\d{1,2}\.\d{1,2}\.\d{2,4}.*$', '',
+                                                                  s_author).strip()
+
+                                                s_text = s_title_div.get_text(" ", strip=True)
+                                                s_text = ' '.join(s_text.split())
+                                                s_m_date = re.search(r"(\d{1,2}\.\d{1,2}\.\d{2,4},?\s+\d{1,2}:\d{2})",
+                                                                     s_text)
+                                                if s_m_date: s_date = s_m_date.group(1)
+
+                                            s_post_id = get_deterministic_hash(f"{sub_title}{s_date}{s_author}")
+
+                                            # Check cache
+                                            cache_key = f"{cid}_{sub_title}"
+                                            if cache_key in cache:
+                                                last_cached = cache[cache_key]
+                                                if last_cached.get("date") == s_date and last_cached.get(
+                                                        "author") == s_author:
+                                                    continue
+
+                                            # Extract all context posts
+                                            conversation = []
+                                            for idx, ctx_post in enumerate(context_posts):
+                                                is_newest = (idx == len(context_posts) - 1)
+
+                                                ctx_content_el = ctx_post.select_one(
+                                                    "div.postbody div.content, section.content, div.content")
+                                                if ctx_content_el:
+                                                    for comment in ctx_content_el.find_all(
+                                                            string=lambda text: isinstance(text,
+                                                                                           str) and text.strip().startswith(
+                                                                    '<!--')):
+                                                        comment.extract()
+                                                    ctx_body = ctx_content_el.get_text("\n", strip=True)
+                                                else:
+                                                    ctx_body = "(No content)"
+
+                                                ctx_title_div = ctx_post.select_one("div.postbody div.title, div.title")
+                                                ctx_author = "Unknown"
+                                                ctx_date = "Unknown Date"
+
+                                                if ctx_title_div:
+                                                    ctx_a_el = ctx_title_div.select_one("a[href*='profile']")
+                                                    if ctx_a_el:
+                                                        ctx_author = ctx_a_el.get_text(strip=True)
+                                                    else:
+                                                        ctx_full = ctx_title_div.get_text(" ", strip=True)
+                                                        ctx_full = ' '.join(ctx_full.split())
+                                                        if ',' in ctx_full:
+                                                            ctx_author = ctx_full.split(',')[0].strip()
+                                                        elif '-' in ctx_full:
+                                                            ctx_author = ctx_full.split('-')[0].strip()
+                                                        else:
+                                                            ctx_author = ctx_full.strip()
+
+                                                    ctx_author = re.sub(r',?\s*\d{1,2}\.\d{1,2}\.\d{2,4}.*$', '',
+                                                                        ctx_author).strip()
+
+                                                    ctx_text = ctx_title_div.get_text(" ", strip=True)
+                                                    ctx_text = ' '.join(ctx_text.split())
+                                                    ctx_m = re.search(r"(\d{1,2}\.\d{1,2}\.\d{2,4},?\s+\d{1,2}:\d{2})",
+                                                                      ctx_text)
+                                                    if ctx_m: ctx_date = ctx_m.group(1)
+
+                                                conversation.append({
+                                                    "author": ctx_author,
+                                                    "date": ctx_date,
+                                                    "body": ctx_body,
+                                                    "is_new": is_newest
+                                                })
+
+                                            logging.info(f"✨ Found post in thread '{sub_title}': {s_author} - {s_date}")
+
+                                            if s_author == "Unknown":
+                                                logging.warning(
+                                                    f"⚠️ Unknown author in thread '{sub_title}'. HTML snippet: {str(last_sub_post)[:500]}")
+
+                                            post_data = {
+                                                "key": cache_key,
+                                                "cid": cid,
+                                                "course": course_name,
+                                                "thread": thread_title + " > " + sub_title,
+                                                "author": s_author,
+                                                "date": s_date,
+                                                "body": s_body,
+                                                "url": sub_url,
+                                                "conversation": conversation  # NEW: full context
+                                            }
+                                            course_new_posts.append(post_data)
+
+                                            cache[cache_key] = {
+                                                "cid": cid,
+                                                "thread_id": get_deterministic_hash(sub_href),
+                                                "thread_title": sub_title,
+                                                "post_id": s_post_id,
+                                                "author": s_author,
+                                                "date": s_date,
+                                                "body_snippet": s_body[:50]
+                                            }
+
+                                    except Exception as e:
+                                        logging.error(f"Failed to scrape sub-thread {sub_title}: {e}")
+
+                                # After processing list, skip the rest of the outer loop (which looks for single posts)
+                                continue
+
+                            # Standard single thread scraping (fallback or if not a list)
+                            if not is_thread_list:
+                                # We are (presumably) in a thread already, or single-thread view
+                                # Relaxed selectors to catch everything, EXCLUDING preview (.bg2)
+                                posts = thread_soup.select(
+                                    "div.real_posting, div.posting:not(.bg2), article.forum_post, div.forum_post")
+
+                                # Filter hidden
+                                posts = [p for p in posts if "display: none" not in p.get("style", "")]
+
+                                # Fallback: look for IDs
+                                if not posts:
+                                    posts = thread_soup.select("div[id^='forumposting_']")
+
+                                # Fallback 2: look for postbody and get parent
+                                if not posts:
+                                    posting_divs = thread_soup.select("div.postbody")
+                                    if posting_divs:
+                                        posts = [div.find_parent() for div in posting_divs if
+                                                 "bg2" not in div.find_parent().get("class", [])]
+
+                            if not posts:
+                                logging.warning(
+                                    f"⚠️ {course_name}: No posts found in '{thread_title}' (Category view? {is_thread_list})")
+                                # Log the URL we tried
+                                logging.info(f"   -> URL: {thread_url}")
+                                # Clean up formatting if empty
+                                continue
+
+                            # Iterate over found posts (usually just 1 if we came from main list, or multiple if from thread list)
+                            for last_post in posts:
+
+                                # Use override name if available (from nested thread)
+                                current_course_name = getattr(last_post, 'course_name_override', course_name)
+                                current_thread_title = getattr(last_post, 'thread_title_override',
+                                                               thread_title)  # not set yet but consistent
+
+                                # Extract ID
+                                post_id = last_post.get("id")  # forumposting_...
+
+                                # Content - strip HTML tags
+                                # Browser: div.postbody -> div.content
+                                content_el = last_post.select_one(
+                                    "div.postbody div.content, div.content, div.formatted-content")
+                                if content_el:
+                                    # Remove HTML comments
+                                    for comment in content_el.find_all(
+                                            string=lambda text: isinstance(text, str) and text.strip().startswith(
+                                                    '<!--')):
+                                        comment.extract()
+                                    body_text = content_el.get_text("\n", strip=True)
+                                else:
+                                    body_text = "(No content)"
+
+                                if body_text == "(No content)":
+                                    logging.warning(
+                                        f"⚠️ {current_course_name}: Post content empty. HTML: {str(last_post)[:200]}")
+
+                                # Author & Date (often in div.title inside postbody)
+                                # Structure: <div class="title"> <a href="...">Author</a> - Date </div>
+
+                                author_text = "Unknown"
+                                date_text = "Unknown Date"
+
+                                # Try finding title div
+                                title_div = last_post.select_one("div.postbody div.title, div.title, header")
+
+                                if title_div:
+                                    # Author - look for link first
+                                    author_el = title_div.select_one(
+                                        "a[href*='profile'], a.profile, a.username, div.small_screen a")
+                                    if author_el:
+                                        author_text = author_el.get_text(strip=True)
+                                    else:
+                                        # Fallback: get text before comma or dash
+                                        full_text = title_div.get_text(" ", strip=True)
+                                        # Clean whitespace
+                                        full_text = ' '.join(full_text.split())
+                                        if ',' in full_text:
+                                            author_text = full_text.split(',')[0].strip()
+                                        elif '-' in full_text:
+                                            author_text = full_text.split('-')[0].strip()
+                                        else:
+                                            author_text = full_text.strip()
+
+                                    # Clean author: remove any date pattern that might have leaked
+                                    author_text = re.sub(r',?\s*\d{1,2}\.\d{1,2}\.\d{2,4}.*$', '', author_text).strip()
+
+                                    # Date
+                                    # Usually text matches: dd.mm.yyyy hh:mm
+                                    # Regex search in the whole title text
+                                    title_text = title_div.get_text(" ", strip=True)
+                                    title_text = ' '.join(title_text.split())  # Clean whitespace
+                                    m_date = re.search(r"(\d{1,2}\.\d{1,2}\.\d{2,4},?\s+\d{1,2}:\d{2})", title_text)
+                                    if m_date:
+                                        date_text = m_date.group(1)
+                                    else:
+                                        logging.info(f"ℹ️ Date extraction failed for '{title_text}'")
+                                else:
+                                    logging.warning(f"⚠️ {current_course_name}: Title/Header div not found in post.")
+
+                                # If still unknown, try fallback
+                                if author_text == "Unknown":
+                                    # Fallback to old header extraction
+                                    author_el = last_post.select_one("a.profile, a.username")
+                                    if author_el:
+                                        author_text = author_el.get_text(strip=True)
+
+                                    header_el = last_post.select_one("header, div.header")
+                                    if header_el:
+                                        header_text = header_el.get_text(" ", strip=True)
+                                        if author_text == "Unknown":
+                                            author_text = header_text  # simplified
+                                        m_date = re.search(r"(\d{1,2}\.\d{1,2}\.\d{2,4},?\s+\d{1,2}:\d{2})",
+                                                           header_text)
+                                        if m_date:
+                                            date_text = m_date.group(1)
+
+                                # Final check and debug dump
+                                if author_text == "Unknown":
+                                    logging.warning(
+                                        f"⚠️ {current_course_name}: Author extraction failed. HTML: {str(last_post)[:1000]}")
+
+                                # Unique Key for Cache
+                                # If no post_id, make one from ThreadID + Date
+                                unique_key = f"{cid}:{post_id if post_id else date_text}"  # Simplified key
+
+                                if unique_key in cached_posts:
+                                    continue
+
+                                # Add to new posts list
+                                new_posts.append({
+                                    "course": current_course_name,
+                                    "thread": current_thread_title if 'current_thread_title' in locals() else thread_title,
+                                    "author": author_text,
+                                    "date": date_text,
+                                    "content": body_text,
+                                    "key": unique_key
+                                })
+
+                            # End of posts loop
+                            # Continue to next row in main loop
+                            pass
+
+                            logging.info(f"✨ Detected Post: {unique_key} | {thread_title}")
+
+                            if unique_key not in cache:
+                                # Found a REAL new post
+                                logging.info(f"🆕 NEW Post added to list: {thread_title}")
+                                post_data = {
+                                    "key": unique_key,
+                                    "cid": cid,
+                                    "course": course_name,
+                                    "thread": thread_title,
+                                    "author": author_text,
+                                    "date": date_text,
+                                    "body": body_text,
+                                    "url": thread_url
+                                }
+                                course_new_posts.append(post_data)
+
+                    return course_new_posts
+
                 except Exception as e:
-                    logging.warning(f"Error while checking forum API for {course_name}: {e}")
+                    logging.warning(f"Forum check error in {course_name}: {e}")
                     return []
 
-        # Scan all courses in parallel
+        # ── Run checks ──────────────────────────────────────────────────────
         tasks = [check_single_course_forum(name, cid) for name, cid in courses]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for res in results:
             if isinstance(res, list):
-                for p in res:
-                    post_key = p["key"]
-                    # Add to notification list if really new OR if it was marked with new indicator
-                    if post_key not in cache and p.get("is_new"):
-                        new_posts_found.append(p)
-                    
-                    # ALWAYS update/add to cache so "Show Last 5" works immediately
-                    cache[post_key] = p
+                new_posts_found.extend(res)
 
+        # ── Notifications ──────────────────────────────────────────────────
         if new_posts_found:
-            for p in new_posts_found:
-                text = (
-                    "🔥 💬 <b>NEW FORUM POST</b> 🔥\n"
-                    "━━━━━━━━━━━━━━━━━\n"
-                    f"🏫 <b>Course:</b> {html.escape(p.get('course', ''))}\n"
-                    f"📂 <b>Thread:</b> {html.escape(p.get('thread', ''))}\n"
-                    f"👤 <b>By:</b> {html.escape(p.get('author', ''))}\n"
-                    f"🕒 <b>Date:</b> {html.escape(p.get('date', '-'))}\n"
-                    "━━━━━━━━━━━━━━━━━\n"
-                    f"{p['body']}\n"
-                    "━━━━━━━━━━━━━━━━━"
-                )
-                await broadcast(bot, text, parse_mode="HTML")
+            # Sort by date maybe? Date parsing is fragile, let's just send.
+            for post in new_posts_found:
+                # Check if we have conversation context
+                if 'conversation' in post and post['conversation']:
+                    # Multi-message format with context
+                    text_parts = [
+                        "🔥 💬 <b>NEW FORUM POST</b> 🔥\n",
+                        "━━━━━━━━━━━━━━━━━\n",
+                        f"🏫 <b>Course:</b> {html.escape(post['course'])}\n",
+                        f"📂 <b>Thread:</b> {html.escape(post['thread'])}\n",
+                        "━━━━━━━━━━━━━━━━━\n\n"
+                    ]
 
-        # Always save cache to bootstrap the "Last 5" feature
-        with open(CACHE_PATH, "w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, ensure_ascii=False)
-            
-        if not new_posts_found and not silent:
-            await bot.send_message(chat_id=chat_id, text="☑️ No new forum posts found (cache updated).", disable_notification=True)
+                    # Add each message in conversation
+                    for msg in post['conversation']:
+                        # Show full message without truncation
+                        msg_body = msg['body']
+
+                        new_marker = " 🔥 <b>LATEST MESSAGE</b>" if msg['is_new'] else ""
+                        text_parts.append(
+                            f"👤 <b>{html.escape(msg['author'])}</b> ({html.escape(msg['date'])}){new_marker}\n"
+                            f"{html.escape(msg_body)}\n\n"
+                        )
+
+                    text_parts.append("━━━━━━━━━━━━━━━━━")
+                    text = "".join(text_parts)
+                else:
+                    # Fallback: single message format (for non-category threads)
+                    body_snippet = post['body']
+                    if len(body_snippet) > 500:
+                        body_snippet = body_snippet[:500] + "..."
+
+                    text = (
+                        "🔥 💬 <b>NEW FORUM POST</b> 🔥\n"
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"🏫 <b>Course:</b> {html.escape(post['course'])}\n"
+                        f"📂 <b>Thread:</b> {html.escape(post['thread'])}\n"
+                        f"👤 <b>By:</b> {html.escape(post['author'])}\n"
+                        f"🕒 <b>Date:</b> {html.escape(post['date'])}\n"
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"{html.escape(body_snippet)}\n"
+                        "━━━━━━━━━━━━━━━━━"
+                    )
+
+                # Send
+                try:
+                    await broadcast(bot, text, parse_mode="HTML")
+                    # Update cache immediately to avoid duplicate on crash
+                    cache[post["key"]] = {k: v for k, v in post.items() if k != "key"}
+                except Exception as e:
+                    logging.error(f"Failed to send forum notification: {e}")
+
+            # Save Cache
+            try:
+                # Limit cache size
+                if len(cache) > 500:
+                    # Remove old random items or implement proper LRU.
+                    # For now just keep it simple, JSON is small.
+                    pass
+
+                with open(CACHE_PATH, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                logging.error(f"Failed to save forum cache: {e}")
+
+        elif not silent:
+            await bot.send_message(chat_id=chat_id, text="☑️ No new forum posts found.",
+                                   disable_notification=True)
 
     except Exception as e:
+        if not silent:
+            await bot.send_message(chat_id=chat_id, text=f"❌ Forum check error:\n{e}")
         logging.error(f"check_new_forum_posts_parallel fatal: {e}")
 
 
-
-async def check_new_forum_posts(bot, chat_id, silent: bool = False):
+async def check_new_forum_posts(page, bot, chat_id, silent: bool = False):
     """Wrapper"""
-    return await check_new_forum_posts_parallel(bot, chat_id, silent)
+    return await check_new_forum_posts_parallel(page, bot, chat_id, silent)
 
 
 # ── watcher loop ───────────────────────────────────────────────────────────────
@@ -2573,24 +3033,282 @@ def _get_course_icon(title: str) -> str:
     return "📘"
 
 
-def clean_course_title(raw_title: str) -> str:
-    """Remove course type (e.g. Vorlesung:) and course code (e.g. 2.02.861)."""
-    if not raw_title:
-        return ""
-    if ":" in raw_title:
-        # Split by first colon, take the right part
-        _, rest = raw_title.split(":", 1)
-        rest = rest.strip()
-        # Remove course code if it exists (e.g. "2.02.861 Name")
-        match = re.match(r'^[\d\.]+\b\s*(.*)$', rest)
-        if match:
-            return match.group(1).strip()
-        return rest
-    return raw_title.strip()
+async def get_calendar_events(page, week_view=False):
+    """
+    Stud.IP Planer -> Return weekly or daily events.
+    With improved error handling.
+    """
+    BASE_PLANER = f"{BASE_URL}/plugins.php/planerplugin/planer"
 
+    async def _ensure_week_view():
+        """Safely switch to 'Wochenkalender' tab and focus on 'Today'"""
+        nav_paths = [
+            {
+                "url": f"{BASE_URL}/plugins.php/planerplugin/planer/calendar/index",
+                "tabs": ["Wochenkalender", "Weekly Calendar", "Wochenansicht", "Week view"],
+                "name": "Planner-Calendar"
+            },
+            {
+                "url": f"{BASE_URL}/plugins.php/planerplugin/planer/schedule/index",
+                "tabs": ["Wochenkalender", "Weekly Calendar", "Wochenansicht", "Week view"],
+                "name": "Planner-Schedule"
+            },
+            {
+                "url": f"{BASE_URL}/plugins.php/planerplugin/planer/index",
+                "tabs": ["Wochenkalender", "Weekly Calendar", "Wochenansicht", "Week view"],
+                "name": "Planner-Main"
+            },
+            {
+                "url": f"{BASE_URL}/dispatch.php/calendar/views/week",
+                "tabs": [],
+                "name": "Standard-Kalender-Week"
+            },
+            {
+                "url": f"{BASE_URL}/dispatch.php/calendar/planner/index",
+                "tabs": [],
+                "name": "Planner-Dispatch"
+            }
+        ]
+        
+        for path in nav_paths:
+            try:
+                # 0. Check Login
+                if "login" in page.url.lower() or await page.locator(SELECTORS["start"]).count() > 0:
+                    logging.info("🕒 Session expired or at login page. Re-logging...")
+                    await login_studip()
 
-# NOTE: get_calendar_events is defined further below in the Calendar helpers section.
+                logging.info(f"📅 Navigating to {path['name']}: {path['url']}")
+                await page.goto(path["url"], wait_until="networkidle", timeout=45000)
+                
+                # Check again after goto
+                if "login" in page.url.lower():
+                    logging.info("🕒 Redirected to login. Re-logging...")
+                    await login_studip()
+                    await page.goto(path["url"], wait_until="networkidle", timeout=45000)
 
+                # 1. Switch Tabs if needed
+                if path["tabs"]:
+                    tab_found = False
+                    for tab_name in path["tabs"]:
+                        tab_loc = page.locator(f"a:has-text('{tab_name}')").first
+                        if await tab_loc.count() > 0:
+                            parent = tab_loc.locator("xpath=..")
+                            cls = await parent.get_attribute("class") or ""
+                            if "active" not in cls.lower():
+                                logging.info(f"Switching tab to '{tab_name}'")
+                                await tab_loc.click(force=True)
+                                await asyncio.sleep(2)
+                            tab_found = True
+                            break
+                    if not tab_found:
+                        logging.debug(f"Direct tab '{path['name']}' not found, attempting to proceed anyway.")
+
+                # 2. Click 'Today' Button
+                today_selectors = [
+                    "button.fc-today-button", 
+                    "button.fc-today-button.fc-button.fc-button-primary",
+                    "button:has-text('today')", 
+                    "button:has-text('heute')", 
+                    "button:has-text('Today')",
+                    ".fc-button-today",
+                    "button.fc-button-primary:has-text('today')"
+                ]
+                for sel in today_selectors:
+                    try:
+                        loc = page.locator(sel).first
+                        if await loc.count() > 0 and await loc.is_visible():
+                            logging.info(f"Clicking 'Today' button via {sel}")
+                            await loc.click(force=True, timeout=5000)
+                            await asyncio.sleep(1)
+                            break
+                    except Exception:
+                        continue
+                
+                # 3. Wait for content
+                try:
+                    await page.wait_for_selector(".fc-view, .fc-content, td.fc-day, .calendar-view, #calendar, .fc-agenda-view", timeout=30000)
+                    logging.info(f"✅ Loaded {path['name']}")
+                    return True
+                except Exception as e:
+                    logging.warning(f"⚠️ Content timeout for {path['name']}: {e}")
+                    # Capture debug screenshot
+                    try:
+                        p_name = str(path.get("name", "unknown")).replace(" ", "_").replace("-", "_")
+                        debug_path = f"debug_calendar_{p_name}.png"
+                        await page.screenshot(path=debug_path)
+                        logging.info(f"📸 Saved diagnostic screenshot to {debug_path}")
+                    except Exception as se:
+                        logging.warning(f"Failed to save debug screenshot: {se}")
+                        
+                    title = await page.title()
+                    logging.info(f"Current Page: '{title}' at {page.url}")
+                    continue
+
+            except Exception as e:
+                logging.warning(f"⚠️ Path {path['name']} failed: {e}")
+                continue
+
+        return False
+
+        pass
+
+    try:
+        # 1) Prepare view (with retry mechanism)
+        success = await _ensure_week_view()
+        if not success:
+            return []
+
+        # 2) Get HTML
+        html_text = await page.content()
+        soup = BeautifulSoup(html_text, "html.parser")
+
+        # 3) Get week dates
+        week_dates = []
+        for th in soup.select(".fc-head .fc-day-header[data-date]"):
+            week_dates.append(th["data-date"])
+
+        # 4) Time-grid column order (excluding axis)
+        dates_order = []
+        for td in soup.select(".fc-time-grid .fc-bg tr > td"):
+            if "fc-axis" in (td.get("class") or []):
+                continue
+            d = td.get("data-date")
+            if d:
+                dates_order.append(d)
+
+        # 5) Event nodes (Modern FullCalendar selectors)
+        ev_nodes = soup.select(".fc-view .fc-event")
+        logging.info(f"🟢 Detected {len(ev_nodes)} event elements in DOM.")
+
+        events: list[dict[str, Any]] = []
+        seen = set()
+        now = datetime.now(TZ_BERLIN)
+
+        for ev in ev_nodes:
+            # --- tooltip / aria (Fallback) ---
+            tooltip_html = ev.get("data-tooltip") or ev.get("title") or ""
+            aria_html = ev.get("aria-label") or ""
+
+            fields = {}
+            if tooltip_html:
+                fields = _parse_tooltip_fields(tooltip_html)
+            elif aria_html:
+                fields = _parse_tooltip_fields(aria_html)
+
+            # --- title & location (Direct DOM extraction) ---
+            t_el = ev.select_one(".fc-title") or ev.select_one(".fc-event-title")
+            title = fields.get("title")
+            location = fields.get("location")
+
+            if t_el:
+                raw_text = t_el.get_text(separator="\n", strip=True)
+                lines = [l.strip() for l in raw_text.split("\n") if l.strip()]
+                if not title and lines:
+                    title = lines[0]
+                if not location and len(lines) > 1:
+                    location = lines[-1]
+
+            title = title or "Untitled"
+
+            # --- time ---
+            start_dt = fields.get("start")
+            end_dt = fields.get("end")
+
+            if not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime):
+                time_el = ev.select_one(".fc-time, .fc-event-time")
+                time_text = time_el.get("data-full") if time_el else None
+                if not time_text and time_el:
+                    time_text = time_el.get_text(" ", strip=True)
+                
+                m = re.search(r"(\d{1,2}:\d{2})\s*[–\-]\s*(\d{1,2}:\d{2})", (time_text or ""))
+                if m:
+                    s_str, e_str = m.groups()
+                    col_date = None
+                    try:
+                        parent_td = ev.find_parent("td")
+                        idx = -1
+                        if parent_td:
+                            tr = parent_td.parent
+                            tds = tr.find_all("td", recursive=False)
+                            if parent_td in tds:
+                                idx = tds.index(parent_td) - 1
+                        
+                        if 0 <= idx < len(week_dates):
+                            col_date = week_dates[idx]
+                    except Exception:
+                        pass
+                    
+                    if not col_date and isinstance(start_dt, datetime):
+                        col_date = start_dt.date().isoformat()
+                    
+                    if col_date:
+                        try:
+                            d0 = datetime.fromisoformat(col_date).date()
+                            s_t = datetime.strptime(s_str, "%H:%M").time()
+                            e_t = datetime.strptime(e_str, "%H:%M").time()
+                            start_dt = datetime.combine(d0, s_t)
+                            end_dt = datetime.combine(d0, e_t)
+                        except Exception:
+                            pass
+
+            if not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime):
+                continue
+
+            # Timezone awareness
+            if isinstance(start_dt, datetime) and start_dt.tzinfo is None: 
+                start_dt = start_dt.replace(tzinfo=TZ_BERLIN)
+            if isinstance(end_dt, datetime) and end_dt.tzinfo is None: 
+                end_dt = end_dt.replace(tzinfo=TZ_BERLIN)
+
+            if not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime):
+                continue
+
+            # status
+            status = "upcoming"
+            if end_dt < now:
+                status = "past"
+            elif start_dt <= now <= end_dt:
+                status = "ongoing"
+            else:
+                status = "upcoming"
+
+            # url
+            href = ev.get("href")
+            url = BASE_URL + href if href and href.startswith("/") else None
+
+            start_iso = start_dt.isoformat() if start_dt else ""
+            end_iso = end_dt.isoformat() if end_dt else ""
+            # Ensure title and location are strings for the key
+            t_key = str(title or "")
+            l_key = str(location or "")
+            key = (t_key, start_iso, end_iso, l_key)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            events.append({
+                "title": str(title or "Untitled"),
+                "start": start_dt,
+                "end": end_dt,
+                "location": str(location or ""),
+                "url": url,
+                "status": status,
+            })
+
+        # For weekly view return all events, for daily only today's
+        if not week_view:
+            today_date = now.date()
+            logging.info(f"🔍 Filtering for today's date: {today_date}")
+            events = [e for e in events if isinstance(e.get("start"), datetime) and e["start"].date() == today_date]
+            for ev in events:
+                logging.info(f"✅ Keeping event: {ev['title']} ({ev['start'].isoformat() if isinstance(ev.get('start'), datetime) else 'N/A'})")
+
+        logging.info(f"📅 Found {len(events)} events for {'week' if week_view else 'today'}")
+        return events
+
+    except Exception as e:
+        logging.error(f"❌ Calendar fetch error: {e}")
+        return []
 
 
 def _get_location_emoji(location: str) -> str:
@@ -2619,7 +3337,135 @@ def _get_location_emoji(location: str) -> str:
     return "📍"
 
 
+async def send_weekly_calendar(message_or_query, events):
+    from datetime import datetime
 
+    async def _edit_or_reply(text, **kw):
+        if hasattr(message_or_query, "edit_message_text"):
+            await message_or_query.edit_message_text(text, **kw)
+        elif hasattr(message_or_query, "reply_text"):
+            await message_or_query.reply_text(text, **kw)
+
+    if not events:
+        text = (
+            "🎉 *No Events This Week!*\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📅 *Your schedule is clear*\n"
+            "🕒 Perfect time to catch up or relax!\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🗓️ *Weekly View*"
+        )
+        await _edit_or_reply(text, parse_mode="Markdown")
+        return
+
+    # Group events by day
+    events_by_day = {}
+    for event in events:
+        day_key = event["start"].strftime("%Y-%m-%d")
+        if day_key not in events_by_day:
+            events_by_day[day_key] = []
+        events_by_day[day_key].append(event)
+
+    # Sort each day's events by time
+    for day_events in events_by_day.values():
+        day_events.sort(key=lambda x: x["start"])
+
+    # Header
+    start_of_week = min(events, key=lambda x: x["start"])["start"]
+    end_of_week = max(events, key=lambda x: x["end"])["end"]
+
+    header = (
+        "✨ *Weekly Schedule* ✨\n"
+        f"🗓️ *{start_of_week:%d %B} - {end_of_week:%d %B %Y}*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    lines = [header]
+
+    # Process days in order
+    for day_key in sorted(events_by_day.keys()):
+        day_events = events_by_day[day_key]
+        day_date = datetime.fromisoformat(day_key)
+        day_name = day_date.strftime("%A")
+        day_emoji = _get_day_emoji(day_name)
+
+        lines.append(f"\n{day_emoji} *{day_name}, {day_date:%d.%m.%Y}*")
+        lines.append("━━━━━━━━━━━━━━━━━━")
+
+        if not day_events:
+            lines.append("   🎉 *No events*")
+            continue
+
+        for event in day_events:
+            status = _status_emoji(event.get("status"))
+            course_icon = _get_course_icon(event.get("title", ""))
+            loc_icon = _get_location_emoji(event.get("location", ""))
+
+            duration = f"{event['start']:%H:%M}–{event['end']:%H:%M}"
+
+            lines.append(
+                f"{status} {course_icon} *{event['title']}*\n"
+                f"   🕒 `{duration}`\n"
+                f"   {loc_icon} {_safe_loc(event['location'])}"
+            )
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    text = "\n".join(lines)
+
+    await _edit_or_reply(text, parse_mode="Markdown")
+
+
+async def send_today_calendar(message_or_query, events):
+    from datetime import datetime
+
+    async def _edit_or_reply(text, **kw):
+        if hasattr(message_or_query, "edit_message_text"):
+            await message_or_query.edit_message_text(text, **kw)
+        elif hasattr(message_or_query, "reply_text"):
+            await message_or_query.reply_text(text, **kw)
+
+    today = datetime.now()
+
+    if not events:
+        text = (
+            "🎉 *No Events Today!*\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "📅 *Your schedule is clear*\n"
+            "🕒 Perfect time to catch up or relax!\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🗓️ *{today:%A, %d %B %Y}*"
+        )
+        await _edit_or_reply(text, parse_mode="Markdown")
+        return
+
+    # header + title
+    header = (
+        "✨ *Today's Schedule* ✨\n"
+        f"📅 *{today:%A, %d %B %Y}*\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
+
+    lines = [header]
+    for ev in events:
+        ev_title = str(ev.get("title") or "Untitled")
+        ev_location = str(ev.get("location") or "")
+        
+        status = _status_emoji(ev.get("status"))
+        course_icon = _get_course_icon(ev_title)
+        loc_icon = "🏫" if "A" in ev_location else "📍"
+
+        duration = f"{ev['start']:%H:%M}–{ev['end']:%H:%M}"
+
+        lines.append(
+            f"{status} {course_icon} *{ev['title']}*\n"
+            f"   🕒 `{duration}`\n"
+            f"   {loc_icon} {_safe_loc(ev['location'])}"
+        )
+
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    text = "\n\n".join(lines)
+
+    await _edit_or_reply(text, parse_mode="Markdown")
 
 
 async def schedule_reminders(events, chat_id, bot):
@@ -2771,7 +3617,8 @@ async def _send_courses_menu(query_or_message, courses):
         clean_name = html_lib.escape(name[:64])
         keyboard.append([InlineKeyboardButton(f"📘 {clean_name}", callback_data=f"course|{cid}")])
 
-
+    # Main Menu button
+    keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="show_menu")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -2893,9 +3740,9 @@ def _normalize_button_text(s: str) -> str:
 
 
 async def _run_check_now(update, context):
-    """Manual full check: messages → announcements → files → forum posts"""
+    """Manual full check: messages → announcements → files + start all watchers"""
     chat_id = update.effective_chat.id
-    global global_watcher_paused, last_full_check_time
+    global page, browser_context, global_watcher_paused, last_full_check_time
 
     if chat_id in check_in_progress:
         await update.message.reply_text("⚠️ Another check is already running.")
@@ -2907,73 +3754,171 @@ async def _run_check_now(update, context):
 
         # Send a single "Checking..." message
         status_msg = await update.message.reply_text(
-            "🔍 Starting full browser-less check...\n\n"
+            "🔍 Starting full check...\n\n"
             "📨 Checking messages...\n"
             "📢 Checking announcements...\n"
-            "📁 Checking files...\n"
-            "💬 Checking forum posts...",
+            "📁 Checking files...",
             disable_notification=True
         )
 
-        # ♻️ Ensure session is alive
-        if not global_session or not await global_session.is_logged_in():
-            await status_msg.edit_text("🔄 Session expired, re-logging...")
-            await login_studip()
+        # ♻️ Reconnect if needed
+        if not page or page.is_closed():
+            emoji_map = {
+                "starting login": "⚙️",
+                "opening idp": "🌐",
+                "submitting username": "👤",
+                "submitting password": "🔒",
+                "submitting one-time code": "🔢",
+                "login successful": "✅",
+            }
 
-        # ✅ Load courses ONCE if needed
+            async def notify(msg: str):
+                try:
+                    key = msg.lower()
+                    icon = next((v for k, v in emoji_map.items() if k in key), "ℹ️")
+                    await status_msg.edit_text(f"{icon} {msg}")
+                except Exception:
+                    pass
+
+            page = await login_studip(notify=notify)
+            browser_context = page.context
+
+        # ✅ Load courses ONCE
         if not courses_map:
-            await list_courses()
+            try:
+                async with page_lock:
+                    await page.goto(STUDIP_URL, wait_until="networkidle", timeout=30000)
+                await list_courses(page)
+                logging.info(f"✅ Loaded {len(courses_map)} courses")
+            except Exception as e:
+                logging.error(f"Failed to load courses: {e}")
 
+        # List to collect results
         results = []
 
-        # ✉️ 1. Check messages
+        # ✉️ 1️⃣ Check messages - SILENT modda
         try:
-            await status_msg.edit_text("🔍 Checking messages...")
-            has_new_messages = await check_new_messages(context.bot, chat_id, silent=True)
+            await status_msg.edit_text(
+                "🔍 Starting full check...\n\n"
+                "✅ Checking messages...\n"
+                "📢 Checking announcements...\n"
+                "📁 Checking files..."
+            )
+            has_new_messages = await check_new_messages(page, context.bot, chat_id, silent=True)
             results.append(("messages", has_new_messages))
         except Exception as e:
-            results.append(("messages", f"error: {e}"))
+            results.append(("messages", f"error: {str(e)[:200]}"))
+            logging.exception("check_new_messages failed")
 
-        # 📢 2. Check announcements
+        # 📢 2️⃣ Check announcements - SILENT modda
         try:
-            await status_msg.edit_text("🔍 Checking announcements...")
-            has_new_announcements = await check_new_announcements_parallel(context.bot, chat_id, silent=True)
+            await status_msg.edit_text(
+                "🔍 Starting full check...\n\n"
+                "✅ Checking messages... ✓\n"
+                "✅ Checking announcements...\n"
+                "📁 Checking files..."
+            )
+            has_new_announcements = await check_new_announcements(page, context.bot, chat_id, silent=True)
             results.append(("announcements", has_new_announcements))
         except Exception as e:
-            results.append(("announcements", f"error: {e}"))
+            results.append(("announcements", f"error: {str(e)[:200]}"))
+            logging.exception("check_new_announcements failed")
 
-        # 📁 3. Check files
+        # 📂 3️⃣ Check files - SILENT modda
         try:
-            await status_msg.edit_text("🔍 Checking files...")
-            has_new_files = await check_new_files(context.bot, chat_id, silent=True)
+            await status_msg.edit_text(
+                "🔍 Starting full check...\n\n"
+                "✅ Checking messages... ✓\n"
+                "✅ Checking announcements... ✓\n"
+                "✅ Checking files...\n"
+                "💬 Checking forum posts..."
+            )
+            has_new_files = await check_new_files(page, context.bot, chat_id, silent=True)
             results.append(("files", has_new_files))
         except Exception as e:
-            results.append(("files", f"error: {e}"))
+            results.append(("files", f"error: {str(e)[:200]}"))
+            logging.exception("check_new_files failed")
 
-        # 💬 4. Check forum
+        # 💬 4️⃣ Check forum - SILENT modda
         try:
-            await status_msg.edit_text("🔍 Checking forum posts...")
-            has_new_forum = await check_new_forum_posts(context.bot, chat_id, silent=True)
-            results.append(("forum", has_new_forum))
+            await status_msg.edit_text(
+                "🔍 Starting full check...\n\n"
+                "✅ Checking messages... ✓\n"
+                "✅ Checking announcements... ✓\n"
+                "✅ Checking files... ✓\n"
+                "✅ Checking forum posts..."
+            )
+            has_new_forum_posts = await check_new_forum_posts_parallel(page, context.bot, chat_id, silent=True)
+            results.append(("forum", has_new_forum_posts))
         except Exception as e:
-            results.append(("forum", f"error: {e}"))
+            results.append(("forum", f"error: {str(e)[:200]}"))
+            logging.exception("check_new_forum_posts failed")
 
-        # Summary with Last 5 buttons
-        summary = "🔍 Full check completed:\n\n"
-        for check, res in results:
-            icon = "✅" if res is True or (isinstance(res, list) and len(res) > 0) else ("❌" if "error" in str(res) else "☑️")
-            label = {"messages": "Messages", "announcements": "Announcements", "files": "Files", "forum": "Forum"}[check]
-            summary += f"{icon} {label}\n"
+        # Build result message
+        result_text = "🔍 Full check completed:\n\n"
 
-        await status_msg.edit_text(summary, reply_markup=get_show_last_keyboard())
+        for check_type, result in results:
+            if check_type == "messages":
+                if result is True:
+                    result_text += "📨 Checking messages...\n✅ New messages found!\n\n"
+                elif "error" in str(result):
+                    result_text += "📨 Checking messages...\n❌ Error\n\n"
+                else:
+                    result_text += "📨 Checking messages...\n☑️ No new messages found\n\n"
+
+            elif check_type == "announcements":
+                if result is True:
+                    result_text += "📢 Checking announcements...\n✅ New announcements found!\n\n"
+                elif "error" in str(result):
+                    result_text += "📢 Checking announcements...\n❌ Error\n\n"
+                else:
+                    result_text += "📢 Checking announcements...\n☑️ No new announcements found\n\n"
+
+            elif check_type == "files":
+                if result is True:
+                    result_text += "📁 Checking files...\n✅ New files found!\n\n"
+                elif "error" in str(result):
+                    result_text += "📁 Checking files...\n❌ Error\n\n"
+                else:
+                    result_text += "📁 Checking files...\n☑️ No new or updated files found\n\n"
+
+            elif check_type == "forum":
+                if result:
+                    result_text += "💬 Checking forum posts...\n✅ New posts found!\n\n"
+                elif "error" in str(result):
+                    result_text += "💬 Checking forum posts...\n❌ Error\n\n"
+                else:
+                    result_text += "💬 Checking forum posts...\n☑️ No new posts found\n\n"
+
+        # Update status message with results
+        await status_msg.edit_text(result_text)
+
+        # 🚀 4️⃣ Schedule file watcher silently AFTER initial full check
+        async def _delayed_watcher_start():
+            await asyncio.sleep(30)  # start 30 seconds after full check completes
+            if chat_id not in watch_tasks or watch_tasks[chat_id].done():
+                task = asyncio.create_task(watch_loop(chat_id, context))
+                watch_tasks[chat_id] = task
+                logging.info(f"👀 File watcher started silently for chat_id={chat_id}")
+
+        asyncio.create_task(_delayed_watcher_start())
+
+        # 🕒 Full check timestamp
         last_full_check_time = datetime.now()
 
+        # ✅ Done
+        await update.message.reply_text(
+            "📌 Quick Access:",
+            reply_markup=get_show_last_keyboard()
+        )
+
     except Exception as e:
-        await update.message.reply_text(f"❌ Fatal error: {e}")
-        logging.exception("_run_check_now failed")
+        await update.message.reply_text(f"❌ Fatal error:\n{str(e)[:500]}")
+        logging.exception("_run_check_now crashed")
+
     finally:
         check_in_progress.discard(chat_id)
-        global_watcher_paused = False
+        global_watcher_paused = False  # ✅ Resume global watchers
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -3007,6 +3952,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data.split("|")
+    global page, browser_context
 
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
@@ -3022,7 +3968,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         root_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
         nav_stack[user_id] = [root_url]
         nav_names[user_id] = [course_name]
-        files = await list_files(cid, root_url)
+        files = await list_files(page, cid, root_url)
         await send_folder(query, files, cid, user_id, current_url=root_url)
 
 
@@ -3052,7 +3998,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         nav_stack.setdefault(user_id, []).append(folder_url)
         nav_names.setdefault(user_id, []).append(folder_name)
 
-        files = await list_files(cid, folder_url)
+        files = await list_files(page, cid, folder_url)
         await send_folder(query, files, cid, user_id, current_url=folder_url)
 
     # ── file download ───────────────────────────────────────────────────
@@ -3079,39 +4025,44 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if temp_url:
             logging.info(f"🔄 Trying cached URL: {temp_url}")
             try:
-                async with await global_session.get(temp_url) as resp:
-                    if resp.status == 200:
-                        content = await resp.read()
-                        if len(content) > 48 * 1024 * 1024:
-                            await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
+                cookies = await browser_context.cookies()
+                cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+                timeout = aiohttp.ClientTimeout(total=120)
+
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(temp_url, headers={"Cookie": cookie_header}) as resp:
+                        if resp.status == 200:
+                            content = await resp.read()
+                            if len(content) > 48 * 1024 * 1024:
+                                await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
+                                return
+
+                            temp_path = os.path.join(tempfile.gettempdir(), fname)
+                            with open(temp_path, "wb") as f:
+                                f.write(content)
+
+                            await query.message.reply_document(
+                                document=open(temp_path, "rb"),
+                                filename=fname
+                            )
+                            os.remove(temp_path)
+                            logging.info(f"✅ Downloaded via cached URL: {fname}")
+
+                            # Update cache (refresh TTL)
+                            link_cache[sid] = {
+                                **info,
+                                "ts": datetime.now().timestamp()
+                            }
                             return
-
-                        temp_path = os.path.join(tempfile.gettempdir(), fname)
-                        with open(temp_path, "wb") as f:
-                            f.write(content)
-
-                        await query.message.reply_document(
-                            document=open(temp_path, "rb"),
-                            filename=fname
-                        )
-                        os.remove(temp_path)
-                        logging.info(f"✅ Downloaded via cached URL: {fname}")
-
-                        # Update cache (refresh TTL)
-                        link_cache[sid] = {
-                            **info,
-                            "ts": datetime.now().timestamp()
-                        }
-                        return
-                    else:
-                        logging.warning(f"⚠️ Cached URL returned HTTP {resp.status}, getting fresh URL")
+                        else:
+                            logging.warning(f"⚠️ Cached URL returned HTTP {resp.status}, getting fresh URL")
             except Exception as e:
                 logging.warning(f"⚠️ Cached URL failed, getting fresh URL: {e}")
 
         # If cached URL doesn't work, get fresh URL
         await query.edit_message_text(f"🔍 Getting fresh download link for:\n📄 {fname}")
 
-        url = await get_fresh_file_url(cid, fname, current_url)
+        url = await get_fresh_file_url(page, cid, fname, current_url)
         if not url:
             await query.message.reply_text(f"⚠️ Could not get download link for:\n{fname}")
             logging.error(f"❌ No download URL found for: {fname}")
@@ -3129,27 +4080,32 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         temp_path = os.path.join(tempfile.gettempdir(), fname)
 
         try:
-            async with await global_session.get(url) as resp:
-                if resp.status != 200:
-                    await query.message.reply_text(f"⚠️ Download failed (HTTP {resp.status}).")
-                    logging.error(f"❌ Download failed: HTTP {resp.status} for {url}")
-                    return
+            cookies = await browser_context.cookies()
+            cookie_header = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+            timeout = aiohttp.ClientTimeout(total=120)
 
-                content = await resp.read()
-                if len(content) > 48 * 1024 * 1024:
-                    await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
-                    return
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, headers={"Cookie": cookie_header}) as resp:
+                    if resp.status != 200:
+                        await query.message.reply_text(f"⚠️ Download failed (HTTP {resp.status}).")
+                        logging.error(f"❌ Download failed: HTTP {resp.status} for {url}")
+                        return
 
-                with open(temp_path, "wb") as f:
-                    f.write(content)
+                    content = await resp.read()
+                    if len(content) > 48 * 1024 * 1024:
+                        await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
+                        return
 
-                await query.message.reply_document(
-                    document=open(temp_path, "rb"),
-                    filename=fname,
-                    caption=f"✅ {fname}"
-                )
-                os.remove(temp_path)
-                logging.info(f"✅ Successfully downloaded: {fname}")
+                    with open(temp_path, "wb") as f:
+                        f.write(content)
+
+                    await query.message.reply_document(
+                        document=open(temp_path, "rb"),
+                        filename=fname,
+                        caption=f"✅ {fname}"
+                    )
+                    os.remove(temp_path)
+                    logging.info(f"✅ Successfully downloaded: {fname}")
 
         except Exception as e:
             logging.error(f"❌ Download failed for {fname}: {e}")
@@ -3159,8 +4115,8 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data[0] == "nav":
         sid = data[1]
         info = link_cache.get(sid, {})
-        action = info.get("action")
         cid = info.get("cid")
+        action = info.get("action")
 
         if action == "back":
             if len(nav_stack.get(user_id, [])) > 1:
@@ -3169,25 +4125,27 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if nav_stack.get(user_id):
                 back_url = nav_stack[user_id][-1]
-                files = await list_files(cid, back_url)
+                files = await list_files(page, cid, back_url)
                 await send_folder(query, files, cid, user_id, current_url=back_url)
             else:
                 # Fallback: course root'a git
                 root_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
                 nav_stack[user_id] = [root_url]
                 nav_names[user_id] = [courses_map.get(cid, f"Course {cid[:6]}")]
-                files = await list_files(cid, root_url)
+                files = await list_files(page, cid, root_url)
                 await send_folder(query, files, cid, user_id, current_url=root_url)
 
         elif action == "home":
             root_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
             nav_stack[user_id] = [root_url]
             nav_names[user_id] = [courses_map.get(cid, f"Course {cid[:6]}")]
-            files = await list_files(cid, root_url)
+            files = await list_files(page, cid, root_url)
             await send_folder(query, files, cid, user_id, current_url=root_url)
 
         elif action == "courses":
-            courses = await list_courses()
+            async with page_lock:
+                await page.goto(STUDIP_URL, wait_until="networkidle")
+            courses = await list_courses(page)
             await _send_courses_menu(query, courses)
 
         elif action == "zip":
@@ -3209,7 +4167,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
 
             buf, total, folder_name, success_count, total_size = await create_recursive_zip(
-                cid, current_url, root_name=root_name, progress_callback=progress
+                page, cid, current_url, browser_context, root_name=root_name, progress_callback=progress
             )
 
             if total == 0:
@@ -3257,64 +4215,27 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not msg_id:
             await query.message.reply_text("⚠️ Message ID not found.")
             return
-        # ── Step 1: fetch planner page to get CSRF token & API URL ───────
-        # This block seems misplaced here, as it's about planner/calendar, not messages.
-        # Assuming it's intended for debugging or a future feature related to calendar.
-        # It requires 'session' and 'index_url' to be defined in this scope.
-        # For now, I'm placing it as requested, but it might cause NameError if not defined.
-        # async with await session.get(index_url) as r: # Commented out as session/index_url are not defined here.
-        #     page_html = await r.text()
-
-        # csrf_token = ""
-        # # Log all discovered event/calendar URLs from the HTML
-        # found_urls = _re.findall(r"['\"]([^'\"]*calendar[^'\"]*)['\"]", page_html)
-        # found_urls += _re.findall(r"['\"]([^'\"]*events[^'\"]*)['\"]", page_html)
-        # logging.info("📅 Discovered URLs in planner HTML:")
-        # for u in set(found_urls):
-        #     logging.info(f"   - {u}")
-
-        # # Also grab any JS lines defining FullCalendar source
-        # lines = [line for line in page_html.split('\n') if 'url' in line.lower() or 'events' in line.lower() or 'source' in line.lower()]
-        # logging.info("📅 Discovered Source JS lines:")
-        # for i, line in enumerate(lines[:15]):
-        #     logging.info(f"   L{i}: {line.strip()[:100]}")
-
-        # # STUDIP.CSRF_TOKEN = { name: '...', value: 'TOKEN' }
-        # m = _re.search(r"security_token['\"]?\s*[,:]\s*['\"]([A-Za-z0-9+/=_.\-]{10,})['\"]", page_html)
-        # if m:
-        #     csrf_token = m.group(1)
-        #     logging.info(f"📅 CSRF token: {csrf_token[:12]}...")
-        # The above block is commented out as it seems to be for a different context (calendar/planner)
-        # and would require `session`, `index_url`, and `_re` to be imported/defined.
 
         try:
             logging.info(f"📨 Opening message ID {msg_id} via direct URL...")
 
             msg_url = f"https://elearning.uni-oldenburg.de/dispatch.php/messages/read/{msg_id}/rec"
-            async with await global_session.get(msg_url) as resp:
-                html = await resp.text()
+            await page.goto(msg_url, wait_until="networkidle", timeout=20000)
 
-            soup = BeautifulSoup(html, "html.parser")
+            html = await page.content()
 
             # Extract information
-            subject_tag = soup.select_one("#ui-id-7, .message-subject, h1")
-            subject = subject_tag.get_text(strip=True) if subject_tag else "(No subject)"
+            subject_match = re.search(r'<span id="ui-id-7".*?>(.*?)</span>', html, re.S)
+            subject = re.sub(r"<.*?>", "", subject_match.group(1)).strip() if subject_match else "(No subject)"
 
-            # Try to find elements by labels
-            sender_name = "Unknown"
-            date_str = "-"
-            for row in soup.select("tr"):
-                th = row.select_one("th, td:first-child")
-                td = row.select_one("td")
-                if th and td:
-                    label = th.get_text(strip=True).lower()
-                    if "from" in label or "von" in label:
-                        sender_name = td.get_text(strip=True)
-                    elif "date" in label or "datum" in label:
-                        date_str = td.get_text(strip=True)
+            sender_match = re.search(r'<td><strong>From</strong></td>\s*<td>(.*?)</td>', html, re.S)
+            sender = re.sub(r"<.*?>", "", sender_match.group(1)).strip() if sender_match else "Unknown"
 
-            body_container = soup.select_one("div.formatted-content, .message-content, .formatted-content.ck-content")
-            content = body_container.get_text("\n", strip=True) if body_container else "No content found."
+            date_match = re.search(r'<td><strong>Date</strong></td>\s*<td>(.*?)</td>', html, re.S)
+            date_str = re.sub(r"<.*?>", "", date_match.group(1)).strip() if date_match else "-"
+
+            body_match = re.search(r'<div class="formatted-content ck-content">(.*?)</div>', html, re.S)
+            content = re.sub(r"<.*?>", "", body_match.group(1)).strip() if body_match else "No content found."
 
             # Send to Telegram
             header = (
@@ -3322,7 +4243,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "                  \n"
                 "━━━━━━━━━━━━━━━━━━\n"
                 f"📬 <b>Subject:</b> {subject}\n"
-                f"👤 <b>From:</b> {sender_name}\n"
+                f"👤 <b>From:</b> {sender}\n"
                 f"📅 <b>Date:</b> {date_str}\n"
                 "━━━━━━━━━━━━━━━━━━\n"
             )
@@ -3339,7 +4260,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except Exception as e:
             logging.error(f"Message read failed: {e}")
-            await query.message.reply_text(f"⚠️ Could not load message content:\n{str(e)[:200]}")
+            await query.message.reply_text(f"⚠️ Could not load message content:\n{e}")
 
     # ── show last items ─────────────────────────────────────────────────
     elif data[0] == "show_last":
@@ -3387,11 +4308,11 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         elif "ℹ️" in text or "status" in text.lower():
             data = ["status"]
         else:
-            data = [text.replace("📅", "").strip()] # Fallback for other text commands
+            data = [text.replace("📅", "").strip()]
         chat_id = message.chat_id
         sender = message
 
-    global watcher_controller_running, global_watcher_paused, check_in_progress
+    global page, browser_context
     user_id = update.effective_user.id
     if not is_user_allowed(user_id):
         await sender.reply_text("Not authorized to use this bot.")
@@ -3401,27 +4322,46 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         # Temporary loading message
         status_msg = await sender.reply_text("⏳ Please wait...")
 
+        # Handle menu command
         if data[0] == "menu":
             await menu_command(update, context)
+
+        # Handle calendar commands - Show Today view and add buttons
         elif data[0] == "calendar":
-            logging.info("📅 Fetching today's schedule...")
-            today = datetime.now().date()
-            week_start = today - timedelta(days=today.weekday())
-            events = await get_calendar_events(session=global_session, week_start=week_start)
-            await send_daily_calendar(sender, events, today, week_start)
+            logging.info("📅 Opening Planer page and fetching today's events...")
+            events = await get_calendar_events(page, week_view=False)
+
+            # Create buttons
+            keyboard = [
+                [InlineKeyboardButton("📅 Today", callback_data="calendar_today"),
+                 InlineKeyboardButton("🗓️ Weekly Plan", callback_data="calendar_weekly")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            await send_today_calendar(sender, events)
+            await sender.reply_text("📌 Quick Access:", reply_markup=reply_markup)
+
+        # Handle start command
         elif data[0] == "start":
             await start(update, context)
+
+        # Handle check command
         elif data[0] == "check":
             await check_command(update, context)
+
+        # Handle status command
         elif data[0] == "status":
             await status_command(update, context)
+
         else:
             await sender.reply_text("❓ Unknown command.")
 
+        # Safely delete loading message
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logging.warning(f"⚠️ Could not delete status message: {e}")
+
     except Exception as e:
         logging.error(f"Button handler error: {e}")
         try:
@@ -3430,304 +4370,86 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
 
 
-# ── Calendar helpers ──────────────────────────────────────────────────────────
-
-async def get_calendar_events(session, week_start) -> list:
-    """Fetch calendar events from the user's personal Stud.IP iCal export URL."""
-    ical_url = os.getenv("STUDIP_ICAL_URL")
-    
-    if not ical_url:
-        logging.error("❌ No STUDIP_ICAL_URL set in environment variables.")
-        return []
-        
-    try:
-        import icalendar
-        import recurring_ical_events
-    except ImportError:
-        logging.error("❌ icalendar or recurring_ical_events not installed. Run: pip install icalendar recurring-ical-events")
-        return []
-
-    try:
-        logging.info(f"📅 Fetching ICS Calendar from: {ical_url[:50]}...")
-        async with await session.get(ical_url, allow_redirects=True) as r:
-            if r.status != 200:
-                logging.warning(f"ICS Calendar API returned {r.status}")
-                return []
-            raw_data = await r.read()
-            raw_text = raw_data.decode('utf-8', errors='ignore')
-
-        # Parse the calendar
-        cal = icalendar.Calendar.from_ical(raw_text)
-        
-        # Get events for the requested week
-        end_date = week_start + timedelta(days=7)
-        # Use recurring_ical_events to expand RRULEs automatically and filter by date boundary
-        week_events = recurring_ical_events.of(cal).between(week_start, end_date)
-        
-        events = []
-        now = datetime.now(ZoneInfo("Europe/Berlin"))
-        for event in week_events:
-            title = str(event.get('SUMMARY', 'Unknown Event'))
-            location = str(event.get('LOCATION', ''))
-            url_link = str(event.get('URL', ''))
-            
-            start_dt = event['DTSTART'].dt
-            end_dt = event['DTEND'].dt
-            
-            # icalendar returns date or datetime depending on whether it's an all-day event
-            if not isinstance(start_dt, datetime):
-                # Convert purely 'date' to 'datetime' at midnight
-                start_dt = datetime.combine(start_dt, datetime.min.time()).replace(tzinfo=ZoneInfo("Europe/Berlin"))
-            if not isinstance(end_dt, datetime):
-                end_dt = datetime.combine(end_dt, datetime.min.time()).replace(tzinfo=ZoneInfo("Europe/Berlin"))
-            
-            # Ensure timezone-aware comparisons by converting all to local time
-            try:
-                start_dt = start_dt.astimezone(ZoneInfo("Europe/Berlin"))
-                end_dt = end_dt.astimezone(ZoneInfo("Europe/Berlin"))
-            except ValueError:
-                # If naive, just replace tzinfo
-                start_dt = start_dt.replace(tzinfo=ZoneInfo("Europe/Berlin"))
-                end_dt = end_dt.replace(tzinfo=ZoneInfo("Europe/Berlin"))
-            
-            # Determine status
-            if end_dt < now:
-                status = "past"
-            elif start_dt <= now <= end_dt:
-                status = "ongoing"
-            else:
-                status = "upcoming"
-                
-            day_str = start_dt.strftime("%A, %d.%m.%Y")
-            time_str = f"{start_dt.strftime('%H:%M')} – {end_dt.strftime('%H:%M')}"
-            date_key = start_dt.date()
-                
-            events.append({
-                "title": title,
-                "day": day_str,
-                "time": time_str,
-                "location": location,
-                "url": url_link,
-                "date_key": date_key,
-                "start_dt": start_dt,
-                "end_dt": end_dt,
-                "status": status
-            })
-
-        # Sort by date + time using the real datetime object
-        events.sort(key=lambda e: e["start_dt"])
-        return events
-    except Exception as exc:
-        logging.error(f"get_calendar_events error: {exc}")
-        return []
-
-
-async def send_daily_calendar(sender, events: list, target_date, week_start):
-    """Send a specific day's schedule with a 'Week Plan' button. Matches backup UI."""
-    today_events = [ev for ev in events if ev["date_key"] == target_date]
-    
-    if not today_events:
-        text = (
-            "🎉 *No Events Today!*\n\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "📅 *Your schedule is clear*\n"
-            "🕒 Perfect time to catch up or relax!\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🗓️ *{target_date:%A, %d %B %Y}*"
-        )
-    else:
-        # Header
-        header = (
-            "✨ *Today's Schedule* ✨\n"
-            f"📅 *{target_date:%A, %d %B %Y}*\n"
-            "━━━━━━━━━━━━━━━━━━"
-        )
-        
-        lines = [header]
-        course_blocks = []
-        for ev in today_events:
-            original_title = ev.get("title", "")
-            status = _status_emoji(ev.get("status"))
-            course_icon = _get_course_icon(original_title)
-            display_title = clean_course_title(original_title)
-            loc_icon = _get_location_emoji(ev.get("location", ""))
-            duration = ev["time"] # Already formatted as HH:MM – HH:MM
-
-            block = (
-                f"{status} {course_icon} *{display_title}*\n"
-                f"   🕒 `{duration}`\n"
-                f"   {loc_icon} {_safe_loc(ev['location'])}"
-            )
-            course_blocks.append(block)
-            
-        lines.append("\n\n".join(course_blocks))
-        lines.append("━━━━━━━━━━━━━━━━━━")
-        text = "\n".join(lines)
-
-    keyboard = [
-        [
-            InlineKeyboardButton("📆 Week Plan", callback_data="calendar_weekly"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if hasattr(sender, "edit_message_text"):
-        try:
-            await sender.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-            return
-        except Exception:
-            pass
-    await sender.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-
-
-async def send_weekly_calendar(sender, events: list, week_start):
-    """Send the weekly schedule with navigation. Matches backup UI."""
-    prev_week = week_start - timedelta(days=7)
-    next_week = week_start + timedelta(days=7)
-    week_end = week_start + timedelta(days=6)
-
-    if not events:
-        text = (
-            "🎉 *No Events Planed!*\n\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            "📅 *Your schedule is clear*\n"
-            "🕒 Perfect time to catch up or relax!\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🗓️ *Weekly View*"
-        )
-    else:
-        # Group events by date_key
-        events_by_day = {}
-        for event in events:
-            dk = event["date_key"]
-            if dk not in events_by_day:
-                events_by_day[dk] = []
-            events_by_day[dk].append(event)
-
-        # Header
-        header = (
-            "✨ *Weekly Schedule* ✨\n"
-            f"🗓️ *{week_start:%d %B} - {week_end:%d %B %Y}*\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        )
-
-        lines = [header]
-
-        # Process days in order
-        for dk in sorted(events_by_day.keys()):
-            now_dt = datetime.combine(dk, datetime.min.time())
-            day_name = now_dt.strftime("%A")
-            day_emoji = _get_day_emoji(day_name)
-            
-            lines.append(f"\n{day_emoji} *{day_name}, {dk:%d.%m.%Y}*")
-            lines.append("━━━━━━━━━━━━━━━━━━")
-
-            day_courses = []
-            for event in events_by_day[dk]:
-                original_title = event.get("title", "")
-                status = _status_emoji(event.get("status"))
-                course_icon = _get_course_icon(original_title)
-                display_title = clean_course_title(original_title)
-                loc_icon = _get_location_emoji(event.get("location", ""))
-                duration = event["time"]
-
-                block = (
-                    f"{status} {course_icon} *{display_title}*\n"
-                    f"   🕒 `{duration}`\n"
-                    f"   {loc_icon} {_safe_loc(event['location'])}"
-                )
-                day_courses.append(block)
-            
-            lines.append("\n\n".join(day_courses))
-
-        lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        text = "\n".join(lines)
-
-    # Navigation buttons
-    keyboard = [
-        [
-            InlineKeyboardButton("⬅️ Prev Week", callback_data=f"calendar_week|{prev_week.isoformat()}"),
-            InlineKeyboardButton("🗓️ This Week", callback_data=f"calendar_week|{(datetime.now().date() - timedelta(days=datetime.now().weekday())).isoformat()}"),
-            InlineKeyboardButton("➡️ Next Week", callback_data=f"calendar_week|{next_week.isoformat()}"),
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    if hasattr(sender, "edit_message_text"):
-        try:
-            await sender.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-            return
-        except Exception:
-            pass
-    await sender.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
-
-
-async def handle_calendar_week(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle calendar_week|YYYY-MM-DD navigation callbacks."""
-    query = update.callback_query
-    await query.answer()
-
-    user_id = query.from_user.id
-    if not is_user_allowed(user_id):
-        return
-
-    try:
-        _, date_str = query.data.split("|")
-        week_start = datetime.strptime(date_str, "%Y-%m-%d").date()
-    except Exception:
-        today = datetime.now().date()
-        week_start = today - timedelta(days=today.weekday())
-
-    try:
-        await query.edit_message_text("⏳ Loading schedule...")
-        session = global_session
-        events = await get_calendar_events(session=session, week_start=week_start)
-        await send_weekly_calendar(query, events, week_start)
-    except Exception as e:
-        logging.error(f"Calendar week nav error: {e}")
-        await query.edit_message_text(f"❌ Error: {str(e)[:200]}")
-
-
 async def handle_calendar_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle calendar_today callback — shows the current day's events."""
+    """Handle calendar_today callback with better error handling"""
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
+        await query.message.reply_text("Not authorized to use this bot.")
         return
 
     try:
-        await query.edit_message_text("📅 Fetching today's events...")
-        session = global_session
-        today = datetime.now().date()
-        week_start = today - timedelta(days=today.weekday())
-        events = await get_calendar_events(session=session, week_start=week_start)
-        await send_daily_calendar(query, events, today, week_start)
+        await query.edit_message_text("📅 Fetching today's schedule...")
+
+        # Page check
+        if not page or page.is_closed():
+            await query.edit_message_text("🔄 Browser session expired, reconnecting...")
+            await login_studip()
+
+        events = await get_calendar_events(page, week_view=False)
+
+        # Create buttons
+        keyboard = [
+            [InlineKeyboardButton("📅 Today", callback_data="calendar_today"),
+             InlineKeyboardButton("🗓️ Weekly Plan", callback_data="calendar_weekly")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await send_today_calendar(query, events)
+        await query.message.reply_text("📌 Quick Access:", reply_markup=reply_markup)
+
     except Exception as e:
         logging.error(f"Calendar today error: {e}")
-        await query.edit_message_text(f"❌ Error loading today's events: {str(e)[:200]}")
+        error_msg = f"❌ Error loading calendar:\n{str(e)[:200]}"
+
+        # User-friendly error message
+        if "ERR_ABORTED" in str(e) or "net::" in str(e):
+            error_msg = "❌ Network error loading calendar. Please try again in a moment."
+
+        await query.edit_message_text(error_msg)
 
 
 async def handle_calendar_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle calendar_weekly callback — shows full week."""
+    """Handle calendar_weekly callback with better error handling"""
     query = update.callback_query
     await query.answer()
 
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
+        await query.message.reply_text("Not authorized to use this bot.")
         return
 
     try:
         await query.edit_message_text("🗓️ Fetching weekly schedule...")
-        session = global_session
-        today = datetime.now().date()
-        week_start = today - timedelta(days=today.weekday())
-        events = await get_calendar_events(session=session, week_start=week_start)
-        await send_weekly_calendar(query, events, week_start)
+
+        # Page check
+        if not page or page.is_closed():
+            await query.edit_message_text("🔄 Browser session expired, reconnecting...")
+            await login_studip()
+
+        events = await get_calendar_events(page, week_view=True)
+
+        # Create buttons
+        keyboard = [
+            [InlineKeyboardButton("📅 Today", callback_data="calendar_today"),
+             InlineKeyboardButton("🗓️ Weekly Plan", callback_data="calendar_weekly")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await send_weekly_calendar(query, events)
+        await query.message.reply_text("📌 Quick Access:", reply_markup=reply_markup)
+
     except Exception as e:
         logging.error(f"Calendar weekly error: {e}")
-        await query.edit_message_text(f"❌ Error loading weekly schedule: {str(e)[:200]}")
+        error_msg = f"❌ Error loading weekly calendar:\n{str(e)[:200]}"
+
+        # User-friendly error message
+        if "ERR_ABORTED" in str(e) or "net::" in str(e):
+            error_msg = "❌ Network error loading calendar. Please try again in a moment."
+
+        await query.edit_message_text(error_msg)
 
 
 async def delete_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3781,9 +4503,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Then do other operations
     try:
-        courses = await list_courses()
-        # Keep keyboard when sending courses
-        await _send_courses_menu(update.message, courses)
+        if page and not page.is_closed():
+            async with page_lock:
+                await page.goto(STUDIP_URL, wait_until="networkidle")
+            courses = await list_courses(page)
+            # Keep keyboard when sending courses
+            await _send_courses_menu(update.message, courses)
     except Exception as e:
         logging.warning(f"Course loading failed but keyboard should be visible: {e}")
 
@@ -3811,10 +4536,10 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed bot status"""
-    global watcher_controller_running, global_watcher_paused, check_in_progress
+    global page, browser_context, watcher_controller_running, global_watcher_paused, check_in_progress
 
-    logged_in = "✅ Yes" if global_session and await global_session.is_logged_in() else "❌ No"
-    browser_ready = "✅ Browser-less"
+    logged_in = "✅ Yes" if page and not page.is_closed() else "❌ No"
+    browser_ready = "✅ Ready" if browser_context else "❌ No"
 
     # Watcher durumu
     if watcher_controller_running:
@@ -3868,7 +4593,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Combine and send
     text += f"\n\n{sys_info}"
 
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=get_show_last_keyboard())
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 # ── BEGIN FLOW (login + course list) ──────────────────────────────────────────
@@ -3898,8 +4623,9 @@ async def _run_begin_flow(message, user, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(0.5)
 
         # Actual operations
-        session = await login_studip()
-        courses = await list_courses()
+        pg = await login_studip()
+        await pg.goto(STUDIP_URL, wait_until="networkidle")
+        courses = await list_courses(pg)
 
         # DELETE TEMPORARY MESSAGE!
         await temp_message.delete()
@@ -3924,82 +4650,276 @@ async def _run_begin_flow(message, user, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def main():
-    logging.info("Telegram bot running (100% browser-less Stud.IP automation)...")
+    import asyncio
+    import nest_asyncio
+
+    logging.info("Telegram bot running (full Stud.IP automation + watcher + ZIP)...")
 
     if not acquire_instance_lock():
         logging.error("❌ Another bot instance is already running. Exiting.")
         return
 
-    app = None
     try:
-        global global_session
-        global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
-        
-        logging.info("🔐 Logging in to Stud.IP...")
-        if not await global_session.login():
-            logging.error("❌ Login failed. Please check your USERNAME, PASSWORD, and TOTP_SECRET.")
-            return
+        # Apply nest_asyncio for Jupyter/async environment compatibility
+        nest_asyncio.apply()
+        loop = asyncio.get_event_loop()
 
-        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        # Build Telegram application
+        app = (
+            ApplicationBuilder()
+            .token(TELEGRAM_TOKEN)
+            .build()
+        )
 
-        # Command & Callback handlers
+        # ── Command handlers ──────────────────────────────────────────────────
+
+        # ── Command handlers ──────────────────────────────────────────────────
+
+        # 1. FIRST specific callback patterns
+        app.add_handler(CallbackQueryHandler(show_last_messages, pattern="^show_last_messages$"))
+        app.add_handler(CallbackQueryHandler(show_last_announcements, pattern="^show_last_announcements$"))
+        app.add_handler(CallbackQueryHandler(show_last_files, pattern="^show_last_files$"))
+        app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
+        app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^show_menu$"))
+        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers)$"))
+
+        # 2. SPECIAL callback patterns (calendar buttons)
+        app.add_handler(CallbackQueryHandler(handle_calendar_today, pattern="^calendar_today$"))
+        app.add_handler(CallbackQueryHandler(handle_calendar_weekly, pattern="^calendar_weekly$"))
+
+        # 3. GENEL callback handler - en SONA
+        app.add_handler(CallbackQueryHandler(handle_selection))
+
+        # 4. Command handlers
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("check", check_command))
         app.add_handler(CommandHandler("watch", watch))
         app.add_handler(CommandHandler("status", status_command))
         app.add_handler(CommandHandler("menu", menu_command))
-        
-        app.add_handler(CallbackQueryHandler(show_last_messages, pattern="^show_last_messages$"))
-        app.add_handler(CallbackQueryHandler(show_last_announcements, pattern="^show_last_announcements$"))
-        app.add_handler(CallbackQueryHandler(show_last_files, pattern="^show_last_files$"))
-        app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
-        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers)$"))
-        app.add_handler(CallbackQueryHandler(handle_calendar_today, pattern="^calendar_today$"))
-        app.add_handler(CallbackQueryHandler(handle_calendar_weekly, pattern="^calendar_weekly$"))
-        app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern="^calendar_week\|.*$"))
-        app.add_handler(CallbackQueryHandler(handle_selection))
 
+        # 5. Message handlers - FIRST handle_reply_buttons, THEN delete_text
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, delete_text))
 
-        # Explicitly initialize and start the application
-        await app.initialize()
-        await app.start()
-        
-        logging.info("🚀 Starting unified watcher...")
-        # Run watcher in background task
-        asyncio.create_task(start_unified_watcher(app))
+        async def initialize_browser():
+            """Initialize browser before starting background services"""
+            global page, browser_context
+            logging.info("🔄 Initializing browser...")
 
-        logging.info("🤖 Starting Telegram bot polling...")
-        await app.updater.start_polling(drop_pending_updates=True)
-
-        logging.info("💬 Bot is now online and listening for messages.")
-
-        # Run until the process is stopped
-        try:
-            while True:
-                await asyncio.sleep(3600)
-        except (KeyboardInterrupt, asyncio.CancelledError):
-            logging.info("🛑 Stop signal received.")
-
-    except Exception as e:
-        logging.error(f"❌ Fatal error in main: {e}", exc_info=True)
-    finally:
-        logging.info("🧹 Cleaning up...")
-        if app:
             try:
-                if app.updater and app.updater.running:
-                    await app.updater.stop()
-                if app.running:
-                    await app.stop()
-                await app.shutdown()
-            except Exception as se:
-                logging.error(f"Error during app shutdown: {se}")
-            
-        if global_session:
-            await global_session.close()
-        
-        release_instance_lock()
-        logging.info("✅ Bot shutdown complete")
+                if not page or page.is_closed():
+                    page = await login_studip()
+                    browser_context = page.context
+
+                    # Load courses
+                    await page.goto(STUDIP_URL, wait_until="networkidle")
+                    await list_courses(page)
+                    logging.info(f"✅ Browser initialized with {len(courses_map)} courses")
+                else:
+                    logging.info("✅ Browser already initialized")
+
+            except Exception as e:
+                logging.error(f"❌ Browser initialization failed: {e}")
+                raise
+
+        async def browser_auto_restart_loop():
+            """Browser auto-restart loop (every 4 hours)"""
+            global playwright, browser, browser_context, page
+
+            logging.info("🟢 Browser auto-restart loop INITIALIZED")
+
+            # Schedule first restart for 4 hours later
+            await asyncio.sleep(BROWSER_RESTART_INTERVAL)
+
+            while True:
+                try:
+                    # Correct condition: restart if browser exists AND is connected
+                    if browser and browser.is_connected():
+                        logging.info("♻️ Browser restart triggered to prevent RAM growth...")
+
+                        # 1️⃣ Save cookies
+                        cookies = await browser_context.cookies()
+                        logging.info(f"💾 Saving {len(cookies)} cookies before restart...")
+
+                        # 2 Safely close old browser
+                        try:
+                            if browser_context:
+                                await browser_context.close()
+                            if browser:
+                                await browser.close()
+                            if playwright:
+                                await playwright.stop()
+                        except Exception as e:
+                            logging.warning(f"Browser cleanup warning: {e}")
+
+                        # 3 Start new browser
+                        playwright = await async_playwright().start()
+                        headless = os.getenv("HEADLESS", "false").lower() != "false"
+                        browser = await playwright.chromium.launch(headless=headless)
+                        browser_context = await browser.new_context()
+                        page = await browser_context.new_page()
+
+                        # 4️⃣ Perform login
+                        await login_studip()
+
+                        # 5 Reload courses
+                        await list_courses(page)
+
+                        logging.info("✅ Browser successfully restarted and restored")
+                    else:
+                        logging.warning("🔴 Browser not connected or not available, skipping restart")
+
+                    # Wait for next restart
+                    await asyncio.sleep(BROWSER_RESTART_INTERVAL)
+
+                except Exception as e:
+                    logging.error(f"❌ Browser auto-restart failed: {e}")
+                    # Wait 30 minutes on error and retry
+                    await asyncio.sleep(1800)
+
+        async def link_cache_cleanup_loop():
+            """Link cache cleanup loop (saatte bir)"""
+            logging.info("🟢 Link cache cleanup loop STARTED")
+            while True:
+                try:
+                    await asyncio.sleep(3600)  # Wait 1 hour
+                    cleanup_link_cache()
+                    logging.info("🧹 Link cache cleaned up")
+                except Exception as e:
+                    logging.error(f"Link cache cleanup error: {e}")
+                    await asyncio.sleep(3600)
+
+        async def monitor_tasks():
+            """Monitor and restart failed background tasks"""
+            logging.info("🟢 Task monitor STARTED")
+
+            task_map = {
+                "message_watcher": global_message_watcher,
+                "announcement_watcher": global_announcement_watcher,
+                "browser_restart": browser_auto_restart_loop,
+                "cache_cleanup": link_cache_cleanup_loop,
+            }
+
+            background_tasks = {}
+
+            # Start initial tasks
+            for name, coro_func in task_map.items():
+                task = asyncio.create_task(coro_func(), name=name)
+                background_tasks[name] = task
+                logging.info(f"✅ Started background task: {name}")
+
+            await asyncio.sleep(10)  # Short wait for initial startup
+
+            while True:
+                try:
+                    for name, task in list(background_tasks.items()):
+                        if task.done():
+                            logging.error(f"❌ Background task {name} died, restarting...")
+
+                            # Check exception
+                            try:
+                                exception = task.exception()
+                                if exception:
+                                    logging.error(f"Task {name} exception: {exception}")
+                            except (asyncio.InvalidStateError, CancelledError):
+                                pass
+
+                            # Start new task
+                            new_task = asyncio.create_task(task_map[name](), name=name)
+                            background_tasks[name] = new_task
+                            logging.info(f"✅ Restarted task: {name}")
+
+                    await asyncio.sleep(30)  # Check every 30 seconds
+
+                except Exception as e:
+                    logging.error(f"Task monitor error: {e}")
+                    await asyncio.sleep(60)
+
+        async def run_all():
+            """Main application runner"""
+            try:
+                logging.info("🚀 Starting bot initialization...")
+
+                # ✅ Browser initialization with error handling
+                try:
+                    # Check if browser needs initialization
+                    if not page or page.is_closed():
+                        logging.info("🔄 Initializing browser...")
+                        await login_studip()
+                        logging.info("✅ Browser initialized successfully")
+                    else:
+                        logging.info("✅ Browser already initialized")
+                except Exception as e:
+                    logging.warning(f"⚠️ Browser initialization warning: {e}")
+                    logging.info("🔄 Continuing without browser initialization...")
+
+                # Start unified watcher
+                logging.info("🚀 Starting unified watcher...")
+                await start_unified_watcher(app)
+
+                logging.info("✅ All background services started successfully")
+                logging.info("🤖 Starting Telegram bot polling...")
+
+                # Start Telegram bot
+                app.run_polling(
+                    drop_pending_updates=True,
+                    allowed_updates=Update.ALL_TYPES,
+                    timeout=60,
+                    close_loop=False
+                )
+
+            except Exception as e:
+                logging.error(f"❌ Error in run_all: {e}")
+                raise
+
+        # First start browser, then run main loop
+        logging.info("🚀 Starting bot initialization...")
+
+        # Browser initialization and start main loop
+        loop.run_until_complete(run_all())
+
+    except KeyboardInterrupt:
+        logging.info("🛑 Bot stopped by user (Ctrl+C)")
+    except Exception as e:
+        logging.error(f"❌ Fatal error in main: {e}")
+        import traceback
+        logging.error(traceback.format_exc())
+    finally:
+        # 🔒 Cleanup
+        logging.info("🧹 Cleaning up resources...")
+        try:
+            # Collect all asyncio tasks and cancel them
+            # Stop unified watcher
+            tasks = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+
+            for task in tasks:
+                task.cancel()
+
+            # Wait for tasks to be cancelled
+            if tasks:
+                loop.run_until_complete(asyncio.gather(*tasks, return_exceptions=True))
+
+            # Close browser
+            if browser_context:
+                loop.run_until_complete(browser_context.close())
+            if browser:
+                loop.run_until_complete(browser.close())
+            if playwright:
+                loop.run_until_complete(playwright.stop())
+
+            logging.info("✅ Resources cleaned up successfully")
+
+        except Exception as e:
+            logging.warning(f"Cleanup warning: {e}")
+
+        finally:
+            # Release instance lock
+            release_instance_lock()
+            logging.info("🔓 Instance lock released")
+            logging.info("✅ Bot shutdown complete")
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import asyncio
+
+    asyncio.run(main())  # Correctly running async function

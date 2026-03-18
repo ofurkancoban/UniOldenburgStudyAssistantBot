@@ -1,7 +1,7 @@
 asyncio
 nest_asyncio
 aiohttp
-playwright
+# playwright use for Playwright version.
 pyotp
 beautifulsoup4
 html5lib
@@ -10,4 +10,6 @@ python-telegram-bot
 python-dotenv
 psutil
 uuid
+icalendar
+recurring-ical-events
 # Verified
