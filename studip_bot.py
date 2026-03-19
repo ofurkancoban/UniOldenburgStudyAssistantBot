@@ -877,44 +877,85 @@ def translate_food_codes(text):
     return text
 
 
-async def get_todays_menu_enhanced(session):
-    """Enhanced menu fetching with dynamic allergen guide - HTML format"""
+async def get_todays_menu_enhanced(session, sub_path="2/"):
+    """Enhanced menu fetching with dynamic allergen guide and navigation links"""
     try:
-        menu_url = "https://elearning.uni-oldenburg.de/plugins.php/mensawidget/menu/2/"
+        # If sub_path is a full URL, extract the part after menu/
+        if "mensawidget/menu/" in sub_path:
+            sub_path = sub_path.split("mensawidget/menu/")[-1]
+            
+        url = f"{BASE_URL}/plugins.php/mensawidget/menu/{sub_path}"
 
-        async with await session.get(menu_url) as r:
+        async with await session.get(url) as r:
             html_content = await r.text()
 
         soup = BeautifulSoup(html_content, "html.parser")
 
-        # Date
+        # Determine the effective date of the menu being requested
+        effective_ts = int(datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).timestamp())
+        ts_match = re.search(r'/(\d{10})(?:/|$)', sub_path)
+        if ts_match:
+            base_ts = int(ts_match.group(1))
+            if "/next" in sub_path:
+                effective_ts = base_ts + 86400
+            elif "/previous" in sub_path:
+                effective_ts = base_ts - 86400
+            else:
+                effective_ts = base_ts
+
+        # Fallback: Check if the page actually specifies a date (rare in fragments)
         date_element = soup.find('h2')
-        date_text = date_element.get_text(strip=True) if date_element else datetime.now().strftime("%d.%m.%Y")
+        if date_element:
+            date_page_text = date_element.get_text(strip=True)
+            if re.search(r'\d{2}\.\d{2}\.\d{4}', date_page_text):
+                date_text = date_page_text
+            else:
+                date_text = datetime.fromtimestamp(effective_ts).strftime("%A, %d.%m.%Y")
+        else:
+            date_text = datetime.fromtimestamp(effective_ts).strftime("%A, %d.%m.%Y")
+
+        # Navigation links: increment/decrement relative to effective date for infinite stepping
+        prev_link = f"2/{effective_ts}/previous"
+        next_link = f"2/{effective_ts}/next"
 
         menu_text = f"🍽️ <b>{html.escape(date_text)}</b> 🍽️\n"
         menu_text += "🏛️ Mensa Uni Oldenburg\n\n"
 
-        # Process all categories and collect ALL allergens used today
+        # Process all categories
         categories = soup.find_all('table', class_='default')
+        if not categories:
+            return "🍽️ <b>Mensa Uni Oldenburg</b>\n\n❌ No dishes found for this date. The Mensa might be closed.", prev_link, next_link
+
+        categories_data = []
         all_allergens_used = set()
+
+        category_priority = {
+            "COUNTER ONE": 1, "COUNTER TWO": 2, "COUNTER THREE": 3, "COUNTER FOUR": 4,
+            "Main Dishes": 5, "PIZZA": 10,
+            "Culinarium Main Dishes": 20, "Culinarium Side Dishes": 21,
+            "Culinarium Salads": 22, "Culinarium Desserts": 23,
+            "Soup": 30, "Side Dishes": 40, "Salads": 50, "Desserts": 60
+        }
 
         for category_table in categories:
             category_name = category_table.find('th').get_text(strip=True)
+            original_category_name = category_name # Keep for sorting
 
             # Map category names to display names
             category_map = {
-                "Main Dishes": "🍴 COUNTER 1",
+                "Main Dishes": "🍴 MAIN DISHES",
                 "Soup": "🍲 SOUPS",
                 "Side Dishes": "🥗 SIDE DISHES",
                 "Salads": "🥗 SALADS",
                 "Desserts": "🍮 DESSERTS",
                 "COUNTER ONE": "🍴 COUNTER 1",
+                "COUNTER TWO": "🍴 COUNTER 2",
                 "COUNTER THREE": "🍴 COUNTER 3",
                 "COUNTER FOUR": "🍴 COUNTER 4",
-                "Culinarium Main Dishes": "👨‍🍳 CULINARIUM",
-                "Culinarium Side Dishes": "👨‍🍳 CULINARIUM",
-                "Culinarium Salads": "👨‍🍳 CULINARIUM",
-                "Culinarium Desserts": "👨‍🍳 CULINARIUM"
+                "Culinarium Main Dishes": "👨‍🍳 CULINARIUM MAIN",
+                "Culinarium Side Dishes": "👨‍🍳 CULINARIUM SIDE",
+                "Culinarium Salads": "👨‍🍳 CULINARIUM SALAD",
+                "Culinarium Desserts": "👨‍🍳 CULINARIUM DESSERT"
             }
 
             # Handle empty category names - check for pizza items
@@ -930,102 +971,70 @@ async def get_todays_menu_enhanced(session):
                             break
                 if has_pizza:
                     category_name = "PIZZA"
+                    original_category_name = "PIZZA"
 
             display_name = category_map.get(category_name, f"🍴 {category_name}")
+            if category_name == "PIZZA": display_name = "🍕 PIZZA"
 
-            # Special pizza category
-            if category_name == "PIZZA":
-                display_name = "🍕 PIZZA"
+            cat_chunk = "━━━━━━━━━━━━━━━━━━\n"
+            cat_chunk += f"{display_name}\n"
+            cat_chunk += "━━━━━━━━━━━━━━━━━━\n"
 
-            menu_text += "━━━━━━━━━━━━━━━━━━\n"
-            menu_text += f"{display_name}\n"
-            menu_text += "━━━━━━━━━━━━━━━━━━\n"
-
-            items = category_table.find_all('tr')[1:]  # Skip header row
+            items = category_table.find_all('tr')[1:]
+            items_found = False
 
             for item in items:
                 cols = item.find_all('td')
                 if len(cols) >= 2:
+                    items_found = True
                     name_cell = cols[0]
                     price = cols[1].get_text(strip=True)
 
-                    # Extract name without allergens
-                    name_text = ""
-                    description = ""
-                    allergens_text = ""
-
-                    # Clone the cell to work with
                     temp_cell = BeautifulSoup(str(name_cell), 'html.parser')
-
-                    # Remove allergen spans first
                     allergen_spans = temp_cell.find_all('span', class_='attributes')
+                    allergens_text = ""
                     for span in allergen_spans:
-                        allergens_text = span.get_text(strip=True)
-                        # Add allergens to the used set
-                        if allergens_text:
-                            # Split by comma and add individual allergens
-                            allergens_list = [a.strip() for a in allergens_text.split(',')]
-                            all_allergens_used.update(allergens_list)
+                        span_text = span.get_text(strip=True)
+                        if span_text:
+                            allergens_text = span_text
+                            all_allergens_used.update([a.strip() for a in span_text.split(',')])
                         span.decompose()
 
-                    # Remove allergen abbr tags
-                    allergen_abbrs = temp_cell.find_all('abbr')
-                    for abbr in allergen_abbrs:
-                        abbr.decompose()
-
-                    # Now get clean text
+                    for abbr in temp_cell.find_all('abbr'): abbr.decompose()
                     clean_text = temp_cell.get_text("\n", strip=True)
-
-                    # Split by newline to separate name and description
                     lines = [line.strip() for line in clean_text.split('\n') if line.strip()]
-
+                    
                     if lines:
                         name_text = lines[0]
-                        if len(lines) > 1:
-                            description = ' '.join(lines[1:])
+                        description = ' '.join(lines[1:]) if len(lines) > 1 else ""
+                        name_text = re.sub(r'[1-9][0-9]*[A-Za-z,+\s]*$', '', name_text).strip()
+                        name_text = re.sub(r'\([^)]*\)$', '', name_text).strip()
+                        if name_text:
+                            cat_chunk += f"• <b>{html.escape(name_text)}</b>"
+                            if '⭐' in name_text or 'limited' in name_text.lower(): cat_chunk += " ⭐"
+                            cat_chunk += "\n"
+                            if description:
+                                description = re.sub(r'[1-9][0-9]*[A-Za-z,+\s]*$', '', description).strip()
+                                description = re.sub(r'\([^)]*\)$', '', description).strip()
+                                if description: cat_chunk += f"  {html.escape(description)}\n"
+                            if allergens_text:
+                                cat_chunk += f"  {translate_food_codes(allergens_text)}\n"
+                                cat_chunk += f"  <i>({html.escape(allergens_text)})</i>\n"
+                            
+                            clean_price = price.replace("&euro;", "€").replace("€", "€").strip().replace('.', ',')
+                            if clean_price and clean_price != "€":
+                                if "€" not in clean_price: clean_price += "€"
+                                cat_chunk += f"  💶 {clean_price}\n\n"
+                            else: cat_chunk += "\n"
 
-                    # Clean up any remaining allergen codes in name
-                    name_text = re.sub(r'[1-9][0-9]*[A-Za-z,+\s]*$', '', name_text).strip()
-                    name_text = re.sub(r'\([^)]*\)$', '', name_text).strip()
+            if items_found:
+                priority = category_priority.get(original_category_name, 100)
+                categories_data.append((priority, cat_chunk))
 
-                    # Clean up description from allergens
-                    if description:
-                        description = re.sub(r'[1-9][0-9]*[A-Za-z,+\s]*$', '', description).strip()
-                        description = re.sub(r'\([^)]*\)$', '', description).strip()
-
-                    # Format the menu item
-                    if name_text:
-                        menu_text += f"• <b>{html.escape(name_text)}</b>"
-
-                        # Add star for limited availability
-                        if '⭐' in name_text or 'limited' in name_text.lower():
-                            menu_text += " ⭐"
-                        menu_text += "\n"
-
-                        if description:
-                            menu_text += f"  {html.escape(description)}\n"
-
-                        # Add allergen emojis and text
-                        if allergens_text:
-                            # Translate codes to emojis
-                            emoji_codes = translate_food_codes(allergens_text)
-                            menu_text += f"  {emoji_codes}\n"
-                            menu_text += f"  <i>({html.escape(allergens_text)})</i>\n"
-
-                        # PRICE FORMAT
-                        clean_price = price.replace("&euro;", "€").replace("€", "€").strip()
-                        # Format price properly (e.g.: 2.50 -> 2,50€)
-                        if clean_price and clean_price != "€":
-                            # Convert dot to comma
-                            clean_price = clean_price.replace('.', ',')
-                            # Add € symbol if missing
-                            if "€" not in clean_price:
-                                clean_price = clean_price + "€"
-                            menu_text += f"  💶 {clean_price}\n\n"
-                        else:
-                            menu_text += "\n"
-
-            menu_text += "\n"
+        # Sort by priority and append to menu_text
+        categories_data.sort(key=lambda x: x[0])
+        for _, chunk in categories_data:
+            menu_text += chunk
 
         # Create COMPLETE allergen guide based on what's actually used today
         menu_text += "━━━━━━━━━━━━━━━━━━\n"
@@ -1117,14 +1126,28 @@ async def get_todays_menu_enhanced(session):
 
         menu_text += "\n\n⭐ <b>Limited availability</b>"
 
-        return menu_text
+        return menu_text, prev_link, next_link
 
     except Exception as e:
         logging.error(f"Enhanced menu fetch error: {e}")
-        return "❌ Menu could not be loaded. Please try again later."
+        return "❌ Menu could not be loaded. Please try again later.", None, None
 
 
 # ── menu commands ────────────────────────────────────────────────────────────
+
+def get_menu_navigation_keyboard(prev_path=None, next_path=None):
+    """Create navigation keyboard for Mensa menu"""
+    row = []
+    if prev_path:
+        row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"menu_nav|{prev_path}"))
+    
+    row.append(InlineKeyboardButton("Today", callback_data="menu_nav|2/"))
+    
+    if next_path:
+        row.append(InlineKeyboardButton("Next ➡️", callback_data=f"menu_nav|{next_path}"))
+    
+    return InlineKeyboardMarkup([row])
+
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show daily food menu in the requested format"""
@@ -1136,30 +1159,18 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # Send message directly, don't try to edit
-        status_msg = await update.message.reply_text(
-            "🍽️ Loading today's menu...",
-            reply_markup=get_main_keyboard()
-        )
-
         # Session check
         session = await login_studip()
 
         # Fetch menu
-        menu_text = await get_todays_menu_enhanced(global_session)
+        menu_text, prev, next_ = await get_todays_menu_enhanced(global_session)
 
-        # Send menu
+        # Send menu with navigation buttons
         await update.message.reply_text(
             menu_text,
             parse_mode="HTML",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_menu_navigation_keyboard(prev, next_)
         )
-
-        # Delete status message (optional)
-        try:
-            await status_msg.delete()
-        except:
-            pass
 
     except Exception as e:
         error_msg = f"❌ Error loading menu:\n{str(e)}"
@@ -1171,28 +1182,54 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler for menu button (enhanced version)"""
+    """Handler for menu navigation items"""
     query = update.callback_query
-    await query.answer()
+    # Split data by | to support menu_nav|path
+    parts = query.data.split("|")
+    sub_path = parts[1] if len(parts) > 1 else "2/"
 
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
-        await query.message.reply_text("Not authorized to use this bot.")
+        await query.answer("Not authorized.")
         return
 
     try:
-        await query.edit_message_text("🍽️ Loading menu...")
-
+        # Show specific loading status for the button pressed
+        direction = "..."
+        if "next" in sub_path: direction = "Next day..."
+        elif "previous" in sub_path: direction = "Previous day..."
+        elif sub_path == "2/": direction = "Today..."
+        
+        await query.answer(f"Loading {direction}")
+        
         # Session check
         session = await login_studip()
 
-        menu_text = await get_todays_menu_enhanced(session)
-        await query.edit_message_text(menu_text, parse_mode="HTML")
+        menu_text, prev, next_ = await get_todays_menu_enhanced(session, sub_path=sub_path)
+        
+        await query.edit_message_text(
+            menu_text, 
+            parse_mode="HTML",
+            reply_markup=get_menu_navigation_keyboard(prev, next_)
+        )
 
     except Exception as e:
-        error_msg = f"❌ Error loading menu:\n{str(e)}"
-        await query.edit_message_text(error_msg)
-        logging.error(f"Menu button error: {e}")
+        error_str = str(e)
+        if "Message is not modified" in error_str:
+            # Not a real error, just the same menu content
+            try:
+                await query.answer("All current information is already displayed.")
+            except:
+                pass
+            return
+
+        error_msg = f"❌ Error loading menu:\n{error_str}"
+        # If edit fails (e.g. same text), don't crash
+        try:
+            await query.edit_message_text(error_msg)
+        except:
+            pass
+        logging.error(f"Menu button navigation error: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -2181,9 +2218,9 @@ async def send_morning_summary(bot, user_ids):
 
     # 2. Get Menu
     try:
-        menu_text = await get_todays_menu_enhanced(session)
-        if "Mensa kapalı" in menu_text or not menu_text:
-            menu_text = "🍽️ *Mensa:* Closed today or menu not found."
+        menu_text, _, _ = await get_todays_menu_enhanced(session)
+        if "closed" in menu_text.lower() or not menu_text:
+            menu_text = "🍽️ <b>Mensa Uni Oldenburg</b>\n\n❌ Closed today or menu not found."
     except Exception as e:
         logging.error(f"Summary menu fetch error: {e}")
         menu_text = "🍽️ *Mensa:* Menu could not be retrieved."
@@ -3403,6 +3440,8 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 
         if data[0] == "menu":
             await menu_command(update, context)
+        elif data[0] == "menu_nav":
+            await menu_button_handler(update, context)
         elif data[0] == "calendar":
             logging.info("📅 Fetching today's schedule...")
             today = datetime.now().date()
@@ -3751,7 +3790,7 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
             ["▶️ Start", "🔁 Check", "ℹ️ Status"],
-            ["🍽️ Menu", "📅 Calendar"]  # Calendar button should be here
+            ["🍽️ Menu", "📅 Calendar"]
         ],
         resize_keyboard=True,
         one_time_keyboard=False
@@ -3957,6 +3996,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_calendar_today, pattern="^calendar_today$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_weekly, pattern="^calendar_weekly$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern="^calendar_week\|.*$"))
+        app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^menu_nav\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_selection))
 
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))
