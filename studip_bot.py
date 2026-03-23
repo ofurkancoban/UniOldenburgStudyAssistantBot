@@ -2198,7 +2198,7 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False):
 
 
 async def send_morning_summary(bot, user_ids):
-    """Fetch today's schedule and menu, then send to users."""
+    """Fetch today's schedule and send to users with a button for the menu."""
     global global_session
     session = global_session
     if not session:
@@ -2216,16 +2216,7 @@ async def send_morning_summary(bot, user_ids):
         logging.error(f"Summary schedule fetch error: {e}")
         today_events = []
 
-    # 2. Get Menu
-    try:
-        menu_text, _, _ = await get_todays_menu_enhanced(session)
-        if "closed" in menu_text.lower() or not menu_text:
-            menu_text = "🍽️ <b>Mensa Uni Oldenburg</b>\n\n❌ Closed today or menu not found."
-    except Exception as e:
-        logging.error(f"Summary menu fetch error: {e}")
-        menu_text = "🍽️ *Mensa:* Menu could not be retrieved."
-
-    # 3. Format Schedule
+    # 2. Format Schedule
     if not today_events:
         schedule_text = "📅 <b>No classes today!</b> Enjoy your day. ✨"
     else:
@@ -2246,24 +2237,35 @@ async def send_morning_summary(bot, user_ids):
         lines.append("\n\n".join(course_blocks))
         schedule_text = "\n".join(lines)
 
-    # 4. Final Message
+    # 3. Final Message
     header = (
         "☀️ <b>GOOD MORNING!</b> ☀️\n"
         f"🗓️ <b>Today:</b> {now:%d %B %Y, %A}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
     )
     
-    final_text = f"{header}{schedule_text}\n\n━━━━━━━━━━━━━━━━━━\n\n{menu_text}"
+    final_text = f"{header}{schedule_text}\n\n━━━━━━━━━━━━━━━━━━"
     
+    # 4. Keyboard for Mensa Menu
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🍴 Today's Menu", callback_data="menu_nav|2/")]
+    ])
+
     for uid in user_ids:
         try:
-            await bot.send_message(chat_id=uid, text=final_text, parse_mode="HTML")
+            await bot.send_message(
+                chat_id=uid, 
+                text=final_text, 
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
         except Exception as e:
             logging.error(f"Failed to send summary to {uid}: {e}")
 
 
+
 async def check_calendar_reminders(bot, chat_id, silent: bool = False):
-    """Check for upcoming classes and send reminders. (Every 30 mins)"""
+    """Check for upcoming classes and send reminders 30 minutes before."""
     global global_session
     session = global_session
     try:
@@ -2288,6 +2290,7 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
             title = event["title"]
             start_dt = event["start"]
             location = event.get("location", "Unknown location")
+            # Create a unique key for this reminder (Title + Timestamp)
             event_key = f"{title}|{int(start_dt.timestamp())}"
 
             if event_key in reminders:
@@ -2296,8 +2299,8 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
             diff = start_dt - now
             minutes_left = diff.total_seconds() / 60
 
-            # Reminder window: 25-30 minutes before
-            if 25 < minutes_left <= 31:
+            # Reminder window: 25-35 minutes before the lesson starts
+            if 25 < minutes_left <= 35:
                 text = (
                     "🔔 <b>LECTURE REMINDER</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
@@ -2308,12 +2311,13 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                 )
                 try:
                     await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-                    logging.info(f"🔔 Sent reminder for {title}")
+                    logging.info(f"🔔 Sent reminder for {title} to {chat_id}")
                     reminders[event_key] = int(now.timestamp())
                     updated = True
                 except Exception as e:
                     logging.error(f"Failed to send reminder for {title}: {e}")
 
+        # Cleanup old reminders (older than 24 hours)
         cutoff = now.timestamp() - 86400
         new_cache = {k: v for k, v in reminders.items() if v > cutoff}
         if len(new_cache) != len(reminders):
@@ -2322,6 +2326,7 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
             save_reminders_cache(new_cache)
     except Exception as e:
         logging.error(f"❌ Error in check_calendar_reminders: {e}")
+
 
 
 async def check_new_messages(bot, chat_id, silent: bool = False):
