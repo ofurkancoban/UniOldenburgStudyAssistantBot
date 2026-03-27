@@ -1202,16 +1202,27 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         
         await query.answer(f"Loading {direction}")
         
+        # Check if we should send a NEW message instead of editing
+        # (Useful for morning summary where we want to keep the schedule)
+        should_reply = len(parts) > 2 and parts[2] == "new"
+
         # Session check
         session = await login_studip()
 
         menu_text, prev, next_ = await get_todays_menu_enhanced(session, sub_path=sub_path)
         
-        await query.edit_message_text(
-            menu_text, 
-            parse_mode="HTML",
-            reply_markup=get_menu_navigation_keyboard(prev, next_)
-        )
+        if should_reply:
+            await query.message.reply_text(
+                menu_text,
+                parse_mode="HTML",
+                reply_markup=get_menu_navigation_keyboard(prev, next_)
+            )
+        else:
+            await query.edit_message_text(
+                menu_text, 
+                parse_mode="HTML",
+                reply_markup=get_menu_navigation_keyboard(prev, next_)
+            )
 
     except Exception as e:
         error_str = str(e)
@@ -2248,7 +2259,7 @@ async def send_morning_summary(bot, user_ids):
     
     # 4. Keyboard for Mensa Menu
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🍴 Today's Menu", callback_data="menu_nav|2/")]
+        [InlineKeyboardButton("🍴 Today's Menu", callback_data="menu_nav|2/|new")]
     ])
 
     for uid in user_ids:
@@ -2284,11 +2295,11 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
         now = datetime.now(TZ_BERLIN)
 
         for event in events:
-            if not event.get("start") or not event.get("title") or event["title"] == "Untitled":
+            if not event.get("start_dt") or not event.get("title") or event["title"] == "Untitled":
                 continue
 
             title = event["title"]
-            start_dt = event["start"]
+            start_dt = event["start_dt"]
             location = event.get("location", "Unknown location")
             # Create a unique key for this reminder (Title + Timestamp)
             event_key = f"{title}|{int(start_dt.timestamp())}"
@@ -3445,8 +3456,6 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 
         if data[0] == "menu":
             await menu_command(update, context)
-        elif data[0] == "menu_nav":
-            await menu_button_handler(update, context)
         elif data[0] == "calendar":
             logging.info("📅 Fetching today's schedule...")
             today = datetime.now().date()
