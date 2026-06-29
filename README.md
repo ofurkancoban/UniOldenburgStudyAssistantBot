@@ -41,6 +41,7 @@ The bot runs a state-of-the-art background loop that tracks:
 *   **📁 File Manager**: Detects new uploads. Download files **directly** with one click.
 *   **💬 Forum Discussions**: Stay in the loop with new posts and full conversation history.
 *   **📨 Direct Messages**: Never miss an important message from lecturers or peers.
+*   **🟢 WhatsApp Integration**: Forward any announcement or message directly to a target WhatsApp group with the tap of a button. The bot runs a local Node.js microservice to handle secure WhatsApp Web sessions.
 
 ### 🍽️ Enhanced Mensa Menu
 A beautiful, emoji-rich menu with:
@@ -83,6 +84,10 @@ TOTP_SECRET=YOUR_KEY            # Optional: If 2FA/App Authenticator is enabled
 
 # --- Calendar Integration ---
 STUDIP_ICAL_URL=https://elearning.uni-oldenburg.de/dispatch.php/ical/index/...
+
+# --- WhatsApp Integration ---
+WHATSAPP_GROUP_NAME="StudIP Alerts"
+PORT=3838  # Port for the WhatsApp Microservice
 ```
 
 > [!IMPORTANT]
@@ -98,7 +103,16 @@ STUDIP_ICAL_URL=https://elearning.uni-oldenburg.de/dispatch.php/ical/index/...
 | `/start` | Start the bot and login. |
 | `/menu` | The main hub. Access Courses, Files, and Calendar. |
 | `/check` | Manual sync of all watchers (Files, News, Posts). |
-| `/status` | View system health, uptime, and last sync timestamps. |
+| `/status` | View system health, uptime, last sync timestamps, and **request WhatsApp QR code / change target WhatsApp group**. |
+
+---
+
+## 📱 WhatsApp Integration Setup
+
+1. **Auto-Start**: When you launch the bot (`python studip_bot.py`), it automatically starts the WhatsApp microservice in the background.
+2. **First Time Login (QR)**: The bot will generate a WhatsApp Web QR code and send it to you via Telegram as an image. Scan it with your phone's WhatsApp (Linked Devices).
+3. **Change Target Group**: Use the `/status` menu and click **"✏️ Change WA Group"** to dynamically change the group where messages are forwarded.
+4. **Session Persistence**: Your session is saved securely. If you need a new QR code (e.g., you logged out), simply tap **"📲 Request WA QR"** in the `/status` menu.
 
 ---
 
@@ -115,6 +129,9 @@ graph TD
     E --> G[Stud.IP JSON/HTML API]
     F --> G
     G --> H[(Persistent Cache)]
+    C -.->|Forward & Status| I[Node.js WhatsApp Microservice]
+    D -.->|Forward & Status| I
+    I --> J[WhatsApp Web]
 ```
 
 ---

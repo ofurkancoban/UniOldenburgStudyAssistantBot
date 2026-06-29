@@ -1775,7 +1775,8 @@ async def check_new_announcements_parallel(page, bot, chat_id, silent: bool = Fa
                     f"{ann['body']}\n"
                     "━━━━━━━━━━━━━━━━━"
                 )
-                await broadcast(bot, text[:4000], parse_mode="HTML")
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+                await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup)
         elif not silent:
             await bot.send_message(chat_id=chat_id, text="☑️ No new announcements found.",
                                    disable_notification=True)
@@ -1851,6 +1852,29 @@ async def fetch_message_body(session, message_url):
     except Exception as e:
         logging.error(f"fetch_message_body failed for {message_url}: {e}")
         return f"[Error fetching content: {str(e)[:100]}]"
+
+async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forward message to WhatsApp group via Node.js microservice."""
+    query = update.callback_query
+    await query.answer("Sending to WhatsApp...")
+    
+    text = query.message.text or query.message.caption or "No text found"
+    group_name = os.getenv("WHATSAPP_GROUP_NAME", "StudIP Alerts")  # Group name from .env
+    
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            payload = {"text": text, "groupName": group_name}
+            async with session.post("http://localhost:3838/send", json=payload, timeout=10) as resp:
+                if resp.status == 200:
+                    await query.edit_message_reply_markup(reply_markup=None) # Remove button after sending
+                    await context.bot.send_message(chat_id=query.message.chat_id, text="✅ Sent to WhatsApp successfully!")
+                else:
+                    data = await resp.json()
+                    await context.bot.send_message(chat_id=query.message.chat_id, text=f"❌ Failed to send to WhatsApp: {data.get('error')}")
+    except Exception as e:
+        logging.error(f"WhatsApp forward error: {e}")
+        await context.bot.send_message(chat_id=query.message.chat_id, text=f"❌ Error connecting to WhatsApp service: {e}")
 
 
 async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2376,7 +2400,8 @@ async def check_new_messages(page, bot, chat_id, silent: bool = False):
                 f"{body_text}\n"
                 "━━━━━━━━━━━━━━━━━"
             )
-            await broadcast(bot, text[:4000], parse_mode="HTML")
+            markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+            await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup)
 
         return True
 
@@ -2963,7 +2988,8 @@ async def check_new_forum_posts_parallel(page, bot, chat_id, silent: bool = Fals
 
                 # Send
                 try:
-                    await broadcast(bot, text, parse_mode="HTML")
+                    markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+                    await broadcast(bot, text, parse_mode="HTML", reply_markup=markup)
                     # Update cache immediately to avoid duplicate on crash
                     cache[post["key"]] = {k: v for k, v in post.items() if k != "key"}
                 except Exception as e:
@@ -3947,6 +3973,24 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         file_watcher_paused = True
         await query.edit_message_text("⏸️ All watchers paused.")
 
+    elif query.data == "request_wa_qr":
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post("http://localhost:3838/request_qr") as resp:
+                    data = await resp.json()
+                    await query.message.reply_text(f"ℹ️ {data.get('message', 'QR request processed.')}")
+        except Exception as e:
+            logging.error(f"Failed to request WA QR: {e}")
+            await query.message.reply_text("❌ WhatsApp service unreachable. Make sure it's running.")
+
+    elif query.data == "change_wa_group":
+        from telegram import ForceReply
+        await query.message.reply_text("Please type the new WhatsApp group name:", reply_markup=ForceReply(selective=True))
+
+    elif query.data == "change_ical_link":
+        from telegram import ForceReply
+        await query.message.reply_text("Please type the new iCal link (STUDIP_ICAL_URL):", reply_markup=ForceReply(selective=True))
 
 async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -4283,6 +4327,28 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ── reply keyboard handling ────────────────────────────────────────────────
+async def handle_settings_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message:
+        return
+    text = update.message.reply_to_message.text
+    if "Please type the new WhatsApp group name:" in text:
+        new_group = update.message.text.strip()
+        import dotenv
+        import os
+        env_path = ".env"
+        dotenv.set_key(env_path, "WHATSAPP_GROUP_NAME", new_group)
+        os.environ["WHATSAPP_GROUP_NAME"] = new_group
+        await update.message.reply_text(f"✅ WhatsApp group successfully updated: {new_group}")
+
+    elif "Please type the new iCal link" in text:
+        new_link = update.message.text.strip()
+        import dotenv
+        import os
+        env_path = ".env"
+        dotenv.set_key(env_path, "STUDIP_ICAL_URL", new_link)
+        os.environ["STUDIP_ICAL_URL"] = new_link
+        await update.message.reply_text(f"✅ iCal link successfully updated!")
+
 async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Support both keyboard and inline callback
     query = update.callback_query
@@ -4593,7 +4659,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Combine and send
     text += f"\n\n{sys_info}"
 
-    await update.message.reply_text(text, parse_mode="HTML")
+    keyboard = [
+        [InlineKeyboardButton("📲 Request WA QR", callback_data="request_wa_qr")],
+        [InlineKeyboardButton("✏️ Change WA Group", callback_data="change_wa_group")],
+        [InlineKeyboardButton("📅 Change iCal Link", callback_data="change_ical_link")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
 
 
 # ── BEGIN FLOW (login + course list) ──────────────────────────────────────────
@@ -4677,11 +4750,12 @@ async def main():
 
         # 1. FIRST specific callback patterns
         app.add_handler(CallbackQueryHandler(show_last_messages, pattern="^show_last_messages$"))
+        app.add_handler(CallbackQueryHandler(forward_to_whatsapp, pattern="^forward_wa$"))
         app.add_handler(CallbackQueryHandler(show_last_announcements, pattern="^show_last_announcements$"))
         app.add_handler(CallbackQueryHandler(show_last_files, pattern="^show_last_files$"))
         app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
         app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^show_menu$"))
-        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers)$"))
+        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|change_wa_group|change_ical_link)$"))
 
         # 2. SPECIAL callback patterns (calendar buttons)
         app.add_handler(CallbackQueryHandler(handle_calendar_today, pattern="^calendar_today$"))
@@ -4696,6 +4770,8 @@ async def main():
         app.add_handler(CommandHandler("watch", watch))
         app.add_handler(CommandHandler("status", status_command))
         app.add_handler(CommandHandler("menu", menu_command))
+
+        app.add_handler(MessageHandler(filters.REPLY & filters.TEXT, handle_settings_reply))
 
         # 5. Message handlers - FIRST handle_reply_buttons, THEN delete_text
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))
@@ -4921,5 +4997,21 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
+    import subprocess
+    import atexit
+    import os
+    import sys
+    
+    # Start WhatsApp microservice automatically
+    wa_service_dir = os.path.join(os.path.dirname(__file__), "whatsapp_service")
+    if os.path.exists(wa_service_dir):
+        logging.info("Starting WhatsApp microservice...")
+        wa_process = subprocess.Popen("npm start", shell=True, cwd=wa_service_dir)
+        
+        def cleanup_wa():
+            logging.info("Stopping WhatsApp microservice...")
+            wa_process.terminate()
+            
+        atexit.register(cleanup_wa)
 
     asyncio.run(main())  # Correctly running async function

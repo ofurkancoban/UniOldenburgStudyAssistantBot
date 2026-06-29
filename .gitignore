@@ -1,13 +1,16 @@
 # Security
 .env
 .venv/
+venv/
 __pycache__/
 *.pyc
-.gitignore
 
 # Logs
 *.log
 watch_log.txt
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Bot Cache & Runtime
 announcement_cache.json
@@ -15,9 +18,16 @@ files_cache.json
 messages_cache.json
 forum_cache.json
 link_cache.json
+studip_cookies.json
 .bot_instance.lock
 
-# IDE
+# WhatsApp Microservice
+whatsapp_service/node_modules/
+whatsapp_service/.wwebjs_auth/
+whatsapp_service/.wwebjs_cache/
+whatsapp_service/qr.png
+
+# IDE & OS
 .idea/
 .DS_Store
 
