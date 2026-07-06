@@ -1704,9 +1704,11 @@ async def check_new_announcements_parallel(page, bot, chat_id, silent: bool = Fa
                     ann_container = None
                     for art in soup.select("article.studip"):
                         h = art.select_one("header h1")
-                        if h and "Announcements" in h.get_text(strip=True):
-                            ann_container = art
-                            break
+                        if h:
+                            h_text = h.get_text(strip=True)
+                            if "Announcements" in h_text or "Ankündigungen" in h_text:
+                                ann_container = art
+                                break
 
                     if not ann_container:
                         return course_name, cid, []
