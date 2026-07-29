@@ -42,6 +42,7 @@ ALLOWED_USER_IDS_ENV = os.getenv("ALLOWED_USER_IDS", "").strip()
 BASE_URL = "https://elearning.uni-oldenburg.de"
 STUDIP_URL = "https://elearning.uni-oldenburg.de/dispatch.php/my_courses"
 last_full_check_time = None
+global_scan_count = 0
 FILE_WATCHER_INTERVAL = 2 * 60 * 60
 # ── global runtime state ───────────────────────────────────────────────────────
 global_session = None
@@ -131,6 +132,29 @@ def clean_for_html(text: str) -> str:
     if not text:
         return ""
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return text.strip()
+
+
+def clean_html_text(soup_element) -> str:
+    """Safely extracts text from HTML by converting block elements to newlines, but keeping inline elements together."""
+    if not soup_element:
+        return ""
+    
+    # We use the element directly, assuming we don't need it pristine afterwards
+    for br in soup_element.find_all("br"):
+        br.replace_with("\n")
+    for p in soup_element.find_all(["p", "div"]):
+        p.insert_after("\n\n")
+    for li in soup_element.find_all("li"):
+        li.insert_before("- ")
+        li.insert_after("\n")
+    for heading in soup_element.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        heading.insert_after("\n\n")
+
+    text = soup_element.get_text()
+    
+    # Clean up excessive newlines (more than 2 to just 2)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 
@@ -497,6 +521,7 @@ async def login_studip(notify=None):
 async def unified_watcher_controller(app):
     """Centrally manage all watchers - with a single task"""
     global watcher_controller_running, global_watcher_paused, global_session
+    global global_scan_count, last_full_check_time
 
     logging.info("🟢 Unified Watcher Controller STARTED")
     watcher_controller_running = True
@@ -592,6 +617,8 @@ async def unified_watcher_controller(app):
                 logging.error(f"❌ Forum check failed: {e}")
 
             logging.info(f"✅ Watcher cycle #{cycle_count} completed")
+            global_scan_count += 1
+            last_full_check_time = datetime.now()
             await asyncio.sleep(90)
 
         except Exception as e:
@@ -1776,7 +1803,7 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
                         title = title_tag.get_text(strip=True) if title_tag else "(No subject)"
                         sender = sender_tag.get_text(strip=True) if sender_tag else "Unknown"
                         date_s = date_tag.get_text(strip=True) if date_tag else ""
-                        body = body_tag.get_text("\n", strip=True) if body_tag else "(No content)"
+                        body = clean_html_text(body_tag) if body_tag else "(No content)"
 
                         key = f"{cid}:{ann_id}" if ann_id else f"{cid}:{title}:{date_s}"
                         dt = _parse_ann_date(date_s)
@@ -1860,13 +1887,13 @@ async def fetch_message_body(session, message_url):
                 for elem in content.select("script, style, nav, header, footer"):
                     elem.decompose()
 
-                text = content.get_text("\n", strip=True)
+                text = clean_html_text(content)
                 if text and len(text.strip()) > 10:  # Meaningful content check
                     return text
 
         # Fallback: extract text from entire page
         main_content = soup.select_one("main") or soup.select_one("article") or soup
-        text = main_content.get_text("\n", strip=True)
+        text = clean_html_text(main_content)
 
         # Truncate if too long
         if len(text) > 3000:
@@ -1902,6 +1929,26 @@ async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logging.error(f"WhatsApp forward error: {e}")
         await context.bot.send_message(chat_id=query.message.chat_id, text=f"❌ Error connecting to WhatsApp service: {e}")
+
+
+async def set_wa_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Persist a WhatsApp group ID discovered by the Node.js microservice as WA_GROUP_ID."""
+    query = update.callback_query
+    group_id = query.data.split("|", 1)[1]
+
+    import dotenv
+    dotenv.set_key(".env", "WA_GROUP_ID", group_id)
+    os.environ["WA_GROUP_ID"] = group_id
+
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            await session.post("http://localhost:3838/set_group_id", json={"groupId": group_id}, timeout=10)
+    except Exception as e:
+        logging.error(f"Failed to notify WhatsApp service of new group ID: {e}")
+
+    await query.answer("Group ID saved!")
+    await query.edit_message_text(f"✅ WA_GROUP_ID saved and active:\n{group_id}")
 
 
 async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2978,7 +3025,7 @@ def _normalize_button_text(s: str) -> str:
 async def _run_check_now(update, context):
     """Manual full check: messages → announcements → files → forum posts"""
     chat_id = update.effective_chat.id
-    global global_watcher_paused, last_full_check_time
+    global global_watcher_paused, last_full_check_time, global_scan_count
 
     if chat_id in check_in_progress:
         await update.message.reply_text("⚠️ Another check is already running.")
@@ -3049,6 +3096,7 @@ async def _run_check_now(update, context):
             summary += f"{icon} {label}\n"
 
         await status_msg.edit_text(summary, reply_markup=get_show_last_keyboard())
+        global_scan_count += 1
         last_full_check_time = datetime.now()
 
     except Exception as e:
@@ -3099,6 +3147,37 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     elif query.data == "change_wa_group":
         from telegram import ForceReply
         await query.message.reply_text("Please type the new WhatsApp group name:", reply_markup=ForceReply(selective=True))
+
+    elif query.data == "detect_wa_groups":
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("http://localhost:3838/discovered_groups", timeout=10) as resp:
+                    data = await resp.json()
+                    groups = data.get("groups", [])
+        except Exception as e:
+            logging.error(f"Failed to fetch discovered WA groups: {e}")
+            await query.message.reply_text("❌ WhatsApp service unreachable. Make sure it's running.")
+            return
+
+        if not groups:
+            await query.message.reply_text(
+                "ℹ️ No WhatsApp groups detected yet. Send or receive a message in the target group, then try again."
+            )
+            return
+
+        current_id = os.getenv("WA_GROUP_ID", "")
+        kb = []
+        for g in groups[:10]:
+            label = g.get("name") or g["groupId"]
+            if g["groupId"] == current_id:
+                label = f"✅ {label} (active)"
+            kb.append([InlineKeyboardButton(label, callback_data=f"set_wa_group|{g['groupId']}")])
+
+        await query.message.reply_text(
+            "📍 Detected WhatsApp groups. Tap one to set it as active:",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
 
     elif query.data == "change_ical_link":
         from telegram import ForceReply
@@ -3415,7 +3494,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         date_str = td.get_text(strip=True)
 
             body_container = soup.select_one("div.formatted-content, .message-content, .formatted-content.ck-content")
-            content = body_container.get_text("\n", strip=True) if body_container else "No content found."
+            content = clean_html_text(body_container) if body_container else "No content found."
 
             # Send to Telegram
             header = (
@@ -3938,7 +4017,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global watcher_controller_running, global_watcher_paused, check_in_progress
 
     logged_in = "✅ Yes" if global_session and await global_session.is_logged_in() else "❌ No"
-    browser_ready = "✅ Browser-less"
 
     # Watcher durumu
     if watcher_controller_running:
@@ -3948,16 +4026,29 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     global_paused = "✅ Yes" if global_watcher_paused else "❌ No"
     active_check = "✅ Yes" if check_in_progress else "❌ No"
+    wa_group_name = os.getenv("WHATSAPP_GROUP_NAME", "StudIP Alerts")
+    
+    # Check WA Connection Status
+    wa_status = "🔴 Offline / Not Connected"
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get("http://localhost:3838/status", timeout=2) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    wa_status = "🟢 Connected" if data.get("isAuthenticated") else "🟡 Waiting for QR Scan"
+    except Exception:
+        pass
 
     text = (
         "━━━━━━━━━━━━━━━━━\n"
         "🤖 <b>Bot Status</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"🔑 Logged in: {logged_in}\n"
-        f"🌐 Browser Context: {browser_ready}\n"
         f"👀 Unified Watcher: {watcher_status}\n"
-        f"⏸️ Global Paused: {global_paused}\n"
-        f"🔁 Active Check: {active_check}"
+        f"🔁 Global Scans: {global_scan_count}\n"
+        f"📱 WA Group: {wa_group_name}\n"
+        f"💬 WA Status: {wa_status}"
     )
 
     # 💾 System resource information
@@ -3977,24 +4068,23 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # High RAM warning
     if mem_mb > 500:
-        sys_info += "\n\n⚠️ <b>High memory usage detected — browser restart recommended.</b>"
+        sys_info += "\n\n⚠️ <b>High memory usage detected — bot restart recommended.</b>"
 
     # Last full check time
-    global last_full_check_time
     if "last_full_check_time" in globals() and last_full_check_time:
         since = datetime.now() - last_full_check_time
         hours, remainder = divmod(int(since.total_seconds()), 3600)
         minutes = remainder // 60
-        text += f"\n🕓 Last Full Check: {last_full_check_time.strftime('%d %b %Y %H:%M')} ({hours}h {minutes}m ago)"
+        text += f"\n\n🕓 Last Full Check: {last_full_check_time.strftime('%d %b %Y %H:%M')} ({hours}h {minutes}m ago)"
     else:
-        text += "\n🕓 Last Full Check: —"
+        text += "\n\n🕓 Last Full Check: —"
 
-    # Combine and send
     text += f"\n\n{sys_info}"
 
     keyboard = [
         [InlineKeyboardButton("📲 Request WA QR", callback_data="request_wa_qr")],
         [InlineKeyboardButton("✏️ Change WA Group", callback_data="change_wa_group")],
+        [InlineKeyboardButton("🔍 Detect WA Groups", callback_data="detect_wa_groups")],
         [InlineKeyboardButton("📅 Change iCal Link", callback_data="change_ical_link")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -4085,7 +4175,8 @@ async def main():
         app.add_handler(CallbackQueryHandler(show_last_announcements, pattern="^show_last_announcements$"))
         app.add_handler(CallbackQueryHandler(show_last_files, pattern="^show_last_files$"))
         app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
-        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|change_wa_group|change_ical_link)$"))
+        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|change_wa_group|detect_wa_groups|change_ical_link)$"))
+        app.add_handler(CallbackQueryHandler(set_wa_group_handler, pattern="^set_wa_group\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_today, pattern="^calendar_today$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_weekly, pattern="^calendar_weekly$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern="^calendar_week\|.*$"))
@@ -4146,11 +4237,16 @@ if __name__ == "__main__":
     wa_service_dir = os.path.join(os.path.dirname(__file__), "whatsapp_service")
     if os.path.exists(wa_service_dir):
         logging.info("Starting WhatsApp microservice...")
-        wa_process = subprocess.Popen("npm start", shell=True, cwd=wa_service_dir)
+        # Start node directly instead of npm via shell to avoid zombie processes on restart
+        wa_process = subprocess.Popen(["node", "server.js"], cwd=wa_service_dir)
         
         def cleanup_wa():
             logging.info("Stopping WhatsApp microservice...")
             wa_process.terminate()
+            try:
+                wa_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                wa_process.kill()
             
         atexit.register(cleanup_wa)
 

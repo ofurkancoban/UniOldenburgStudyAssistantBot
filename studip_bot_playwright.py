@@ -37,6 +37,7 @@ ALLOWED_USER_IDS_ENV = os.getenv("ALLOWED_USER_IDS", "").strip()
 BASE_URL = "https://elearning.uni-oldenburg.de"
 STUDIP_URL = "https://elearning.uni-oldenburg.de/dispatch.php/my_courses"
 last_full_check_time = None
+global_scan_count = 0
 FILE_WATCHER_INTERVAL = 2 * 60 * 60
 # ── global runtime state ───────────────────────────────────────────────────────
 playwright = None
@@ -133,6 +134,28 @@ def clean_for_html(text: str) -> str:
     text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return text.strip()
 
+
+def clean_html_text(soup_element) -> str:
+    """Safely extracts text from HTML by converting block elements to newlines, but keeping inline elements together."""
+    if not soup_element:
+        return ""
+    
+    for br in soup_element.find_all("br"):
+        br.replace_with("\n")
+    for p in soup_element.find_all(["p", "div"]):
+        p.insert_after("\n\n")
+    for li in soup_element.find_all("li"):
+        li.insert_before("- ")
+        li.insert_after("\n")
+    for heading in soup_element.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        heading.insert_after("\n\n")
+
+    text = soup_element.get_text()
+    
+    # Clean up excessive newlines
+    import re
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 def _short_id() -> str:
     return str(uuid.uuid4())[:8]
@@ -489,6 +512,7 @@ async def login_studip(notify=None):
 async def unified_watcher_controller(app):
     """Centrally manage all watchers - with a single task"""
     global watcher_controller_running, global_watcher_paused, page
+    global global_scan_count, last_full_check_time
 
     logging.info("🟢 Unified Watcher Controller STARTED")
     watcher_controller_running = True
@@ -562,6 +586,8 @@ async def unified_watcher_controller(app):
                     logging.error(f"❌ Forum check failed: {e}")
 
             logging.info(f"✅ Watcher cycle #{cycle_count} completed")
+            global_scan_count += 1
+            last_full_check_time = datetime.now()
 
             # Main wait - total cycle duration ≈2.5-3 minutes
             await asyncio.sleep(90)
@@ -1724,7 +1750,7 @@ async def check_new_announcements_parallel(page, bot, chat_id, silent: bool = Fa
                         title = title_tag.get_text(strip=True) if title_tag else "(No subject)"
                         sender = sender_tag.get_text(strip=True) if sender_tag else "Unknown"
                         date_s = date_tag.get_text(strip=True) if date_tag else ""
-                        body = body_tag.get_text("\n", strip=True) if body_tag else "(No content)"
+                        body = clean_html_text(body_tag) if body_tag else "(No content)"
 
                         key = f"{cid}:{ann_id}" if ann_id else f"{cid}:{title}:{date_s}"
                         dt = _parse_ann_date(date_s)
@@ -1837,13 +1863,13 @@ async def fetch_message_body(session, message_url):
                 for elem in content.select("script, style, nav, header, footer"):
                     elem.decompose()
 
-                text = content.get_text("\n", strip=True)
+                text = clean_html_text(content)
                 if text and len(text.strip()) > 10:  # Meaningful content check
                     return text
 
         # Fallback: extract text from entire page
         main_content = soup.select_one("main") or soup.select_one("article") or soup
-        text = main_content.get_text("\n", strip=True)
+        text = clean_html_text(main_content)
 
         # Truncate if too long
         if len(text) > 3000:
@@ -2639,7 +2665,7 @@ async def check_new_forum_posts_parallel(page, bot, chat_id, silent: bool = Fals
                                                                                        str) and text.strip().startswith(
                                                                 '<!--')):
                                                     comment.extract()
-                                                s_body = s_content_el.get_text("\n", strip=True)
+                                                s_body = clean_html_text(s_content_el)
                                             else:
                                                 s_body = "(No content)"
 
@@ -2694,7 +2720,7 @@ async def check_new_forum_posts_parallel(page, bot, chat_id, silent: bool = Fals
                                                                                            str) and text.strip().startswith(
                                                                     '<!--')):
                                                         comment.extract()
-                                                    ctx_body = ctx_content_el.get_text("\n", strip=True)
+                                                    ctx_body = clean_html_text(ctx_content_el)
                                                 else:
                                                     ctx_body = "(No content)"
 
@@ -2817,7 +2843,7 @@ async def check_new_forum_posts_parallel(page, bot, chat_id, silent: bool = Fals
                                             string=lambda text: isinstance(text, str) and text.strip().startswith(
                                                     '<!--')):
                                         comment.extract()
-                                    body_text = content_el.get_text("\n", strip=True)
+                                    body_text = clean_html_text(content_el)
                                 else:
                                     body_text = "(No content)"
 
@@ -3770,7 +3796,7 @@ def _normalize_button_text(s: str) -> str:
 async def _run_check_now(update, context):
     """Manual full check: messages → announcements → files + start all watchers"""
     chat_id = update.effective_chat.id
-    global page, browser_context, global_watcher_paused, last_full_check_time
+    global page, browser_context, global_watcher_paused, last_full_check_time, global_scan_count
 
     if chat_id in check_in_progress:
         await update.message.reply_text("⚠️ Another check is already running.")
@@ -3932,6 +3958,7 @@ async def _run_check_now(update, context):
         asyncio.create_task(_delayed_watcher_start())
 
         # 🕒 Full check timestamp
+        global_scan_count += 1
         last_full_check_time = datetime.now()
 
         # ✅ Done
@@ -4607,7 +4634,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global page, browser_context, watcher_controller_running, global_watcher_paused, check_in_progress
 
     logged_in = "✅ Yes" if page and not page.is_closed() else "❌ No"
-    browser_ready = "✅ Ready" if browser_context else "❌ No"
 
     # Watcher durumu
     if watcher_controller_running:
@@ -4617,16 +4643,29 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     global_paused = "✅ Yes" if global_watcher_paused else "❌ No"
     active_check = "✅ Yes" if check_in_progress else "❌ No"
+    wa_group_name = os.getenv("WHATSAPP_GROUP_NAME", "StudIP Alerts")
+
+    # Check WA Connection Status
+    wa_status = "🔴 Offline / Not Connected"
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get("http://localhost:3838/status", timeout=2) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    wa_status = "🟢 Connected" if data.get("isAuthenticated") else "🟡 Waiting for QR Scan"
+    except Exception:
+        pass
 
     text = (
         "━━━━━━━━━━━━━━━━━\n"
         "🤖 <b>Bot Status</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"🔑 Logged in: {logged_in}\n"
-        f"🌐 Browser Context: {browser_ready}\n"
         f"👀 Unified Watcher: {watcher_status}\n"
-        f"⏸️ Global Paused: {global_paused}\n"
-        f"🔁 Active Check: {active_check}"
+        f"🔁 Global Scans: {global_scan_count}\n"
+        f"📱 WA Group: {wa_group_name}\n"
+        f"💬 WA Status: {wa_status}"
     )
 
     # 💾 System resource information
@@ -4646,19 +4685,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # High RAM warning
     if mem_mb > 500:
-        sys_info += "\n\n⚠️ <b>High memory usage detected — browser restart recommended.</b>"
+        sys_info += "\n\n⚠️ <b>High memory usage detected — bot restart recommended.</b>"
 
     # Last full check time
-    global last_full_check_time
     if "last_full_check_time" in globals() and last_full_check_time:
         since = datetime.now() - last_full_check_time
         hours, remainder = divmod(int(since.total_seconds()), 3600)
         minutes = remainder // 60
-        text += f"\n🕓 Last Full Check: {last_full_check_time.strftime('%d %b %Y %H:%M')} ({hours}h {minutes}m ago)"
+        text += f"\n\n🕓 Last Full Check: {last_full_check_time.strftime('%d %b %Y %H:%M')} ({hours}h {minutes}m ago)"
     else:
-        text += "\n🕓 Last Full Check: —"
-
-    # Combine and send
+        text += "\n\n🕓 Last Full Check: —"
+        
     text += f"\n\n{sys_info}"
 
     keyboard = [
@@ -5008,11 +5045,16 @@ if __name__ == "__main__":
     wa_service_dir = os.path.join(os.path.dirname(__file__), "whatsapp_service")
     if os.path.exists(wa_service_dir):
         logging.info("Starting WhatsApp microservice...")
-        wa_process = subprocess.Popen("npm start", shell=True, cwd=wa_service_dir)
+        # Start node directly instead of npm via shell to avoid zombie processes on restart
+        wa_process = subprocess.Popen(["node", "server.js"], cwd=wa_service_dir)
         
         def cleanup_wa():
             logging.info("Stopping WhatsApp microservice...")
             wa_process.terminate()
+            try:
+                wa_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                wa_process.kill()
             
         atexit.register(cleanup_wa)
 
