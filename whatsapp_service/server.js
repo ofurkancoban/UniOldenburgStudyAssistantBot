@@ -13,6 +13,20 @@ const PORT = process.env.PORT || 3838;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ALLOWED_USER_IDS = process.env.ALLOWED_USER_IDS ? process.env.ALLOWED_USER_IDS.split(',') : [];
 
+// Safety net: whatsapp-web.js/Puppeteer occasionally throws from internal async
+// code paths that aren't awaited by our own try/catch blocks (e.g. duplicate
+// page-binding errors during a fast destroy+initialize cycle). Without these
+// handlers such an error is an unhandled rejection/exception and Node exits,
+// killing the whole service (and pm2 then restarts it from scratch, dropping
+// the session). Log and keep running instead; reconnectClient()'s own guard
+// (isReconnecting) prevents pile-ups if this fires during a reconnect.
+process.on('unhandledRejection', (err) => {
+    console.error('Unhandled rejection (kept process alive):', err);
+});
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception (kept process alive):', err);
+});
+
 // Initialize WhatsApp Client
 const client = new Client({
     authStrategy: new LocalAuth(),
@@ -80,6 +94,7 @@ async function sendTextToTelegram(text, replyMarkup) {
 
 let lastQrCode = null;
 let isAuthenticated = false;
+let isReconnecting = false;
 const announcedGroupIds = new Set();
 const discoveredGroups = new Map(); // groupId -> { name, lastSeen }
 
@@ -96,30 +111,74 @@ client.on('qr', (qr) => {
 client.on('ready', () => {
     console.log('WhatsApp Client is ready!');
     isAuthenticated = true;
+    isReconnecting = false;
     lastQrCode = null;
 });
 
-client.on('disconnected', () => {
-    isAuthenticated = false;
-});
-
-app.post('/request_qr', async (req, res) => {
-    if (isAuthenticated) {
-        return res.json({ status: 'authenticated', message: 'Already authenticated.' });
+// Destroys and re-initializes the client. Guarded against overlapping calls so a
+// disconnect event, a failed send, and a manual /request_qr can't race each other.
+//
+// If forceLogout is true, the stored LocalAuth session is invalidated first
+// (via client.logout()) so initialize() is forced to emit a real 'qr' event
+// instead of silently restoring the existing session - use this only when the
+// caller explicitly wants a fresh QR (e.g. to link a different phone), since
+// it breaks the current connection and requires re-scanning.
+async function reconnectClient(reason, { forceLogout = false } = {}) {
+    if (isReconnecting) {
+        console.log(`Reconnect already in progress, skipping duplicate trigger (${reason}).`);
+        return;
     }
-    
-    // YENİ QR kodu üretmesi için client'i yeniden başlatıyoruz.
-    res.json({ status: 'waiting', message: 'Generating a fresh QR code. It will be sent to you shortly.' });
-    
+    isReconnecting = true;
+    isAuthenticated = false;
+    lastQrCode = null;
+    console.log(`Re-initializing WhatsApp client (${reason})...`);
+    if (forceLogout) {
+        try {
+            await client.logout();
+        } catch (err) {
+            console.error('Error logging out client:', err);
+        }
+    }
     try {
         await client.destroy();
     } catch (err) {
         console.error('Error destroying client:', err);
     }
-    
-    lastQrCode = null;
-    console.log('Re-initializing client to get a fresh QR code...');
-    client.initialize();
+    // Give Puppeteer/Chromium time to fully tear down the old page before a new
+    // one is created - re-initializing too fast makes whatsapp-web.js try to
+    // expose its page bindings (e.g. onQRChangedEvent) on a window that still
+    // has them from the old page, which throws and can crash the process.
+    await new Promise(resolve => setTimeout(resolve, 3000));
+    try {
+        await client.initialize();
+    } catch (err) {
+        console.error('Error re-initializing client:', err);
+        isReconnecting = false;
+    }
+}
+
+client.on('disconnected', (reason) => {
+    console.log('WhatsApp client disconnected:', reason);
+    reconnectClient(`disconnected: ${reason}`);
+});
+
+app.post('/request_qr', async (req, res) => {
+    // Always force a fresh QR on explicit request, even if isAuthenticated is
+    // (possibly stale) true - the operator only calls this when the connection
+    // is actually broken, so trust the request over a stale in-memory flag.
+    // NOTE: if a valid session is still saved on disk (LocalAuth), this just
+    // silently restores it and no 'qr' event fires - use /force_new_qr to
+    // guarantee a real QR even when currently connected.
+    res.json({ status: 'waiting', message: 'Reconnecting. If a saved session is still valid it will restore silently; otherwise a QR code will be sent shortly.' });
+    await reconnectClient('manual /request_qr');
+});
+
+// Forces a brand new QR code even if currently authenticated, by invalidating
+// the saved session first. Use this to link a different phone/account or when
+// the connection is stuck in a way a plain reconnect can't fix.
+app.post('/force_new_qr', async (req, res) => {
+    res.json({ status: 'waiting', message: 'Logging out and generating a brand new QR code. It will be sent to you shortly.' });
+    await reconnectClient('manual /force_new_qr', { forceLogout: true });
 });
 
 client.on('auth_failure', msg => {
@@ -241,8 +300,7 @@ app.post('/send', async (req, res) => {
         const errorString = err && err.message ? err.message : String(err);
         if (errorString === 'r' || errorString.includes('r: r') || errorString.includes('Evaluation failed') || errorString.includes('Session closed')) {
             console.log("WhatsApp Web client seems broken. Triggering self-healing restart...");
-            isAuthenticated = false;
-            client.destroy().catch(() => {}).then(() => client.initialize());
+            reconnectClient(`send failure: ${errorString}`);
             return res.status(500).json({ error: 'WhatsApp client error. Re-initializing automatically. Please try again in 30 seconds.' });
         }
         

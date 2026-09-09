@@ -13,6 +13,8 @@ import uuid
 import hashlib
 from urllib.parse import unquote, urljoin
 import errno
+import sys
+import subprocess
 from bs4 import BeautifulSoup
 import html
 import re
@@ -28,6 +30,8 @@ from zoneinfo import ZoneInfo
 from telegram.constants import ChatAction
 from asyncio import CancelledError
 from studip_session import StudIPSession
+from fast_enroll import run_fast_enroll, load_pending, list_pending_jobs, save_pending_job, clear_pending_job
+from exam_reminder import check_exam_reminders, check_exam_date_reminders, check_grade_reminders, get_open_exam_registrations, get_registered_exams, get_registered_exam_schedule, get_all_exam_dates, filter_exams_by_module_codes, submit_exam_action, get_grades, compute_transcript_summary
 
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -53,11 +57,13 @@ global_message_watcher = None
 global_announcement_watcher = None
 # navigation & cache
 link_cache = {}  # short_id -> { url, cid, name?, action?, user_id?, current_url?, ts }
+exam_action_cache = {}  # short_id -> { unit_id, action_type ("anmelden"|"abmelden"), title, ts }
 nav_stack = {}  # user_id -> [url1, url2, ...]
 nav_names = {}  # user_id -> [name1, name2, ...]  (for breadcrumb)
 user_courses = {}  # user_id -> cid
 courses_map = {}  # cid -> course_name
 watch_tasks = {}  # chat_id -> asyncio.Task
+fastenroll_tasks = {}  # chat_id -> {sem_id -> asyncio.Task}
 start_in_progress = set()  # chat_id currently running /start
 START_MENU_DEDUP_SECONDS = 30
 check_in_progress: set[int] = set()  # chat_id set to prevent concurrent checks
@@ -373,6 +379,29 @@ def save_general_cache(data):
         logging.error(f"Could not save general cache: {e}")
 
 
+TASKS_CACHE_PATH = "tasks_cache.json"
+
+
+def load_tasks() -> list:
+    if os.path.exists(TASKS_CACHE_PATH):
+        try:
+            with open(TASKS_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load tasks cache: {e}")
+    return []
+
+
+def save_tasks(tasks: list) -> None:
+    try:
+        tmp = TASKS_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(tasks, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, TASKS_CACHE_PATH)
+    except Exception as e:
+        logging.error(f"Could not save tasks cache: {e}")
+
+
 # ── logging setup ──────────────────────────────────────────────────────────────
 LOG_FILE = "watch_log.txt"
 logging.basicConfig(
@@ -396,6 +425,10 @@ root_logger.addHandler(_console_handler)
 
 # ── single-instance lock ───────────────────────────────────────────────────────
 LOCK_FILE = ".bot_instance.lock"
+
+# Handle to the WhatsApp microservice subprocess, set once it's spawned in __main__.
+# Referenced by restart_command() so a self-restart can shut it down cleanly first.
+wa_process = None
 
 
 def acquire_instance_lock():
@@ -582,6 +615,45 @@ async def unified_watcher_controller(app):
                     await check_calendar_reminders(app.bot, uid, silent=True)
             except Exception as e:
                 logging.error(f"❌ Calendar reminder check failed: {e}")
+
+            # Personal task reminders (local JSON, no network calls needed)
+            try:
+                await check_task_reminders(app.bot)
+            except Exception as e:
+                logging.error(f"❌ Task reminder check failed: {e}")
+
+            # Exam registrations and grades run every watcher cycle (same cadence
+            # as messages/announcements/etc).
+            try:
+                logging.info("🎓 Checking exam registrations...")
+                await check_exam_reminders(session, app.bot, broadcast)
+            except Exception as e:
+                logging.error(f"❌ Exam reminder check failed: {e}")
+            try:
+                logging.info("🎓 Checking for new grades...")
+                await check_grade_reminders(session, app.bot, broadcast)
+            except Exception as e:
+                logging.error(f"❌ Grade reminder check failed: {e}")
+
+            # Upcoming exam dates change far less often; throttle to every 3 hours.
+            EXAM_DATE_CHECK_INTERVAL_SECONDS = 3 * 3600
+            general_cache = load_general_cache()
+            last_exam_date_check_iso = general_cache.get("last_exam_date_check")
+            due_for_exam_date_check = True
+            if last_exam_date_check_iso:
+                try:
+                    last_exam_date_check = datetime.fromisoformat(last_exam_date_check_iso)
+                    due_for_exam_date_check = (now - last_exam_date_check).total_seconds() >= EXAM_DATE_CHECK_INTERVAL_SECONDS
+                except ValueError:
+                    pass
+            if due_for_exam_date_check:
+                try:
+                    logging.info("🎓 Checking upcoming exam dates...")
+                    await check_exam_date_reminders(session, app.bot, broadcast)
+                except Exception as e:
+                    logging.error(f"❌ Exam date reminder check failed: {e}")
+                general_cache["last_exam_date_check"] = now.isoformat()
+                save_general_cache(general_cache)
 
             # 1️⃣ MESSAGE CHECK
             try:
@@ -1651,8 +1723,13 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ No file history found.")
         return
 
-    with open(FILES_CACHE_PATH, "r", encoding="utf-8") as f:
-        cache = json.load(f)
+    try:
+        with open(FILES_CACHE_PATH, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception as e:
+        logging.error(f"Failed to load files cache: {e}")
+        await query.edit_message_text("⚠️ Error reading file history.")
+        return
 
     all_files = []
     for cid, files in cache.items():
@@ -1753,8 +1830,17 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
         CACHE_PATH = "announcement_cache.json"
         cache = {"seen": [], "history": []}
         if os.path.exists(CACHE_PATH):
-            with open(CACHE_PATH, "r", encoding="utf-8") as f:
-                cache = json.load(f)
+            try:
+                with open(CACHE_PATH, "r", encoding="utf-8") as f:
+                    cache = json.load(f)
+            except json.JSONDecodeError as e:
+                corrupt_path = CACHE_PATH + ".corrupt"
+                try:
+                    os.replace(CACHE_PATH, corrupt_path)
+                except OSError:
+                    pass
+                logging.error(f"{CACHE_PATH} was corrupted ({e}); moved to {corrupt_path} and starting fresh.")
+                cache = {"seen": [], "history": []}
         seen = set(cache.get("seen", []))
 
         if not courses_map:
@@ -1855,8 +1941,10 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
                 merged.append(a)
         cache["history"] = merged[-100:]
 
-        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+        tmp_path = CACHE_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, CACHE_PATH)
     except Exception as e:
         logging.error(f"check_new_announcements_parallel fatal: {e}")
 
@@ -1905,6 +1993,34 @@ async def fetch_message_body(session, message_url):
         logging.error(f"fetch_message_body failed for {message_url}: {e}")
         return f"[Error fetching content: {str(e)[:100]}]"
 
+
+
+WA_FORWARD_ASK_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+WA_FORWARD_CONFIRM_MARKUP = InlineKeyboardMarkup([[
+    InlineKeyboardButton("✅ Yes, forward", callback_data="forward_wa_confirm"),
+    InlineKeyboardButton("❌ Cancel", callback_data="forward_wa_cancel"),
+]])
+
+
+async def handle_forward_wa_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """First tap on any 'Forward to WA' button — swap it for a Yes/No confirmation
+    instead of sending immediately, since these messages can carry personal info."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=WA_FORWARD_CONFIRM_MARKUP)
+    except Exception as e:
+        logging.warning(f"handle_forward_wa_ask: failed to swap markup: {e}")
+
+
+async def handle_forward_wa_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User declined forwarding — restore the original button so they can retry."""
+    query = update.callback_query
+    await query.answer("Cancelled")
+    try:
+        await query.edit_message_reply_markup(reply_markup=WA_FORWARD_ASK_MARKUP)
+    except Exception as e:
+        logging.warning(f"handle_forward_wa_cancel: failed to restore markup: {e}")
 
 
 async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1962,8 +2078,13 @@ async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("⚠️ No announcement history available.")
         return
 
-    with open(CACHE_PATH, "r", encoding="utf-8") as f:
-        cache = json.load(f)
+    try:
+        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception as e:
+        logging.error(f"Failed to load announcement cache: {e}")
+        await query.edit_message_text("⚠️ Error reading announcement history.")
+        return
 
     history = cache.get("history", [])
     if not isinstance(history, list) or not history:
@@ -2469,8 +2590,10 @@ async def check_new_messages(bot, chat_id, silent: bool = False):
         # Update cache with new messages prepended or appended
         # Best to just store all recent ones
         all_messages_combined = (new_messages + old_messages)[:100]
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        tmp_path = CACHE_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(all_messages_combined, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, CACHE_FILE)
 
         new_messages_sorted = sorted(new_messages, key=lambda m: parse_date_safe(m.get("date", "")))
         for msg in new_messages_sorted:
@@ -2651,9 +2774,11 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
                 await broadcast(bot, text, parse_mode="HTML", reply_markup=markup)
 
         # Always save cache to bootstrap the "Last 5" feature
-        with open(CACHE_PATH, "w", encoding="utf-8") as f:
+        tmp_path = CACHE_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
-            
+        os.replace(tmp_path, CACHE_PATH)
+
         if not new_posts_found and not silent:
             await bot.send_message(chat_id=chat_id, text="☑️ No new forum posts found (cache updated).", disable_notification=True)
 
@@ -3120,7 +3245,47 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    if query.data == "start_watchers":
+    if query.data == "fastenroll_menu":
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id is None or not is_user_allowed(user_id):
+            await query.message.reply_text("Not authorized to use this bot.")
+            return
+        keyboard = [
+            [InlineKeyboardButton("➕ New Fast Enroll", callback_data="fastenroll_new")],
+            [InlineKeyboardButton("📋 List / Cancel", callback_data="fastenroll_list_inline")],
+        ]
+        await query.message.reply_text("⚡ Fast Enroll menu:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif query.data == "wa_menu":
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id is None or not is_user_allowed(user_id):
+            await query.message.reply_text("Not authorized to use this bot.")
+            return
+        keyboard = [
+            [InlineKeyboardButton("📲 Request WA QR", callback_data="request_wa_qr")],
+            [InlineKeyboardButton("🔄 Force New WA QR", callback_data="force_wa_qr")],
+            [InlineKeyboardButton("✏️ Change WA Group", callback_data="change_wa_group")],
+            [InlineKeyboardButton("🔍 Detect WA Groups", callback_data="detect_wa_groups")],
+        ]
+        await query.message.reply_text("📱 WhatsApp menu:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif query.data == "fastenroll_new":
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id is None or not is_user_allowed(user_id):
+            await query.message.reply_text("Not authorized to use this bot.")
+            return
+        context.user_data.pop("fastenroll_wizard", None)
+        context.user_data["pending_step"] = "fastenroll_date"
+        await query.message.reply_text(FASTENROLL_ASK_DATE, reply_markup=get_main_keyboard())
+
+    elif query.data == "fastenroll_list_inline":
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id is None or not is_user_allowed(user_id):
+            await query.message.reply_text("Not authorized to use this bot.")
+            return
+        await send_fastenroll_list(query.message, query.message.chat_id)
+
+    elif query.data == "start_watchers":
         global message_watcher_paused, announcement_watcher_paused, file_watcher_paused
         message_watcher_paused = False
         announcement_watcher_paused = False
@@ -3144,9 +3309,23 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             logging.error(f"Failed to request WA QR: {e}")
             await query.message.reply_text("❌ WhatsApp service unreachable. Make sure it's running.")
 
+    elif query.data == "force_wa_qr":
+        # Logs the current WhatsApp session out first, so a real QR is generated
+        # even if the client is currently connected (plain /request_qr silently
+        # restores a still-valid saved session instead of producing a QR).
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post("http://localhost:3838/force_new_qr") as resp:
+                    data = await resp.json()
+                    await query.message.reply_text(f"ℹ️ {data.get('message', 'QR request processed.')}")
+        except Exception as e:
+            logging.error(f"Failed to force new WA QR: {e}")
+            await query.message.reply_text("❌ WhatsApp service unreachable. Make sure it's running.")
+
     elif query.data == "change_wa_group":
-        from telegram import ForceReply
-        await query.message.reply_text("Please type the new WhatsApp group name:", reply_markup=ForceReply(selective=True))
+        context.user_data["pending_step"] = "wa_group_name"
+        await query.message.reply_text("Please type the new WhatsApp group name:", reply_markup=get_main_keyboard())
 
     elif query.data == "detect_wa_groups":
         import aiohttp
@@ -3180,8 +3359,133 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     elif query.data == "change_ical_link":
-        from telegram import ForceReply
-        await query.message.reply_text("Please type the new iCal link (STUDIP_ICAL_URL):", reply_markup=ForceReply(selective=True))
+        context.user_data["pending_step"] = "ical_link"
+        await query.message.reply_text("Please type the new iCal link (STUDIP_ICAL_URL):", reply_markup=get_main_keyboard())
+
+
+async def send_exam_registration_menu(message):
+    """Show currently open-for-registration and currently-registered exams on
+    the StuMS/HISinOne portal, each with a Register/Deregister button."""
+    session = await login_studip()
+
+    try:
+        open_exams = await get_open_exam_registrations(session)
+    except Exception as e:
+        logging.error(f"exam menu: failed to fetch open exams: {e}")
+        await message.reply_text("❌ Could not reach the exam registration portal. Please try again later.")
+        return
+
+    try:
+        registered_exams = await get_registered_exams(session)
+    except Exception as e:
+        logging.error(f"exam menu: failed to fetch registered exams: {e}")
+        registered_exams = []
+
+    keyboard = []
+
+    if open_exams:
+        # A unit can have several open sittings at once; one Register button per unit is enough.
+        seen_units = set()
+        keyboard.append([InlineKeyboardButton("📖 Open for registration", callback_data="exam_noop")])
+        for exam in sorted(open_exams, key=lambda e: e["end_date"] or ""):
+            if exam["unit_id"] in seen_units:
+                continue
+            seen_units.add(exam["unit_id"])
+            sid = str(uuid.uuid4())[:8]
+            exam_action_cache[sid] = {
+                "unit_id": exam["unit_id"],
+                "action_type": "anmelden",
+                "title": exam["title"],
+            }
+            label = f"📝 {exam['title']}"
+            if exam.get("exam_date_text"):
+                label += f" ({exam['exam_date_text']})"
+            keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"exam_ask|{sid}")])
+
+    if registered_exams:
+        keyboard.append([InlineKeyboardButton("📌 Currently registered", callback_data="exam_noop")])
+        for exam in registered_exams:
+            sid = str(uuid.uuid4())[:8]
+            exam_action_cache[sid] = {
+                "unit_id": exam["unit_id"],
+                "action_type": "abmelden",
+                "title": exam["title"],
+            }
+            keyboard.append([InlineKeyboardButton(f"🗑️ {exam['title']}"[:64], callback_data=f"exam_ask|{sid}")])
+
+    if not keyboard:
+        await message.reply_text("ℹ️ No open exam registrations and no active registrations found right now.")
+        return
+
+    await message.reply_text(
+        "🎓 <b>Exam Registration</b>\nSelect an exam to register or deregister:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        await query.message.reply_text("Not authorized to use this bot.")
+        return
+
+    if query.data == "exam_menu":
+        await query.message.reply_text("🎓 Loading exam registration status...", disable_notification=True)
+        await send_exam_registration_menu(query.message)
+        return
+
+    if query.data == "exam_noop":
+        return
+
+    if query.data == "exam_cancel":
+        await query.edit_message_text("Cancelled.")
+        return
+
+    action, sid = query.data.split("|", 1)
+    info = exam_action_cache.get(sid)
+    if not info:
+        await query.message.reply_text("⚠️ This exam action has expired. Please open the Exam Registration menu again.")
+        return
+
+    verb = "register for" if info["action_type"] == "anmelden" else "deregister from"
+
+    if action == "exam_ask":
+        keyboard = [[
+            InlineKeyboardButton("✅ Yes", callback_data=f"exam_do|{sid}"),
+            InlineKeyboardButton("❌ No", callback_data="exam_cancel"),
+        ]]
+        await query.message.reply_text(
+            f"⚠️ Are you sure you want to <b>{verb}</b>:\n<b>{info['title']}</b>?",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    if action == "exam_do":
+        await query.edit_message_text(f"⏳ Submitting: {verb} {info['title']}...")
+        try:
+            session = await login_studip()
+            result = await submit_exam_action(session, info["unit_id"], info["action_type"])
+        except Exception as e:
+            logging.error(f"exam action failed: {e}")
+            await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
+            return
+        exam_action_cache.pop(sid, None)
+        title = result.get("title") or info["title"]
+        if result["success"]:
+            if info["action_type"] == "anmelden":
+                status_line = f"\nStatus: {result['status']}" if result.get("status") else ""
+                await query.message.reply_text(f"✅ Registered: {title}{status_line}")
+            else:
+                await query.message.reply_text(f"🗑️ Deregistered: {title}")
+        else:
+            failed_verb = "register for" if info["action_type"] == "anmelden" else "deregister from"
+            await query.message.reply_text(f"❌ Failed to {failed_verb} {title}: {result['message']}")
+
 
 async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3541,28 +3845,49 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("⚠️ Unknown action.")
 
 
-# ── reply keyboard handling ────────────────────────────────────────────────
-async def handle_settings_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.reply_to_message:
-        return
-    text = update.message.reply_to_message.text
-    if "Please type the new WhatsApp group name:" in text:
+# ── multi-step text input (task/fast-enroll/settings wizards) ──────────────────
+# These wizards used to rely on ForceReply + matching update.message.reply_to_message
+# text. ForceReply causes several Telegram clients to permanently hide the bottom
+# custom keyboard (get_main_keyboard()) even after it's resent later, so instead
+# each step is tracked in context.user_data["pending_step"] and plain text answers
+# (no forced reply) are matched against it here.
+async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """If the user has an active multi-step wizard pending, consume this message
+    as that step's answer and return True. Otherwise return False so the caller
+    falls through to normal button/text handling."""
+    step = context.user_data.get("pending_step")
+    if not step:
+        return False
+
+    if step in ("fastenroll_date", "fastenroll_time", "fastenroll_link"):
+        return await _handle_fastenroll_wizard_reply(update, context, step)
+
+    if step in ("task_text", "task_time"):
+        return await _handle_task_wizard_reply(update, context, step)
+
+    if step == "wa_group_name":
         new_group = update.message.text.strip()
         import dotenv
-        import os
         env_path = ".env"
         dotenv.set_key(env_path, "WHATSAPP_GROUP_NAME", new_group)
         os.environ["WHATSAPP_GROUP_NAME"] = new_group
-        await update.message.reply_text(f"✅ WhatsApp group successfully updated: {new_group}")
+        context.user_data.pop("pending_step", None)
+        await update.message.reply_text(f"✅ WhatsApp group successfully updated: {new_group}", reply_markup=get_main_keyboard())
+        return True
 
-    elif "Please type the new iCal link" in text:
+    if step == "ical_link":
         new_link = update.message.text.strip()
         import dotenv
-        import os
         env_path = ".env"
         dotenv.set_key(env_path, "STUDIP_ICAL_URL", new_link)
         os.environ["STUDIP_ICAL_URL"] = new_link
-        await update.message.reply_text(f"✅ iCal link successfully updated!")
+        context.user_data.pop("pending_step", None)
+        await update.message.reply_text("✅ iCal link successfully updated!", reply_markup=get_main_keyboard())
+        return True
+
+    # Unknown/stale step — clear it so the user isn't stuck.
+    context.user_data.pop("pending_step", None)
+    return False
 
 
 async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3570,6 +3895,9 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     message = update.message
     data = None
+
+    if not query and message and message.text and await handle_pending_step(update, context):
+        return
 
     if query:
         await query.answer()
@@ -3583,7 +3911,9 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             data = ["menu"]
         elif "📅" in text or "calendar" in text.lower():
             data = ["calendar"]
-        elif "▶️" in text or "start" in text.lower():
+        elif "✅" in text or "task" in text.lower():
+            data = ["tasks"]
+        elif "⬇️" in text or "start" in text.lower():
             data = ["start"]
         elif "🔁" in text or "check" in text.lower():
             data = ["check"]
@@ -3612,6 +3942,8 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             week_start = today - timedelta(days=today.weekday())
             events = await get_calendar_events(session=global_session, week_start=week_start)
             await send_daily_calendar(sender, events, today, week_start)
+        elif data[0] == "tasks":
+            await send_tasks_menu(sender)
         elif data[0] == "start":
             await start(update, context)
         elif data[0] == "check":
@@ -3770,7 +4102,10 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
     keyboard = [
         [
             InlineKeyboardButton("📆 Week Plan", callback_data="calendar_weekly"),
-        ]
+        ],
+        [
+            InlineKeyboardButton("📚 My Exam Dates", callback_data="exam_dates_list"),
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -3933,13 +4268,231 @@ async def handle_calendar_weekly(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(f"❌ Error loading weekly schedule: {str(e)[:200]}")
 
 
+def _exam_registration_status_line(exam: dict) -> str:
+    """Render a short registration-status line for an exam entry from
+    exam_reminder.get_all_exam_dates (action_type/status come from the study
+    planner tree's row for that unit)."""
+    if exam.get("action_type") == "deregister":
+        return "📝 ✅ Registered"
+    status = exam.get("status") or ""
+    if status == "Passed":
+        return "📝 🏁 Passed"
+    if status == "Failed":
+        return "📝 ❌ Failed"
+    return "📝 ⬜ Not registered"
+
+
+def _registration_period_line(exam: dict) -> Optional[str]:
+    """Render the exam's registration (enrollment) window, if known, from
+    exam_reminder.get_all_exam_dates's start_date/end_date/is_open fields."""
+    start = exam.get("start_date")
+    end = exam.get("end_date")
+    if not start or not end:
+        return None
+    start_dt = datetime.fromisoformat(start)
+    end_dt = datetime.fromisoformat(end)
+    state = "🟢 open" if exam.get("is_open") else "🔴 closed"
+    return f"🗓 Registration: {start_dt.strftime('%d.%m.%y')}–{end_dt.strftime('%d.%m.%y')} ({state})"
+
+
+def _format_exam_dates_message(header: str, exams: list[dict], show_status: bool = True) -> list[str]:
+    """`show_status` controls the per-exam registration-status line (Registered /
+    Not registered / Passed / Failed). Off for the full-curriculum list, where
+    most entries are irrelevant to the student and that line is just noise."""
+    lines = [header, "━━━━━━━━━━━━━━━━━"]
+    for e in exams:
+        title = e["title"]
+        if e.get("group_label"):
+            title += f" ({e['group_label']})"
+        lines.append(f"📘 <b>{title}</b>")
+        lines.append(f"📅 {e['exam_date_display']}")
+        if e.get("room"):
+            lines.append(f"📍 {e['room']}")
+        period_line = _registration_period_line(e)
+        if period_line:
+            lines.append(period_line)
+        if show_status:
+            lines.append(_exam_registration_status_line(e))
+        lines.append("━━━━━━━━━━━━━━━━━")
+    return lines
+
+
+async def _send_exam_dates_chunks(message, lines: list[str], final_reply_markup=None):
+    """Telegram messages are capped at 4096 chars; split into chunks if needed and
+    attach `final_reply_markup` (e.g. a WhatsApp-forward or navigation button) to
+    only the last chunk."""
+    chunks = []
+    chunk = ""
+    for line in lines:
+        candidate = chunk + line + "\n"
+        if len(candidate) > 3800:
+            chunks.append(chunk)
+            chunk = line + "\n"
+        else:
+            chunk = candidate
+    if chunk:
+        chunks.append(chunk)
+
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+        await message.reply_text(chunk, parse_mode="HTML", reply_markup=final_reply_markup if is_last else None)
+
+
+MODULE_CODE_RE = re.compile(r'title="((?:wir|inf|ma)[a-z]*\d+)\s*-\s*[^"]+"', re.IGNORECASE)
+
+
+async def get_my_module_codes(session, courses) -> set:
+    """Scrape each Stud.IP course's details page for the StuMS module code(s) it
+    belongs to (e.g. 'wir893' for the course "Development Economics"). Stud.IP
+    course names and StuMS exam titles frequently do not match at all, but both
+    systems reference the same underlying module code, so this is the reliable
+    way to link a Stud.IP course to its StuMS exam(s).
+    """
+    codes = set()
+    semaphore = asyncio.Semaphore(3)
+
+    async def fetch_one(cid):
+        async with semaphore:
+            try:
+                url = f"{BASE_URL}/dispatch.php/course/details?cid={cid}"
+                async with await session.get(url) as r:
+                    html_text = await r.text()
+            except Exception as e:
+                logging.warning(f"get_my_module_codes: failed to fetch course {cid}: {e}")
+                return
+        for m in MODULE_CODE_RE.finditer(html_text):
+            codes.add(m.group(1).lower())
+
+    await asyncio.gather(*(fetch_one(cid) for _, cid in courses))
+    return codes
+
+
+async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle exam_dates_list callback — shows upcoming exam dates for the courses
+    the student is currently enrolled in on Stud.IP, with each exam's registration
+    status, skipping any dates that have already passed."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    await query.message.reply_text("📚 Fetching your exam dates... this may take a moment.", disable_notification=True)
+
+    try:
+        session = await login_studip()
+        courses = await list_courses()
+        module_codes = await get_my_module_codes(session, courses)
+        exams = await get_all_exam_dates(session)
+    except Exception as e:
+        logging.error(f"My exam dates error: {e}")
+        await query.message.reply_text(f"❌ Error loading exam dates: {str(e)[:200]}")
+        return
+
+    matched = filter_exams_by_module_codes(exams, module_codes)
+
+    today = datetime.now().date()
+    upcoming = [e for e in matched if datetime.fromisoformat(e["exam_date"]).date() >= today]
+    upcoming.sort(key=lambda e: (e["exam_date"], e["title"]))
+
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📋 All Exams", callback_data="exam_dates_all")]])
+
+    if not upcoming:
+        await query.message.reply_text("ℹ️ No upcoming exam dates found for your enrolled courses.", reply_markup=keyboard)
+        return
+
+    lines = _format_exam_dates_message("📚 <b>My Upcoming Exam Dates</b>", upcoming)
+    await _send_exam_dates_chunks(query.message, lines, final_reply_markup=keyboard)
+
+
+async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle exam_dates_all callback — shows every upcoming exam date across the
+    whole curriculum (registered or not), with each exam's registration status,
+    skipping any dates that have already passed."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    await query.message.reply_text("📚 Fetching all exam dates... this may take a moment.", disable_notification=True)
+
+    try:
+        session = await login_studip()
+        exams = await get_all_exam_dates(session)
+    except Exception as e:
+        logging.error(f"All exam dates error: {e}")
+        await query.message.reply_text(f"❌ Error loading exam dates: {str(e)[:200]}")
+        return
+
+    today = datetime.now().date()
+    upcoming = [e for e in exams if datetime.fromisoformat(e["exam_date"]).date() >= today]
+    upcoming.sort(key=lambda e: (e["exam_date"], e["title"]))
+
+    if not upcoming:
+        await query.message.reply_text("ℹ️ No upcoming exam dates found across the curriculum.")
+        return
+
+    lines = _format_exam_dates_message("📋 <b>All Upcoming Exam Dates</b>", upcoming, show_status=False)
+    wa_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+    await _send_exam_dates_chunks(query.message, lines, final_reply_markup=wa_markup)
+
+
+async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle transcript_summary callback — shows a weighted-average grade and
+    credit total computed from "My achievements" (Notenspiegel). No WA-forward
+    button: this is personal grade data."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    await query.message.reply_text("📜 Fetching your transcript...", disable_notification=True)
+
+    try:
+        session = await login_studip()
+        grades = await get_grades(session)
+    except Exception as e:
+        logging.error(f"Transcript summary error: {e}")
+        await query.message.reply_text(f"❌ Error loading transcript: {str(e)[:200]}")
+        return
+
+    summary = compute_transcript_summary(grades)
+
+    lines = ["📜 <b>Transcript Summary</b>", "━━━━━━━━━━━━━━━━━"]
+    gpa_text = summary["gpa"] if summary["gpa"] is not None else "—"
+    lines.append(f"📊 <b>Weighted Average Grade:</b> {gpa_text}")
+    lines.append(f"🎓 <b>Total Credits Earned:</b> {summary['total_credits']}")
+    lines.append(f"✅ <b>Passed:</b> {len(summary['passed'])} module(s)")
+    lines.append(f"❌ <b>Failed:</b> {len(summary['failed'])} module(s)")
+    lines.append("━━━━━━━━━━━━━━━━━")
+
+    for item in summary["passed"]:
+        lines.append(f"✅ {item['title']} — {item['grade']} ({item['credits']} ECTS)")
+    for item in summary["failed"]:
+        grade_part = f" — {item['grade']}" if item.get("grade") else ""
+        lines.append(f"❌ {item['title']}{grade_part}")
+
+    if not summary["passed"] and not summary["failed"]:
+        lines.append("ℹ️ No finalized results yet.")
+
+    lines.append("━━━━━━━━━━━━━━━━━")
+    lines.append("<i>Approximate — not an official transcript.</i>")
+
+    await _send_exam_dates_chunks(query.message, lines)
+
+
 async def delete_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete any free text that isn't a valid keyboard command."""
     try:
         if not update.message or not update.message.text:
             return
         text = _normalize_button_text(update.message.text)
-        if text.startswith(("▶️", "🔁", "ℹ️", "🍽️", "📅")):
+        if text.startswith(("⬇️", "🔁", "ℹ️", "🍽️", "✅", "📅")):
             return
         await update.message.delete()
     except Exception:
@@ -3953,11 +4506,12 @@ def get_main_keyboard():
     """Update main reply keyboard with menu button"""
     return ReplyKeyboardMarkup(
         [
-            ["▶️ Start", "🔁 Check", "ℹ️ Status"],
-            ["🍽️ Menu", "📅 Calendar"]
+            ["⬇️ Files", "🔁 Check", "ℹ️ Status"],
+            ["🍽️ Menu", "✅ Tasks", "📅 Calendar"]
         ],
         resize_keyboard=True,
-        one_time_keyboard=False
+        one_time_keyboard=False,
+        is_persistent=True
     )
 
 
@@ -3974,7 +4528,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send keyboard IMMEDIATELY - not conditional on anything
     welcome_msg = await update.message.reply_text(
         "🤖 Welcome to Stud.IP Bot!\n\n"
-        "▶️ Start - Browse courses\n"
+        "⬇️ Files - Browse courses\n"
         "🔁 Check - Manual check\n"
         "ℹ️ Status - Bot status\n"
         "🍽️ Menu - Today's meals\n"
@@ -3998,6 +4552,471 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_check_now(update, context)
 
 
+async def _run_fastenroll_task(chat_id: int, sem_id: str, target_time_str: str, target_date_str: str, context: ContextTypes.DEFAULT_TYPE):
+    async def on_progress(msg: str):
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=f"⏱️ {msg}", disable_notification=True)
+        except Exception:
+            logging.warning("fastenroll progress notify failed", exc_info=True)
+
+    try:
+        session = await login_studip()
+        success, message = await run_fast_enroll(session, sem_id, target_time_str, target_date_str, on_progress=on_progress)
+        icon = "✅" if success else "❌"
+        await context.bot.send_message(chat_id=chat_id, text=f"{icon} {message}")
+    except asyncio.CancelledError:
+        logging.info(f"fastenroll job for chat {chat_id}, course {sem_id} was cancelled")
+        raise
+    except Exception as e:
+        logging.error(f"fastenroll failed: {e}", exc_info=True)
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ Fast enroll failed: {e}")
+    finally:
+        fastenroll_tasks.get(chat_id, {}).pop(sem_id, None)
+        clear_pending_job(chat_id, sem_id)
+
+
+SEM_ID_RE = re.compile(r"(?:sem_id=|course_id=)?([a-f0-9]{32})")
+
+
+def extract_sem_id(text: str) -> Optional[str]:
+    """Pull a 32-char hex Stud.IP course id out of a raw id or a pasted course URL."""
+    match = SEM_ID_RE.search(text.strip())
+    return match.group(1) if match else None
+
+
+def validate_fastenroll_args(sem_id: str, target_time_str: str, target_date_str: Optional[str]) -> Optional[str]:
+    """Return an error message if invalid, else None."""
+    if not sem_id or not re.fullmatch(r"[a-f0-9]{32}", sem_id):
+        return "Could not find a valid course id (expected a 32-char hex sem_id, or a course link containing one)."
+    if not re.fullmatch(r"[0-9]{2}:[0-9]{2}:[0-9]{2}", target_time_str):
+        return "Time must be in HH:MM:SS format (Europe/Berlin)."
+    if target_date_str and not re.fullmatch(r"[0-9]{2}\.[0-9]{2}\.[0-9]{4}", target_date_str):
+        return "Date must be in DD.MM.YYYY format."
+    return None
+
+
+async def schedule_fastenroll_job(chat_id: int, sem_id: str, target_time_str: str, target_date_str: Optional[str], context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Validate, persist and launch a fast-enroll job. Returns the reply text to show the user."""
+    error = validate_fastenroll_args(sem_id, target_time_str, target_date_str)
+    if error:
+        return f"⚠️ {error}"
+
+    existing = fastenroll_tasks.get(chat_id, {}).get(sem_id)
+    if existing and not existing.done():
+        return f"A fast-enroll job is already scheduled for course {sem_id}. Cancel it first with /fastenroll_cancel {sem_id}."
+
+    # The bot logs into a single shared Stud.IP account regardless of which
+    # Telegram chat is talking to it, so the same course must not be scheduled
+    # twice from two different chats — that would fire two redundant enrollment
+    # attempts at the same instant.
+    all_pending = load_pending()
+    for other_chat_id_str, other_jobs in all_pending.items():
+        if int(other_chat_id_str) != chat_id and sem_id in other_jobs:
+            return (
+                f"⚠️ Course {sem_id} is already scheduled from another Telegram chat connected to this bot. "
+                "Cancel it there first if you want to reschedule it here."
+            )
+
+    when = f"{target_date_str} {target_time_str}" if target_date_str else f"{target_time_str} (next occurrence)"
+    save_pending_job(chat_id, sem_id, target_time_str, target_date_str)
+    task = asyncio.create_task(_run_fastenroll_task(chat_id, sem_id, target_time_str, target_date_str, context))
+    fastenroll_tasks.setdefault(chat_id, {})[sem_id] = task
+    return f"🎯 Fast enroll scheduled for course {sem_id} at {when} (Europe/Berlin)."
+
+
+def _fastenroll_job_line(sem_id: str, job: dict) -> str:
+    when = f"{job.get('target_date_str')} {job.get('target_time_str')}" if job.get("target_date_str") else f"{job.get('target_time_str')} (next occurrence)"
+    return f"• {sem_id} — {when}"
+
+
+def _build_fastenroll_list_content(chat_id: int):
+    """Return (text, InlineKeyboardMarkup | None) for the jobs across every Telegram
+    chat connected to this bot, not just `chat_id` — the bot logs into a single
+    shared Stud.IP account regardless of which chat scheduled a job, so a job set
+    up from one chat/device should be visible (and cancellable) from any other."""
+    all_pending = load_pending()
+    entries = [
+        (other_chat_id_str, sem_id, job)
+        for other_chat_id_str, jobs in all_pending.items()
+        for sem_id, job in jobs.items()
+    ]
+    if not entries:
+        return "No fast-enroll jobs scheduled.", None
+
+    lines = ["📋 Scheduled fast-enroll jobs (all chats):"]
+    keyboard = []
+    for owner_chat_id_str, sem_id, job in entries:
+        owner_tag = " (this chat)" if owner_chat_id_str == str(chat_id) else f" (chat {owner_chat_id_str})"
+        lines.append(_fastenroll_job_line(sem_id, job) + owner_tag)
+        keyboard.append([InlineKeyboardButton(
+            f"🛑 Cancel {sem_id[:8]}…{owner_tag}",
+            callback_data=f"fastenroll_cancel|{owner_chat_id_str}|{sem_id}",
+        )])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+async def send_fastenroll_list(chat, chat_id: int):
+    """Send the pending-jobs list with an inline Cancel button per job. `chat` is
+    anything with a .reply_text(...) coroutine (an Update.message or CallbackQuery.message)."""
+    text, markup = _build_fastenroll_list_content(chat_id)
+    await chat.reply_text(text, reply_markup=markup)
+
+
+async def fastenroll_list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        await update.message.reply_text("Not authorized to use this bot.")
+        return
+    await send_fastenroll_list(update.message, update.effective_chat.id)
+
+
+async def cancel_fastenroll_job(chat_id: int, sem_id: str) -> str:
+    """Cancel a running/pending job for one course. Returns the result message."""
+    task = fastenroll_tasks.get(chat_id, {}).get(sem_id)
+    if task and not task.done():
+        task.cancel()
+        return f"🛑 Cancelled fast-enroll job for course {sem_id}."
+    clear_pending_job(chat_id, sem_id)
+    return f"No running job found for {sem_id}, removed from pending list if present."
+
+
+def _find_job_owner_chat_id(sem_id: str) -> Optional[int]:
+    """Search every chat's pending jobs for `sem_id`, return the owning chat_id or None."""
+    all_pending = load_pending()
+    for chat_id_str, jobs in all_pending.items():
+        if sem_id in jobs:
+            return int(chat_id_str)
+    return None
+
+
+async def fastenroll_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        await update.message.reply_text("Not authorized to use this bot.")
+        return
+    chat_id = update.effective_chat.id
+    args = context.args or []
+    if len(args) != 1:
+        if not load_pending():
+            await update.message.reply_text("No fast-enroll jobs scheduled to cancel.")
+            return
+        await send_fastenroll_list(update.message, chat_id)
+        return
+
+    sem_id = extract_sem_id(args[0]) or args[0]
+    owner_chat_id = _find_job_owner_chat_id(sem_id) or chat_id
+    result = await cancel_fastenroll_job(owner_chat_id, sem_id)
+    await update.message.reply_text(result)
+
+
+async def fastenroll_cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        await query.message.reply_text("Not authorized to use this bot.")
+        return
+    _, owner_chat_id_str, sem_id = query.data.split("|", 2)
+    owner_chat_id = int(owner_chat_id_str)
+    result = await cancel_fastenroll_job(owner_chat_id, sem_id)
+
+    text, markup = _build_fastenroll_list_content(query.message.chat_id)
+    try:
+        await query.edit_message_text(f"{result}\n\n{text}", reply_markup=markup)
+    except Exception:
+        # Message may be too old to edit (>48h) or already identical; fall back to a fresh reply.
+        await query.message.reply_text(result)
+
+
+async def fastenroll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Usage: /fastenroll <sem_id_or_link> <HH:MM:SS> [DD.MM.YYYY]  — waits until the
+    given Berlin-time clock reading (tracked from the site's own clock widget, not
+    the local machine's clock), then submits the course enrollment the instant it
+    arrives. If the date is omitted, the next occurrence of that time (today or
+    tomorrow) is used."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        await update.message.reply_text("Not authorized to use this bot.")
+        return
+
+    chat_id = update.effective_chat.id
+    args = context.args or []
+    if len(args) not in (2, 3):
+        await update.message.reply_text(
+            "Usage: /fastenroll <sem_id_or_link> <HH:MM:SS> [DD.MM.YYYY]\n"
+            "Example: /fastenroll c62312911d752b8f2e11344377cc1bff 08:30:00\n"
+            "Example with date: /fastenroll c62312911d752b8f2e11344377cc1bff 08:30:00 15.09.2026\n\n"
+            "Tip: send ⚡ Fast Enroll from the menu for a guided step-by-step setup."
+        )
+        return
+
+    sem_id = extract_sem_id(args[0])
+    target_time_str = args[1]
+    target_date_str = args[2] if len(args) == 3 else None
+
+    reply = await schedule_fastenroll_job(chat_id, sem_id, target_time_str, target_date_str, context)
+    await update.message.reply_text(reply)
+
+
+# ── Personal tasks / reminders (todo list with an optional due time) ───────────
+TASK_ASK_TEXT = "📝 What's the task?"
+TASK_ASK_TIME = "⏰ When should I remind you? (e.g. 'tomorrow 15:00', '20.09 09:00', 'in 2 hours') Type 'skip' for no reminder time."
+TASK_SKIP_WORDS = {"skip", "yok", "hayır", "hayir", "none", "-"}
+
+
+def parse_task_due_time(text: str):
+    """Parse a task's due time from free text. Returns None if the user opted to
+    skip setting a time (a plain to-do with no reminder). Raises ValueError if the
+    text doesn't match any supported pattern.
+    """
+    t = text.strip()
+    if t.lower() in TASK_SKIP_WORDS:
+        return None
+
+    now = datetime.now(TZ_BERLIN)
+
+    m = re.match(r"^(\d+)\s*(?:saat|hours?)\s*sonra$", t, re.IGNORECASE) or re.match(r"^in\s+(\d+)\s*hours?$", t, re.IGNORECASE)
+    if m:
+        return now + timedelta(hours=int(m.group(1)))
+
+    m = re.match(r"^(\d+)\s*(?:gün|gun|days?)\s*sonra$", t, re.IGNORECASE) or re.match(r"^in\s+(\d+)\s*days?$", t, re.IGNORECASE)
+    if m:
+        return now + timedelta(days=int(m.group(1)))
+
+    m = re.match(r"^(?:yarın|yarin|tomorrow)\s+(\d{1,2}):(\d{2})$", t, re.IGNORECASE)
+    if m:
+        target_date = (now + timedelta(days=1)).date()
+        return datetime(target_date.year, target_date.month, target_date.day, int(m.group(1)), int(m.group(2)), tzinfo=TZ_BERLIN)
+
+    m = re.match(r"^(?:bugün|bugun|today)\s+(\d{1,2}):(\d{2})$", t, re.IGNORECASE)
+    if m:
+        target_date = now.date()
+        return datetime(target_date.year, target_date.month, target_date.day, int(m.group(1)), int(m.group(2)), tzinfo=TZ_BERLIN)
+
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})$", t)
+    if m:
+        day, month, year, hour, minute = map(int, m.groups())
+        return datetime(year, month, day, hour, minute, tzinfo=TZ_BERLIN)
+
+    m = re.match(r"^(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})$", t)
+    if m:
+        day, month, hour, minute = map(int, m.groups())
+        candidate = datetime(now.year, month, day, hour, minute, tzinfo=TZ_BERLIN)
+        if candidate < now:
+            candidate = candidate.replace(year=now.year + 1)
+        return candidate
+
+    raise ValueError(f"Could not understand the date/time: {text}")
+
+
+async def send_tasks_menu(sender):
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Task", callback_data="task_add")],
+        [InlineKeyboardButton("📋 My Tasks", callback_data="task_list")],
+    ]
+    await sender.reply_text("✅ Tasks menu:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def send_task_list(message, user_id: int):
+    tasks = [t for t in load_tasks() if t["user_id"] == user_id]
+    if not tasks:
+        await message.reply_text("ℹ️ No tasks yet. Use ➕ Add Task to create one.")
+        return
+
+    reminders = sorted((t for t in tasks if t.get("due_time")), key=lambda t: t["due_time"])
+    plain = [t for t in tasks if not t.get("due_time")]
+
+    for t in reminders:
+        due = datetime.fromisoformat(t["due_time"])
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"task_delete|{t['id']}")]])
+        await message.reply_text(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} — {t['text']}", reply_markup=keyboard)
+
+    for t in plain:
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✔️ Done", callback_data=f"task_done|{t['id']}"),
+            InlineKeyboardButton("❌ Delete", callback_data=f"task_delete|{t['id']}"),
+        ]])
+        await message.reply_text(f"📝 {t['text']}", reply_markup=keyboard)
+
+
+async def handle_task_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    if query.data == "task_add":
+        context.user_data.pop("task_wizard", None)
+        context.user_data["pending_step"] = "task_text"
+        await query.message.reply_text(TASK_ASK_TEXT, reply_markup=get_main_keyboard())
+        return
+
+    if query.data == "task_list":
+        await send_task_list(query.message, user_id)
+        return
+
+    action, task_id = query.data.split("|", 1)
+    tasks = load_tasks()
+    if action == "task_done":
+        tasks = [t for t in tasks if t["id"] != task_id]
+        save_tasks(tasks)
+        await query.edit_message_text("✔️ Done!")
+    elif action == "task_delete":
+        tasks = [t for t in tasks if t["id"] != task_id]
+        save_tasks(tasks)
+        await query.edit_message_text("🗑️ Deleted.")
+
+
+async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str) -> bool:
+    """If `step` is one of the task wizard steps, handle it and return True."""
+    text = update.message.text.strip()
+    state = context.user_data.setdefault("task_wizard", {})
+
+    if step == "task_text":
+        state["text"] = text
+        context.user_data["pending_step"] = "task_time"
+        await update.message.reply_text(TASK_ASK_TIME, reply_markup=get_main_keyboard())
+        return True
+
+    if step == "task_time":
+        task_text = state.get("text")
+        if not task_text:
+            context.user_data.pop("task_wizard", None)
+            context.user_data.pop("pending_step", None)
+            return False
+        try:
+            due_dt = parse_task_due_time(text)
+        except ValueError as e:
+            await update.message.reply_text(f"⚠️ {e}")
+            await update.message.reply_text(TASK_ASK_TIME, reply_markup=get_main_keyboard())
+            return True  # pending_step stays "task_time" — ask again
+
+        task = {
+            "id": str(uuid.uuid4())[:8],
+            "user_id": update.effective_user.id,
+            "text": task_text,
+            "due_time": due_dt.isoformat() if due_dt else None,
+            "created_at": datetime.now(TZ_BERLIN).isoformat(),
+            "notified": False,
+        }
+        tasks = load_tasks()
+        tasks.append(task)
+        save_tasks(tasks)
+        context.user_data.pop("task_wizard", None)
+        context.user_data.pop("pending_step", None)
+
+        if due_dt:
+            await update.message.reply_text(f"✅ Reminder set: {due_dt.strftime('%d.%m.%Y %H:%M')} — {task_text}", reply_markup=get_main_keyboard())
+        else:
+            await update.message.reply_text(f"✅ Task added: {task_text}", reply_markup=get_main_keyboard())
+        return True
+
+    return False
+
+
+async def check_task_reminders(bot):
+    """Send any reminder-tasks whose due time has passed, then drop them (one-shot).
+    Plain to-dos (no due_time) are left untouched until the user marks them done."""
+    tasks = load_tasks()
+    now = datetime.now(TZ_BERLIN)
+    remaining = []
+    changed = False
+
+    for task in tasks:
+        due = task.get("due_time")
+        if due:
+            due_dt = datetime.fromisoformat(due)
+            if due_dt <= now:
+                try:
+                    await bot.send_message(chat_id=task["user_id"], text=f"⏰ <b>Reminder:</b> {task['text']}", parse_mode="HTML")
+                except Exception as e:
+                    logging.error(f"Failed to send task reminder {task['id']}: {e}")
+                changed = True
+                continue
+        remaining.append(task)
+
+    if changed:
+        save_tasks(remaining)
+
+
+# ── Fast Enroll guided wizard (date → time → course link) ──────────────────────
+FASTENROLL_ASK_DATE = "Please type the enrollment date (DD.MM.YYYY), or 'today' / 'tomorrow':"
+FASTENROLL_ASK_TIME = "Please type the enrollment time (HH:MM:SS, Europe/Berlin):"
+FASTENROLL_ASK_LINK = "Please paste the course link (or its sem_id):"
+
+
+async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str) -> bool:
+    """If `step` is one of the fast-enroll wizard steps, handle it and return True."""
+    text = update.message.text.strip()
+    state = context.user_data.setdefault("fastenroll_wizard", {})
+
+    if step == "fastenroll_date":
+        today = datetime.now(ZoneInfo("Europe/Berlin")).date()
+        lowered = text.lower()
+        if lowered == "today":
+            date_str = today.strftime("%d.%m.%Y")
+        elif lowered == "tomorrow":
+            date_str = (today + timedelta(days=1)).strftime("%d.%m.%Y")
+        elif re.fullmatch(r"[0-9]{2}\.[0-9]{2}\.[0-9]{4}", text):
+            date_str = text
+        else:
+            await update.message.reply_text(
+                "Please use DD.MM.YYYY, 'today', or 'tomorrow'.",
+                reply_markup=get_main_keyboard(),
+            )
+            return True  # pending_step stays "fastenroll_date" — ask again
+        state["target_date_str"] = date_str
+        context.user_data["pending_step"] = "fastenroll_time"
+        await update.message.reply_text(FASTENROLL_ASK_TIME, reply_markup=get_main_keyboard())
+        return True
+
+    if step == "fastenroll_time":
+        if not re.fullmatch(r"[0-9]{2}:[0-9]{2}:[0-9]{2}", text):
+            await update.message.reply_text(
+                "Please use HH:MM:SS (Europe/Berlin), e.g. 08:30:00.",
+                reply_markup=get_main_keyboard(),
+            )
+            return True  # pending_step stays "fastenroll_time" — ask again
+        state["target_time_str"] = text
+        context.user_data["pending_step"] = "fastenroll_link"
+        await update.message.reply_text(FASTENROLL_ASK_LINK, reply_markup=get_main_keyboard())
+        return True
+
+    if step == "fastenroll_link":
+        sem_id = extract_sem_id(text)
+        chat_id = update.effective_chat.id
+        reply = await schedule_fastenroll_job(
+            chat_id, sem_id, state.get("target_time_str"), state.get("target_date_str"), context
+        )
+        context.user_data.pop("fastenroll_wizard", None)
+        context.user_data.pop("pending_step", None)
+        await update.message.reply_text(reply, reply_markup=get_main_keyboard())
+        return True
+
+    return False
+
+
+async def restore_pending_fastenroll_jobs(app):
+    """Re-schedule fast-enroll jobs that were still pending when the bot last stopped
+    (e.g. VPS reboot or pm2 restart), so a job scheduled for later is not silently lost."""
+    pending = load_pending()
+    for chat_id_str, jobs in pending.items():
+        chat_id = int(chat_id_str)
+        for sem_id, job in jobs.items():
+            target_time_str = job.get("target_time_str")
+            target_date_str = job.get("target_date_str")
+            context = ContextTypes.DEFAULT_TYPE(application=app)
+            logging.info(f"Restoring pending fastenroll job for chat {chat_id}: {sem_id} @ {target_date_str or ''} {target_time_str}")
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=f"🔄 Resuming previously scheduled fast enroll for course {sem_id} at {target_time_str}.")
+            except Exception:
+                logging.warning(f"Could not notify chat {chat_id} about resumed fastenroll job", exc_info=True)
+            task = asyncio.create_task(_run_fastenroll_task(chat_id, sem_id, target_time_str, target_date_str, context))
+            fastenroll_tasks.setdefault(chat_id, {})[sem_id] = task
+
+
 async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else None
@@ -4010,6 +5029,50 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("👀 Watcher started (checks every 2 hours).", disable_notification=True)
     task = asyncio.create_task(watch_loop(chat_id, context))
     watch_tasks[chat_id] = task
+
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Restart the bot process itself (and cleanly shut down the WhatsApp microservice first)."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        await update.message.reply_text("Not authorized to use this bot.")
+        return
+
+    await update.message.reply_text("♻️ Restarting bot...")
+    logging.info(f"Restart requested by user {user_id}.")
+    asyncio.create_task(_restart_process())
+
+
+async def _restart_process():
+    global wa_process
+    # Give the reply above a moment to actually reach Telegram before we tear things down.
+    await asyncio.sleep(0.5)
+
+    if wa_process:
+        logging.info("Stopping WhatsApp microservice before restart...")
+        try:
+            wa_process.terminate()
+            wa_process.wait(timeout=5)
+        except Exception:
+            try:
+                wa_process.kill()
+            except Exception:
+                pass
+
+    # os.execv replaces the current process image in place (same PID), which
+    # works the same whether pm2 is managing us or not - pm2 just sees its
+    # monitored PID stay alive and keeps watching it, no restart-detection
+    # needed. execv also skips atexit handlers, which is why the WhatsApp
+    # subprocess is stopped explicitly above.
+    #
+    # The lock file must still be released here even though the PID will be
+    # identical after execv: acquire_instance_lock() only checks "does a
+    # process with this PID exist", and since our own PID trivially exists,
+    # a stale lock left in place makes the re-exec'd process think another
+    # instance is already running and refuse to start.
+    release_instance_lock()
+    logging.info("Re-executing process for restart...")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4082,9 +5145,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n\n{sys_info}"
 
     keyboard = [
-        [InlineKeyboardButton("📲 Request WA QR", callback_data="request_wa_qr")],
-        [InlineKeyboardButton("✏️ Change WA Group", callback_data="change_wa_group")],
-        [InlineKeyboardButton("🔍 Detect WA Groups", callback_data="detect_wa_groups")],
+        [InlineKeyboardButton("⚡ Fast Enroll", callback_data="fastenroll_menu")],
+        [InlineKeyboardButton("🎓 Exam Registration", callback_data="exam_menu")],
+        [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
+        [InlineKeyboardButton("📱 WhatsApp", callback_data="wa_menu")],
         [InlineKeyboardButton("📅 Change iCal Link", callback_data="change_ical_link")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -4166,24 +5230,35 @@ async def main():
         # Command & Callback handlers
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("check", check_command))
+        app.add_handler(CommandHandler("fastenroll", fastenroll_command))
+        app.add_handler(CommandHandler("fastenroll_list", fastenroll_list_command))
+        app.add_handler(CommandHandler("fastenroll_cancel", fastenroll_cancel_command))
+        app.add_handler(CallbackQueryHandler(fastenroll_cancel_callback, pattern="^fastenroll_cancel\\|.*$"))
         app.add_handler(CommandHandler("watch", watch))
         app.add_handler(CommandHandler("status", status_command))
         app.add_handler(CommandHandler("menu", menu_command))
+        app.add_handler(CommandHandler("restart", restart_command))
         
         app.add_handler(CallbackQueryHandler(show_last_messages, pattern="^show_last_messages$"))
-        app.add_handler(CallbackQueryHandler(forward_to_whatsapp, pattern="^forward_wa$"))
+        app.add_handler(CallbackQueryHandler(handle_forward_wa_ask, pattern="^forward_wa$"))
+        app.add_handler(CallbackQueryHandler(forward_to_whatsapp, pattern="^forward_wa_confirm$"))
+        app.add_handler(CallbackQueryHandler(handle_forward_wa_cancel, pattern="^forward_wa_cancel$"))
         app.add_handler(CallbackQueryHandler(show_last_announcements, pattern="^show_last_announcements$"))
         app.add_handler(CallbackQueryHandler(show_last_files, pattern="^show_last_files$"))
         app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
-        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|change_wa_group|detect_wa_groups|change_ical_link)$"))
+        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|force_wa_qr|change_wa_group|detect_wa_groups|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu)$"))
+        app.add_handler(CallbackQueryHandler(handle_exam_buttons, pattern="^(exam_menu|exam_noop|exam_cancel|exam_ask\\|.*|exam_do\\|.*)$"))
         app.add_handler(CallbackQueryHandler(set_wa_group_handler, pattern="^set_wa_group\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_today, pattern="^calendar_today$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_weekly, pattern="^calendar_weekly$"))
+        app.add_handler(CallbackQueryHandler(handle_exam_dates_list, pattern="^exam_dates_list$"))
+        app.add_handler(CallbackQueryHandler(handle_all_exam_dates, pattern="^exam_dates_all$"))
+        app.add_handler(CallbackQueryHandler(handle_transcript_summary, pattern="^transcript_summary$"))
+        app.add_handler(CallbackQueryHandler(handle_task_buttons, pattern="^(task_add|task_list|task_done\\|.*|task_delete\\|.*)$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern="^calendar_week\|.*$"))
         app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^menu_nav\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_selection))
 
-        app.add_handler(MessageHandler(filters.REPLY & filters.TEXT, handle_settings_reply))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))
 
         # Explicitly initialize and start the application
@@ -4193,6 +5268,8 @@ async def main():
         logging.info("🚀 Starting unified watcher...")
         # Run watcher in background task
         asyncio.create_task(start_unified_watcher(app))
+
+        await restore_pending_fastenroll_jobs(app)
 
         logging.info("🤖 Starting Telegram bot polling...")
         await app.updater.start_polling(drop_pending_updates=True)
@@ -4228,18 +5305,15 @@ async def main():
 
 if __name__ == "__main__":
     import asyncio
-    import subprocess
     import atexit
-    import os
-    import sys
-    
+
     # Start WhatsApp microservice automatically
     wa_service_dir = os.path.join(os.path.dirname(__file__), "whatsapp_service")
     if os.path.exists(wa_service_dir):
         logging.info("Starting WhatsApp microservice...")
         # Start node directly instead of npm via shell to avoid zombie processes on restart
         wa_process = subprocess.Popen(["node", "server.js"], cwd=wa_service_dir)
-        
+
         def cleanup_wa():
             logging.info("Stopping WhatsApp microservice...")
             wa_process.terminate()

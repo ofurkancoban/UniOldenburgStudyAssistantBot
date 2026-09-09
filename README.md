@@ -49,6 +49,21 @@ A beautiful, emoji-rich menu with:
 - Full allergen and additive guide.
 - **Smart Filtering**: Identification of Vegan (🌿 V+), Vegetarian (🥗 V), and meat types.
 
+### 🎓 Exam & Grade Intelligence (StuMS/HISinOne)
+The bot goes beyond Stud.IP and reverse-engineers the university's separate **StuMS/HISinOne** exam portal to close the entire loop — *register → remind → sit the exam → get the result*:
+*   **📖 Registration Watcher**: Detects the moment an exam's registration window opens, and warns you **7 / 3 / 1 days** before it closes.
+*   **✅❌ Register / Deregister In-Chat**: Browse open registrations and your current ones via **"🎓 Exam Registration"**, and (de)register with one tap — a confirmation step guards against accidental taps.
+*   **📅 Exam Date Reminders**: Once registered, get pinged **3 / 1 / 0 days** before the exam, plus a heads-up a few hours before if a start time is set.
+*   **🏆 Grade Notifications**: The instant a result is released (passed / not passed), you get a private message with your grade — and a separate, grade-**free** announcement that's safe to forward to a shared WhatsApp group.
+*   **📜 Transcript Summary**: A running credit-weighted average grade and total ECTS, computed from your finalized results (**"📜 Transcript"** button).
+*   **📚 My Exam Dates vs. 📋 All Exams**: "My Exam Dates" matches your active Stud.IP courses to their real StuMS module codes (name-matching alone is unreliable across the two systems) so you only see what's relevant; "All Exams" lists every upcoming date across your whole curriculum.
+
+### ✅ Personal Tasks & Reminders
+A lightweight to-do list that lives inside the bot:
+*   Add a plain **to-do** or a **timed reminder** in free text — `tomorrow 15:00`, `in 2 hours`, `20.09 09:00`.
+*   Manage everything from **"📋 My Tasks"**: mark done, delete, or cancel a pending reminder.
+*   Reminders fire automatically once due — no forced-reply prompts, so the bot's keyboard never disappears mid-flow.
+
 ---
 
 ## 🛠️ Installation & Deployment
@@ -103,7 +118,18 @@ PORT=3838  # Port for the WhatsApp Microservice
 | `/start` | Start the bot and login. |
 | `/menu` | The main hub. Access Courses, Files, and Calendar. |
 | `/check` | Manual sync of all watchers (Files, News, Posts). |
-| `/status` | View system health, uptime, last sync timestamps, and **request WhatsApp QR code / change target WhatsApp group**. |
+| `/status` | View system health, uptime, last sync timestamps, and access **Fast Enroll, Exam Registration, Transcript, and WhatsApp settings**. |
+
+### ⌨️ Persistent Keyboard
+
+| Button | Action |
+| :--- | :--- |
+| ⬇️ Files | Browse your courses and download files. |
+| 🔁 Check | Manual sync of all watchers. |
+| ℹ️ Status | Bot health + Fast Enroll / Exam Registration / Transcript / WhatsApp submenus. |
+| 🍽️ Menu | Today's Mensa menu. |
+| ✅ Tasks | Add or manage personal to-dos and reminders. |
+| 📅 Calendar | Today's schedule, with **📆 Week Plan** and **📚 My Exam Dates** shortcuts. |
 
 ---
 
@@ -113,6 +139,9 @@ PORT=3838  # Port for the WhatsApp Microservice
 2. **First Time Login (QR)**: The bot will generate a WhatsApp Web QR code and send it to you via Telegram as an image. Scan it with your phone's WhatsApp (Linked Devices).
 3. **Change Target Group**: Use the `/status` menu and click **"✏️ Change WA Group"** to dynamically change the group where messages are forwarded.
 4. **Session Persistence**: Your session is saved securely. If you need a new QR code (e.g., you logged out), simply tap **"📲 Request WA QR"** in the `/status` menu.
+
+> [!TIP]
+> Every **"📲 Forward to WA"** button requires a **Yes/No confirmation** tap before anything is sent, to prevent an accidental forward into a shared group. Grade notifications go a step further: the message with your actual grade never carries a forward button at all — only a separate, grade-free announcement does.
 
 ---
 
@@ -129,10 +158,15 @@ graph TD
     E --> G[Stud.IP JSON/HTML API]
     F --> G
     G --> H[(Persistent Cache)]
+    C --> K[exam_reminder.py]
+    K -->|Shared SSO session| L[StuMS / HISinOne Portal]
+    L --> H
     C -.->|Forward & Status| I[Node.js WhatsApp Microservice]
     D -.->|Forward & Status| I
     I --> J[WhatsApp Web]
 ```
+
+> **exam_reminder.py** shares the same authenticated session as `studip_bot.py` (Stud.IP's SSO trust extends to the StuMS/HISinOne exam portal) to track registrations, exam dates, and grades — no separate login required.
 
 ---
 

@@ -118,12 +118,53 @@ class StudIPSession:
                  return True
 
             self.logger.info("Starting fresh async browser-less login (NetIQ optimized)...")
-            
+
             elearn = "https://elearning.uni-oldenburg.de"
             start_url = f"{elearn}/dispatch.php/my_courses"
             login_link_cancel = f"{elearn}/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
-            
-            async def follow_redirects(url, text, tag, depth=0):
+
+            # 1. Prime the session before triggering the login flow.
+            async with self.session.get(start_url) as r:
+                pass
+
+            try:
+                await self._run_sso_flow(login_link_cancel, referer=start_url)
+            except RuntimeError as e:
+                self.logger.error(f"Login failed: {e}")
+                return False
+
+            await self.save_cookies()
+            self.logger.info("✅ Login successful.")
+            return True
+
+    async def sso_handoff(self, entry_url: str, success_host: str, referer: str = None) -> str:
+        """Run the same NetIQ SSO state machine as `login()`, but to reach a different
+        relying party (e.g. stums.uni-oldenburg.de) instead of elearning.uni-oldenburg.de.
+
+        A valid elearning session does not guarantee this succeeds in one plain
+        HTTP redirect: the underlying NetIQ SSO trust can have its own, independent
+        timeout, in which case this transparently falls through to the very same
+        credential-entry steps `login()` uses (Ecom fields, TOTP/contract page).
+
+        Returns the final URL once `success_host` is reached, or raises RuntimeError.
+        """
+        await self.ensure_session()
+
+        async def is_done(url, _text):
+            return urlparse(url).netloc == success_host
+
+        final_url, _ = await self._run_sso_flow(entry_url, referer=referer, is_done=is_done)
+        return final_url
+
+    async def _run_sso_flow(self, entry_url: str, referer: str = None, is_done=None):
+        """Shared NetIQ SSO redirect + credential-entry state machine.
+
+        `is_done(url, text)` decides when the flow has reached its destination;
+        defaults to `self.is_logged_in()` (elearning-specific) when omitted, which
+        is what `login()` uses. Returns (final_url, final_text) on success, raises
+        RuntimeError if the flow gets stuck or exhausts its step budget.
+        """
+        async def follow_redirects(url, text, tag, depth=0):
                 if depth > 20: 
                     self.logger.warning(f"[{tag}] Max redirect depth reached at {url}")
                     return url, text
@@ -191,100 +232,95 @@ class StudIPSession:
                 self.logger.debug(f"[{tag}] No more redirects detected at {url}")
                 return url, text
 
-            # Helper for form submission
-            def get_payload(soup, overrides=None):
-                form = soup.find("form")
-                if not form: return None, None, None
-                action = form.get("action") or ""
-                method = (form.get("method") or "POST").upper()
-                inputs = {}
-                for inp in form.find_all("input"):
-                    name = inp.get("name")
-                    if name:
-                        inputs[name] = inp.get("value") or ""
-                if overrides:
-                    inputs.update(overrides)
-                return action, method, inputs
+        # Helper for form submission
+        def get_payload(soup, overrides=None):
+            form = soup.find("form")
+            if not form: return None, None, None
+            action = form.get("action") or ""
+            method = (form.get("method") or "POST").upper()
+            inputs = {}
+            for inp in form.find_all("input"):
+                name = inp.get("name")
+                if name:
+                    inputs[name] = inp.get("value") or ""
+            if overrides:
+                inputs.update(overrides)
+            return action, method, inputs
 
-            # 1. Start flow
-            async with self.session.get(start_url) as r:
-                curr_url, curr_text = str(r.url), await r.text()
-            
-            async with self.session.get(login_link_cancel, headers={"Referer": start_url}) as r:
-                curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "entry")
+        async def check_done(url, text):
+            if is_done:
+                return await is_done(url, text)
+            return await self.is_logged_in()
 
-            # 2. Main Login Loop
-            prev_text = ""
-            for i in range(15):
-                if curr_text == prev_text:
-                    self.logger.warning("Page content stayed identical. Breaking loop.")
-                    break
-                prev_text = curr_text
-                
-                soup = BeautifulSoup(curr_text, "html.parser")
-                page_text = curr_text.lower()
-                
-                # Dump for debug
-                with open(f"/tmp/login_step_{i}.html", "w") as f:
-                    f.write(f"URL: {curr_url}\n\n" + curr_text)
-                self.logger.info(f"Step {i}: URL {curr_url}")
-                
-                if await self.is_logged_in():
-                    self.logger.info("✅ Login successful.")
-                    await self.save_cookies()
-                    return True
+        # 1. Entry
+        async with self.session.get(entry_url, headers={"Referer": referer} if referer else None) as r:
+            curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "entry")
 
-                # Identification Logic
-                
-                # A. Legacy Login Page (Ecom fields)
-                if "ecom_user_id" in page_text and "ecom_password" not in page_text:
-                    self.logger.info(f"Step {i+1}: Username Submission")
-                    action, method, payload = get_payload(soup, {"Ecom_User_ID": self.username, "loginButton2": "true"})
-                    action = urljoin(curr_url, action)
-                    async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
-                        curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "user")
-                    continue
+        # 2. Main state-machine loop
+        prev_text = ""
+        for i in range(15):
+            if curr_text == prev_text:
+                self.logger.warning("Page content stayed identical. Breaking loop.")
+                break
+            prev_text = curr_text
 
-                if "ecom_password" in page_text:
-                    self.logger.info(f"Step {i+1}: Password Submission (Legacy)")
-                    action, method, payload = get_payload(soup, {"Ecom_Password": self.password, "loginButton2": "true"})
-                    action = urljoin(curr_url, action)
-                    async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
-                        curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "pass")
-                    continue
+            soup = BeautifulSoup(curr_text, "html.parser")
+            page_text = curr_text.lower()
 
-                # B. contract Page (Unified)
-                if "/osp/a/TOP/auth/app/contract" in curr_url or "/osp/a/TOP/auth/app/contract" in curr_text:
-                    title_area = soup.find(id="authenticationAreaTitle")
-                    title_text = title_area.get_text().lower() if title_area else ""
-                    # Check if it's OTP based on title OR specific text
-                    is_otp = any(x in title_text for x in ["one time", "otp", "code", "authenticator"])
-                    # If title doesn't help, check whole page but more conservatively
-                    if not is_otp and not ("password" in title_text):
-                        is_otp = any(x in page_text for x in ["one time password", "totp code", "google authenticator"])
+            self.logger.info(f"Step {i}: URL {curr_url}")
 
-                    if is_otp:
-                        self.logger.info(f"Step {i+1}: TOTP Submission (Contract)")
-                        token = self._get_totp_token()
-                        action, method, payload = get_payload(soup, {"nffc": token, "loginButton2": "Next"})
-                    else:
-                        self.logger.info(f"Step {i+1}: Password Submission (Contract)")
-                        action, method, payload = get_payload(soup, {"nffc": self.password, "loginButton2": "Next"})
-                    
-                    action = urljoin(curr_url, action)
-                    async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
-                        curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "contract")
-                    continue
+            if await check_done(curr_url, curr_text):
+                return curr_url, curr_text
 
-                # C. Unhandled
-                self.logger.warning(f"Step {i}: Unhandled state. URL: {curr_url}")
-                if i > 10: break
+            # Identification Logic
 
-            if await self.is_logged_in():
-                 await self.save_cookies()
-                 return True
-            self.logger.error("Login failed after max steps.")
-            return False
+            # A. Legacy Login Page (Ecom fields)
+            if "ecom_user_id" in page_text and "ecom_password" not in page_text:
+                self.logger.info(f"Step {i+1}: Username Submission")
+                action, method, payload = get_payload(soup, {"Ecom_User_ID": self.username, "loginButton2": "true"})
+                action = urljoin(curr_url, action)
+                async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
+                    curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "user")
+                continue
+
+            if "ecom_password" in page_text:
+                self.logger.info(f"Step {i+1}: Password Submission (Legacy)")
+                action, method, payload = get_payload(soup, {"Ecom_Password": self.password, "loginButton2": "true"})
+                action = urljoin(curr_url, action)
+                async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
+                    curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "pass")
+                continue
+
+            # B. contract Page (Unified)
+            if "/osp/a/TOP/auth/app/contract" in curr_url or "/osp/a/TOP/auth/app/contract" in curr_text:
+                title_area = soup.find(id="authenticationAreaTitle")
+                title_text = title_area.get_text().lower() if title_area else ""
+                # Check if it's OTP based on title OR specific text
+                is_otp = any(x in title_text for x in ["one time", "otp", "code", "authenticator"])
+                # If title doesn't help, check whole page but more conservatively
+                if not is_otp and not ("password" in title_text):
+                    is_otp = any(x in page_text for x in ["one time password", "totp code", "google authenticator"])
+
+                if is_otp:
+                    self.logger.info(f"Step {i+1}: TOTP Submission (Contract)")
+                    token = self._get_totp_token()
+                    action, method, payload = get_payload(soup, {"nffc": token, "loginButton2": "Next"})
+                else:
+                    self.logger.info(f"Step {i+1}: Password Submission (Contract)")
+                    action, method, payload = get_payload(soup, {"nffc": self.password, "loginButton2": "Next"})
+
+                action = urljoin(curr_url, action)
+                async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
+                    curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "contract")
+                continue
+
+            # C. Unhandled
+            self.logger.warning(f"Step {i}: Unhandled state. URL: {curr_url}")
+            if i > 10: break
+
+        if await check_done(curr_url, curr_text):
+            return curr_url, curr_text
+        raise RuntimeError(f"SSO flow did not complete; stuck at {curr_url}")
 
     async def get(self, url, **kwargs):
         await self.ensure_session()

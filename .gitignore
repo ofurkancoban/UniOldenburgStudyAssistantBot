@@ -19,6 +19,9 @@ messages_cache.json
 forum_cache.json
 link_cache.json
 studip_cookies.json
+fastenroll_pending.json
+exam_reminder_cache.json
+tasks_cache.json
 .bot_instance.lock
 
 # WhatsApp Microservice
