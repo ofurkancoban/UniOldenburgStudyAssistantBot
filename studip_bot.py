@@ -30,7 +30,7 @@ from zoneinfo import ZoneInfo
 from telegram.constants import ChatAction
 from asyncio import CancelledError
 from studip_session import StudIPSession
-from fast_enroll import run_fast_enroll, load_pending, list_pending_jobs, save_pending_job, clear_pending_job
+from fast_enroll import run_fast_enroll, load_pending, list_pending_jobs, save_pending_job, clear_pending_job, get_semester_options, get_open_courses, enroll_now, decline_course, get_course_type_map
 from exam_reminder import check_exam_reminders, check_exam_date_reminders, check_grade_reminders, get_open_exam_registrations, get_registered_exams, get_registered_exam_schedule, get_all_exam_dates, filter_exams_by_module_codes, submit_exam_action, get_grades, compute_transcript_summary
 
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
@@ -402,6 +402,41 @@ def save_tasks(tasks: list) -> None:
         logging.error(f"Could not save tasks cache: {e}")
 
 
+DEFAULT_SEMESTER_CACHE_PATH = "default_semester.json"
+
+
+def load_default_semester() -> dict:
+    """Return {"id": ..., "label": ...} for the semester picked via /status's
+    "Set Default Semester" button, or {} if none has been set — in which case
+    Files/Browse Courses/Sign Out each fall back to showing their own semester
+    picker as before."""
+    if os.path.exists(DEFAULT_SEMESTER_CACHE_PATH):
+        try:
+            with open(DEFAULT_SEMESTER_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load default semester: {e}")
+    return {}
+
+
+def save_default_semester(semester_id: str, label: str) -> None:
+    try:
+        tmp = DEFAULT_SEMESTER_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"id": semester_id, "label": label}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, DEFAULT_SEMESTER_CACHE_PATH)
+    except Exception as e:
+        logging.error(f"Could not save default semester: {e}")
+
+
+def clear_default_semester() -> None:
+    try:
+        if os.path.exists(DEFAULT_SEMESTER_CACHE_PATH):
+            os.remove(DEFAULT_SEMESTER_CACHE_PATH)
+    except Exception as e:
+        logging.error(f"Could not clear default semester: {e}")
+
+
 # ── logging setup ──────────────────────────────────────────────────────────────
 LOG_FILE = "watch_log.txt"
 logging.basicConfig(
@@ -733,24 +768,44 @@ async def stop_unified_watcher():
 
 
 # ── course listing ────────────────────────────────────────────────────────────
-async def list_courses():
+async def list_courses(semester_id: str = None):
     """
     Extract courses from the 'my_courses' page.
     Uses multi-method strategy: Vuex Store analysis (modern) and DOM Scrapy (legacy).
+
+    If semester_id is given, first switches the account's my_courses semester
+    filter to that specific semester (via my_courses/set_semester?sem_select=
+    <id>, the same request the page's own semester dropdown makes) so the
+    listing that follows is scoped to it, instead of whatever the account's
+    filter happened to be left on last.
     """
     session = await login_studip()
     if session is None:
         logging.error("❌ Failed to get session for list_courses")
         return []
 
+    if semester_id:
+        try:
+            async with await session.get(
+                "https://elearning.uni-oldenburg.de/dispatch.php/my_courses/set_semester",
+                params={"sem_select": semester_id},
+            ) as r:
+                await r.text()
+        except Exception as e:
+            logging.warning(f"list_courses: failed to switch semester filter: {e}")
+
     all_courses_dict = {}
-    
-    # Try multiple attempts or varying URLs if needed
+
+    # Try multiple attempts or varying URLs if needed. The "all semesters"
+    # fallback would defeat a specific semester_id filter set just above, so
+    # it's only used when no specific semester was requested.
     urls = [
+        "https://elearning.uni-oldenburg.de/dispatch.php/my_courses",
+    ] if semester_id else [
         "https://elearning.uni-oldenburg.de/dispatch.php/my_courses",
         "https://elearning.uni-oldenburg.de/dispatch.php/my_courses?semester_filter=all"
     ]
-    
+
     for url in urls:
         logging.info(f"Attempting course extraction from: {url}")
         try:
@@ -2608,7 +2663,14 @@ async def check_new_messages(bot, chat_id, silent: bool = False):
                 f"{body_text}\n"
                 "━━━━━━━━━━━━━━━━━"
             )
-            markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+            # Auto-generated "Enrolment in course" notifications aren't the kind
+            # of thing anyone forwards to the WhatsApp group, so skip the button
+            # for those rather than offering an action that's never used.
+            subject = (msg.get("title") or "").strip()
+            if subject.lower().startswith("enrolment in course"):
+                markup = None
+            else:
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
             await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup)
         return True
     except Exception as e:
@@ -2995,13 +3057,14 @@ def _breadcrumb(user_id: int) -> str:
         return f"📂 *{chain}*"
 
 
-async def _send_courses_menu(query_or_message, courses):
-    """Send main course list as buttons."""
+async def _send_courses_menu(query_or_message, courses, extra_buttons=None):
+    """Send main course list as buttons. extra_buttons, if given, is a list of
+    keyboard rows appended after the course rows (e.g. a "Change Semester" row)."""
     import html as html_lib
-    
+
     if not courses:
         text = "⚠️ <b>No courses found for the current semester.</b>\nPlease check your semester filter settings on the Stud.IP website."
-        keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="show_menu")]]
+        keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="show_menu")]] + (extra_buttons or [])
         reply_markup = InlineKeyboardMarkup(keyboard)
         if hasattr(query_or_message, "edit_message_text"):
             await query_or_message.edit_message_text(text, parse_mode="HTML", reply_markup=reply_markup)
@@ -3017,16 +3080,16 @@ async def _send_courses_menu(query_or_message, courses):
         text = f"📚 <b>Select a course (Showing first {MAX_COURSES}):</b>"
     else:
         text = "📚 <b>Select a course to browse its files:</b>"
-    
+
     logging.info(f"Sending courses menu with {len(courses)} buttons.")
-    
+
     keyboard = []
     for name, cid in courses:
         # Avoid extremely long names just in case
         clean_name = html_lib.escape(name[:64])
         keyboard.append([InlineKeyboardButton(f"📘 {clean_name}", callback_data=f"course|{cid}")])
 
-
+    keyboard.extend(extra_buttons or [])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -3040,12 +3103,98 @@ async def _send_courses_menu(query_or_message, courses):
             logging.error(f"FATAL: Keyboard still too long for {len(courses)} courses! {e}")
             # Dynamic fallback: send even fewer
             if len(courses) > 20:
-                await _send_courses_menu(query_or_message, courses[:20])
+                await _send_courses_menu(query_or_message, courses[:20], extra_buttons=extra_buttons)
             else:
                 if hasattr(query_or_message, "reply_text"):
                     await query_or_message.reply_text("⚠️ Too many courses to display in one menu. Please select a specific semester on the website.")
         else:
             raise e
+
+
+async def _reply_or_edit(sender, text, reply_markup=None, parse_mode=None):
+    """Send text as a new message, or edit sender's message in place when
+    sender is a CallbackQuery (has edit_message_text). Stepping through a
+    semester picker and its resulting list this way reuses one message
+    instead of stacking new ones — stacked messages made it easy to mis-tap a
+    stale button left over from an earlier list (e.g. picking a new semester
+    while the old course list's "Enroll" buttons were still live underneath,
+    accidentally enrolling from the old list instead)."""
+    kwargs = {}
+    if reply_markup is not None:
+        kwargs["reply_markup"] = reply_markup
+    if parse_mode is not None:
+        kwargs["parse_mode"] = parse_mode
+    if hasattr(sender, "edit_message_text"):
+        try:
+            await sender.edit_message_text(text, **kwargs)
+            return
+        except Exception as e:
+            logging.debug(f"_reply_or_edit: edit failed, falling back to reply: {e}")
+    await sender.reply_text(text, **kwargs)
+
+
+async def _show_semester_picker(sender, callback_prefix: str, prompt: str):
+    """Fetch semesters and show a picker whose buttons carry
+    "<callback_prefix>|<semester_id>". Shared by the three "browse" entry
+    points (Files/Enroll/Sign Out) for their initial pick, and by the
+    "📆 Change Semester" button they each offer afterwards to override it."""
+    try:
+        session = await login_studip()
+        semesters = await get_semester_options(session)
+    except Exception as e:
+        logging.error(f"_show_semester_picker: failed to fetch semesters: {e}")
+        await _reply_or_edit(sender, f"❌ Could not load semesters: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
+        return
+
+    if not semesters:
+        await _reply_or_edit(sender, "❌ Could not find any semesters.", reply_markup=InlineKeyboardMarkup([]))
+        return
+
+    keyboard = [[InlineKeyboardButton(label, callback_data=f"{callback_prefix}|{sid}")] for sid, label in semesters]
+    await _reply_or_edit(sender, prompt, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def _render_files_courses_for_semester(sender, semester_id: str):
+    """List a given semester's courses so the student can pick one to browse
+    its files. Shared by handle_files_semester_pick (explicit picker) and
+    handle_files_browse (when a default semester is set, skipping the picker)."""
+    try:
+        courses = await list_courses(semester_id=semester_id)
+    except Exception as e:
+        logging.error(f"_render_files_courses_for_semester: failed to fetch courses: {e}")
+        await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
+        return
+
+    change_semester_row = [[InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|files")]]
+    await _send_courses_menu(sender, courses, extra_buttons=change_semester_row)
+
+
+async def handle_files_browse(sender):
+    """Handle the "⬇️ Files" reply-keyboard button. If a default semester is
+    set (via /status's "Set Default Semester"), skip straight to that
+    semester's course list; otherwise show a semester picker first, instead of
+    always defaulting to whatever semester the account's my_courses filter
+    happened to be on."""
+    default = load_default_semester()
+    if default.get("id"):
+        await _render_files_courses_for_semester(sender, default["id"])
+        return
+
+    await _show_semester_picker(sender, "files_sem", "⬇️ Pick a semester to browse its courses' files:")
+
+
+async def handle_files_semester_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle files_sem|<id> callback — list that semester's courses so the
+    student can pick one to browse its files."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    semester_id = query.data.split("|", 1)[1]
+    await _render_files_courses_for_semester(query, semester_id)
 
 
 async def send_folder(query, files, cid, user_id, current_url=None):
@@ -3919,7 +4068,9 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             data = ["calendar"]
         elif "✅" in text or "task" in text.lower():
             data = ["tasks"]
-        elif "⬇️" in text or "start" in text.lower():
+        elif "⬇️" in text:
+            data = ["files"]
+        elif "start" in text.lower():
             data = ["start"]
         elif "🔁" in text or "check" in text.lower():
             data = ["check"]
@@ -3952,6 +4103,8 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             await send_tasks_menu(sender)
         elif data[0] == "start":
             await start(update, context)
+        elif data[0] == "files":
+            await handle_files_browse(sender)
         elif data[0] == "check":
             await check_command(update, context)
         elif data[0] == "status":
@@ -5169,6 +5322,426 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+async def handle_course_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The module-name header rows in the grouped course list are buttons only
+    so they render as visual separators; tapping one does nothing."""
+    await update.callback_query.answer()
+
+
+async def handle_browse_courses(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle browse_courses callback. If a default semester is set (via
+    /status's "Set Default Semester"), skip straight to that semester's open
+    courses; otherwise show a semester picker first, listing the semesters
+    available in the student's own degree-programme module directory."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    default = load_default_semester()
+    if default.get("id"):
+        await _render_open_courses_for_semester(query, default["id"])
+        return
+
+    await _show_semester_picker(query, "course_sem", "📚 Pick a semester to see courses currently open for enrolment:")
+
+
+async def _render_open_courses_for_semester(sender, semester_id: str):
+    """List a given semester's currently open-for-enrolment courses within the
+    student's own degree programme. Shared by handle_course_semester_pick
+    (explicit picker) and handle_browse_courses (when a default semester is
+    set, skipping the picker)."""
+    # Explicitly clear the keyboard here: editing text alone leaves whatever
+    # buttons were on the previous message (e.g. the prior semester's "Enroll"
+    # rows) live and tappable during this network wait, which let an
+    # impatient tap land on stale "Enroll" buttons and silently enroll in the
+    # wrong course from the old list.
+    await _reply_or_edit(sender, "📚 Checking which courses are open for enrolment... this may take a moment.", reply_markup=InlineKeyboardMarkup([]))
+
+    try:
+        session = await login_studip()
+        open_courses = await get_open_courses(session, semester_id=semester_id)
+        # get_open_courses() only reads each component's own "unrestricted
+        # access" badge on the module listing page — it doesn't know which of
+        # those the student is already enrolled in, so that's cross-checked
+        # here against the student's own course list before displaying.
+        enrolled_cids = {cid for _, cid in await list_courses(semester_id=semester_id)}
+        open_courses = [c for c in open_courses if c["sem_id"] not in enrolled_cids]
+    except Exception as e:
+        logging.error(f"_render_open_courses_for_semester: failed to fetch open courses: {e}")
+        await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
+        return
+
+    change_semester_row = [InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|enroll")]
+
+    if not open_courses:
+        await _reply_or_edit(
+            sender,
+            "ℹ️ No courses in your degree programme are currently open for enrolment in that semester.",
+            reply_markup=InlineKeyboardMarkup([change_semester_row]),
+        )
+        return
+
+    # Group by module (a module can require both a Lecture and a separate
+    # Seminar/Exercise, each its own enrolment) so the two aren't just two
+    # unrelated-looking rows in a flat list.
+    grouped = {}
+    for c in open_courses:
+        grouped.setdefault(c["module"], []).append(c)
+
+    # Circles first, then squares once a semester has more modules than
+    # circle colors — same color on a module's header and every one of its
+    # components ties them together at a glance.
+    color_palette = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚫️", "⚪️", "🟤",
+                      "🟥", "🟧", "🟨", "🟩", "🟦", "🟪", "⬛", "⬜", "🟫"]
+
+    keyboard = []
+    for i, (module_label, courses) in enumerate(grouped.items()):
+        color = color_palette[i % len(color_palette)]
+        # "Module:" distinguishes this header row (a non-tappable group label,
+        # callback_data="course_noop") from the actual Lecture/Seminar/Exercise
+        # buttons below it, which otherwise looked identical apart from lacking
+        # a type prefix.
+        keyboard.append([InlineKeyboardButton(f"{color} Module: {module_label[:48]}", callback_data="course_noop")])
+        for c in courses:
+            keyboard.append([InlineKeyboardButton(
+                f"{color} {c['type']}: {c['course'][:45]}",
+                callback_data=f"course_enroll_ask|{c['sem_id']}",
+            )])
+
+    keyboard.append([change_semester_row[0]])
+
+    await _reply_or_edit(
+        sender,
+        f"📚 {len(open_courses)} course component(s) open for enrolment, grouped by module.\n"
+        "A module can require both a Lecture and a separate Seminar/Exercise — each is enrolled in individually. Tap one to enroll:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_course_semester_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle course_sem|<id> callback — list this semester's currently
+    open-for-enrolment courses within the student's own degree programme."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    semester_id = query.data.split("|", 1)[1]
+    await _render_open_courses_for_semester(query, semester_id)
+
+
+async def handle_course_enroll_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm before actually submitting an enrolment request."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    sem_id = query.data.split("|", 1)[1]
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, enroll", callback_data=f"course_enroll_confirm|{sem_id}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="course_enroll_cancel"),
+    ]])
+    await query.message.reply_text("⚠️ Enroll in this course now?", reply_markup=keyboard)
+
+
+async def handle_course_enroll_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    sem_id = query.data.split("|", 1)[1]
+    await query.edit_message_text("⏳ Enrolling...")
+
+    try:
+        session = await login_studip()
+        success, message = await enroll_now(session, sem_id)
+    except Exception as e:
+        logging.error(f"handle_course_enroll_confirm: enroll failed: {e}")
+        await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
+        return
+
+    if success:
+        await query.message.reply_text("✅ Enrolled successfully!")
+    else:
+        await query.message.reply_text(f"❌ {message}")
+
+
+async def handle_course_enroll_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Cancelled")
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    await query.edit_message_text("Cancelled.")
+
+
+async def handle_browse_my_courses_for_deenroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle browse_my_courses_deenroll callback. If a default semester is
+    set (via /status's "Set Default Semester"), skip straight to that
+    semester's enrolled courses; otherwise show a semester picker first."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    default = load_default_semester()
+    if default.get("id"):
+        await _render_enrolled_courses_for_semester(query, default["id"])
+        return
+
+    await _show_semester_picker(query, "deenroll_sem", "🚪 Pick a semester to see its enrolled courses:")
+
+
+async def _render_enrolled_courses_for_semester(sender, semester_id: str):
+    """List a given semester's currently enrolled courses so the student can
+    pick one to sign out of. Shared by handle_deenroll_semester_pick (explicit
+    picker) and handle_browse_my_courses_for_deenroll (when a default
+    semester is set, skipping the picker)."""
+    # Explicitly clear the keyboard here: editing text alone leaves whatever
+    # buttons were on the previous message (e.g. the prior semester's "Sign
+    # out" rows) live and tappable during this network wait, which let an
+    # impatient tap land on a stale "Sign out" button for the wrong course.
+    await _reply_or_edit(sender, "📚 Loading your enrolled courses for that semester...", reply_markup=InlineKeyboardMarkup([]))
+
+    try:
+        courses = await list_courses(semester_id=semester_id)
+    except Exception as e:
+        logging.error(f"_render_enrolled_courses_for_semester: failed to fetch courses: {e}")
+        await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
+        return
+
+    change_semester_row = InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|deenroll")
+
+    if not courses:
+        await _reply_or_edit(
+            sender,
+            "ℹ️ No enrolled courses found for that semester.",
+            reply_markup=InlineKeyboardMarkup([[change_semester_row]]),
+        )
+        return
+
+    # Best-effort: label each course by Lecture/Exercise/Seminar/etc. using the
+    # same module scrape browse-courses uses. Only covers courses that belong
+    # to one of the student's own degree-programme modules for that semester —
+    # older/other courses (e.g. a language course) just show without a type
+    # prefix rather than failing the whole list.
+    type_map = {}
+    try:
+        session = await login_studip()
+        type_map = await get_course_type_map(session, semester_id=semester_id)
+    except Exception as e:
+        logging.warning(f"_render_enrolled_courses_for_semester: type lookup failed, showing list without types: {e}")
+
+    keyboard = []
+    for name, cid in courses:
+        course_type = type_map.get(cid)
+        label = f"🚪 [{course_type}] {name[:45]}" if course_type else f"🚪 {name[:55]}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"course_deenroll_ask|{cid}")])
+    keyboard.append([change_semester_row])
+    await _reply_or_edit(
+        sender,
+        "📚 Your enrolled courses for that semester. Tap one to sign out of it:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_deenroll_semester_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle deenroll_sem|<id> callback — list that semester's currently
+    enrolled courses so the student can pick one to sign out of."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    semester_id = query.data.split("|", 1)[1]
+    await _render_enrolled_courses_for_semester(query, semester_id)
+
+
+async def handle_course_deenroll_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm before actually signing the student out of a course."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    cid = query.data.split("|", 1)[1]
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, sign out", callback_data=f"course_deenroll_confirm|{cid}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="course_deenroll_cancel"),
+    ]])
+    await query.message.reply_text("⚠️ Sign out of this course now? This withdraws your enrolment.", reply_markup=keyboard)
+
+
+async def handle_course_deenroll_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    cid = query.data.split("|", 1)[1]
+    await query.edit_message_text("⏳ Signing out...")
+
+    try:
+        session = await login_studip()
+        success, message = await decline_course(session, cid)
+    except Exception as e:
+        logging.error(f"handle_course_deenroll_confirm: decline failed: {e}")
+        await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
+        return
+
+    if success:
+        await query.message.reply_text("✅ Signed out of the course successfully!")
+    else:
+        await query.message.reply_text(f"❌ {message}")
+
+
+async def handle_course_deenroll_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Cancelled")
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    await query.edit_message_text("Cancelled.")
+
+
+async def handle_enrollment_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle enrollment_menu callback (from /status) — submenu grouping the
+    three course-enrollment-related actions that used to be separate
+    top-level /status buttons."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    keyboard = [
+        [InlineKeyboardButton("⚡ Fast Enroll", callback_data="fastenroll_menu")],
+        [InlineKeyboardButton("➕ Enroll Course", callback_data="browse_courses")],
+        [InlineKeyboardButton("🚪 Sign Out of a Course", callback_data="browse_my_courses_deenroll")],
+    ]
+    await query.message.reply_text("🎓 Course Enrollment:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_set_default_semester(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle set_default_semester callback (from /status) — show a semester
+    picker; picking one makes Files, Browse Courses (enroll), and Sign Out
+    (deenroll) all skip straight to that semester instead of asking each time."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    try:
+        session = await login_studip()
+        semesters = await get_semester_options(session)
+    except Exception as e:
+        logging.error(f"handle_set_default_semester: failed to fetch semesters: {e}")
+        await query.message.reply_text(f"❌ Could not load semesters: {str(e)[:200]}")
+        return
+
+    if not semesters:
+        await query.message.reply_text("❌ Could not find any semesters.")
+        return
+
+    keyboard = [[InlineKeyboardButton(label, callback_data=f"default_sem|{sid}")] for sid, label in semesters]
+    current = load_default_semester()
+    if current.get("id"):
+        keyboard.append([InlineKeyboardButton("🗑️ Clear default (always ask)", callback_data="default_sem_clear")])
+    await query.message.reply_text(
+        "📆 Pick the default semester for Files, Browse Courses, and Sign Out:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def handle_default_semester_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle default_sem|<id> callback — save the picked semester as the
+    default used by Files, Browse Courses, and Sign Out."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    semester_id = query.data.split("|", 1)[1]
+    try:
+        session = await login_studip()
+        semesters = await get_semester_options(session)
+    except Exception as e:
+        logging.error(f"handle_default_semester_pick: failed to fetch semesters: {e}")
+        await query.message.reply_text(f"❌ Error: {str(e)[:200]}")
+        return
+
+    label = next((lbl for sid, lbl in semesters if sid == semester_id), semester_id)
+    save_default_semester(semester_id, label)
+    await query.edit_message_text(f"✅ Default semester set to: {label}\nFiles, Browse Courses, and Sign Out will now use it directly.")
+
+
+async def handle_default_semester_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle default_sem_clear callback — go back to asking for a semester
+    every time in Files, Browse Courses, and Sign Out."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    clear_default_semester()
+    await query.edit_message_text("✅ Default semester cleared. Files, Browse Courses, and Sign Out will ask each time again.")
+
+
+CHANGE_SEM_CONFIG = {
+    "files": ("files_sem", "⬇️ Pick a semester to browse its courses' files:"),
+    "enroll": ("course_sem", "📚 Pick a semester to see courses currently open for enrolment:"),
+    "deenroll": ("deenroll_sem", "🚪 Pick a semester to see its enrolled courses:"),
+}
+
+
+async def handle_change_semester(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle change_sem|<files|enroll|deenroll> callback — the "📆 Change
+    Semester" button at the bottom of the Files/Enroll/Sign Out course lists.
+    Always shows the full semester picker for that list (ignoring any default
+    semester set in /status), so the student can view a different semester
+    just this once without having to clear their default."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    kind = query.data.split("|", 1)[1]
+    callback_prefix, prompt = CHANGE_SEM_CONFIG[kind]
+    await _show_semester_picker(query, callback_prefix, prompt)
+
+
 async def check_task_reminders(bot):
     """Send any reminder-tasks whose due time has passed, then drop them (one-shot).
     Plain to-dos (no due_time) are left untouched until the user marks them done."""
@@ -5545,8 +6118,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text += f"\n\n{sys_info}"
 
+    default_semester = load_default_semester()
+    default_semester_label = default_semester.get("label") or "Not set (always asks)"
+    text += f"\n\n📆 Default Semester: {default_semester_label}"
+
     keyboard = [
-        [InlineKeyboardButton("⚡ Fast Enroll", callback_data="fastenroll_menu")],
+        [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
+        [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
         [InlineKeyboardButton("🎓 Exam Registration", callback_data="exam_menu")],
         [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
         [InlineKeyboardButton("📱 WhatsApp", callback_data="wa_menu")],
@@ -5661,6 +6239,23 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_voice_reject, pattern="^voice_reject$"))
         app.add_handler(CallbackQueryHandler(handle_task_course_pick, pattern="^(task_course\\|.*|task_course_skip)$"))
         app.add_handler(CallbackQueryHandler(handle_course_view, pattern="^course_view\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_browse_courses, pattern="^browse_courses$"))
+        app.add_handler(CallbackQueryHandler(handle_course_noop, pattern="^course_noop$"))
+        app.add_handler(CallbackQueryHandler(handle_course_semester_pick, pattern="^course_sem\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_course_enroll_ask, pattern="^course_enroll_ask\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_course_enroll_confirm, pattern="^course_enroll_confirm\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_course_enroll_cancel, pattern="^course_enroll_cancel$"))
+        app.add_handler(CallbackQueryHandler(handle_browse_my_courses_for_deenroll, pattern="^browse_my_courses_deenroll$"))
+        app.add_handler(CallbackQueryHandler(handle_deenroll_semester_pick, pattern="^deenroll_sem\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_files_semester_pick, pattern="^files_sem\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_enrollment_menu, pattern="^enrollment_menu$"))
+        app.add_handler(CallbackQueryHandler(handle_set_default_semester, pattern="^set_default_semester$"))
+        app.add_handler(CallbackQueryHandler(handle_default_semester_pick, pattern="^default_sem\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_default_semester_clear, pattern="^default_sem_clear$"))
+        app.add_handler(CallbackQueryHandler(handle_change_semester, pattern="^change_sem\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_course_deenroll_ask, pattern="^course_deenroll_ask\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_course_deenroll_confirm, pattern="^course_deenroll_confirm\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_course_deenroll_cancel, pattern="^course_deenroll_cancel$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern="^calendar_week\|.*$"))
         app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^menu_nav\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_selection))

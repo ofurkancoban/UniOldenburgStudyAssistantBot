@@ -14,6 +14,8 @@ import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from bs4 import BeautifulSoup
+
 BASE_URL = "https://elearning.uni-oldenburg.de"
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
 PENDING_FILE = "fastenroll_pending.json"
@@ -151,13 +153,36 @@ async def _site_clock_offset(session) -> float:
 
 
 async def _fetch_security_token(session, sem_id: str) -> str:
+    """Fetch the Apply dialog's security_token.
+
+    The apply URL redirects rather than showing a dialog in two cases that both
+    need to be told apart from "genuinely open": already enrolled (redirects to
+    course/overview, which happens to contain an unrelated security_token of its
+    own — a plain page-wide token search would false-positive as still open) and
+    not currently enrollable (redirects to course/details with no apply form).
+    Only the actual Apply form's own token is used, never one from elsewhere on
+    the page.
+    """
     apply_url = f"{BASE_URL}/dispatch.php/course/enrolment/apply/{sem_id}"
-    async with await session.get(apply_url) as resp:
+    async with await session.get(apply_url, allow_redirects=True) as resp:
         html = await resp.text()
-    match = TOKEN_RE.search(html)
-    if not match:
+        final_url = str(resp.url)
+
+    if "course/overview" in final_url:
+        raise EnrollError("Already enrolled in this course.")
+
+    soup = BeautifulSoup(html, "html.parser")
+    apply_form = next(
+        (f for f in soup.find_all("form") if "enrolment/apply" in (f.get("action") or "")),
+        None,
+    )
+    if apply_form is None:
         raise EnrollError("Could not find security_token in enrolment dialog (course may already be full, closed, or already enrolled).")
-    return match.group(1)
+
+    token_input = apply_form.find("input", attrs={"name": "security_token"})
+    if not token_input or not token_input.get("value"):
+        raise EnrollError("Could not find security_token in enrolment dialog (course may already be full, closed, or already enrolled).")
+    return token_input["value"]
 
 
 async def _submit_enrollment(session, sem_id: str, security_token: str):
@@ -251,3 +276,285 @@ async def run_fast_enroll(session, sem_id: str, target_time_str: str, target_dat
         await notify(f"Submitted (HTTP {status}). Page title: {page_title!r}")
         return True, f"Enrollment request submitted at {target.strftime('%H:%M:%S')}. Response title: {page_title}"
     return False, f"Unexpected HTTP status {status} when submitting enrollment."
+
+
+# ── Browse & enroll (immediate, within the student's own degree programme) ─────
+STUDENTMODULE_URL = f"{BASE_URL}/plugins.php/studienmodulplugin/studentmodule"
+
+
+async def get_semester_options(session) -> list:
+    """Return [(semester_id, label), ...] from the student's module overview page
+    (Stud.IP's own degree-programme module directory), newest first. Semesters
+    starting before 2022 are dropped — old enough to be irrelevant clutter in
+    every semester picker (browse/enroll and sign-out)."""
+    async with await session.get(STUDENTMODULE_URL) as r:
+        html = await r.text()
+    soup = BeautifulSoup(html, "html.parser")
+    select = soup.find("select", attrs={"name": "semester_id"})
+    if not select:
+        return []
+    options = [(opt.get("value"), opt.get_text(strip=True)) for opt in select.find_all("option") if opt.get("value")]
+
+    def starts_before_2022(label: str) -> bool:
+        m = re.search(r"\d{4}", label)
+        return bool(m) and int(m.group()) < 2022
+
+    return [(sid, label) for sid, label in options if not starts_before_2022(label)]
+
+
+def _parse_module_links(html: str) -> list:
+    """Extract (module_label, verzeichnis_url) pairs from the student module
+    overview page: each module with an offering in the selected semester links
+    to its course directory (title text is already "code - name")."""
+    soup = BeautifulSoup(html, "html.parser")
+    table = soup.find("table")
+    if not table:
+        return []
+    results = []
+    for row in table.find_all("tr"):
+        for a in row.find_all("a"):
+            href = a.get("href") or ""
+            if "veranstaltungsverzeichnis/verzeichnis/overview" in href:
+                results.append((a.get_text(strip=True), href))
+    return results
+
+
+MODULE_COMPONENT_TYPE_RE = re.compile(r"course/details\?sem_id=([a-f0-9]{32})")
+
+# Each module's overview table has one row per component type (a module can
+# require e.g. both a Vorlesung *and* a Seminar/Übung, each its own separate
+# course with its own sem_id and its own enrolment) — the type label lives in
+# that row's first cell, right next to the component's course link(s).
+COMPONENT_TYPE_TRANSLATIONS = {
+    "Vorlesung": "Lecture",
+    "Übung": "Exercise",
+    "Praktikum": "Practical",
+    "Tutorium": "Tutorial",
+    "Kolloquium": "Colloquium",
+    "Projekt": "Project",
+    "Exkursion": "Excursion",
+    "Vorlesung oder Seminar": "Lecture/Seminar",
+    "Vorlesung ggf. mit Übung": "Lecture (+Exercise)",
+}
+
+
+async def _fetch_module_courses(session, verzeichnis_url: str) -> list:
+    """Return [(component_type, course_title, sem_id, has_open_access), ...]
+    of the actual course instance(s) offered under one module (e.g. its
+    Lecture and, separately, its Seminar/Exercise), in the semester the
+    verzeichnis link points to. Each is its own independent enrolment.
+
+    has_open_access reflects the row's own "Uneingeschränkter Zugang"
+    (unrestricted access) badge — a green status icon Stud.IP already shows
+    per component on this listing page — used by get_open_courses() to tell
+    which components offer self-service enrolment at all, entirely from this
+    one already-fetched, read-only page. This deliberately replaces an older
+    approach that checked each course's Apply dialog directly: for some
+    modules that GET wasn't side-effect-free — merely checking could complete
+    the enrolment for that course, so browsing "open courses" could silently
+    enrol you. Reading this page's own badge instead makes browsing wholly
+    read-only; only the explicit "Enroll" -> "Yes" tap ever posts anything.
+    """
+    async with await session.get(verzeichnis_url) as r:
+        html = await r.text()
+    soup = BeautifulSoup(html, "html.parser")
+
+    seen = set()
+    results = []
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            tds = row.find_all("td", recursive=False)
+            if len(tds) != 3:
+                continue  # only component rows have this exact shape
+            component_type = tds[0].get_text(strip=True)
+            if not component_type:
+                continue
+            if component_type in COMPONENT_TYPE_TRANSLATIONS:
+                component_type = COMPONENT_TYPE_TRANSLATIONS[component_type]
+            elif len(component_type) > 25 or ":" in component_type:
+                # An occasional row's first cell picks up adjacent, unrelated
+                # text (e.g. a merged/irregular table layout for that module)
+                # rather than a clean type label — fall back to a generic one
+                # instead of showing the garbled text.
+                component_type = "Component"
+            has_open_access = "Uneingeschränkter Zugang" in tds[1].get_text(" ", strip=True)
+            for a in tds[1].find_all("a", href=True):
+                m = MODULE_COMPONENT_TYPE_RE.search(a["href"])
+                if m and m.group(1) not in seen:
+                    seen.add(m.group(1))
+                    results.append((component_type, a.get_text(strip=True), m.group(1), has_open_access))
+    return results
+
+
+async def _is_enrollment_open(session, sem_id: str) -> bool:
+    """A course's Apply dialog only contains a security_token while its
+    enrolment period is actually open (and the student isn't already
+    enrolled/it isn't full) — this is the same check run() relies on."""
+    try:
+        await _fetch_security_token(session, sem_id)
+        return True
+    except EnrollError:
+        return False
+    except Exception as e:
+        logging.warning("fast_enroll: open-check failed for %s: %s", sem_id, e)
+        return False
+
+
+async def _get_module_course_candidates(session, semester_id: str = None) -> dict:
+    """Walk the student's own degree-programme modules for the given semester
+    and return every course component found under them, keyed by sem_id:
+    {sem_id: {"modules": [...], "type": "Lecture"/"Exercise"/"Seminar"/...,
+    "course": "..."}}. Shared by get_open_courses (which further filters to
+    ones still open) and get_course_type_map (which needs the type label for
+    courses regardless of open/closed status, e.g. already-enrolled ones).
+    """
+    params = {"semester_id": semester_id} if semester_id else None
+    async with await session.get(STUDENTMODULE_URL, params=params) as r:
+        html = await r.text()
+    if "Login notwendig" in html:
+        raise EnrollError("Stud.IP session expired while fetching your modules")
+
+    module_links = _parse_module_links(html)
+
+    # Dedupe by sem_id while collecting: the same course can be a valid elective
+    # for more than one module and would otherwise show up once per module it
+    # satisfies. Keep every module it's listed under (comma-joined) instead of
+    # only the first, so nothing is silently dropped.
+    candidates = {}  # sem_id -> {"modules": [...], "type": ..., "course": ..., "has_open_access": ...}
+    semaphore = asyncio.Semaphore(3)
+
+    async def fetch_one_module(module_label, verzeichnis_url):
+        async with semaphore:
+            try:
+                courses = await _fetch_module_courses(session, verzeichnis_url)
+            except Exception as e:
+                logging.warning("fast_enroll: failed to fetch courses for %s: %s", module_label, e)
+                return
+        for component_type, course_title, sem_id, has_open_access in courses:
+            entry = candidates.setdefault(sem_id, {
+                "modules": [], "type": component_type, "course": course_title, "has_open_access": has_open_access,
+            })
+            if module_label not in entry["modules"]:
+                entry["modules"].append(module_label)
+
+    await asyncio.gather(*(fetch_one_module(label, url) for label, url in module_links))
+    return candidates
+
+
+async def get_course_type_map(session, semester_id: str = None) -> dict:
+    """Return {sem_id: "Lecture"/"Exercise"/"Seminar"/...} for every course
+    component found under the student's own degree-programme modules for the
+    given semester, regardless of whether it's still open for enrolment —
+    used to label already-enrolled courses (e.g. in the sign-out list) by
+    which component they are.
+    """
+    candidates = await _get_module_course_candidates(session, semester_id)
+    return {sem_id: entry["type"] for sem_id, entry in candidates.items()}
+
+
+async def get_open_courses(session, semester_id: str = None) -> list:
+    """Return every course, within the student's own degree-programme modules,
+    that offers self-service enrolment for the given semester (or the page's
+    default/current semester if omitted) — determined purely by that
+    "Uneingeschränkter Zugang" (unrestricted access) badge the module listing
+    page already shows per component (see _fetch_module_courses), never by
+    probing each course's own Apply dialog.
+
+    Each item: {"module": "wir823 - International Finance...", "type": "Lecture",
+    "course": "...", "sem_id": "..."}. A module that requires both a Lecture and
+    a separate Seminar/Exercise yields one item per component — each is its own
+    independent enrolment.
+
+    This does NOT exclude courses the student is already enrolled in — that
+    needs the student's own course list, which lives outside this module
+    (studip_bot.py's list_courses()); callers should cross-filter the result
+    against it themselves. Enrolling in an already-enrolled course via
+    enroll_now() still fails safely on its own (its Apply-dialog check
+    detects "already enrolled" and refuses to submit), so an unfiltered
+    result here is a display nuisance at worst, never a real double-enrol.
+    """
+    candidates = await _get_module_course_candidates(session, semester_id)
+
+    return [
+        {
+            "module": " / ".join(entry["modules"]),
+            "type": entry["type"],
+            "course": entry["course"],
+            "sem_id": sem_id,
+        }
+        for sem_id, entry in candidates.items()
+        if entry["has_open_access"]
+    ]
+
+
+async def enroll_now(session, sem_id: str) -> tuple:
+    """Enroll immediately (no scheduling) by reusing the same Apply-dialog flow
+    run_fast_enroll() uses. Returns (success: bool, message: str).
+
+    Success is confirmed by re-checking the Apply dialog afterwards: Stud.IP
+    only keeps offering a fresh security_token while enrolment is still
+    possible, so its absence now (when it was present a moment ago) means the
+    submission actually went through. The response page's own <title> isn't
+    used for this — it isn't guaranteed to reflect the outcome (e.g. it can
+    pick up an unrelated icon's accessibility label instead of the real page
+    title), which reads as confusing/wrong even on a successful enrolment.
+    """
+    try:
+        security_token = await _fetch_security_token(session, sem_id)
+    except EnrollError as e:
+        return False, str(e)
+
+    status, _html = await _submit_enrollment(session, sem_id, security_token)
+    if status != 200:
+        return False, f"Unexpected HTTP status {status} when submitting enrollment."
+
+    still_open = await _is_enrollment_open(session, sem_id)
+    if still_open:
+        return False, "The site did not confirm the enrolment — please check your course list manually."
+    return True, "Enrolled successfully."
+
+
+async def decline_course(session, cid: str) -> tuple:
+    """Sign out of (withdraw from) a course the student is currently enrolled in.
+
+    Unlike enrolment, this is a two-step server-rendered confirmation flow (not
+    a modal dialog fetched separately): GET my_courses/decline/<cid>?cid=<cid>
+    &cmd=suppose_to_kill returns a page (redirected to my_courses/index, but
+    with a "Please confirm action" form embedded in the body) containing a
+    <form action=".../decline/<cid>?cmd=kill&studipticket=<ticket>"> with
+    hidden security_token/cmd/studipticket fields and a submit button
+    name="yes". A plain GET to the *first* URl alone never withdraws anything
+    — that only requests the confirmation; the actual withdrawal happens on
+    the POST to the second (cmd=kill) URL with those fields plus yes="".
+    Confirmed live: the studipticket is single-use/short-lived per GET, so it
+    must be freshly fetched right before the POST, not cached.
+
+    Returns (success: bool, message: str).
+    """
+    ask_url = f"{BASE_URL}/dispatch.php/my_courses/decline/{cid}?cid={cid}&cmd=suppose_to_kill"
+    referer = f"{BASE_URL}/dispatch.php/course/overview?cid={cid}"
+    async with await session.get(ask_url, allow_redirects=True, headers={"Referer": referer}) as resp:
+        html = await resp.text()
+
+    soup = BeautifulSoup(html, "html.parser")
+    form = next((f for f in soup.find_all("form") if "cmd=kill" in (f.get("action") or "")), None)
+    if form is None:
+        return False, "Could not find the sign-out confirmation form (you may already be signed out, or the course doesn't allow self sign-out)."
+
+    action = form["action"]
+    if not action.startswith("http"):
+        action = f"{BASE_URL}/{action.lstrip('/')}"
+    fields = {inp["name"]: inp.get("value", "") for inp in form.find_all("input") if inp.get("name")}
+    fields["yes"] = ""
+
+    async with await session.post(action, data=fields, allow_redirects=True, headers={"Referer": ask_url}) as resp2:
+        status = resp2.status
+
+    if status != 200:
+        return False, f"Unexpected HTTP status {status} when confirming sign-out."
+
+    async with await session.get(f"{BASE_URL}/dispatch.php/my_courses") as r3:
+        html3 = await r3.text()
+    if cid in html3:
+        return False, "The site did not confirm the sign-out — please check your course list manually."
+    return True, "Signed out of the course successfully."

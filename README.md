@@ -58,6 +58,15 @@ The bot goes beyond Stud.IP and reverse-engineers the university's separate **St
 *   **📜 Transcript Summary**: A running credit-weighted average grade and total ECTS, computed from your finalized results (**"📜 Transcript"** button).
 *   **📚 My Exam Dates vs. 📋 All Exams**: "My Exam Dates" matches your active Stud.IP courses to their real StuMS module codes (name-matching alone is unreliable across the two systems) so you only see what's relevant; "All Exams" lists every upcoming date across your whole curriculum.
 
+### 📝 Course Enrollment (Enroll / Sign Out)
+Manage your own Stud.IP course enrolments (Veranstaltungsanmeldung) directly from the chat, scoped to your own degree programme (M.Sc. Applied Economics and Data Science) — no need to hunt through the website:
+*   **➕ Enroll Course**: Lists every course component currently open for self-service enrolment, grouped by module — a module needing both a Lecture and a separate Seminar/Exercise shows each as its own row, since they're independent enrolments. Same-module rows share a color-emoji prefix (🔴🟠🟡🟢🔵🟣… then 🟥🟧🟨🟩…) so it's obvious at a glance which components belong together. Tap one, confirm, and you're enrolled.
+*   **🚪 Sign Out of a Course**: Lists your currently enrolled courses (labeled `[Lecture]` / `[Exercise]` / `[Seminar]` where known) so you can withdraw from one with a tap and a confirmation.
+*   **📆 Set Default Semester**: Pick one semester in `/status` and Files, Enroll Course, and Sign Out all skip straight to it instead of asking every time; each of those lists still offers a **📆 Change Semester** button at the bottom to view a different one just for that session.
+*   **Read-only browsing, by design**: figuring out which courses are open is done entirely by reading Stud.IP's own "unrestricted access" badge on the module listing page and cross-checking your real enrolled-course list — it never touches the actual enrolment endpoint until you explicitly tap **Enroll → Yes**, so simply browsing or switching semesters can never enrol you in anything by accident.
+*   **⚡ Fast Enroll**: schedule a one-shot enrolment attempt for a course link ahead of time (e.g. the moment a registration window opens), via `/status` → **"⚡ Fast Enroll"**.
+*   All three actions live together under `/status` → **"🎓 Course Enrollment"**.
+
 ### ✅ Personal Tasks & Reminders
 A lightweight to-do list that lives inside the bot:
 *   Add a plain **to-do** or a **timed reminder** in free text — `tomorrow 15:00`, `in 2 hours`, `20.09 09:00`.
@@ -125,15 +134,15 @@ PORT=3838  # Port for the WhatsApp Microservice
 | `/start` | Start the bot and login. |
 | `/menu` | The main hub. Access Courses, Files, and Calendar. |
 | `/check` | Manual sync of all watchers (Files, News, Posts). |
-| `/status` | View system health, uptime, last sync timestamps, and access **Fast Enroll, Exam Registration, Transcript, and WhatsApp settings**. |
+| `/status` | View system health, uptime, last sync timestamps, and access **Course Enrollment (Fast Enroll / Enroll Course / Sign Out), Default Semester, Exam Registration, Transcript, and WhatsApp settings**. |
 
 ### ⌨️ Persistent Keyboard
 
 | Button | Action |
 | :--- | :--- |
-| ⬇️ Files | Browse your courses and download files. |
+| ⬇️ Files | Pick a semester, then browse its courses and download files. |
 | 🔁 Check | Manual sync of all watchers. |
-| ℹ️ Status | Bot health + Fast Enroll / Exam Registration / Transcript / WhatsApp submenus. |
+| ℹ️ Status | Bot health + Course Enrollment / Default Semester / Exam Registration / Transcript / WhatsApp submenus. |
 | 🍽️ Menu | Today's Mensa menu. |
 | ✅ Tasks | Add or manage personal to-dos and reminders. |
 | 📅 Calendar | Today's schedule, with **📆 Week Plan**, **📚 My Exam Dates**, and **🔔 Upcoming** shortcuts. |
@@ -148,7 +157,7 @@ PORT=3838  # Port for the WhatsApp Microservice
 4. **Session Persistence**: Your session is saved securely. If you need a new QR code (e.g., you logged out), simply tap **"📲 Request WA QR"** in the `/status` menu.
 
 > [!TIP]
-> Every **"📲 Forward to WA"** button requires a **Yes/No confirmation** tap before anything is sent, to prevent an accidental forward into a shared group. Grade notifications go a step further: the message with your actual grade never carries a forward button at all — only a separate, grade-free announcement does.
+> Every **"📲 Forward to WA"** button requires a **Yes/No confirmation** tap before anything is sent, to prevent an accidental forward into a shared group. Grade notifications go a step further: the message with your actual grade never carries a forward button at all — only a separate, grade-free announcement does. Auto-generated "Enrolment in course" messages also skip the forward button, since they're never meant for a shared group.
 
 ---
 
