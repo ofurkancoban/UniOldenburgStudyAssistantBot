@@ -12,4 +12,7 @@ psutil
 uuid
 icalendar
 recurring-ical-events
+SpeechRecognition
+pydub
+langdetect
 # Verified

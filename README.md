@@ -61,8 +61,15 @@ The bot goes beyond Stud.IP and reverse-engineers the university's separate **St
 ### ✅ Personal Tasks & Reminders
 A lightweight to-do list that lives inside the bot:
 *   Add a plain **to-do** or a **timed reminder** in free text — `tomorrow 15:00`, `in 2 hours`, `20.09 09:00`.
+*   **🎙️ Voice input**: just send a voice note instead of typing — it's transcribed (via the free Google Web Speech API, no API key needed), shown back to you for a quick **✅ Yes / ✏️ Try again** confirmation, then dropped into the task wizard.
+*   **📘 Course tagging**: after setting the text and time, optionally tag the task to one of your currently-enrolled Stud.IP courses — shown in the task list as `[Course Name]`.
+*   **📘 By Course**: pick a course to see its tagged tasks and upcoming StuMS exam dates together in one view.
 *   Manage everything from **"📋 My Tasks"**: mark done, delete, or cancel a pending reminder.
 *   Reminders fire automatically once due — no forced-reply prompts, so the bot's keyboard never disappears mid-flow.
+*   Combines with **🔔 Upcoming** (under the Calendar message) for one chronologically-sorted view of task reminders, exam dates, and registration deadlines together.
+
+> [!NOTE]
+> Voice-note transcription requires **ffmpeg** on the server (`apt install ffmpeg` / `brew install ffmpeg`) to convert Telegram's audio format. `setup.sh` warns if it's missing. **Turkish and English are both tried automatically** on every voice note (`VOICE_TASK_LANGUAGES` in `studip_bot.py`), and `langdetect` picks whichever transcript actually matches its language — no need to specify which one you're speaking.
 
 ---
 
@@ -129,7 +136,7 @@ PORT=3838  # Port for the WhatsApp Microservice
 | ℹ️ Status | Bot health + Fast Enroll / Exam Registration / Transcript / WhatsApp submenus. |
 | 🍽️ Menu | Today's Mensa menu. |
 | ✅ Tasks | Add or manage personal to-dos and reminders. |
-| 📅 Calendar | Today's schedule, with **📆 Week Plan** and **📚 My Exam Dates** shortcuts. |
+| 📅 Calendar | Today's schedule, with **📆 Week Plan**, **📚 My Exam Dates**, and **🔔 Upcoming** shortcuts. |
 
 ---
 

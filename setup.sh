@@ -17,6 +17,11 @@ if (( $(echo "$PY_VER < 3.10" | bc -l) )); then
   exit 1
 fi
 
+if ! command -v ffmpeg &> /dev/null; then
+  echo "⚠️  ffmpeg not found — voice-message task input won't work without it."
+  echo "   Install it with: apt install ffmpeg (Linux) or brew install ffmpeg (Mac)."
+fi
+
 # ── 2️⃣ Menu Selection ───────────────────────────────────────────────
 echo "Which version would you like to set up?"
 echo "1) Standard (Browser-less, Recommended) - Fast, low RAM"

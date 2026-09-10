@@ -3851,22 +3851,28 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # custom keyboard (get_main_keyboard()) even after it's resent later, so instead
 # each step is tracked in context.user_data["pending_step"] and plain text answers
 # (no forced reply) are matched against it here.
-async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text_override: str = None) -> bool:
     """If the user has an active multi-step wizard pending, consume this message
     as that step's answer and return True. Otherwise return False so the caller
-    falls through to normal button/text handling."""
+    falls through to normal button/text handling.
+
+    `text_override` lets a caller supply the answer text directly (e.g. a
+    voice-message transcription) instead of reading it from update.message.text.
+    """
     step = context.user_data.get("pending_step")
     if not step:
         return False
 
+    text = text_override if text_override is not None else (update.message.text or "").strip()
+
     if step in ("fastenroll_date", "fastenroll_time", "fastenroll_link"):
-        return await _handle_fastenroll_wizard_reply(update, context, step)
+        return await _handle_fastenroll_wizard_reply(update, context, step, text)
 
     if step in ("task_text", "task_time"):
-        return await _handle_task_wizard_reply(update, context, step)
+        return await _handle_task_wizard_reply(update, context, step, text)
 
     if step == "wa_group_name":
-        new_group = update.message.text.strip()
+        new_group = text
         import dotenv
         env_path = ".env"
         dotenv.set_key(env_path, "WHATSAPP_GROUP_NAME", new_group)
@@ -3876,7 +3882,7 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         return True
 
     if step == "ical_link":
-        new_link = update.message.text.strip()
+        new_link = text
         import dotenv
         env_path = ".env"
         dotenv.set_key(env_path, "STUDIP_ICAL_URL", new_link)
@@ -4105,6 +4111,9 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
         ],
         [
             InlineKeyboardButton("📚 My Exam Dates", callback_data="exam_dates_list"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Upcoming", callback_data="upcoming_dashboard"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -4486,6 +4495,111 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
     await _send_exam_dates_chunks(query.message, lines)
 
 
+def _format_relative(dt: datetime, now: datetime, show_time: bool = True) -> str:
+    """Render a datetime as a short relative label: 'today [HH:MM]', 'tomorrow
+    [HH:MM]', 'in Nd [HH:MM]', or 'overdue'. The clock time is only appended
+    when it's meaningfully set (not midnight, i.e. a real reminder/exam time
+    is known) and `show_time` is True — registration deadlines all close at
+    23:59, so that time is never worth showing there."""
+    days = (dt.date() - now.date()).days
+    has_time = show_time and dt.time() != datetime.min.time()
+    time_suffix = f" {dt.strftime('%H:%M')}" if has_time else ""
+    if days < 0:
+        return "overdue"
+    if days == 0:
+        return f"today{time_suffix}"
+    if days == 1:
+        return f"tomorrow{time_suffix}"
+    return f"in {days}d{time_suffix}"
+
+
+async def build_upcoming_dashboard(session, user_id: int) -> str:
+    """Aggregate exam registration deadlines, upcoming exam dates, and personal
+    task reminders into one chronologically-sorted overview."""
+    now = datetime.now(TZ_BERLIN)
+    items = []  # list of (sort_datetime, line)
+
+    try:
+        open_exams = await get_open_exam_registrations(session)
+        seen_units = set()
+        for e in open_exams:
+            if e["unit_id"] in seen_units or not e.get("end_date"):
+                continue
+            seen_units.add(e["unit_id"])
+            end_dt = datetime.fromisoformat(e["end_date"])
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=TZ_BERLIN)
+            items.append((end_dt, f"🔴 <b>Registration closes:</b> {e['title']} — {_format_relative(end_dt, now, show_time=False)}"))
+    except Exception as e:
+        logging.warning(f"Upcoming dashboard: exam registration fetch failed: {e}")
+
+    try:
+        registered = await get_registered_exam_schedule(session)
+        today = now.date()
+        for e in registered:
+            exam_date = datetime.fromisoformat(e["date"]).date()
+            if exam_date < today:
+                continue
+            if e.get("start_datetime"):
+                dt = datetime.fromisoformat(e["start_datetime"])
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=TZ_BERLIN)
+            else:
+                dt = datetime(exam_date.year, exam_date.month, exam_date.day, tzinfo=TZ_BERLIN)
+            items.append((dt, f"📚 <b>Exam:</b> {e['title']} — {_format_relative(dt, now)}"))
+    except Exception as e:
+        logging.warning(f"Upcoming dashboard: exam date fetch failed: {e}")
+
+    todos = []
+    for t in load_tasks():
+        if t["user_id"] != user_id:
+            continue
+        course_suffix = f" [{t['course']}]" if t.get("course") else ""
+        if t.get("due_time"):
+            dt = datetime.fromisoformat(t["due_time"])
+            items.append((dt, f"✅ <b>Task:</b> {t['text']}{course_suffix} — {_format_relative(dt, now)}"))
+        else:
+            todos.append(f"{t['text']}{course_suffix}")
+
+    items.sort(key=lambda x: x[0])
+
+    lines = ["🔔 <b>Upcoming</b>", "━━━━━━━━━━━━━━━━━"]
+    if items:
+        lines.extend(line for _, line in items)
+    else:
+        lines.append("ℹ️ Nothing urgent right now.")
+
+    if todos:
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("📝 <b>To-dos (no date):</b>")
+        lines.extend(f"• {t}" for t in todos)
+
+    return "\n".join(lines)
+
+
+async def handle_upcoming_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle upcoming_dashboard callback — one combined, chronologically-sorted
+    view of exam registration deadlines, exam dates, and personal task reminders."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    await query.message.reply_text("🔔 Fetching your upcoming items...", disable_notification=True)
+
+    try:
+        session = await login_studip()
+        text = await build_upcoming_dashboard(session, user_id)
+    except Exception as e:
+        logging.error(f"Upcoming dashboard error: {e}")
+        await query.message.reply_text(f"❌ Error loading upcoming items: {str(e)[:200]}")
+        return
+
+    await query.message.reply_text(text, parse_mode="HTML")
+
+
 async def delete_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Delete any free text that isn't a valid keyboard command."""
     try:
@@ -4813,6 +4927,7 @@ async def send_tasks_menu(sender):
     keyboard = [
         [InlineKeyboardButton("➕ Add Task", callback_data="task_add")],
         [InlineKeyboardButton("📋 My Tasks", callback_data="task_list")],
+        [InlineKeyboardButton("📘 By Course", callback_data="task_by_course")],
     ]
     await sender.reply_text("✅ Tasks menu:", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -4828,15 +4943,17 @@ async def send_task_list(message, user_id: int):
 
     for t in reminders:
         due = datetime.fromisoformat(t["due_time"])
+        course_line = f" [{t['course']}]" if t.get("course") else ""
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"task_delete|{t['id']}")]])
-        await message.reply_text(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} — {t['text']}", reply_markup=keyboard)
+        await message.reply_text(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} — {t['text']}{course_line}", reply_markup=keyboard)
 
     for t in plain:
+        course_line = f" [{t['course']}]" if t.get("course") else ""
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("✔️ Done", callback_data=f"task_done|{t['id']}"),
             InlineKeyboardButton("❌ Delete", callback_data=f"task_delete|{t['id']}"),
         ]])
-        await message.reply_text(f"📝 {t['text']}", reply_markup=keyboard)
+        await message.reply_text(f"📝 {t['text']}{course_line}", reply_markup=keyboard)
 
 
 async def handle_task_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4857,6 +4974,10 @@ async def handle_task_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await send_task_list(query.message, user_id)
         return
 
+    if query.data == "task_by_course":
+        await send_course_picker(query.message, context)
+        return
+
     action, task_id = query.data.split("|", 1)
     tasks = load_tasks()
     if action == "task_done":
@@ -4869,15 +4990,14 @@ async def handle_task_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("🗑️ Deleted.")
 
 
-async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str) -> bool:
+async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str, text: str) -> bool:
     """If `step` is one of the task wizard steps, handle it and return True."""
-    text = update.message.text.strip()
     state = context.user_data.setdefault("task_wizard", {})
 
     if step == "task_text":
         state["text"] = text
         context.user_data["pending_step"] = "task_time"
-        await update.message.reply_text(TASK_ASK_TIME, reply_markup=get_main_keyboard())
+        await update.effective_message.reply_text(TASK_ASK_TIME, reply_markup=get_main_keyboard())
         return True
 
     if step == "task_time":
@@ -4889,31 +5009,164 @@ async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAUL
         try:
             due_dt = parse_task_due_time(text)
         except ValueError as e:
-            await update.message.reply_text(f"⚠️ {e}")
-            await update.message.reply_text(TASK_ASK_TIME, reply_markup=get_main_keyboard())
+            await update.effective_message.reply_text(f"⚠️ {e}")
+            await update.effective_message.reply_text(TASK_ASK_TIME, reply_markup=get_main_keyboard())
             return True  # pending_step stays "task_time" — ask again
 
-        task = {
-            "id": str(uuid.uuid4())[:8],
-            "user_id": update.effective_user.id,
-            "text": task_text,
-            "due_time": due_dt.isoformat() if due_dt else None,
-            "created_at": datetime.now(TZ_BERLIN).isoformat(),
-            "notified": False,
-        }
-        tasks = load_tasks()
-        tasks.append(task)
-        save_tasks(tasks)
-        context.user_data.pop("task_wizard", None)
+        # Text and time are set; course tagging is button-driven from here, so
+        # the free-text wizard step ends and pending_step is cleared.
+        state["due_time"] = due_dt.isoformat() if due_dt else None
         context.user_data.pop("pending_step", None)
-
-        if due_dt:
-            await update.message.reply_text(f"✅ Reminder set: {due_dt.strftime('%d.%m.%Y %H:%M')} — {task_text}", reply_markup=get_main_keyboard())
-        else:
-            await update.message.reply_text(f"✅ Task added: {task_text}", reply_markup=get_main_keyboard())
+        await _send_task_course_picker(update.effective_message, context)
         return True
 
     return False
+
+
+async def _send_task_course_picker(message, context: ContextTypes.DEFAULT_TYPE):
+    """Ask which of the student's currently-enrolled Stud.IP courses (if any)
+    this task belongs to, before finally saving it."""
+    try:
+        courses = await list_courses()
+    except Exception as e:
+        logging.warning(f"Task course picker: failed to fetch courses: {e}")
+        courses = []
+
+    state = context.user_data.setdefault("task_wizard", {})
+    state["course_options"] = courses
+
+    keyboard = [
+        [InlineKeyboardButton(f"📘 {name[:40]}", callback_data=f"task_course|{i}")]
+        for i, (name, cid) in enumerate(courses)
+    ]
+    keyboard.append([InlineKeyboardButton("⏭ No course (general)", callback_data="task_course_skip")])
+    await message.reply_text("📚 Tag this to one of your courses? (optional)", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_task_course_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Finalize and save the task once a course (or "no course") is chosen."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    state = context.user_data.get("task_wizard")
+    if not state or "text" not in state:
+        await query.edit_message_text("⚠️ This task setup has expired — please start again with ➕ Add Task.")
+        return
+
+    course_name = None
+    if query.data != "task_course_skip":
+        idx = int(query.data.split("|", 1)[1])
+        options = state.get("course_options", [])
+        if 0 <= idx < len(options):
+            course_name = options[idx][0]
+
+    task = {
+        "id": str(uuid.uuid4())[:8],
+        "user_id": user_id,
+        "text": state["text"],
+        "due_time": state.get("due_time"),
+        "course": course_name,
+        "created_at": datetime.now(TZ_BERLIN).isoformat(),
+        "notified": False,
+    }
+    tasks = load_tasks()
+    tasks.append(task)
+    save_tasks(tasks)
+    context.user_data.pop("task_wizard", None)
+
+    course_line = f" [{course_name}]" if course_name else ""
+    if task["due_time"]:
+        due_dt = datetime.fromisoformat(task["due_time"])
+        await query.edit_message_text(f"✅ Reminder set: {due_dt.strftime('%d.%m.%Y %H:%M')} — {task['text']}{course_line}")
+    else:
+        await query.edit_message_text(f"✅ Task added: {task['text']}{course_line}")
+
+
+async def send_course_picker(message, context: ContextTypes.DEFAULT_TYPE):
+    """List the student's currently-enrolled Stud.IP courses so they can pick one
+    for the combined tasks+exam-info view."""
+    try:
+        courses = await list_courses()
+    except Exception as e:
+        logging.error(f"send_course_picker: failed to fetch courses: {e}")
+        await message.reply_text("❌ Could not load your courses right now.")
+        return
+
+    if not courses:
+        await message.reply_text("ℹ️ No enrolled courses found.")
+        return
+
+    context.user_data["course_view_options"] = courses
+    keyboard = [
+        [InlineKeyboardButton(f"📘 {name[:40]}", callback_data=f"course_view|{i}")]
+        for i, (name, cid) in enumerate(courses)
+    ]
+    await message.reply_text("📘 Pick a course:", reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show one course's tasks and upcoming exam info together."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    options = context.user_data.get("course_view_options", [])
+    idx = int(query.data.split("|", 1)[1])
+    if not (0 <= idx < len(options)):
+        await query.message.reply_text("⚠️ This course list has expired — tap 📘 By Course again.")
+        return
+    course_name, course_cid = options[idx]
+
+    await query.message.reply_text(f"📘 Loading {course_name}...", disable_notification=True)
+
+    lines = [f"📘 <b>{course_name}</b>", "━━━━━━━━━━━━━━━━━"]
+
+    course_tasks = [t for t in load_tasks() if t["user_id"] == user_id and t.get("course") == course_name]
+    if course_tasks:
+        lines.append("📝 <b>Tasks</b>")
+        for t in sorted(course_tasks, key=lambda t: t.get("due_time") or ""):
+            if t.get("due_time"):
+                due = datetime.fromisoformat(t["due_time"])
+                lines.append(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} — {t['text']}")
+            else:
+                lines.append(f"• {t['text']}")
+        lines.append("━━━━━━━━━━━━━━━━━")
+    else:
+        lines.append("📝 <b>Tasks:</b> none")
+        lines.append("━━━━━━━━━━━━━━━━━")
+
+    try:
+        session = await login_studip()
+        module_codes = await get_my_module_codes(session, [(course_name, course_cid)])
+        exams = await get_all_exam_dates(session)
+        matched = filter_exams_by_module_codes(exams, module_codes)
+        today = datetime.now().date()
+        upcoming = [e for e in matched if datetime.fromisoformat(e["exam_date"]).date() >= today]
+        upcoming.sort(key=lambda e: (e["exam_date"], e["title"]))
+    except Exception as e:
+        logging.error(f"handle_course_view: exam fetch failed: {e}")
+        upcoming = None
+
+    if upcoming is None:
+        lines.append("📅 <b>Exams:</b> could not load right now")
+    elif not upcoming:
+        lines.append("📅 <b>Exams:</b> none upcoming")
+    else:
+        lines.append("📅 <b>Exams</b>")
+        for e in upcoming:
+            title = e["title"]
+            if e.get("group_label"):
+                title += f" ({e['group_label']})"
+            lines.append(f"{title} — {e['exam_date_display']}")
+
+    await query.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def check_task_reminders(bot):
@@ -4941,15 +5194,163 @@ async def check_task_reminders(bot):
         save_tasks(remaining)
 
 
+# ── Voice-to-task (free-tier speech-to-text, no API key needed) ────────────────
+# Google's free endpoint only accepts one language per call, so both are tried
+# concurrently and langdetect picks whichever transcript actually matches the
+# language it was recognized in.
+VOICE_TASK_LANGUAGES = ["tr-TR", "en-US"]
+VOICE_TASK_LANGDETECT_CODES = {"tr-TR": "tr", "en-US": "en"}
+
+
+async def _recognize_in_language(recognizer, audio, language: str):
+    """Return (text, request_error). text is None if unrecognized in this
+    language; request_error is set only when the service itself failed."""
+    import speech_recognition as sr
+    try:
+        text = await asyncio.to_thread(recognizer.recognize_google, audio, language=language)
+        return text, None
+    except sr.UnknownValueError:
+        return None, None
+    except sr.RequestError as e:
+        return None, e
+
+
+async def transcribe_voice_message(ogg_path: str) -> str:
+    """Convert a Telegram voice note (OGG/Opus) to text using SpeechRecognition's
+    free Google Web Speech endpoint, trying Turkish and English concurrently.
+    Requires ffmpeg on PATH for the OGG->WAV conversion (via pydub). Raises
+    RuntimeError with a user-facing message on any failure (missing ffmpeg,
+    unclear audio in both languages, network issue, ...).
+    """
+    import speech_recognition as sr
+    from pydub import AudioSegment
+
+    wav_path = ogg_path + ".wav"
+    try:
+        AudioSegment.from_file(ogg_path).export(wav_path, format="wav")
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg is not installed on the server — voice messages can't be converted. Install it with `apt install ffmpeg` (Linux) or `brew install ffmpeg` (Mac).")
+    except Exception as e:
+        raise RuntimeError(f"Could not process the audio file: {e}")
+
+    try:
+        recognizer = sr.Recognizer()
+        with sr.AudioFile(wav_path) as source:
+            audio = recognizer.record(source)
+
+        results = await asyncio.gather(
+            *(_recognize_in_language(recognizer, audio, lang) for lang in VOICE_TASK_LANGUAGES)
+        )
+        candidates = {}
+        request_error = None
+        for lang, (text, err) in zip(VOICE_TASK_LANGUAGES, results):
+            if text:
+                candidates[lang] = text
+            if err:
+                request_error = err
+
+        if not candidates:
+            if request_error:
+                raise RuntimeError(f"Speech recognition service unavailable: {request_error}")
+            raise RuntimeError("Couldn't understand the audio — please try speaking more clearly.")
+
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+
+        # Both languages produced something — trust whichever transcript's
+        # actual detected language matches the model that produced it.
+        from langdetect import detect
+        for lang, text in candidates.items():
+            try:
+                if detect(text) == VOICE_TASK_LANGDETECT_CODES.get(lang):
+                    return text
+            except Exception:
+                continue
+        return candidates[VOICE_TASK_LANGUAGES[0]]
+    finally:
+        for path in (ogg_path, wav_path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Transcribe an incoming voice note and feed it into the task wizard: if a
+    task step is already pending (e.g. waiting for the due time), the
+    transcription answers that step; otherwise it starts a new task using the
+    transcription as the task text."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        return
+
+    status_msg = await update.message.reply_text("🎙️ Transcribing...", disable_notification=True)
+
+    ogg_path = os.path.join(tempfile.gettempdir(), f"voice_{update.message.voice.file_unique_id}.oga")
+    try:
+        file = await context.bot.get_file(update.message.voice.file_id)
+        await file.download_to_drive(ogg_path)
+        transcript = await transcribe_voice_message(ogg_path)
+    except Exception as e:
+        await status_msg.edit_text(f"⚠️ {e}")
+        return
+
+    # Google's free STT can mishear things, so confirm before it's actually used
+    # to answer the wizard step (or start a new task) — nothing is committed yet.
+    step = context.user_data.get("pending_step")
+    if step not in ("task_text", "task_time"):
+        step = "task_text"
+        context.user_data.pop("task_wizard", None)
+
+    context.user_data["pending_voice"] = {"step": step, "text": transcript}
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes", callback_data="voice_confirm"),
+        InlineKeyboardButton("✏️ Try again", callback_data="voice_reject"),
+    ]])
+    await status_msg.edit_text(f"🎙️ Heard: “{transcript}”\n\nIs this correct?", reply_markup=keyboard)
+
+
+async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User confirmed a voice transcription is correct — feed it into the task
+    wizard step it was waiting to answer."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    pending = context.user_data.pop("pending_voice", None)
+    if not pending:
+        await query.edit_message_text("⚠️ This confirmation has expired — please send a new voice note.")
+        return
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    context.user_data["pending_step"] = pending["step"]
+    await handle_pending_step(update, context, text_override=pending["text"])
+
+
+async def handle_voice_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User said the transcription was wrong — discard it and let them retry."""
+    query = update.callback_query
+    await query.answer("Discarded")
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    context.user_data.pop("pending_voice", None)
+    await query.edit_message_text("🎙️ Okay — send another voice note, or type your answer instead.")
+
+
 # ── Fast Enroll guided wizard (date → time → course link) ──────────────────────
 FASTENROLL_ASK_DATE = "Please type the enrollment date (DD.MM.YYYY), or 'today' / 'tomorrow':"
 FASTENROLL_ASK_TIME = "Please type the enrollment time (HH:MM:SS, Europe/Berlin):"
 FASTENROLL_ASK_LINK = "Please paste the course link (or its sem_id):"
 
 
-async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str) -> bool:
+async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str, text: str) -> bool:
     """If `step` is one of the fast-enroll wizard steps, handle it and return True."""
-    text = update.message.text.strip()
     state = context.user_data.setdefault("fastenroll_wizard", {})
 
     if step == "fastenroll_date":
@@ -5254,12 +5655,18 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_exam_dates_list, pattern="^exam_dates_list$"))
         app.add_handler(CallbackQueryHandler(handle_all_exam_dates, pattern="^exam_dates_all$"))
         app.add_handler(CallbackQueryHandler(handle_transcript_summary, pattern="^transcript_summary$"))
-        app.add_handler(CallbackQueryHandler(handle_task_buttons, pattern="^(task_add|task_list|task_done\\|.*|task_delete\\|.*)$"))
+        app.add_handler(CallbackQueryHandler(handle_upcoming_dashboard, pattern="^upcoming_dashboard$"))
+        app.add_handler(CallbackQueryHandler(handle_task_buttons, pattern="^(task_add|task_list|task_by_course|task_done\\|.*|task_delete\\|.*)$"))
+        app.add_handler(CallbackQueryHandler(handle_voice_confirm, pattern="^voice_confirm$"))
+        app.add_handler(CallbackQueryHandler(handle_voice_reject, pattern="^voice_reject$"))
+        app.add_handler(CallbackQueryHandler(handle_task_course_pick, pattern="^(task_course\\|.*|task_course_skip)$"))
+        app.add_handler(CallbackQueryHandler(handle_course_view, pattern="^course_view\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern="^calendar_week\|.*$"))
         app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^menu_nav\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_selection))
 
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))
+        app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
 
         # Explicitly initialize and start the application
         await app.initialize()
