@@ -96,7 +96,14 @@ Every voice note is transcribed first (via the free Google Web Speech API, no AP
     | "show bot status" | Runs `/status`. |
     | "list the last file of Development Economics" | Finds that course's most recently uploaded file and offers a one-tap **📥 Download**. |
     | "list the files of Development Economics" | Lists every file/folder at that course's top level, each with its own tap-to-open/download button. |
-    | anything else | Falls back to creating a plain task with that text — the same safe default as before. |
+    | "show every exam date in the curriculum" | Opens **📋 All Exams**. |
+    | "what's coming up" | Opens **🔔 Upcoming** (tasks, exam dates, and deadlines together). |
+    | "what's my schedule today" / "show this week's schedule" | Opens **📅 Today** / **📆 Week Plan**. |
+    | "set my default semester" | Opens the semester picker used by **📆 Set Default Semester**. |
+    | "run a manual sync" | Same as **🔁 Check** — force-refreshes messages/announcements/files/forum now. |
+    | "list my scheduled fast enroll jobs" | Shows your pending **⚡ Fast Enroll** jobs. |
+    | anything else the bot can't place at all | Asks **"Want me to save it as a task instead?"** rather than silently guessing. |
+    | something ambiguous between two known actions (e.g. just "exam") | Offers up to two **"did you mean...?"** buttons for the closest-matching actions, plus a plain-task fallback — tapping one runs that action exactly as if you'd said it clearly the first time. |
 
     Destructive actions (enroll, sign out, exam register/deregister) are **never** executed directly from voice — the bot only figures out which button you meant and presents it pre-selected; tapping it still goes through the normal confirmation.
 

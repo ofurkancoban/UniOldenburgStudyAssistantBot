@@ -5955,8 +5955,37 @@ VOICE_INTENTS = [
     "create_task", "create_exam_reminder_task", "course_enroll", "course_deenroll",
     "exam_register", "exam_deregister", "check_grades", "check_exam_dates",
     "check_status", "show_menu", "set_food_preferences", "show_last_file",
-    "list_course_files", "unclear",
+    "list_course_files", "exam_dates_all", "upcoming_dashboard", "calendar_today",
+    "calendar_weekly", "set_default_semester", "run_check", "fastenroll_list",
+    "unclear",
 ]
+
+# Friendly button labels for every real (non-"unclear") intent, used both by
+# the "did you mean...?" clarification buttons (see _route_voice_intent) and
+# nowhere else — kept as a single source of truth so a new intent only needs
+# one label added here to work in both places.
+INTENT_LABELS = {
+    "create_task": "📝 Create a task",
+    "create_exam_reminder_task": "⏰ Set an exam reminder",
+    "course_enroll": "🎓 Enroll in a course",
+    "course_deenroll": "🚪 Sign out of a course",
+    "exam_register": "📝 Register for an exam",
+    "exam_deregister": "🗑️ Deregister from an exam",
+    "check_grades": "📜 Show my grades",
+    "check_exam_dates": "📚 Show my upcoming exam dates",
+    "check_status": "ℹ️ Show bot status",
+    "show_menu": "🍽️ Show today's menu",
+    "set_food_preferences": "🚫 Set food preferences",
+    "show_last_file": "📄 Show a course's latest file",
+    "list_course_files": "📁 List a course's files",
+    "exam_dates_all": "📋 Show all exam dates",
+    "upcoming_dashboard": "🔔 Show what's coming up",
+    "calendar_today": "📅 Show today's schedule",
+    "calendar_weekly": "📆 Show this week's schedule",
+    "set_default_semester": "📆 Set default semester",
+    "run_check": "🔁 Run a manual sync",
+    "fastenroll_list": "⚡ List Fast Enroll jobs",
+}
 
 CLASSIFY_INTENT_SYSTEM_PROMPT = """You classify a spoken command (transcribed from Turkish or English) sent to a university assistant Telegram bot into exactly one intent.
 
@@ -5968,17 +5997,26 @@ Intents, each with example phrasings in both languages:
 - exam_register: "Makro İktisat sınavına kayıt ol" / "register me for the Macroeconomics exam"
 - exam_deregister: "sınav kaydımı iptal et" / "deregister me from my exam"
 - check_grades: "notlarımı göster" / "show me my grades" / "transkriptimi göster"
-- check_exam_dates: "yaklaşan sınavlarım neler" / "what are my upcoming exams"
+- check_exam_dates: "yaklaşan sınavlarım neler" / "what are my upcoming exams" — only MY registered exams
 - check_status: "bot durumunu göster" / "show bot status"
 - show_menu: "bugünün yemek menüsünü göster" / "what's on the menu today" / "yemekhanede ne var"
 - set_food_preferences: "domuz eti yemiyorum" / "I don't eat pork" / "mantar ve balık istemiyorum, menüde gösterme"
 - show_last_file: "Computational Intelligence dersinin son dosyasını göster" / "list the last file of Computational Intelligence" / "show me the latest file for Linear Algebra" — asks for only the single most recently uploaded file of a named course
 - list_course_files: "Linear Algebra dersinin dosyalarını listele" / "list the files of Linear Algebra" / "show me all files for Computational Economics" — asks to see every file of a named course, not just the latest one
+- exam_dates_all: "tüm sınav tarihlerini göster" / "show every exam date" / "list all exams in the curriculum" — every exam across the whole curriculum, not just mine
+- upcoming_dashboard: "önümüzdeki günlerde neler var" / "what's coming up" / "show my upcoming schedule" — a combined view of tasks, exam dates and deadlines
+- calendar_today: "bugünkü derslerim neler" / "what's my schedule today" / "show today's lectures"
+- calendar_weekly: "bu haftaki ders programımı göster" / "show this week's schedule" / "what's my week plan"
+- set_default_semester: "varsayılan dönemi ayarla" / "set my default semester" / "change my default semester" — opens the semester picker, doesn't require a semester to be named
+- run_check: "her şeyi manuel kontrol et" / "run a manual sync" / "check for updates now" — force-refreshes messages/announcements/files/forum right now
+- fastenroll_list: "planlanmış fast enroll işlerimi listele" / "list my scheduled fast enroll jobs" / "show my pending enrollments"
 - unclear: anything that doesn't clearly match one of the above
 
 For course_enroll, course_deenroll, exam_register, exam_deregister, create_exam_reminder_task, show_last_file, and list_course_files, also extract the course or exam name mentioned (in whatever language it was said) as "query"; otherwise "query" is null.
 
-Respond with strict JSON only, no other text: {"intent": "<intent>", "query": "<name or null>"}"""
+If — and only if — you pick "unclear", also set "alternatives" to an array of the 1-2 intents (from the list above, excluding "unclear") that are the next most plausible reading of the phrase; use an empty array if nothing else is remotely plausible. For every other intent, "alternatives" is an empty array.
+
+Respond with strict JSON only, no other text: {"intent": "<intent>", "query": "<name or null>", "alternatives": ["<intent>", ...]}"""
 
 
 async def _call_openrouter(system_prompt: str, user_text: str) -> Optional[str]:
@@ -6033,13 +6071,17 @@ def _extract_json_object(raw: Optional[str]) -> Optional[dict]:
 
 async def classify_voice_intent(transcript: str) -> dict:
     """Classify a fresh (no wizard pending) voice transcript into one of
-    VOICE_INTENTS. Always returns {"intent": ..., "query": ...}; falls back
-    to {"intent": "unclear", "query": None} on any failure."""
+    VOICE_INTENTS. Always returns {"intent", "query", "alternatives"};
+    falls back to {"intent": "unclear", "query": None, "alternatives": []}
+    on any failure. "alternatives" is only ever non-empty when "intent" is
+    "unclear" — see _route_voice_intent for how those become "did you
+    mean...?" buttons instead of silently defaulting to task creation."""
     raw = await _call_openrouter(CLASSIFY_INTENT_SYSTEM_PROMPT, transcript)
     parsed = _extract_json_object(raw)
     if not parsed or parsed.get("intent") not in VOICE_INTENTS:
-        return {"intent": "unclear", "query": None}
-    return {"intent": parsed["intent"], "query": parsed.get("query")}
+        return {"intent": "unclear", "query": None, "alternatives": []}
+    alternatives = [a for a in (parsed.get("alternatives") or []) if a in INTENT_LABELS]
+    return {"intent": parsed["intent"], "query": parsed.get("query"), "alternatives": alternatives[:2]}
 
 
 def _food_preferences_system_prompt() -> str:
@@ -6381,12 +6423,31 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
     """
     intent = result.get("intent", "unclear")
     query_text = result.get("query")
+    alternatives = result.get("alternatives") or []
     message = update.effective_message
 
-    if intent in ("create_task", "unclear"):
+    if intent == "create_task":
         context.user_data["pending_step"] = "task_text"
         context.user_data.pop("task_wizard", None)
         await handle_pending_step(update, context, text_override=transcript)
+        return
+
+    if intent == "unclear":
+        if not alternatives:
+            # Nothing plausible enough to even guess at — the old default of
+            # silently turning it into a task would just create garbage, so
+            # ask instead of assuming.
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📝 Just make it a task", callback_data="voice_clarify|create_task")]])
+            context.user_data["pending_voice_clarify"] = {"transcript": transcript, "query": query_text}
+            await message.reply_text("🤔 I didn't catch a clear command in that. Want me to save it as a task instead?", reply_markup=keyboard)
+            return
+
+        context.user_data["pending_voice_clarify"] = {"transcript": transcript, "query": query_text}
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(INTENT_LABELS[alt], callback_data=f"voice_clarify|{alt}")] for alt in alternatives]
+            + [[InlineKeyboardButton("📝 Just make it a task", callback_data="voice_clarify|create_task")]]
+        )
+        await message.reply_text("🤔 Not quite sure what you meant — did you mean:", reply_markup=keyboard)
         return
 
     if intent == "create_exam_reminder_task":
@@ -6637,12 +6698,68 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
             await send_exam_registration_menu(message)
         return
 
+    if intent == "exam_dates_all":
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📋 All Exams", callback_data="exam_dates_all")]])
+        await message.reply_text("🎙️ Sounds like you want every exam date in the curriculum:", reply_markup=keyboard)
+        return
+
+    if intent == "upcoming_dashboard":
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔔 Upcoming", callback_data="upcoming_dashboard")]])
+        await message.reply_text("🎙️ Sounds like you want a combined view of what's coming up:", reply_markup=keyboard)
+        return
+
+    if intent == "calendar_today":
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📅 Today's Schedule", callback_data="calendar_today")]])
+        await message.reply_text("🎙️ Sounds like you want today's schedule:", reply_markup=keyboard)
+        return
+
+    if intent == "calendar_weekly":
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📆 Week Plan", callback_data="calendar_weekly")]])
+        await message.reply_text("🎙️ Sounds like you want this week's schedule:", reply_markup=keyboard)
+        return
+
+    if intent == "set_default_semester":
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")]])
+        await message.reply_text("🎙️ Sounds like you want to set your default semester:", reply_markup=keyboard)
+        return
+
+    if intent == "run_check":
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+        await _run_check_now(_UpdateMessageShim(update), context)
+        return
+
+    if intent == "fastenroll_list":
+        await send_fastenroll_list(message, update.effective_chat.id)
+        return
+
     # Unreachable given VOICE_INTENTS, but degrade to task creation rather
     # than silently dropping the voice note if a new intent is ever added
     # here without a branch.
     context.user_data["pending_step"] = "task_text"
     context.user_data.pop("task_wizard", None)
     await handle_pending_step(update, context, text_override=transcript)
+
+
+async def handle_voice_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User tapped one of the "did you mean...?" buttons offered when
+    classify_voice_intent came back "unclear" — re-run the same routing
+    logic, this time with the intent forced to whichever one they picked."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    pending = context.user_data.pop("pending_voice_clarify", None)
+    if not pending:
+        await query.edit_message_text("⚠️ This suggestion has expired — please send a new voice note.")
+        return
+
+    await query.edit_message_reply_markup(reply_markup=None)
+    chosen_intent = query.data.split("|", 1)[1]
+    result = {"intent": chosen_intent, "query": pending["query"], "alternatives": []}
+    await _route_voice_intent(update, context, result, pending["transcript"])
 
 
 # ── Fast Enroll guided wizard (date → time → course link) ──────────────────────
@@ -6966,6 +7083,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_task_buttons, pattern="^(task_add|task_list|task_by_course|task_done\\|.*|task_delete\\|.*)$"))
         app.add_handler(CallbackQueryHandler(handle_voice_confirm, pattern="^voice_confirm$"))
         app.add_handler(CallbackQueryHandler(handle_voice_reject, pattern="^voice_reject$"))
+        app.add_handler(CallbackQueryHandler(handle_voice_clarify, pattern="^voice_clarify\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_task_course_pick, pattern="^(task_course\\|.*|task_course_skip)$"))
         app.add_handler(CallbackQueryHandler(handle_course_view, pattern="^course_view\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_browse_courses, pattern="^browse_courses$"))
