@@ -83,17 +83,17 @@ Every voice note is transcribed first (via the free Google Web Speech API, no AP
 *   **Mid-wizard, it just answers the question** — e.g. speaking a due time while the bot is waiting for one behaves exactly like typing it.
 *   **Otherwise, a free-tier LLM (via [OpenRouter](https://openrouter.ai)) classifies what you meant** and routes it to the matching action — no need to open a menu first:
 
-    | You say (TR or EN) | What happens |
+    | You say (English or Turkish) | What happens |
     | :--- | :--- |
     | "remind me about the Computational Intelligence exam 3 days before" | 📌 Looks up that exam's real date (your registered sitting if known, otherwise the curriculum-wide date) and **saves the reminder task directly** — no follow-up questions asked. |
-    | "Computational Economics dersine kayıt olmak istiyorum" | Finds the matching open course and offers a one-tap **Enroll?** confirmation. |
-    | "Lineer Cebir dersinden kaydımı sil" | Same, for signing out of an enrolled course. |
-    | "Makro İktisat sınavına kayıt ol" / "sınav kaydımı iptal et" | Same, for exam registration / deregistration. |
-    | "notlarımı göster" | Opens **📜 Transcript**. |
-    | "yaklaşan sınavlarım neler" | Opens **📚 My Exam Dates**. |
-    | "bugünün yemek menüsünü göster" | Shows today's Mensa menu (filtered per your food preferences). |
-    | "domuz eti ve mantar yemiyorum" | Saves those as food preferences (see 🍽️ Enhanced Mensa Menu above). |
-    | "bot durumunu göster" | Runs `/status`. |
+    | "sign me up for Computational Economics" | Finds the matching open course and offers a one-tap **Enroll?** confirmation. |
+    | "unenroll me from Linear Algebra" | Same, for signing out of an enrolled course. |
+    | "register me for the Macroeconomics exam" / "deregister me from my exam" | Same, for exam registration / deregistration. |
+    | "show me my grades" | Opens **📜 Transcript**. |
+    | "what are my upcoming exams" | Opens **📚 My Exam Dates**. |
+    | "what's on the menu today" | Shows today's Mensa menu (filtered per your food preferences). |
+    | "I don't eat pork or mushrooms" | Saves those as food preferences (see 🍽️ Enhanced Mensa Menu above). |
+    | "show bot status" | Runs `/status`. |
     | "list the last file of Development Economics" | Finds that course's most recently uploaded file and offers a one-tap **📥 Download**. |
     | anything else | Falls back to creating a plain task with that text — the same safe default as before. |
 
