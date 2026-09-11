@@ -45,7 +45,7 @@ TOTP_SECRET = os.getenv("TOTP_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ALLOWED_USER_IDS_ENV = os.getenv("ALLOWED_USER_IDS", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "cohere/north-mini-code:free")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 BASE_URL = "https://elearning.uni-oldenburg.de"
 STUDIP_URL = "https://elearning.uni-oldenburg.de/dispatch.php/my_courses"
@@ -5952,15 +5952,16 @@ async def transcribe_voice_message(ogg_path: str) -> str:
 # today's task-creation behavior rather than breaking the voice flow.
 
 VOICE_INTENTS = [
-    "create_task", "course_enroll", "course_deenroll", "exam_register",
-    "exam_deregister", "check_grades", "check_exam_dates", "check_status",
-    "show_menu", "set_food_preferences", "unclear",
+    "create_task", "create_exam_reminder_task", "course_enroll", "course_deenroll",
+    "exam_register", "exam_deregister", "check_grades", "check_exam_dates",
+    "check_status", "show_menu", "set_food_preferences", "unclear",
 ]
 
 CLASSIFY_INTENT_SYSTEM_PROMPT = """You classify a spoken command (transcribed from Turkish or English) sent to a university assistant Telegram bot into exactly one intent.
 
 Intents, each with example phrasings in both languages:
-- create_task: "yeni görev ekle, yarın rapor teslim et" / "add a task, submit the report tomorrow"
+- create_task: "yeni görev ekle, yarın rapor teslim et" / "add a task, submit the report tomorrow" — a plain to-do, not tied to a specific exam's date
+- create_exam_reminder_task: "Computational Intelligence sınavından 3 gün önce hatırlat" / "remind me about the Computational Intelligence exam 3 days before" / "sınav günü hatırlat" — specifically asks to be reminded relative to a named exam's date (N days/hours before it, or on the day)
 - course_enroll: "Computational Economics dersine kayıt olmak istiyorum" / "sign me up for Computational Economics"
 - course_deenroll: "Lineer Cebir dersinden kaydımı sil" / "unenroll me from Linear Algebra"
 - exam_register: "Makro İktisat sınavına kayıt ol" / "register me for the Macroeconomics exam"
@@ -5972,7 +5973,7 @@ Intents, each with example phrasings in both languages:
 - set_food_preferences: "domuz eti yemiyorum" / "I don't eat pork" / "mantar ve balık istemiyorum, menüde gösterme"
 - unclear: anything that doesn't clearly match one of the above
 
-For course_enroll, course_deenroll, exam_register, and exam_deregister, also extract the course or exam name mentioned (in whatever language it was said) as "query"; otherwise "query" is null.
+For course_enroll, course_deenroll, exam_register, exam_deregister, and create_exam_reminder_task, also extract the course or exam name mentioned (in whatever language it was said) as "query"; otherwise "query" is null.
 
 Respond with strict JSON only, no other text: {"intent": "<intent>", "query": "<name or null>"}"""
 
@@ -6067,6 +6068,117 @@ async def extract_food_preferences(transcript: str) -> dict:
     return {"avoid_codes": codes, "avoid_keywords": keywords}
 
 
+EXAM_REMINDER_TASK_SYSTEM_PROMPT = """You extract the details of an exam reminder request (spoken in Turkish or English) for a university assistant bot. The user wants a task/reminder created some amount of time before a named exam.
+
+Extract:
+- "course_query": the course or exam name mentioned (in whatever language/form it was said)
+- "offset_value": a non-negative integer, how far before the exam to remind them (0 if they said "on the day of the exam")
+- "offset_unit": either "days" or "hours" (default "days" if unstated but a number of days-like phrase is used; infer "hours" only if hours were explicitly said)
+
+Examples:
+"Computational Intelligence sınavından 3 gün önce hatırlat" -> {"course_query": "Computational Intelligence", "offset_value": 3, "offset_unit": "days"}
+"remind me about the Macroeconomics exam 2 hours before" -> {"course_query": "Macroeconomics", "offset_value": 2, "offset_unit": "hours"}
+"Lineer Cebir sınav günü hatırlat" -> {"course_query": "Lineer Cebir", "offset_value": 0, "offset_unit": "days"}
+
+If the course/exam name or the offset can't be determined, use null for that field.
+
+Respond with strict JSON only, no other text: {"course_query": "<name or null>", "offset_value": <int or null>, "offset_unit": "<days|hours>"}"""
+
+
+async def extract_exam_reminder_task(transcript: str) -> dict:
+    """Extract {"course_query", "offset_value", "offset_unit"} from a spoken
+    "remind me about <exam> N days/hours before" request. Falls back to all
+    None/"days" on any failure — the caller must treat missing course_query or
+    offset_value as "couldn't understand" rather than guessing."""
+    raw = await _call_openrouter(EXAM_REMINDER_TASK_SYSTEM_PROMPT, transcript)
+    parsed = _extract_json_object(raw)
+    if not parsed:
+        return {"course_query": None, "offset_value": None, "offset_unit": "days"}
+    offset_value = parsed.get("offset_value")
+    try:
+        offset_value = int(offset_value) if offset_value is not None else None
+    except (TypeError, ValueError):
+        offset_value = None
+    offset_unit = parsed.get("offset_unit") if parsed.get("offset_unit") in ("days", "hours") else "days"
+    return {
+        "course_query": parsed.get("course_query") or None,
+        "offset_value": offset_value,
+        "offset_unit": offset_unit,
+    }
+
+
+async def _find_exam_datetime(session, query_text: Optional[str]):
+    """Find the best-matching exam for a spoken course/exam name and return
+    (title, exam_datetime, has_exact_time), or (None, None, False) if nothing
+    scores confidently enough. Pools candidates from both the student's own
+    registered exams (get_registered_exam_schedule, which can carry an exact
+    start time) and the full curriculum's exam dates (get_all_exam_dates,
+    date only — defaults to 09:00 local).
+
+    The same title can appear more than once across semesters (a retake, or
+    a past sitting still listed), so among near-equally good text matches a
+    today-or-later one is preferred — silently picking a past sitting would
+    create a reminder that's already overdue. But recency never overrides a
+    clearly better text match: a much stronger match wins even if its date
+    has already passed, since substituting a different, worse-matching
+    course by date alone would be actively misleading.
+    """
+    if not query_text:
+        return None, None, False
+
+    try:
+        registered = await get_registered_exam_schedule(session)
+    except Exception as e:
+        logging.warning(f"_find_exam_datetime: registered schedule fetch failed: {e}")
+        registered = []
+    try:
+        all_exams = await get_all_exam_dates(session)
+    except Exception as e:
+        logging.warning(f"_find_exam_datetime: all exam dates fetch failed: {e}")
+        all_exams = []
+
+    pool = []  # (title, datetime, has_exact_time)
+    for e in registered:
+        if not e.get("date"):
+            continue
+        if e.get("start_datetime"):
+            pool.append((e["title"], datetime.fromisoformat(e["start_datetime"]), True))
+        else:
+            pool.append((e["title"], datetime.fromisoformat(e["date"]).replace(hour=9, minute=0), False))
+    for e in all_exams:
+        if e.get("exam_date"):
+            pool.append((e["title"], datetime.fromisoformat(e["exam_date"]).replace(hour=9, minute=0), False))
+
+    if not pool:
+        return None, None, False
+
+    query_lower = query_text.strip().lower()
+    scored = []
+    for title, dt, has_time in pool:
+        title_lower = (title or "").lower()
+        if not title_lower:
+            continue
+        score = difflib.SequenceMatcher(None, query_lower, title_lower).ratio()
+        if query_lower in title_lower or title_lower in query_lower:
+            score = max(score, 0.85)
+        scored.append((score, title, dt, has_time))
+
+    if not scored:
+        return None, None, False
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, best_title, best_dt, best_has_time = scored[0]
+    if best_score < 0.45:
+        return None, None, False
+
+    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    if best_dt < today_start:
+        for score, title, dt, has_time in scored[1:]:
+            if dt >= today_start and score >= best_score - 0.15:
+                return title, dt, has_time
+
+    return best_title, best_dt, best_has_time
+
+
 def _best_title_match(query: Optional[str], candidates: list):
     """Fuzzy-match a spoken course/exam name against a list of (title, payload)
     candidates (e.g. (course_name, sem_id), (exam_title, exam_dict)). Returns
@@ -6105,6 +6217,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     status_msg = await update.message.reply_text("🎙️ Transcribing...", disable_notification=True)
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     ogg_path = os.path.join(tempfile.gettempdir(), f"voice_{update.message.voice.file_unique_id}.oga")
     try:
@@ -6146,14 +6259,18 @@ async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("⚠️ This confirmation has expired — please send a new voice note.")
         return
 
+    chat_id = update.effective_chat.id
     await query.edit_message_reply_markup(reply_markup=None)
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     if pending["step"]:
         context.user_data["pending_step"] = pending["step"]
         await handle_pending_step(update, context, text_override=pending["text"])
         return
 
+    await query.edit_message_text(f"🎙️ Heard: “{pending['text']}”\n\n🤔 Understanding...")
     result = await classify_voice_intent(pending["text"])
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     await _route_voice_intent(update, context, result, pending["text"])
 
 
@@ -6209,6 +6326,53 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         await handle_pending_step(update, context, text_override=transcript)
         return
 
+    if intent == "create_exam_reminder_task":
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+        extracted = await extract_exam_reminder_task(transcript)
+        course_query = extracted["course_query"] or query_text
+        offset_value = extracted["offset_value"]
+        if not course_query or offset_value is None:
+            await message.reply_text(
+                "🤷 Couldn't tell which exam or how far ahead to remind you — try e.g. "
+                "\"remind me about the Computational Intelligence exam 3 days before\"."
+            )
+            return
+        try:
+            session = await login_studip()
+            exam_title, exam_dt, has_time = await _find_exam_datetime(session, course_query)
+        except Exception as e:
+            logging.error(f"_route_voice_intent: create_exam_reminder_task fetch failed: {e}")
+            await message.reply_text(f"❌ Error: {str(e)[:200]}")
+            return
+        if not exam_title:
+            await message.reply_text(
+                f"🎙️ Couldn't find an exam matching \"{course_query}\" — check the spelling, "
+                "or set the reminder manually via ➕ Add Task."
+            )
+            return
+
+        delta = timedelta(hours=offset_value) if extracted["offset_unit"] == "hours" else timedelta(days=offset_value)
+        due_dt = (exam_dt - delta).replace(tzinfo=TZ_BERLIN)
+        task = {
+            "id": str(uuid.uuid4())[:8],
+            "user_id": update.effective_user.id,
+            "text": f"{exam_title} exam",
+            "due_time": due_dt.isoformat(),
+            "course": exam_title,
+            "created_at": datetime.now(TZ_BERLIN).isoformat(),
+            "notified": False,
+        }
+        tasks = load_tasks()
+        tasks.append(task)
+        save_tasks(tasks)
+
+        exam_when = exam_dt.strftime("%d.%m.%Y %H:%M") if has_time else exam_dt.strftime("%d.%m.%Y (time unknown)")
+        past_warning = "\n⚠️ That exam date has already passed — double-check this is the sitting you meant." if exam_dt.date() < datetime.now().date() else ""
+        await message.reply_text(
+            f"✅ Reminder set for {due_dt.strftime('%d.%m.%Y %H:%M')} — {exam_title} exam ({exam_when}){past_warning}"
+        )
+        return
+
     if intent == "check_status":
         await status_command(_UpdateMessageShim(update), context)
         return
@@ -6224,6 +6388,7 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if intent == "show_menu":
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
         try:
             session = await login_studip()
             prefs = load_food_preferences()
@@ -6255,6 +6420,7 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
             await message.reply_text("🎙️ No default semester set, so I can't match a course by name yet — pick a semester:")
             await _show_semester_picker(message, "course_sem", "📚 Pick a semester to see courses currently open for enrolment:")
             return
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
         try:
             session = await login_studip()
             open_courses = await get_open_courses(session, semester_id=default["id"])
@@ -6277,6 +6443,7 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
     if intent == "course_deenroll":
         default = load_default_semester()
         semester_id = default.get("id")
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
         try:
             courses = await list_courses(semester_id=semester_id)
         except Exception as e:
@@ -6297,6 +6464,7 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if intent in ("exam_register", "exam_deregister"):
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
         try:
             session = await login_studip()
             if intent == "exam_register":

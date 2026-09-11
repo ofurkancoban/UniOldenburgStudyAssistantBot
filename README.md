@@ -48,6 +48,7 @@ A beautiful, emoji-rich menu with:
 - Pricing for students/guests.
 - Full allergen and additive guide.
 - **Smart Filtering**: Identification of Vegan (🌿 V+), Vegetarian (🥗 V), and meat types.
+- **🚫 Food Preferences**: Tell the bot what you don't eat (by tapping **"⚙️ Food Preferences"** on the menu, or just saying it out loud — see 🎙️ Voice Commands below) and it hides matching dishes from every menu view from then on, checking both official allergen/ingredient codes (e.g. pork, fish, nuts) and free-text ingredients (e.g. "mushrooms") that aren't in the official code table.
 
 ### 🎓 Exam & Grade Intelligence (StuMS/HISinOne)
 The bot goes beyond Stud.IP and reverse-engineers the university's separate **StuMS/HISinOne** exam portal to close the entire loop — *register → remind → sit the exam → get the result*:
@@ -70,15 +71,37 @@ Manage your own Stud.IP course enrolments (Veranstaltungsanmeldung) directly fro
 ### ✅ Personal Tasks & Reminders
 A lightweight to-do list that lives inside the bot:
 *   Add a plain **to-do** or a **timed reminder** in free text — `tomorrow 15:00`, `in 2 hours`, `20.09 09:00`.
-*   **🎙️ Voice input**: just send a voice note instead of typing — it's transcribed (via the free Google Web Speech API, no API key needed), shown back to you for a quick **✅ Yes / ✏️ Try again** confirmation, then dropped into the task wizard.
 *   **📘 Course tagging**: after setting the text and time, optionally tag the task to one of your currently-enrolled Stud.IP courses — shown in the task list as `[Course Name]`.
 *   **📘 By Course**: pick a course to see its tagged tasks and upcoming StuMS exam dates together in one view.
 *   Manage everything from **"📋 My Tasks"**: mark done, delete, or cancel a pending reminder.
 *   Reminders fire automatically once due — no forced-reply prompts, so the bot's keyboard never disappears mid-flow.
 *   Combines with **🔔 Upcoming** (under the Calendar message) for one chronologically-sorted view of task reminders, exam dates, and registration deadlines together.
 
+### 🎙️ Voice Commands (AI Intent Routing)
+Every voice note is transcribed first (via the free Google Web Speech API, no API key needed — **Turkish and English are both tried automatically**, `langdetect` picks whichever transcript actually matches its language) and shown back to you for a quick **✅ Yes / ✏️ Try again** confirmation before anything happens.
+
+*   **Mid-wizard, it just answers the question** — e.g. speaking a due time while the bot is waiting for one behaves exactly like typing it.
+*   **Otherwise, a free-tier LLM (via [OpenRouter](https://openrouter.ai)) classifies what you meant** and routes it to the matching action — no need to open a menu first:
+
+    | You say (TR or EN) | What happens |
+    | :--- | :--- |
+    | "remind me about the Computational Intelligence exam 3 days before" | 📌 Looks up that exam's real date (your registered sitting if known, otherwise the curriculum-wide date) and **saves the reminder task directly** — no follow-up questions asked. |
+    | "Computational Economics dersine kayıt olmak istiyorum" | Finds the matching open course and offers a one-tap **Enroll?** confirmation. |
+    | "Lineer Cebir dersinden kaydımı sil" | Same, for signing out of an enrolled course. |
+    | "Makro İktisat sınavına kayıt ol" / "sınav kaydımı iptal et" | Same, for exam registration / deregistration. |
+    | "notlarımı göster" | Opens **📜 Transcript**. |
+    | "yaklaşan sınavlarım neler" | Opens **📚 My Exam Dates**. |
+    | "bugünün yemek menüsünü göster" | Shows today's Mensa menu (filtered per your food preferences). |
+    | "domuz eti ve mantar yemiyorum" | Saves those as food preferences (see 🍽️ Enhanced Mensa Menu above). |
+    | "bot durumunu göster" | Runs `/status`. |
+    | anything else | Falls back to creating a plain task with that text — the same safe default as before. |
+
+    Destructive actions (enroll, sign out, exam register/deregister) are **never** executed directly from voice — the bot only figures out which button you meant and presents it pre-selected; tapping it still goes through the normal confirmation.
+
 > [!NOTE]
-> Voice-note transcription requires **ffmpeg** on the server (`apt install ffmpeg` / `brew install ffmpeg`) to convert Telegram's audio format. `setup.sh` warns if it's missing. **Turkish and English are both tried automatically** on every voice note (`VOICE_TASK_LANGUAGES` in `studip_bot.py`), and `langdetect` picks whichever transcript actually matches its language — no need to specify which one you're speaking.
+> Voice-note transcription requires **ffmpeg** on the server (`apt install ffmpeg` / `brew install ffmpeg`) to convert Telegram's audio format. `setup.sh` warns if it's missing.
+>
+> Intent routing requires an **`OPENROUTER_API_KEY`** (free to create at [openrouter.ai](https://openrouter.ai/keys)) — without one, every voice note just falls back to plain task creation, exactly like before this feature existed. OpenRouter's `:free` models cap free accounts at 50 requests/day; a one-time $10 credit purchase (never actually spent on `:free` models) permanently raises that to 1,000/day — worth doing once real usage picks up.
 
 ---
 
@@ -119,6 +142,10 @@ STUDIP_ICAL_URL=https://elearning.uni-oldenburg.de/dispatch.php/ical/index/...
 # --- WhatsApp Integration ---
 WHATSAPP_GROUP_NAME="StudIP Alerts"
 PORT=3838  # Port for the WhatsApp Microservice
+
+# --- Voice Command Intent Routing (optional) ---
+OPENROUTER_API_KEY=your_openrouter_key_here   # https://openrouter.ai/keys — omit to disable, tasks-only voice input still works
+OPENROUTER_MODEL=cohere/north-mini-code:free  # any OpenRouter model id; defaults to this free one
 ```
 
 > [!IMPORTANT]
@@ -180,9 +207,14 @@ graph TD
     C -.->|Forward & Status| I[Node.js WhatsApp Microservice]
     D -.->|Forward & Status| I
     I --> J[WhatsApp Web]
+    C -.->|Voice note| M[Google Web Speech STT]
+    M -.->|Transcript| N[OpenRouter free LLM]
+    N -.->|Classified intent| C
 ```
 
 > **exam_reminder.py** shares the same authenticated session as `studip_bot.py` (Stud.IP's SSO trust extends to the StuMS/HISinOne exam portal) to track registrations, exam dates, and grades — no separate login required.
+>
+> Voice notes go through two free external calls before anything happens: Google's Web Speech API for transcription, then an OpenRouter `:free` model for intent classification — both optional, both fail gracefully back to plain-text behavior if unavailable.
 
 ---
 
