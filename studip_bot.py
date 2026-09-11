@@ -3056,23 +3056,29 @@ async def show_last_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     # First show "Loading..." message
-    await query.edit_message_text("📨 Loading last 5 messages...")
+    status_msg = await query.edit_message_text("📨 Loading last 5 messages...")
     await _show_typing(query)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Loading last 5 messages...")
 
     chat_id = query.message.chat_id
 
-    # Load message cache
-    if not os.path.exists(CACHE_FILE):
-        await query.edit_message_text("⚠️ No message history available.")
-        return
-
     try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            all_messages = json.load(f)
-    except Exception as e:
-        logging.error(f"Failed to load message cache: {e}")
-        await query.edit_message_text("⚠️ Error loading message history.")
-        return
+        # Load message cache
+        if not os.path.exists(CACHE_FILE):
+            await _stop_loading_animation(stop_evt, anim_task)
+            await query.edit_message_text("⚠️ No message history available.")
+            return
+
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                all_messages = json.load(f)
+        except Exception as e:
+            logging.error(f"Failed to load message cache: {e}")
+            await _stop_loading_animation(stop_evt, anim_task)
+            await query.edit_message_text("⚠️ Error loading message history.")
+            return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
 
     if not all_messages:
         await query.edit_message_text("ℹ️ No messages found in history.")
@@ -3211,6 +3217,51 @@ async def _show_typing(sender, action=ChatAction.TYPING):
         pass
 
 
+LOADING_ANIMATION_FRAMES = ("⏳", "⌛")
+
+
+def _start_loading_animation(status_message, base_text: str, frames=LOADING_ANIMATION_FRAMES, interval: float = 1.5):
+    """Start a background task that cycles an emoji prefix on
+    `status_message`'s text (a real telegram.Message, e.g. whatever
+    `await ...reply_text(...)` or `await query.edit_message_text(...)`
+    returned) every `interval` seconds, so a "please wait" bubble visibly
+    animates instead of sitting static.
+
+    Returns (stop_event, task). MUST be paired with a matching
+    `await _stop_loading_animation(stop_event, task)` in a `finally` block
+    BEFORE the caller sends/edits that message with the real result —
+    otherwise a late animation tick can overwrite real content with a
+    stale loading frame. Keep the wrapped span to just the actual slow
+    call(s); don't wrap unrelated code after the result is already decided.
+    """
+    stop_event = asyncio.Event()
+
+    async def _loop():
+        i = 0
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                break  # stop_event was set while waiting
+            except asyncio.TimeoutError:
+                pass
+            i += 1
+            try:
+                await status_message.edit_text(f"{frames[i % len(frames)]} {base_text}")
+            except Exception:
+                # Message deleted/unchanged/whatever — stop rather than spam retries.
+                break
+
+    return stop_event, asyncio.create_task(_loop())
+
+
+async def _stop_loading_animation(stop_event: asyncio.Event, task: "asyncio.Task"):
+    stop_event.set()
+    try:
+        await task
+    except Exception:
+        pass
+
+
 async def _reply_or_edit(sender, text, reply_markup=None, parse_mode=None):
     """Send text as a new message, or edit sender's message in place when
     sender is a CallbackQuery (has edit_message_text). Stepping through a
@@ -3218,7 +3269,10 @@ async def _reply_or_edit(sender, text, reply_markup=None, parse_mode=None):
     instead of stacking new ones — stacked messages made it easy to mis-tap a
     stale button left over from an earlier list (e.g. picking a new semester
     while the old course list's "Enroll" buttons were still live underneath,
-    accidentally enrolling from the old list instead)."""
+    accidentally enrolling from the old list instead).
+
+    Returns the resulting telegram.Message (useful e.g. to animate it via
+    _start_loading_animation while the next step is slow)."""
     kwargs = {}
     if reply_markup is not None:
         kwargs["reply_markup"] = reply_markup
@@ -3226,11 +3280,10 @@ async def _reply_or_edit(sender, text, reply_markup=None, parse_mode=None):
         kwargs["parse_mode"] = parse_mode
     if hasattr(sender, "edit_message_text"):
         try:
-            await sender.edit_message_text(text, **kwargs)
-            return
+            return await sender.edit_message_text(text, **kwargs)
         except Exception as e:
             logging.debug(f"_reply_or_edit: edit failed, falling back to reply: {e}")
-    await sender.reply_text(text, **kwargs)
+    return await sender.reply_text(text, **kwargs)
 
 
 async def _show_semester_picker(sender, callback_prefix: str, prompt: str):
@@ -3683,9 +3736,13 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if query.data == "exam_menu":
-        await query.message.reply_text("📝 Loading exam registration status...", disable_notification=True)
+        status_msg = await query.message.reply_text("📝 Loading exam registration status...", disable_notification=True)
         await _show_typing(query)
-        await send_exam_registration_menu(query.message)
+        stop_evt, anim_task = _start_loading_animation(status_msg, "Loading exam registration status...")
+        try:
+            await send_exam_registration_menu(query.message)
+        finally:
+            await _stop_loading_animation(stop_evt, anim_task)
         return
 
     if query.data == "exam_noop":
@@ -3716,8 +3773,9 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if action == "exam_do":
-        await query.edit_message_text(f"⏳ Submitting: {verb} {info['title']}...")
+        status_msg = await query.edit_message_text(f"⏳ Submitting: {verb} {info['title']}...")
         await _show_typing(query)
+        stop_evt, anim_task = _start_loading_animation(status_msg, f"Submitting: {verb} {info['title']}...")
         try:
             session = await login_studip()
             result = await submit_exam_action(session, info["unit_id"], info["action_type"])
@@ -3725,6 +3783,8 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             logging.error(f"exam action failed: {e}")
             await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
             return
+        finally:
+            await _stop_loading_animation(stop_evt, anim_task)
         exam_action_cache.pop(sid, None)
         title = result.get("title") or info["title"]
         if result["success"]:
@@ -3845,52 +3905,56 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.warning(f"⚠️ Cached URL failed, getting fresh URL: {e}")
 
         # If cached URL doesn't work, get fresh URL
-        await query.edit_message_text(f"🔍 Getting fresh download link for:\n📄 {fname}")
+        status_msg = await query.edit_message_text(f"🔍 Getting fresh download link for:\n📄 {fname}")
         await _show_typing(query, action=ChatAction.UPLOAD_DOCUMENT)
-
-        url = await get_fresh_file_url(cid, fname, current_url)
-        if not url:
-            await query.message.reply_text(f"⚠️ Could not get download link for:\n{fname}")
-            logging.error(f"❌ No download URL found for: {fname}")
-            return
-
-        # Save URL to cache (for future use)
-        link_cache[sid] = {
-            **info,
-            "url": url,
-            "ts": datetime.now().timestamp(),
-            "user_id": user_id  # Save current user
-        }
-        cleanup_link_cache()
-
-        temp_path = os.path.join(tempfile.gettempdir(), fname)
+        stop_evt, anim_task = _start_loading_animation(status_msg, f"Getting fresh download link for:\n📄 {fname}")
 
         try:
-            async with await global_session.get(url) as resp:
-                if resp.status != 200:
-                    await query.message.reply_text(f"⚠️ Download failed (HTTP {resp.status}).")
-                    logging.error(f"❌ Download failed: HTTP {resp.status} for {url}")
-                    return
+            url = await get_fresh_file_url(cid, fname, current_url)
+            if not url:
+                await query.message.reply_text(f"⚠️ Could not get download link for:\n{fname}")
+                logging.error(f"❌ No download URL found for: {fname}")
+                return
 
-                content = await resp.read()
-                if len(content) > 48 * 1024 * 1024:
-                    await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
-                    return
+            # Save URL to cache (for future use)
+            link_cache[sid] = {
+                **info,
+                "url": url,
+                "ts": datetime.now().timestamp(),
+                "user_id": user_id  # Save current user
+            }
+            cleanup_link_cache()
 
-                with open(temp_path, "wb") as f:
-                    f.write(content)
+            temp_path = os.path.join(tempfile.gettempdir(), fname)
 
-                await query.message.reply_document(
-                    document=open(temp_path, "rb"),
-                    filename=fname,
-                    caption=f"✅ {fname}"
-                )
-                os.remove(temp_path)
-                logging.info(f"✅ Successfully downloaded: {fname}")
+            try:
+                async with await global_session.get(url) as resp:
+                    if resp.status != 200:
+                        await query.message.reply_text(f"⚠️ Download failed (HTTP {resp.status}).")
+                        logging.error(f"❌ Download failed: HTTP {resp.status} for {url}")
+                        return
 
-        except Exception as e:
-            logging.error(f"❌ Download failed for {fname}: {e}")
-            await query.message.reply_text(f"⚠️ Download failed:\n{str(e)[:200]}")
+                    content = await resp.read()
+                    if len(content) > 48 * 1024 * 1024:
+                        await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
+                        return
+
+                    with open(temp_path, "wb") as f:
+                        f.write(content)
+
+                    await query.message.reply_document(
+                        document=open(temp_path, "rb"),
+                        filename=fname,
+                        caption=f"✅ {fname}"
+                    )
+                    os.remove(temp_path)
+                    logging.info(f"✅ Successfully downloaded: {fname}")
+
+            except Exception as e:
+                logging.error(f"❌ Download failed for {fname}: {e}")
+                await query.message.reply_text(f"⚠️ Download failed:\n{str(e)[:200]}")
+        finally:
+            await _stop_loading_animation(stop_evt, anim_task)
 
     # ── navigation (back, home, courses, zip) ────────────────────────────
     elif data[0] == "nav":
@@ -4210,27 +4274,31 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         # Temporary loading message
         status_msg = await sender.reply_text("⏳ Please wait...")
         await _show_typing(sender)
+        stop_evt, anim_task = _start_loading_animation(status_msg, "Please wait...")
 
-        if data[0] == "menu":
-            await menu_command(update, context)
-        elif data[0] == "calendar":
-            logging.info("📅 Fetching today's schedule...")
-            today = datetime.now().date()
-            week_start = today - timedelta(days=today.weekday())
-            events = await get_calendar_events(session=global_session, week_start=week_start)
-            await send_daily_calendar(sender, events, today, week_start)
-        elif data[0] == "tasks":
-            await send_tasks_menu(sender)
-        elif data[0] == "start":
-            await start(update, context)
-        elif data[0] == "files":
-            await handle_files_browse(sender)
-        elif data[0] == "check":
-            await check_command(update, context)
-        elif data[0] == "status":
-            await status_command(update, context)
-        else:
-            await sender.reply_text("❓ Unknown command.")
+        try:
+            if data[0] == "menu":
+                await menu_command(update, context)
+            elif data[0] == "calendar":
+                logging.info("📅 Fetching today's schedule...")
+                today = datetime.now().date()
+                week_start = today - timedelta(days=today.weekday())
+                events = await get_calendar_events(session=global_session, week_start=week_start)
+                await send_daily_calendar(sender, events, today, week_start)
+            elif data[0] == "tasks":
+                await send_tasks_menu(sender)
+            elif data[0] == "start":
+                await start(update, context)
+            elif data[0] == "files":
+                await handle_files_browse(sender)
+            elif data[0] == "check":
+                await check_command(update, context)
+            elif data[0] == "status":
+                await status_command(update, context)
+            else:
+                await sender.reply_text("❓ Unknown command.")
+        finally:
+            await _stop_loading_animation(stop_evt, anim_task)
 
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
@@ -4499,10 +4567,14 @@ async def handle_calendar_week(update: Update, context: ContextTypes.DEFAULT_TYP
         week_start = today - timedelta(days=today.weekday())
 
     try:
-        await query.edit_message_text("⏳ Loading schedule...")
+        status_msg = await query.edit_message_text("⏳ Loading schedule...")
         await _show_typing(query)
+        stop_evt, anim_task = _start_loading_animation(status_msg, "Loading schedule...")
         session = global_session
-        events = await get_calendar_events(session=session, week_start=week_start)
+        try:
+            events = await get_calendar_events(session=session, week_start=week_start)
+        finally:
+            await _stop_loading_animation(stop_evt, anim_task)
         await send_weekly_calendar(query, events, week_start)
     except Exception as e:
         logging.error(f"Calendar week nav error: {e}")
@@ -4519,12 +4591,16 @@ async def handle_calendar_today(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     try:
-        await query.edit_message_text("📅 Fetching today's events...")
+        status_msg = await query.edit_message_text("📅 Fetching today's events...")
         await _show_typing(query)
+        stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching today's events...")
         session = global_session
         today = datetime.now().date()
         week_start = today - timedelta(days=today.weekday())
-        events = await get_calendar_events(session=session, week_start=week_start)
+        try:
+            events = await get_calendar_events(session=session, week_start=week_start)
+        finally:
+            await _stop_loading_animation(stop_evt, anim_task)
         await send_daily_calendar(query, events, today, week_start)
     except Exception as e:
         logging.error(f"Calendar today error: {e}")
@@ -4541,12 +4617,16 @@ async def handle_calendar_weekly(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     try:
-        await query.edit_message_text("🗓️ Fetching weekly schedule...")
+        status_msg = await query.edit_message_text("🗓️ Fetching weekly schedule...")
         await _show_typing(query)
+        stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching weekly schedule...")
         session = global_session
         today = datetime.now().date()
         week_start = today - timedelta(days=today.weekday())
-        events = await get_calendar_events(session=session, week_start=week_start)
+        try:
+            events = await get_calendar_events(session=session, week_start=week_start)
+        finally:
+            await _stop_loading_animation(stop_evt, anim_task)
         await send_weekly_calendar(query, events, week_start)
     except Exception as e:
         logging.error(f"Calendar weekly error: {e}")
@@ -4663,8 +4743,9 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
     if not is_user_allowed(user_id):
         return
 
-    await query.message.reply_text("📚 Fetching your exam dates... this may take a moment.", disable_notification=True)
+    status_msg = await query.message.reply_text("📚 Fetching your exam dates... this may take a moment.", disable_notification=True)
     await _show_typing(query)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching your exam dates... this may take a moment.")
 
     try:
         session = await login_studip()
@@ -4675,6 +4756,8 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
         logging.error(f"My exam dates error: {e}")
         await query.message.reply_text(f"❌ Error loading exam dates: {str(e)[:200]}")
         return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
 
     matched = filter_exams_by_module_codes(exams, module_codes)
 
@@ -4703,8 +4786,9 @@ async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_user_allowed(user_id):
         return
 
-    await query.message.reply_text("📚 Fetching all exam dates... this may take a moment.", disable_notification=True)
+    status_msg = await query.message.reply_text("📚 Fetching all exam dates... this may take a moment.", disable_notification=True)
     await _show_typing(query)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching all exam dates... this may take a moment.")
 
     try:
         session = await login_studip()
@@ -4713,6 +4797,8 @@ async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TY
         logging.error(f"All exam dates error: {e}")
         await query.message.reply_text(f"❌ Error loading exam dates: {str(e)[:200]}")
         return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
 
     today = datetime.now().date()
     upcoming = [e for e in exams if datetime.fromisoformat(e["exam_date"]).date() >= today]
@@ -4738,8 +4824,9 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
     if not is_user_allowed(user_id):
         return
 
-    await query.message.reply_text("📜 Fetching your transcript...", disable_notification=True)
+    status_msg = await query.message.reply_text("📜 Fetching your transcript...", disable_notification=True)
     await _show_typing(query)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching your transcript...")
 
     try:
         session = await login_studip()
@@ -4748,6 +4835,8 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
         logging.error(f"Transcript summary error: {e}")
         await query.message.reply_text(f"❌ Error loading transcript: {str(e)[:200]}")
         return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
 
     summary = compute_transcript_summary(grades)
 
@@ -4866,8 +4955,9 @@ async def handle_upcoming_dashboard(update: Update, context: ContextTypes.DEFAUL
     if not is_user_allowed(user_id):
         return
 
-    await query.message.reply_text("🔔 Fetching your upcoming items...", disable_notification=True)
+    status_msg = await query.message.reply_text("🔔 Fetching your upcoming items...", disable_notification=True)
     await _show_typing(query)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching your upcoming items...")
 
     try:
         session = await login_studip()
@@ -4876,6 +4966,8 @@ async def handle_upcoming_dashboard(update: Update, context: ContextTypes.DEFAUL
         logging.error(f"Upcoming dashboard error: {e}")
         await query.message.reply_text(f"❌ Error loading upcoming items: {str(e)[:200]}")
         return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
 
     await query.message.reply_text(text, parse_mode="HTML")
 
@@ -5404,8 +5496,9 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     course_name, course_cid = options[idx]
 
-    await query.message.reply_text(f"📘 Loading {course_name}...", disable_notification=True)
+    status_msg = await query.message.reply_text(f"📘 Loading {course_name}...", disable_notification=True)
     await _show_typing(query)
+    stop_evt, anim_task = _start_loading_animation(status_msg, f"Loading {course_name}...")
 
     lines = [f"📘 <b>{course_name}</b>", "━━━━━━━━━━━━━━━━━"]
 
@@ -5434,6 +5527,8 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logging.error(f"handle_course_view: exam fetch failed: {e}")
         upcoming = None
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
 
     if upcoming is None:
         lines.append("📅 <b>Exams:</b> could not load right now")
@@ -5486,8 +5581,9 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
     # rows) live and tappable during this network wait, which let an
     # impatient tap land on stale "Enroll" buttons and silently enroll in the
     # wrong course from the old list.
-    await _reply_or_edit(sender, "📚 Checking which courses are open for enrolment... this may take a moment.", reply_markup=InlineKeyboardMarkup([]))
+    status_msg = await _reply_or_edit(sender, "📚 Checking which courses are open for enrolment... this may take a moment.", reply_markup=InlineKeyboardMarkup([]))
     await _show_typing(sender)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Checking which courses are open for enrolment... this may take a moment.")
 
     try:
         session = await login_studip()
@@ -5499,9 +5595,15 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
         enrolled_cids = {cid for _, cid in await list_courses(semester_id=semester_id)}
         open_courses = [c for c in open_courses if c["sem_id"] not in enrolled_cids]
     except Exception as e:
+        # Stop the animation before this edits the same status_msg with the
+        # error — otherwise a late animation tick can race with (or land
+        # after) this edit and clobber it back to a loading frame.
+        await _stop_loading_animation(stop_evt, anim_task)
         logging.error(f"_render_open_courses_for_semester: failed to fetch open courses: {e}")
         await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
         return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
 
     change_semester_row = [InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|enroll")]
 
@@ -5590,8 +5692,9 @@ async def handle_course_enroll_confirm(update: Update, context: ContextTypes.DEF
         return
 
     sem_id = query.data.split("|", 1)[1]
-    await query.edit_message_text("⏳ Enrolling...")
+    status_msg = await query.edit_message_text("⏳ Enrolling...")
     await _show_typing(query)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Enrolling...")
 
     try:
         session = await login_studip()
@@ -5600,6 +5703,8 @@ async def handle_course_enroll_confirm(update: Update, context: ContextTypes.DEF
         logging.error(f"handle_course_enroll_confirm: enroll failed: {e}")
         await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
         return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
 
     if success:
         await query.message.reply_text("✅ Enrolled successfully!")
@@ -5646,15 +5751,21 @@ async def _render_enrolled_courses_for_semester(sender, semester_id: str):
     # buttons were on the previous message (e.g. the prior semester's "Sign
     # out" rows) live and tappable during this network wait, which let an
     # impatient tap land on a stale "Sign out" button for the wrong course.
-    await _reply_or_edit(sender, "📚 Loading your enrolled courses for that semester...", reply_markup=InlineKeyboardMarkup([]))
+    status_msg = await _reply_or_edit(sender, "📚 Loading your enrolled courses for that semester...", reply_markup=InlineKeyboardMarkup([]))
     await _show_typing(sender)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Loading your enrolled courses for that semester...")
 
     try:
         courses = await list_courses(semester_id=semester_id)
     except Exception as e:
+        # Stop before this edits the same status_msg with the error — see
+        # the identical note in _render_open_courses_for_semester.
+        await _stop_loading_animation(stop_evt, anim_task)
         logging.error(f"_render_enrolled_courses_for_semester: failed to fetch courses: {e}")
         await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
         return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
 
     change_semester_row = InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|deenroll")
 
@@ -5731,8 +5842,9 @@ async def handle_course_deenroll_confirm(update: Update, context: ContextTypes.D
         return
 
     cid = query.data.split("|", 1)[1]
-    await query.edit_message_text("⏳ Signing out...")
+    status_msg = await query.edit_message_text("⏳ Signing out...")
     await _show_typing(query)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Signing out...")
 
     try:
         session = await login_studip()
@@ -5741,6 +5853,8 @@ async def handle_course_deenroll_confirm(update: Update, context: ContextTypes.D
         logging.error(f"handle_course_deenroll_confirm: decline failed: {e}")
         await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
         return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
 
     if success:
         await query.message.reply_text("✅ Signed out of the course successfully!")
