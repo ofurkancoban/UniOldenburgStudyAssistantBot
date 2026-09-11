@@ -94,6 +94,7 @@ Every voice note is transcribed first (via the free Google Web Speech API, no AP
     | "bugünün yemek menüsünü göster" | Shows today's Mensa menu (filtered per your food preferences). |
     | "domuz eti ve mantar yemiyorum" | Saves those as food preferences (see 🍽️ Enhanced Mensa Menu above). |
     | "bot durumunu göster" | Runs `/status`. |
+    | "list the last file of Development Economics" | Finds that course's most recently uploaded file and offers a one-tap **📥 Download**. |
     | anything else | Falls back to creating a plain task with that text — the same safe default as before. |
 
     Destructive actions (enroll, sign out, exam register/deregister) are **never** executed directly from voice — the bot only figures out which button you meant and presents it pre-selected; tapping it still goes through the normal confirmation.
