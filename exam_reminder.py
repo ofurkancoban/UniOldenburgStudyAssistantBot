@@ -604,6 +604,9 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
                 except Exception as e:
                     logging.error(f"exam_reminder: failed to send exam-date reminder for {key}: {e}")
                 sent_days.add(threshold)
+                notified_days[key] = sorted(sent_days)
+                cache["notified_exam_date"] = notified_days
+                save_exam_cache(cache)
         notified_days[key] = sorted(sent_days)
 
         if exam.get("start_datetime") and not notified_hours.get(key):
@@ -626,6 +629,8 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
                 except Exception as e:
                     logging.error(f"exam_reminder: failed to send starting-soon reminder for {key}: {e}")
                 notified_hours[key] = True
+                cache["notified_exam_hours"] = notified_hours
+                save_exam_cache(cache)
 
     # Drop bookkeeping for exams that dropped off the upcoming list (already
     # happened, or deregistered), so a future re-registration is treated as new.
@@ -816,6 +821,10 @@ async def check_exam_reminders(session, bot, broadcast_fn) -> None:
             except Exception as e:
                 logging.error(f"exam_reminder: failed to send open-notification for {occurrence_key}: {e}")
             notified_open[occurrence_key] = now.isoformat()
+            # Persist immediately so a crash while processing a later exam in this
+            # same batch can't cause this notification to be resent on restart.
+            cache["notified_open"] = notified_open
+            save_exam_cache(cache)
 
         if end_date:
             days_left = (end_date.date() - now.date()).days
@@ -838,6 +847,9 @@ async def check_exam_reminders(session, bot, broadcast_fn) -> None:
                     except Exception as e:
                         logging.error(f"exam_reminder: failed to send deadline-notification for {occurrence_key}: {e}")
                     sent_thresholds.add(threshold)
+                    notified_deadline[occurrence_key] = sorted(sent_thresholds)
+                    cache["notified_deadline"] = notified_deadline
+                    save_exam_cache(cache)
             notified_deadline[occurrence_key] = sorted(sent_thresholds)
 
     # A sitting missing from still_open_keys has either closed or its registration
@@ -1090,6 +1102,5 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
             logging.error(f"exam_reminder: failed to send grade notification for {number}: {e}")
 
         known_grades[number] = fingerprint
-
-    cache["known_grades"] = known_grades
-    save_exam_cache(cache)
+        cache["known_grades"] = known_grades
+        save_exam_cache(cache)

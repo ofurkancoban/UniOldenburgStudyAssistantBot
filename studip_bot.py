@@ -3567,7 +3567,7 @@ async def send_exam_registration_menu(message):
         return
 
     await message.reply_text(
-        "🎓 <b>Exam Registration</b>\nSelect an exam to register or deregister:",
+        "📝 <b>Exam Registration</b>\nSelect an exam to register or deregister:",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -3583,7 +3583,7 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if query.data == "exam_menu":
-        await query.message.reply_text("🎓 Loading exam registration status...", disable_notification=True)
+        await query.message.reply_text("📝 Loading exam registration status...", disable_notification=True)
         await send_exam_registration_menu(query.message)
         return
 
@@ -6125,7 +6125,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
         [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
-        [InlineKeyboardButton("🎓 Exam Registration", callback_data="exam_menu")],
+        [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
         [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
         [InlineKeyboardButton("📱 WhatsApp", callback_data="wa_menu")],
         [InlineKeyboardButton("📅 Change iCal Link", callback_data="change_ical_link")]
