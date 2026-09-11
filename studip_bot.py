@@ -11,6 +11,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 import pyotp
 import uuid
 import hashlib
+import difflib
 from urllib.parse import unquote, urljoin
 import errno
 import sys
@@ -43,6 +44,9 @@ PASSWORD = os.getenv("PASSWORD")
 TOTP_SECRET = os.getenv("TOTP_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ALLOWED_USER_IDS_ENV = os.getenv("ALLOWED_USER_IDS", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 BASE_URL = "https://elearning.uni-oldenburg.de"
 STUDIP_URL = "https://elearning.uni-oldenburg.de/dispatch.php/my_courses"
 last_full_check_time = None
@@ -435,6 +439,36 @@ def clear_default_semester() -> None:
             os.remove(DEFAULT_SEMESTER_CACHE_PATH)
     except Exception as e:
         logging.error(f"Could not clear default semester: {e}")
+
+
+FOOD_PREFERENCES_CACHE_PATH = "food_preferences.json"
+
+
+def load_food_preferences() -> dict:
+    """Return {"avoid_codes": [...], "avoid_keywords": [...]} describing
+    ingredients/allergen codes the user doesn't eat, or empty lists if none
+    have been set — in which case the Mensa menu shows everything as before."""
+    if os.path.exists(FOOD_PREFERENCES_CACHE_PATH):
+        try:
+            with open(FOOD_PREFERENCES_CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {
+                    "avoid_codes": data.get("avoid_codes", []),
+                    "avoid_keywords": data.get("avoid_keywords", []),
+                }
+        except Exception as e:
+            logging.warning(f"Could not load food preferences: {e}")
+    return {"avoid_codes": [], "avoid_keywords": []}
+
+
+def save_food_preferences(avoid_codes: list, avoid_keywords: list) -> None:
+    try:
+        tmp = FOOD_PREFERENCES_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"avoid_codes": avoid_codes, "avoid_keywords": avoid_keywords}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, FOOD_PREFERENCES_CACHE_PATH)
+    except Exception as e:
+        logging.error(f"Could not save food preferences: {e}")
 
 
 # ── logging setup ──────────────────────────────────────────────────────────────
@@ -945,6 +979,78 @@ FOOD_CODES = {
     "V+": "🌿",  # Vegan
 }
 
+# Full code -> English name table for the Mensa's allergen/ingredient codes.
+# Shared by the menu's allergen guide (get_todays_menu_enhanced) and the
+# food-preference voice extraction prompt (extract_food_preferences), so
+# spoken ingredients and displayed dishes are checked against the same codes.
+ALLERGEN_CODE_NAMES = {
+    # General Information
+    "A": "Alcohol",
+    "KL": "Calf Rennet",
+    "Kn": "Garlic",
+    "RG": "Beef Gelatin",
+    "SG": "Pork Gelatin",
+
+    # Additives
+    "1": "Colorant",
+    "2": "Preservative",
+    "3": "Antioxidant",
+    "4": "Flavor Enhancer",
+    "5": "Sulfured",
+    "6": "Blackened",
+    "7": "Waxed",
+    "8": "Sweeteners",
+    "9": "Phenylalanine Source",
+    "10": "Phosphate",
+    "11": "Caffeine",
+    "12": "Cocoa Coating",
+
+    # Allergens
+    "Ei": "Eggs",
+    "En": "Peanuts",
+    "Fi": "Fish",
+    "Kr": "Crustaceans",
+    "Lu": "Lupin",
+    "Mi": "Milk/Lactose",
+    "Se": "Sesame",
+    "Sf": "Mustard",
+    "Sl": "Celery",
+    "So": "Soy",
+    "Sw": "Sulfites",
+    "Wt": "Molluscs",
+
+    # Gluten-containing grains
+    "Di": "Spelt (Wheat)",
+    "Ge": "Barley",
+    "Ha": "Oats",
+    "Hy": "Hybrid Strains",
+    "Ka": "Kamut",
+    "Ro": "Rye",
+    "We": "Wheat",
+
+    # Nuts
+    "Cn": "Cashews",
+    "Hn": "Hazelnuts",
+    "Ma": "Almonds",
+    "Mn": "Macadamia",
+    "Pa": "Brazil Nuts",
+    "Pi": "Pistachios",
+    "Pn": "Pecans",
+    "Wa": "Walnuts",
+
+    # Meat types
+    "S": "Pork",
+    "Sch": "Pork",
+    "Su": "Pork",
+    "G": "Poultry",
+    "R": "Beef",
+    "L": "Lamb",
+    "W": "Game",
+    "F": "Fish",
+    "V": "Vegetarian",
+    "V+": "Vegan",
+}
+
 
 def translate_food_codes(text):
     """Translate food codes to emojis with proper handling"""
@@ -1031,8 +1137,17 @@ def translate_food_codes(text):
     return text
 
 
-async def get_todays_menu_enhanced(session, sub_path="2/"):
-    """Enhanced menu fetching with dynamic allergen guide and navigation links"""
+async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avoid_keywords=None):
+    """Enhanced menu fetching with dynamic allergen guide and navigation links.
+
+    avoid_codes/avoid_keywords (from food_preferences.json, see
+    load_food_preferences) hide dishes matching the user's stated food
+    preferences: avoid_codes against each dish's parsed allergen/ingredient
+    codes (exact), avoid_keywords as a case-insensitive substring match
+    against the dish's name/description text."""
+    avoid_codes = set(avoid_codes or [])
+    avoid_keywords = [kw.lower() for kw in (avoid_keywords or [])]
+    hidden_count = 0
     try:
         # If sub_path is a full URL, extract the part after menu/
         if "mensawidget/menu/" in sub_path:
@@ -1140,7 +1255,6 @@ async def get_todays_menu_enhanced(session, sub_path="2/"):
             for item in items:
                 cols = item.find_all('td')
                 if len(cols) >= 2:
-                    items_found = True
                     name_cell = cols[0]
                     price = cols[1].get_text(strip=True)
 
@@ -1163,14 +1277,22 @@ async def get_todays_menu_enhanced(session, sub_path="2/"):
                         description = ' '.join(lines[1:]) if len(lines) > 1 else ""
                         name_text = re.sub(r'[1-9][0-9]*[A-Za-z,+\s]*$', '', name_text).strip()
                         name_text = re.sub(r'\([^)]*\)$', '', name_text).strip()
-                        if name_text:
+                        if description:
+                            description = re.sub(r'[1-9][0-9]*[A-Za-z,+\s]*$', '', description).strip()
+                            description = re.sub(r'\([^)]*\)$', '', description).strip()
+
+                        item_codes = {a.strip() for a in allergens_text.split(',')} if allergens_text else set()
+                        haystack = f"{name_text} {description}".lower()
+                        is_hidden = bool(item_codes & avoid_codes) or any(kw in haystack for kw in avoid_keywords)
+                        if is_hidden:
+                            hidden_count += 1
+
+                        if name_text and not is_hidden:
+                            items_found = True
                             cat_chunk += f"• <b>{html.escape(name_text)}</b>"
                             if '⭐' in name_text or 'limited' in name_text.lower(): cat_chunk += " ⭐"
                             cat_chunk += "\n"
-                            if description:
-                                description = re.sub(r'[1-9][0-9]*[A-Za-z,+\s]*$', '', description).strip()
-                                description = re.sub(r'\([^)]*\)$', '', description).strip()
-                                if description: cat_chunk += f"  {html.escape(description)}\n"
+                            if description: cat_chunk += f"  {html.escape(description)}\n"
                             if allergens_text:
                                 cat_chunk += f"  {translate_food_codes(allergens_text)}\n"
                                 cat_chunk += f"  <i>({html.escape(allergens_text)})</i>\n"
@@ -1195,82 +1317,13 @@ async def get_todays_menu_enhanced(session, sub_path="2/"):
         menu_text += "📋 <b>ALLERGEN GUIDE</b>\n"
         menu_text += "━━━━━━━━━━━━━━━━━━\n"
 
-        # Define COMPLETE allergen mappings
-        allergen_guide = {
-            # General Information
-            "A": "Alcohol",
-            "KL": "Calf Rennet",
-            "Kn": "Garlic",
-            "RG": "Beef Gelatin",
-            "SG": "Pork Gelatin",
-
-            # Additives
-            "1": "Colorant",
-            "2": "Preservative",
-            "3": "Antioxidant",
-            "4": "Flavor Enhancer",
-            "5": "Sulfured",
-            "6": "Blackened",
-            "7": "Waxed",
-            "8": "Sweeteners",
-            "9": "Phenylalanine Source",
-            "10": "Phosphate",
-            "11": "Caffeine",
-            "12": "Cocoa Coating",
-
-            # Allergens
-            "Ei": "Eggs",
-            "En": "Peanuts",
-            "Fi": "Fish",
-            "Kr": "Crustaceans",
-            "Lu": "Lupin",
-            "Mi": "Milk/Lactose",
-            "Se": "Sesame",
-            "Sf": "Mustard",
-            "Sl": "Celery",
-            "So": "Soy",
-            "Sw": "Sulfites",
-            "Wt": "Molluscs",
-
-            # Gluten-containing grains
-            "Di": "Spelt (Wheat)",
-            "Ge": "Barley",
-            "Ha": "Oats",
-            "Hy": "Hybrid Strains",
-            "Ka": "Kamut",
-            "Ro": "Rye",
-            "We": "Wheat",
-
-            # Nuts
-            "Cn": "Cashews",
-            "Hn": "Hazelnuts",
-            "Ma": "Almonds",
-            "Mn": "Macadamia",
-            "Pa": "Brazil Nuts",
-            "Pi": "Pistachios",
-            "Pn": "Pecans",
-            "Wa": "Walnuts",
-
-            # Meat types
-            "S": "Pork",
-            "Sch": "Pork",
-            "Su": "Pork",
-            "G": "Poultry",
-            "R": "Beef",
-            "L": "Lamb",
-            "W": "Game",
-            "F": "Fish",
-            "V": "Vegetarian",
-            "V+": "Vegan"
-        }
-
         # Add only the allergens that were actually used in today's menu
         used_guide_lines = []
         for allergen_code in sorted(all_allergens_used):
-            if allergen_code in allergen_guide:
+            if allergen_code in ALLERGEN_CODE_NAMES:
                 emoji = translate_food_codes(allergen_code)
                 # Add in EMOJI + CODE + DESCRIPTION format
-                used_guide_lines.append(f"{emoji} <b>{allergen_code}</b> - {allergen_guide[allergen_code]}")
+                used_guide_lines.append(f"{emoji} <b>{allergen_code}</b> - {ALLERGEN_CODE_NAMES[allergen_code]}")
 
         # Add the used allergens to the menu
         if used_guide_lines:
@@ -1279,6 +1332,9 @@ async def get_todays_menu_enhanced(session, sub_path="2/"):
             menu_text += "No allergens listed in today's menu"
 
         menu_text += "\n\n⭐ <b>Limited availability</b>"
+
+        if hidden_count:
+            menu_text += f"\n🚫 {hidden_count} dish(es) hidden based on your food preferences"
 
         return menu_text, prev_link, next_link
 
@@ -1294,13 +1350,15 @@ def get_menu_navigation_keyboard(prev_path=None, next_path=None):
     row = []
     if prev_path:
         row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"menu_nav|{prev_path}"))
-    
+
     row.append(InlineKeyboardButton("Today", callback_data="menu_nav|2/"))
-    
+
     if next_path:
         row.append(InlineKeyboardButton("Next ➡️", callback_data=f"menu_nav|{next_path}"))
-    
-    return InlineKeyboardMarkup([row])
+
+    prefs_row = [InlineKeyboardButton("⚙️ Food Preferences", callback_data="menu_prefs")]
+
+    return InlineKeyboardMarkup([row, prefs_row])
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1316,8 +1374,11 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Session check
         session = await login_studip()
 
-        # Fetch menu
-        menu_text, prev, next_ = await get_todays_menu_enhanced(global_session)
+        # Fetch menu, filtered per any saved food preferences
+        prefs = load_food_preferences()
+        menu_text, prev, next_ = await get_todays_menu_enhanced(
+            global_session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
+        )
 
         # Send menu with navigation buttons
         await update.message.reply_text(
@@ -1333,6 +1394,24 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard()
         )
         logging.error(f"Menu command error: {e}")
+
+
+async def handle_menu_preferences_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle menu_prefs callback — ask what the user doesn't eat, then save
+    the answer (typed or voice) via extract_food_preferences."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    context.user_data["pending_step"] = "food_preferences"
+    prefs = load_food_preferences()
+    current = ", ".join(prefs["avoid_codes"] + prefs["avoid_keywords"]) or "none set"
+    await query.message.reply_text(
+        f"🚫 What don't you eat? (e.g. \"no pork, fish, or mushrooms\")\nCurrently avoiding: {current}"
+    )
 
 
 async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1353,9 +1432,9 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         if "next" in sub_path: direction = "Next day..."
         elif "previous" in sub_path: direction = "Previous day..."
         elif sub_path == "2/": direction = "Today..."
-        
+
         await query.answer(f"Loading {direction}")
-        
+
         # Check if we should send a NEW message instead of editing
         # (Useful for morning summary where we want to keep the schedule)
         should_reply = len(parts) > 2 and parts[2] == "new"
@@ -1363,7 +1442,10 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Session check
         session = await login_studip()
 
-        menu_text, prev, next_ = await get_todays_menu_enhanced(session, sub_path=sub_path)
+        prefs = load_food_preferences()
+        menu_text, prev, next_ = await get_todays_menu_enhanced(
+            session, sub_path=sub_path, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
+        )
         
         if should_reply:
             await query.message.reply_text(
@@ -4040,6 +4122,20 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("✅ iCal link successfully updated!", reply_markup=get_main_keyboard())
         return True
 
+    if step == "food_preferences":
+        context.user_data.pop("pending_step", None)
+        result = await extract_food_preferences(text)
+        if not result["avoid_codes"] and not result["avoid_keywords"]:
+            await update.message.reply_text("🤷 Couldn't pick out any specific ingredient from that — try naming foods directly, e.g. \"pork, fish, mushrooms\".")
+            return True
+        existing = load_food_preferences()
+        merged_codes = sorted(set(existing["avoid_codes"]) | set(result["avoid_codes"]))
+        merged_keywords = sorted(set(existing["avoid_keywords"]) | set(result["avoid_keywords"]))
+        save_food_preferences(merged_codes, merged_keywords)
+        named = [ALLERGEN_CODE_NAMES.get(c, c) for c in result["avoid_codes"]] + result["avoid_keywords"]
+        await update.message.reply_text(f"🚫 Noted — won't show: {', '.join(named)}", reply_markup=get_main_keyboard())
+        return True
+
     # Unknown/stale step — clear it so the user isn't stuck.
     context.user_data.pop("pending_step", None)
     return False
@@ -5848,11 +5944,162 @@ async def transcribe_voice_message(ogg_path: str) -> str:
                 pass
 
 
+# ── Voice intent routing (free-tier OpenRouter LLM) ─────────────────────────
+# A fresh voice note (no wizard step pending) is classified into one of
+# VOICE_INTENTS instead of always being treated as a new task. Any failure
+# anywhere in this pipeline (missing API key, network error, bad JSON) must
+# resolve to {"intent": "unclear", ...} so the feature degrades to exactly
+# today's task-creation behavior rather than breaking the voice flow.
+
+VOICE_INTENTS = [
+    "create_task", "course_enroll", "course_deenroll", "exam_register",
+    "exam_deregister", "check_grades", "check_exam_dates", "check_status",
+    "show_menu", "set_food_preferences", "unclear",
+]
+
+CLASSIFY_INTENT_SYSTEM_PROMPT = """You classify a spoken command (transcribed from Turkish or English) sent to a university assistant Telegram bot into exactly one intent.
+
+Intents, each with example phrasings in both languages:
+- create_task: "yeni görev ekle, yarın rapor teslim et" / "add a task, submit the report tomorrow"
+- course_enroll: "Computational Economics dersine kayıt olmak istiyorum" / "sign me up for Computational Economics"
+- course_deenroll: "Lineer Cebir dersinden kaydımı sil" / "unenroll me from Linear Algebra"
+- exam_register: "Makro İktisat sınavına kayıt ol" / "register me for the Macroeconomics exam"
+- exam_deregister: "sınav kaydımı iptal et" / "deregister me from my exam"
+- check_grades: "notlarımı göster" / "show me my grades" / "transkriptimi göster"
+- check_exam_dates: "yaklaşan sınavlarım neler" / "what are my upcoming exams"
+- check_status: "bot durumunu göster" / "show bot status"
+- show_menu: "bugünün yemek menüsünü göster" / "what's on the menu today" / "yemekhanede ne var"
+- set_food_preferences: "domuz eti yemiyorum" / "I don't eat pork" / "mantar ve balık istemiyorum, menüde gösterme"
+- unclear: anything that doesn't clearly match one of the above
+
+For course_enroll, course_deenroll, exam_register, and exam_deregister, also extract the course or exam name mentioned (in whatever language it was said) as "query"; otherwise "query" is null.
+
+Respond with strict JSON only, no other text: {"intent": "<intent>", "query": "<name or null>"}"""
+
+
+async def _call_openrouter(system_prompt: str, user_text: str) -> Optional[str]:
+    """POST one chat completion to OpenRouter's free tier and return the raw
+    assistant text, or None on any failure (missing key, network error,
+    timeout, non-2xx response). Callers must treat None as "couldn't
+    understand" and degrade gracefully rather than raising."""
+    if not OPENROUTER_API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+                json={
+                    "model": OPENROUTER_MODEL,
+                    "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_text},
+                    ],
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    logging.warning(f"OpenRouter call failed: HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+                return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        logging.warning(f"OpenRouter call failed: {e}")
+        return None
+
+
+def _extract_json_object(raw: Optional[str]) -> Optional[dict]:
+    """Parse the first JSON object out of a model response, tolerating any
+    prose the model wraps it in despite being asked for strict JSON."""
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+async def classify_voice_intent(transcript: str) -> dict:
+    """Classify a fresh (no wizard pending) voice transcript into one of
+    VOICE_INTENTS. Always returns {"intent": ..., "query": ...}; falls back
+    to {"intent": "unclear", "query": None} on any failure."""
+    raw = await _call_openrouter(CLASSIFY_INTENT_SYSTEM_PROMPT, transcript)
+    parsed = _extract_json_object(raw)
+    if not parsed or parsed.get("intent") not in VOICE_INTENTS:
+        return {"intent": "unclear", "query": None}
+    return {"intent": parsed["intent"], "query": parsed.get("query")}
+
+
+def _food_preferences_system_prompt() -> str:
+    code_table = ", ".join(f"{code}={name}" for code, name in ALLERGEN_CODE_NAMES.items())
+    return (
+        "You extract food/ingredient dislikes from a spoken sentence (Turkish or English) "
+        "for a university dining-hall bot. The bot's dishes are tagged with these official "
+        f"ingredient/allergen codes: {code_table}. For each ingredient the user says they "
+        "don't eat: if it matches one of those codes, put the code in \"avoid_codes\"; "
+        "otherwise put its English name in \"avoid_keywords\" (translate if the user spoke "
+        "Turkish, since dish descriptions are in English). Ignore anything in the sentence "
+        "that isn't a food/ingredient.\n\n"
+        "Respond with strict JSON only, no other text: "
+        '{"avoid_codes": ["<code>", ...], "avoid_keywords": ["<english word>", ...]}'
+    )
+
+
+async def extract_food_preferences(transcript: str) -> dict:
+    """Extract avoided allergen codes / free-text ingredient keywords from a
+    spoken statement like "domuz eti ve mantar yemiyorum" or "I don't eat
+    pork or mushrooms". Always returns {"avoid_codes": [...], "avoid_keywords":
+    [...]}; falls back to empty lists on any failure."""
+    raw = await _call_openrouter(_food_preferences_system_prompt(), transcript)
+    parsed = _extract_json_object(raw)
+    if not parsed:
+        return {"avoid_codes": [], "avoid_keywords": []}
+    codes = [c for c in parsed.get("avoid_codes", []) if isinstance(c, str) and c in ALLERGEN_CODE_NAMES]
+    keywords = [str(k).strip().lower() for k in parsed.get("avoid_keywords", []) if k]
+    return {"avoid_codes": codes, "avoid_keywords": keywords}
+
+
+def _best_title_match(query: Optional[str], candidates: list):
+    """Fuzzy-match a spoken course/exam name against a list of (title, payload)
+    candidates (e.g. (course_name, sem_id), (exam_title, exam_dict)). Returns
+    the payload of the best match, or None if nothing scores confidently
+    enough — callers must fall back to showing the full list in that case."""
+    if not query or not candidates:
+        return None
+    query_lower = query.strip().lower()
+    if not query_lower:
+        return None
+
+    best_payload = None
+    best_score = 0.0
+    for title, payload in candidates:
+        title_lower = (title or "").lower()
+        if not title_lower:
+            continue
+        score = difflib.SequenceMatcher(None, query_lower, title_lower).ratio()
+        if query_lower in title_lower or title_lower in query_lower:
+            score = max(score, 0.85)
+        if score > best_score:
+            best_score = score
+            best_payload = payload
+
+    return best_payload if best_score >= 0.45 else None
+
+
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Transcribe an incoming voice note and feed it into the task wizard: if a
-    task step is already pending (e.g. waiting for the due time), the
-    transcription answers that step; otherwise it starts a new task using the
-    transcription as the task text."""
+    """Transcribe an incoming voice note. If a wizard step is already pending
+    (e.g. waiting for a task's due time, an iCal link, food preferences), the
+    transcription answers that step; otherwise — a fresh, unprompted voice
+    note — it's routed by spoken intent (see classify_voice_intent /
+    _route_voice_intent) instead of always assuming a new task."""
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None or not is_user_allowed(user_id):
         return
@@ -5869,11 +6116,11 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # Google's free STT can mishear things, so confirm before it's actually used
-    # to answer the wizard step (or start a new task) — nothing is committed yet.
-    step = context.user_data.get("pending_step")
-    if step not in ("task_text", "task_time"):
-        step = "task_text"
-        context.user_data.pop("task_wizard", None)
+    # to answer the wizard step (or classified as a fresh command) — nothing is
+    # committed yet. `step` is None when there's no wizard waiting, which is
+    # what tells handle_voice_confirm to run intent classification instead of
+    # feeding straight into handle_pending_step.
+    step = context.user_data.get("pending_step") or None
 
     context.user_data["pending_voice"] = {"step": step, "text": transcript}
     keyboard = InlineKeyboardMarkup([[
@@ -5884,8 +6131,9 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User confirmed a voice transcription is correct — feed it into the task
-    wizard step it was waiting to answer."""
+    """User confirmed a voice transcription is correct. If it was answering a
+    pending wizard step, feed it into that step as before; otherwise this is a
+    fresh voice command, so classify its intent and route it."""
     query = update.callback_query
     await query.answer()
 
@@ -5899,8 +6147,14 @@ async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     await query.edit_message_reply_markup(reply_markup=None)
-    context.user_data["pending_step"] = pending["step"]
-    await handle_pending_step(update, context, text_override=pending["text"])
+
+    if pending["step"]:
+        context.user_data["pending_step"] = pending["step"]
+        await handle_pending_step(update, context, text_override=pending["text"])
+        return
+
+    result = await classify_voice_intent(pending["text"])
+    await _route_voice_intent(update, context, result, pending["text"])
 
 
 async def handle_voice_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5914,6 +6168,165 @@ async def handle_voice_reject(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     context.user_data.pop("pending_voice", None)
     await query.edit_message_text("🎙️ Okay — send another voice note, or type your answer instead.")
+
+
+class _UpdateMessageShim:
+    """Wraps a callback-query-originated Update so handlers written for a
+    plain message update (which read update.message) can be reused as-is.
+    python-telegram-bot's Update.message is the raw message field and is
+    None for callback-query updates — update.effective_message is the one
+    that resolves across both, so this shim exposes that as .message while
+    forwarding every other attribute to the real update."""
+
+    def __init__(self, real_update: Update):
+        self._real_update = real_update
+        self.message = real_update.effective_message
+
+    def __getattr__(self, name):
+        return getattr(self._real_update, name)
+
+
+async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE, result: dict, transcript: str):
+    """Dispatch a freshly-classified voice command (no wizard was pending) to
+    the matching existing action.
+
+    Destructive actions (enroll, sign out, exam register/deregister) are
+    never executed directly here — this only figures out which existing
+    button the user meant, by fuzzy-matching the spoken course/exam name
+    against the same candidate lists the real menus use, and presents that
+    one button using the exact callback_data the real menu would generate.
+    Tapping it drives the real, unmodified confirm/submit handler. A
+    low-confidence or missing match falls back to showing the full list, the
+    same one the button-driven flow would have shown.
+    """
+    intent = result.get("intent", "unclear")
+    query_text = result.get("query")
+    message = update.effective_message
+
+    if intent in ("create_task", "unclear"):
+        context.user_data["pending_step"] = "task_text"
+        context.user_data.pop("task_wizard", None)
+        await handle_pending_step(update, context, text_override=transcript)
+        return
+
+    if intent == "check_status":
+        await status_command(_UpdateMessageShim(update), context)
+        return
+
+    if intent == "check_grades":
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📜 View Transcript", callback_data="transcript_summary")]])
+        await message.reply_text("🎙️ Sounds like you want your grades:", reply_markup=keyboard)
+        return
+
+    if intent == "check_exam_dates":
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📚 My Exam Dates", callback_data="exam_dates_list")]])
+        await message.reply_text("🎙️ Sounds like you want your upcoming exam dates:", reply_markup=keyboard)
+        return
+
+    if intent == "show_menu":
+        try:
+            session = await login_studip()
+            prefs = load_food_preferences()
+            menu_text, prev, next_ = await get_todays_menu_enhanced(
+                session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
+            )
+            await message.reply_text(menu_text, parse_mode="HTML", reply_markup=get_menu_navigation_keyboard(prev, next_))
+        except Exception as e:
+            logging.error(f"_route_voice_intent: show_menu failed: {e}")
+            await message.reply_text(f"❌ Error loading menu: {str(e)[:200]}")
+        return
+
+    if intent == "set_food_preferences":
+        extracted = await extract_food_preferences(transcript)
+        if not extracted["avoid_codes"] and not extracted["avoid_keywords"]:
+            await message.reply_text("🤷 Couldn't pick out any specific ingredient from that — try naming foods directly, e.g. \"pork, fish, mushrooms\".")
+            return
+        existing = load_food_preferences()
+        merged_codes = sorted(set(existing["avoid_codes"]) | set(extracted["avoid_codes"]))
+        merged_keywords = sorted(set(existing["avoid_keywords"]) | set(extracted["avoid_keywords"]))
+        save_food_preferences(merged_codes, merged_keywords)
+        named = [ALLERGEN_CODE_NAMES.get(c, c) for c in extracted["avoid_codes"]] + extracted["avoid_keywords"]
+        await message.reply_text(f"🚫 Noted — won't show: {', '.join(named)}")
+        return
+
+    if intent == "course_enroll":
+        default = load_default_semester()
+        if not default.get("id"):
+            await message.reply_text("🎙️ No default semester set, so I can't match a course by name yet — pick a semester:")
+            await _show_semester_picker(message, "course_sem", "📚 Pick a semester to see courses currently open for enrolment:")
+            return
+        try:
+            session = await login_studip()
+            open_courses = await get_open_courses(session, semester_id=default["id"])
+            enrolled_cids = {cid for _, cid in await list_courses(semester_id=default["id"])}
+            open_courses = [c for c in open_courses if c["sem_id"] not in enrolled_cids]
+        except Exception as e:
+            logging.error(f"_route_voice_intent: course_enroll fetch failed: {e}")
+            await message.reply_text(f"❌ Error: {str(e)[:200]}")
+            return
+        match_sem_id = _best_title_match(query_text, [(c["course"], c["sem_id"]) for c in open_courses])
+        if match_sem_id:
+            matched = next(c for c in open_courses if c["sem_id"] == match_sem_id)
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Enroll in {matched['course'][:40]}?", callback_data=f"course_enroll_ask|{match_sem_id}")]])
+            await message.reply_text(f"🎙️ Found a match: {matched['course']}", reply_markup=keyboard)
+        else:
+            await message.reply_text("🎙️ Couldn't confidently match that course — here's the full list:")
+            await _render_open_courses_for_semester(message, default["id"])
+        return
+
+    if intent == "course_deenroll":
+        default = load_default_semester()
+        semester_id = default.get("id")
+        try:
+            courses = await list_courses(semester_id=semester_id)
+        except Exception as e:
+            logging.error(f"_route_voice_intent: course_deenroll fetch failed: {e}")
+            await message.reply_text(f"❌ Error: {str(e)[:200]}")
+            return
+        match_cid = _best_title_match(query_text, courses)
+        if match_cid:
+            title = next(t for t, cid in courses if cid == match_cid)
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"🚪 Sign out of {title[:40]}?", callback_data=f"course_deenroll_ask|{match_cid}")]])
+            await message.reply_text(f"🎙️ Found a match: {title}", reply_markup=keyboard)
+        elif semester_id:
+            await message.reply_text("🎙️ Couldn't confidently match that course — here's your enrolled list:")
+            await _render_enrolled_courses_for_semester(message, semester_id)
+        else:
+            await message.reply_text("🎙️ Couldn't confidently match that course — pick a semester:")
+            await _show_semester_picker(message, "deenroll_sem", "🚪 Pick a semester to see its enrolled courses:")
+        return
+
+    if intent in ("exam_register", "exam_deregister"):
+        try:
+            session = await login_studip()
+            if intent == "exam_register":
+                exams = await get_open_exam_registrations(session)
+                action_type = "anmelden"
+            else:
+                exams = await get_registered_exams(session)
+                action_type = "abmelden"
+        except Exception as e:
+            logging.error(f"_route_voice_intent: {intent} fetch failed: {e}")
+            await message.reply_text(f"❌ Error: {str(e)[:200]}")
+            return
+        matched_exam = _best_title_match(query_text, [(e["title"], e) for e in exams])
+        if matched_exam:
+            sid = str(uuid.uuid4())[:8]
+            exam_action_cache[sid] = {"unit_id": matched_exam["unit_id"], "action_type": action_type, "title": matched_exam["title"]}
+            label = "📝 Register" if intent == "exam_register" else "🗑️ Deregister"
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"{label}: {matched_exam['title'][:40]}?", callback_data=f"exam_ask|{sid}")]])
+            await message.reply_text(f"🎙️ Found a match: {matched_exam['title']}", reply_markup=keyboard)
+        else:
+            await message.reply_text("🎙️ Couldn't confidently match that exam — here's the full list:")
+            await send_exam_registration_menu(message)
+        return
+
+    # Unreachable given VOICE_INTENTS, but degrade to task creation rather
+    # than silently dropping the voice note if a new intent is ever added
+    # here without a branch.
+    context.user_data["pending_step"] = "task_text"
+    context.user_data.pop("task_wizard", None)
+    await handle_pending_step(update, context, text_override=transcript)
 
 
 # ── Fast Enroll guided wizard (date → time → course link) ──────────────────────
@@ -6258,6 +6671,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_course_deenroll_cancel, pattern="^course_deenroll_cancel$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern="^calendar_week\|.*$"))
         app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^menu_nav\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_menu_preferences_button, pattern="^menu_prefs$"))
         app.add_handler(CallbackQueryHandler(handle_selection))
 
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))

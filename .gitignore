@@ -22,6 +22,7 @@ studip_cookies.json
 fastenroll_pending.json
 exam_reminder_cache.json
 tasks_cache.json
+food_preferences.json
 .bot_instance.lock
 
 # WhatsApp Microservice
