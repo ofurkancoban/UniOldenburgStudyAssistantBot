@@ -3194,16 +3194,19 @@ async def _send_courses_menu(query_or_message, courses, extra_buttons=None):
             raise e
 
 
-async def _show_typing(sender):
-    """Show Telegram's native "typing..." animation in the relevant chat
-    before a slow operation (a network fetch, a page scrape, ...). Works
-    with either a Message or a CallbackQuery — both expose get_bot() and a
-    way to reach the chat (.chat / .message.chat) — so callers don't need
-    to know which one they were handed. Best-effort: never raises, since
-    this is a cosmetic nicety and must not block the actual operation."""
+async def _show_typing(sender, action=ChatAction.TYPING):
+    """Show one of Telegram's native chat-action animations in the relevant
+    chat before a slow operation — "typing..." by default (a network fetch,
+    a page scrape, ...), or a more specific one like ChatAction.UPLOAD_DOCUMENT
+    where that's what's actually about to happen (a file/ZIP is being sent).
+    Works with either a Message or a CallbackQuery — both expose get_bot()
+    and a way to reach the chat (.chat / .message.chat) — so callers don't
+    need to know which one they were handed. Best-effort: never raises,
+    since this is a cosmetic nicety and must not block the actual
+    operation."""
     try:
         chat = sender.chat if hasattr(sender, "chat") else sender.message.chat
-        await sender.get_bot().send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+        await sender.get_bot().send_chat_action(chat_id=chat.id, action=action)
     except Exception:
         pass
 
@@ -3810,6 +3813,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Try cached URL first
         if temp_url:
             logging.info(f"🔄 Trying cached URL: {temp_url}")
+            await _show_typing(query, action=ChatAction.UPLOAD_DOCUMENT)
             try:
                 async with await global_session.get(temp_url) as resp:
                     if resp.status == 200:
@@ -3842,6 +3846,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # If cached URL doesn't work, get fresh URL
         await query.edit_message_text(f"🔍 Getting fresh download link for:\n📄 {fname}")
+        await _show_typing(query, action=ChatAction.UPLOAD_DOCUMENT)
 
         url = await get_fresh_file_url(cid, fname, current_url)
         if not url:
@@ -3932,7 +3937,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
             root_name = nav_names.get(user_id, ["course"])[-1]
 
             msg = await query.message.reply_text("📦 Preparing ZIP... (0%)")
-            await _show_typing(query)
+            await _show_typing(query, action=ChatAction.UPLOAD_DOCUMENT)
 
             async def progress(total, current):
                 pct = int((current / total) * 100) if total else 100
