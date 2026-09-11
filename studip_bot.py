@@ -3057,6 +3057,7 @@ async def show_last_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     # First show "Loading..." message
     await query.edit_message_text("📨 Loading last 5 messages...")
+    await _show_typing(query)
 
     chat_id = query.message.chat_id
 
@@ -3191,6 +3192,20 @@ async def _send_courses_menu(query_or_message, courses, extra_buttons=None):
                     await query_or_message.reply_text("⚠️ Too many courses to display in one menu. Please select a specific semester on the website.")
         else:
             raise e
+
+
+async def _show_typing(sender):
+    """Show Telegram's native "typing..." animation in the relevant chat
+    before a slow operation (a network fetch, a page scrape, ...). Works
+    with either a Message or a CallbackQuery — both expose get_bot() and a
+    way to reach the chat (.chat / .message.chat) — so callers don't need
+    to know which one they were handed. Best-effort: never raises, since
+    this is a cosmetic nicety and must not block the actual operation."""
+    try:
+        chat = sender.chat if hasattr(sender, "chat") else sender.message.chat
+        await sender.get_bot().send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
+    except Exception:
+        pass
 
 
 async def _reply_or_edit(sender, text, reply_markup=None, parse_mode=None):
@@ -3666,6 +3681,7 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if query.data == "exam_menu":
         await query.message.reply_text("📝 Loading exam registration status...", disable_notification=True)
+        await _show_typing(query)
         await send_exam_registration_menu(query.message)
         return
 
@@ -3698,6 +3714,7 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "exam_do":
         await query.edit_message_text(f"⏳ Submitting: {verb} {info['title']}...")
+        await _show_typing(query)
         try:
             session = await login_studip()
             result = await submit_exam_action(session, info["unit_id"], info["action_type"])
@@ -3915,6 +3932,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
             root_name = nav_names.get(user_id, ["course"])[-1]
 
             msg = await query.message.reply_text("📦 Preparing ZIP... (0%)")
+            await _show_typing(query)
 
             async def progress(total, current):
                 pct = int((current / total) * 100) if total else 100
@@ -4186,6 +4204,7 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         # Temporary loading message
         status_msg = await sender.reply_text("⏳ Please wait...")
+        await _show_typing(sender)
 
         if data[0] == "menu":
             await menu_command(update, context)
@@ -4476,6 +4495,7 @@ async def handle_calendar_week(update: Update, context: ContextTypes.DEFAULT_TYP
 
     try:
         await query.edit_message_text("⏳ Loading schedule...")
+        await _show_typing(query)
         session = global_session
         events = await get_calendar_events(session=session, week_start=week_start)
         await send_weekly_calendar(query, events, week_start)
@@ -4495,6 +4515,7 @@ async def handle_calendar_today(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         await query.edit_message_text("📅 Fetching today's events...")
+        await _show_typing(query)
         session = global_session
         today = datetime.now().date()
         week_start = today - timedelta(days=today.weekday())
@@ -4516,6 +4537,7 @@ async def handle_calendar_weekly(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         await query.edit_message_text("🗓️ Fetching weekly schedule...")
+        await _show_typing(query)
         session = global_session
         today = datetime.now().date()
         week_start = today - timedelta(days=today.weekday())
@@ -4637,6 +4659,7 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     await query.message.reply_text("📚 Fetching your exam dates... this may take a moment.", disable_notification=True)
+    await _show_typing(query)
 
     try:
         session = await login_studip()
@@ -4676,6 +4699,7 @@ async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     await query.message.reply_text("📚 Fetching all exam dates... this may take a moment.", disable_notification=True)
+    await _show_typing(query)
 
     try:
         session = await login_studip()
@@ -4710,6 +4734,7 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
         return
 
     await query.message.reply_text("📜 Fetching your transcript...", disable_notification=True)
+    await _show_typing(query)
 
     try:
         session = await login_studip()
@@ -4837,6 +4862,7 @@ async def handle_upcoming_dashboard(update: Update, context: ContextTypes.DEFAUL
         return
 
     await query.message.reply_text("🔔 Fetching your upcoming items...", disable_notification=True)
+    await _show_typing(query)
 
     try:
         session = await login_studip()
@@ -5374,6 +5400,7 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
     course_name, course_cid = options[idx]
 
     await query.message.reply_text(f"📘 Loading {course_name}...", disable_notification=True)
+    await _show_typing(query)
 
     lines = [f"📘 <b>{course_name}</b>", "━━━━━━━━━━━━━━━━━"]
 
@@ -5455,6 +5482,7 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
     # impatient tap land on stale "Enroll" buttons and silently enroll in the
     # wrong course from the old list.
     await _reply_or_edit(sender, "📚 Checking which courses are open for enrolment... this may take a moment.", reply_markup=InlineKeyboardMarkup([]))
+    await _show_typing(sender)
 
     try:
         session = await login_studip()
@@ -5558,6 +5586,7 @@ async def handle_course_enroll_confirm(update: Update, context: ContextTypes.DEF
 
     sem_id = query.data.split("|", 1)[1]
     await query.edit_message_text("⏳ Enrolling...")
+    await _show_typing(query)
 
     try:
         session = await login_studip()
@@ -5613,6 +5642,7 @@ async def _render_enrolled_courses_for_semester(sender, semester_id: str):
     # out" rows) live and tappable during this network wait, which let an
     # impatient tap land on a stale "Sign out" button for the wrong course.
     await _reply_or_edit(sender, "📚 Loading your enrolled courses for that semester...", reply_markup=InlineKeyboardMarkup([]))
+    await _show_typing(sender)
 
     try:
         courses = await list_courses(semester_id=semester_id)
@@ -5697,6 +5727,7 @@ async def handle_course_deenroll_confirm(update: Update, context: ContextTypes.D
 
     cid = query.data.split("|", 1)[1]
     await query.edit_message_text("⏳ Signing out...")
+    await _show_typing(query)
 
     try:
         session = await login_studip()
@@ -6993,6 +7024,7 @@ async def _run_begin_flow(message, user, context: ContextTypes.DEFAULT_TYPE):
     try:
         # TEMPORARY MESSAGE
         temp_message = await message.reply_text("🚀 Starting Stud.IP Bot...")
+        await _show_typing(message)
 
         # Loading animasyonu
         steps = [
