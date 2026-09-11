@@ -5954,7 +5954,8 @@ async def transcribe_voice_message(ogg_path: str) -> str:
 VOICE_INTENTS = [
     "create_task", "create_exam_reminder_task", "course_enroll", "course_deenroll",
     "exam_register", "exam_deregister", "check_grades", "check_exam_dates",
-    "check_status", "show_menu", "set_food_preferences", "show_last_file", "unclear",
+    "check_status", "show_menu", "set_food_preferences", "show_last_file",
+    "list_course_files", "unclear",
 ]
 
 CLASSIFY_INTENT_SYSTEM_PROMPT = """You classify a spoken command (transcribed from Turkish or English) sent to a university assistant Telegram bot into exactly one intent.
@@ -5971,10 +5972,11 @@ Intents, each with example phrasings in both languages:
 - check_status: "bot durumunu göster" / "show bot status"
 - show_menu: "bugünün yemek menüsünü göster" / "what's on the menu today" / "yemekhanede ne var"
 - set_food_preferences: "domuz eti yemiyorum" / "I don't eat pork" / "mantar ve balık istemiyorum, menüde gösterme"
-- show_last_file: "Computational Intelligence dersinin son dosyasını göster" / "list the last file of Computational Intelligence" / "show me the latest file for Linear Algebra" — asks for the most recently uploaded file of a named course
+- show_last_file: "Computational Intelligence dersinin son dosyasını göster" / "list the last file of Computational Intelligence" / "show me the latest file for Linear Algebra" — asks for only the single most recently uploaded file of a named course
+- list_course_files: "Linear Algebra dersinin dosyalarını listele" / "list the files of Linear Algebra" / "show me all files for Computational Economics" — asks to see every file of a named course, not just the latest one
 - unclear: anything that doesn't clearly match one of the above
 
-For course_enroll, course_deenroll, exam_register, exam_deregister, create_exam_reminder_task, and show_last_file, also extract the course or exam name mentioned (in whatever language it was said) as "query"; otherwise "query" is null.
+For course_enroll, course_deenroll, exam_register, exam_deregister, create_exam_reminder_task, show_last_file, and list_course_files, also extract the course or exam name mentioned (in whatever language it was said) as "query"; otherwise "query" is null.
 
 Respond with strict JSON only, no other text: {"intent": "<intent>", "query": "<name or null>"}"""
 
@@ -6180,11 +6182,38 @@ async def _find_exam_datetime(session, query_text: Optional[str]):
     return best_title, best_dt, best_has_time
 
 
+async def _match_course(course_query: Optional[str]):
+    """Fuzzy-match a spoken course name to one of the student's actual
+    Stud.IP courses (list_courses()). Returns (course_name, cid), or
+    (None, None) if nothing matches confidently.
+
+    Uses a stricter bar than the enroll/exam flows: those always show the
+    matched title on a button before anything happens, so a shaky match is
+    easy to notice and just not tap. Callers of this (file-listing voice
+    commands) hand over real files/downloads directly with no such
+    checkpoint, so a wrong match (e.g. StuMS exam titles like "Computational
+    Economics" often share only a generic word like "Economics" with the
+    actual, unrelated Stud.IP course name) needs a higher bar.
+    """
+    if not course_query:
+        return None, None
+    try:
+        courses = await list_courses()
+    except Exception as e:
+        logging.warning(f"_match_course: list_courses failed: {e}")
+        return None, None
+    match_cid = _best_title_match(course_query, courses, min_score=0.6)
+    if not match_cid:
+        return None, None
+    course_name = next((name for name, cid in courses if cid == match_cid), course_query)
+    return course_name, match_cid
+
+
 async def _find_latest_file(course_query: Optional[str]):
-    """Fuzzy-match a spoken course name to one of the student's courses, then
-    return (course_name, cid, file_item) for the most recently modified file
-    at that course's top-level Stud.IP file listing (list_files) — this is a
-    live fetch, not the cached "last 5 files across all courses" that
+    """Fuzzy-match a spoken course name (via _match_course) and return
+    (course_name, cid, file_item) for the most recently modified file at
+    that course's top-level Stud.IP file listing (list_files) — a live
+    fetch, not the cached "last 5 files across all courses" that
     show_last_files uses, so it reflects the course's actual current state
     even if the watcher hasn't noticed a given file yet.
 
@@ -6192,25 +6221,9 @@ async def _find_latest_file(course_query: Optional[str]):
     (course_name, cid, None) if the course matched but has no files at its
     top level (subfolders aren't crawled).
     """
-    if not course_query:
-        return None, None, None
-
-    try:
-        courses = await list_courses()
-    except Exception as e:
-        logging.warning(f"_find_latest_file: list_courses failed: {e}")
-        return None, None, None
-
-    # Stricter bar than the enroll/exam flows: those always show the matched
-    # title on a button before anything happens, so a shaky match is easy to
-    # notice and just not tap. This path hands over a real file directly, so
-    # a wrong match (e.g. StuMS exam titles like "Computational Economics"
-    # often share only a generic word like "Economics" with the actual
-    # Stud.IP course name, unrelated to it otherwise) needs a higher bar.
-    match_cid = _best_title_match(course_query, courses, min_score=0.6)
+    course_name, match_cid = await _match_course(course_query)
     if not match_cid:
         return None, None, None
-    course_name = next((name for name, cid in courses if cid == match_cid), course_query)
 
     try:
         items = await list_files(match_cid)
@@ -6471,6 +6484,55 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📥 Download", callback_data=f"file|{sid}")]])
         await message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+
+    if intent == "list_course_files":
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+        try:
+            course_name, cid = await _match_course(query_text)
+        except Exception as e:
+            logging.error(f"_route_voice_intent: list_course_files match failed: {e}")
+            await message.reply_text(f"❌ Error: {str(e)[:200]}")
+            return
+        if not cid:
+            await message.reply_text(f"🎙️ Couldn't match a course to \"{query_text}\" — try ⬇️ Files from the menu instead.")
+            return
+        try:
+            root_url = f"{BASE_URL}/dispatch.php/course/files?cid={cid}"
+            items = await list_files(cid, root_url)
+        except Exception as e:
+            logging.error(f"_route_voice_intent: list_course_files fetch failed: {e}")
+            await message.reply_text(f"❌ Error: {str(e)[:200]}")
+            return
+        if not items:
+            await message.reply_text(f"ℹ️ No files found at the top level of {course_name}.")
+            return
+
+        # Same cache shape / callback_data as the button-driven Files browser
+        # (send_folder), so tapping an item here opens a subfolder or
+        # downloads a file exactly like it would from that flow.
+        cleanup_link_cache()
+        user_id = update.effective_user.id
+        nav_stack[user_id] = [root_url]
+        nav_names[user_id] = [course_name]
+        keyboard = []
+        for f in items:
+            sid = _short_id()
+            cache_entry = {"cid": cid, "name": f["name"], "ts": datetime.now().timestamp(), "user_id": user_id}
+            if f.get("url"):
+                cache_entry["url"] = _normalize_url(f["url"])
+            link_cache[sid] = cache_entry
+            if f["type"] == "folder":
+                keyboard.append([InlineKeyboardButton(f"📁 {f['name']}"[:64], callback_data=f"folder|{sid}")])
+            else:
+                meta = f" ({f['size']}, {f['modified']})"
+                keyboard.append([InlineKeyboardButton(f"📄 {f['name']}{meta}"[:64], callback_data=f"file|{sid}")])
+
+        await message.reply_text(
+            f"📁 <b>{html.escape(course_name)}</b>\n{len(items)} item(s) at top level:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
         return
 
     if intent == "show_menu":
