@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import uuid
 from datetime import datetime
 from typing import Optional
 from urllib.parse import urljoin
@@ -785,11 +786,14 @@ async def submit_exam_action(session, unit_id: str, action_type: str) -> dict:
     }
 
 
-async def check_exam_reminders(session, bot, broadcast_fn) -> None:
+async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: dict) -> None:
     """Check for newly-opened exam registrations and closing-soon deadlines.
 
     `broadcast_fn` must be an async callable with signature (bot, text, parse_mode="HTML"),
-    matching studip_bot.broadcast.
+    matching studip_bot.broadcast. `exam_action_cache` is studip_bot's short_id -> {unit_id,
+    action_type, title, ...} cache (the same one the Exam Registration menu's buttons use) —
+    each notification gets its own short id registered here so its "Register" button can
+    reuse the existing exam_ask/exam_do confirm flow instead of a new one.
     """
     failed_codes: set = set()
     try:
@@ -801,6 +805,7 @@ async def check_exam_reminders(session, bot, broadcast_fn) -> None:
     cache = load_exam_cache()
     notified_open = cache.get("notified_open", {})
     notified_deadline = cache.get("notified_deadline", {})
+    muted_codes = set(cache.get("muted_codes", []))
 
     now = datetime.now()
     still_open_keys = set()
@@ -810,11 +815,28 @@ async def check_exam_reminders(session, bot, broadcast_fn) -> None:
         # A unit can have several parallel groups open at once (each its own sitting),
         # so the notification/dedup key has to include the sitting, not just the code.
         occurrence_key = f"{code}:{exam['start_date']}:{exam['end_date']}"
+        # Still tracked even when muted, so the cache-cleanup pass below doesn't
+        # treat "muted" as "closed" and purge its notification state.
         still_open_keys.add(occurrence_key)
+        if code in muted_codes:
+            continue
         end_date = datetime.fromisoformat(exam["end_date"]) if exam["end_date"] else None
         class_line = f"👥 <b>Class:</b> {exam['group_label']}\n" if exam.get("group_label") else ""
         room_line = f"📍 <b>Room:</b> {exam['room']}\n" if exam.get("room") else ""
         exam_date_line = f"📅 <b>Exam Date:</b> {exam['exam_date_display']}\n" if exam.get("exam_date_display") else ""
+
+        sid = str(uuid.uuid4())[:8]
+        exam_action_cache[sid] = {
+            "unit_id": exam["unit_id"],
+            "action_type": "anmelden",
+            "title": exam["title"],
+            "code": code,
+        }
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Register", callback_data=f"exam_ask|{sid}")],
+            [InlineKeyboardButton("📲 Forward to WA", callback_data=f"examopen_wa_ask|{sid}")],
+            [InlineKeyboardButton("🔕 Don't remind me again", callback_data=f"examopen_mute_ask|{sid}")],
+        ])
 
         if occurrence_key not in notified_open:
             text = (
@@ -828,7 +850,7 @@ async def check_exam_reminders(session, bot, broadcast_fn) -> None:
                 "━━━━━━━━━━━━━━━━━"
             )
             try:
-                await broadcast_fn(bot, text, reply_markup=WA_FORWARD_MARKUP)
+                await broadcast_fn(bot, text, reply_markup=keyboard)
                 logging.info(f"🎓 Notified: exam registration opened for {occurrence_key}")
             except Exception as e:
                 logging.error(f"exam_reminder: failed to send open-notification for {occurrence_key}: {e}")
@@ -854,7 +876,7 @@ async def check_exam_reminders(session, bot, broadcast_fn) -> None:
                         "━━━━━━━━━━━━━━━━━"
                     )
                     try:
-                        await broadcast_fn(bot, text, reply_markup=WA_FORWARD_MARKUP)
+                        await broadcast_fn(bot, text, reply_markup=keyboard)
                         logging.info(f"🎓 Notified: {days_left} day(s) left for {occurrence_key}")
                     except Exception as e:
                         logging.error(f"exam_reminder: failed to send deadline-notification for {occurrence_key}: {e}")

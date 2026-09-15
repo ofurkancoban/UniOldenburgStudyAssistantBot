@@ -32,7 +32,7 @@ from telegram.constants import ChatAction
 from asyncio import CancelledError
 from studip_session import StudIPSession
 from fast_enroll import run_fast_enroll, load_pending, list_pending_jobs, save_pending_job, clear_pending_job, get_semester_options, get_open_courses, enroll_now, decline_course, get_course_type_map
-from exam_reminder import check_exam_reminders, check_exam_date_reminders, check_grade_reminders, get_open_exam_registrations, get_registered_exams, get_registered_exam_schedule, get_all_exam_dates, filter_exams_by_module_codes, submit_exam_action, get_grades, compute_transcript_summary
+from exam_reminder import check_exam_reminders, check_exam_date_reminders, check_grade_reminders, get_open_exam_registrations, get_registered_exams, get_registered_exam_schedule, get_all_exam_dates, filter_exams_by_module_codes, submit_exam_action, get_grades, compute_transcript_summary, load_exam_cache, save_exam_cache
 
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -695,7 +695,7 @@ async def unified_watcher_controller(app):
             # as messages/announcements/etc).
             try:
                 logging.info("🎓 Checking exam registrations...")
-                await check_exam_reminders(session, app.bot, broadcast)
+                await check_exam_reminders(session, app.bot, broadcast, exam_action_cache)
             except Exception as e:
                 logging.error(f"❌ Exam reminder check failed: {e}")
             try:
@@ -2164,24 +2164,12 @@ async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Forward message to WhatsApp group via Node.js microservice."""
     query = update.callback_query
     await query.answer("Sending to WhatsApp...")
-    
+
     text = query.message.text or query.message.caption or "No text found"
-    group_name = os.getenv("WHATSAPP_GROUP_NAME", "StudIP Alerts")  # Group name from .env
-    
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            payload = {"text": text, "groupName": group_name}
-            async with session.post("http://localhost:3838/send", json=payload, timeout=10) as resp:
-                if resp.status == 200:
-                    await query.edit_message_reply_markup(reply_markup=None) # Remove button after sending
-                    await context.bot.send_message(chat_id=query.message.chat_id, text="✅ Sent to WhatsApp successfully!")
-                else:
-                    data = await resp.json()
-                    await context.bot.send_message(chat_id=query.message.chat_id, text=f"❌ Failed to send to WhatsApp: {data.get('error')}")
-    except Exception as e:
-        logging.error(f"WhatsApp forward error: {e}")
-        await context.bot.send_message(chat_id=query.message.chat_id, text=f"❌ Error connecting to WhatsApp service: {e}")
+    success, message = await _send_text_to_whatsapp(text)
+    if success:
+        await query.edit_message_reply_markup(reply_markup=None)  # Remove button after sending
+    await context.bot.send_message(chat_id=query.message.chat_id, text=f"✅ {message}" if success else f"❌ {message}")
 
 
 async def set_wa_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3796,6 +3784,112 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             failed_verb = "register for" if info["action_type"] == "anmelden" else "deregister from"
             await query.message.reply_text(f"❌ Failed to {failed_verb} {title}: {result['message']}")
+
+
+async def _send_text_to_whatsapp(text: str) -> tuple[bool, str]:
+    """POST plain text to the local WhatsApp microservice's target group.
+    Returns (success, message) — mirrors forward_to_whatsapp's own request,
+    factored out so the "EXAM REGISTRATION OPEN"-style notifications (which
+    have no single Telegram message to re-read text from, since their WA
+    button opens its own confirm step) can send their own composed text
+    through the same path."""
+    group_name = os.getenv("WHATSAPP_GROUP_NAME", "StudIP Alerts")
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            payload = {"text": text, "groupName": group_name}
+            async with session.post("http://localhost:3838/send", json=payload, timeout=10) as resp:
+                if resp.status == 200:
+                    return True, "Sent to WhatsApp successfully!"
+                data = await resp.json()
+                return False, f"Failed to send to WhatsApp: {data.get('error')}"
+    except Exception as e:
+        logging.error(f"WhatsApp forward error: {e}")
+        return False, f"Error connecting to WhatsApp service: {e}"
+
+
+async def handle_examopen_wa_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """First tap on an exam-registration notification's "Forward to WA" button
+    — ask for confirmation with a new message rather than touching the
+    notification's own row, so its other two buttons (Register / Don't
+    remind me again) stay usable no matter what's tapped first."""
+    query = update.callback_query
+    await query.answer()
+    sid = query.data.split("|", 1)[1]
+    info = exam_action_cache.get(sid)
+    if not info:
+        await query.message.reply_text("⚠️ This notification has expired.")
+        return
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, forward", callback_data=f"examopen_wa_confirm|{sid}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="examopen_cancel"),
+    ]])
+    await query.message.reply_text(
+        f"📲 Forward this exam registration notice to WhatsApp?\n<b>{info['title']}</b>",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_examopen_wa_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Sending to WhatsApp...")
+    sid = query.data.split("|", 1)[1]
+    info = exam_action_cache.get(sid)
+    if not info:
+        await query.edit_message_text("⚠️ This notification has expired.")
+        return
+    text = f"📢 <b>EXAM REGISTRATION OPEN</b>\n{info['title']}"
+    success, message = await _send_text_to_whatsapp(text)
+    await query.edit_message_text(f"✅ {message}" if success else f"❌ {message}")
+
+
+async def handle_examopen_mute_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """First tap on an exam-registration notification's "Don't remind me
+    again" button — ask for confirmation with a new message, same reasoning
+    as handle_examopen_wa_ask."""
+    query = update.callback_query
+    await query.answer()
+    sid = query.data.split("|", 1)[1]
+    info = exam_action_cache.get(sid)
+    if not info:
+        await query.message.reply_text("⚠️ This notification has expired.")
+        return
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, mute", callback_data=f"examopen_mute_confirm|{sid}"),
+        InlineKeyboardButton("❌ Cancel", callback_data="examopen_cancel"),
+    ]])
+    await query.message.reply_text(
+        f"🔕 Stop notifying you about this exam's registration open/closing-soon reminders?\n<b>{info['title']}</b>",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+async def handle_examopen_mute_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Add this exam's module code to exam_reminder_cache.json's muted_codes
+    list — check_exam_reminders skips building/sending both the "open" and
+    "closing soon" notifications for any code in that list, but keeps
+    tracking it internally so it isn't mistaken for closed."""
+    query = update.callback_query
+    await query.answer()
+    sid = query.data.split("|", 1)[1]
+    info = exam_action_cache.get(sid)
+    if not info:
+        await query.edit_message_text("⚠️ This notification has expired.")
+        return
+    cache = load_exam_cache()
+    muted = set(cache.get("muted_codes", []))
+    muted.add(info["code"])
+    cache["muted_codes"] = sorted(muted)
+    save_exam_cache(cache)
+    await query.edit_message_text(f"🔕 Won't remind you about this exam's registration anymore:\n{info['title']}")
+
+
+async def handle_examopen_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Cancelled")
+    await query.edit_message_text("Cancelled.")
 
 
 async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7224,6 +7318,11 @@ async def main():
         app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
         app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|force_wa_qr|change_wa_group|detect_wa_groups|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu)$"))
         app.add_handler(CallbackQueryHandler(handle_exam_buttons, pattern="^(exam_menu|exam_noop|exam_cancel|exam_ask\\|.*|exam_do\\|.*)$"))
+        app.add_handler(CallbackQueryHandler(handle_examopen_wa_ask, pattern="^examopen_wa_ask\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_examopen_wa_confirm, pattern="^examopen_wa_confirm\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_examopen_mute_ask, pattern="^examopen_mute_ask\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_examopen_mute_confirm, pattern="^examopen_mute_confirm\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_examopen_cancel, pattern="^examopen_cancel$"))
         app.add_handler(CallbackQueryHandler(set_wa_group_handler, pattern="^set_wa_group\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_today, pattern="^calendar_today$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_weekly, pattern="^calendar_weekly$"))
