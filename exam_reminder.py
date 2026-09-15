@@ -356,9 +356,18 @@ async def _fetch_examination_periods(session, referer: str, unit_id: str, period
     return _parse_examination_periods(body_text)
 
 
-async def get_open_exam_registrations(session) -> list[dict]:
+async def get_open_exam_registrations(session, failed_codes: Optional[set] = None) -> list[dict]:
     """Return one entry per currently-open exam sitting (a unit may yield more than one,
-    e.g. two parallel groups each with their own open registration window)."""
+    e.g. two parallel groups each with their own open registration window).
+
+    Each unit's detail page is fetched independently, so one unit's fetch can
+    fail (network blip, StuMS hiccup) without the others — that unit is just
+    silently skipped from the result rather than raising. If `failed_codes`
+    is given (a set), such units' codes are added to it, so a caller that
+    treats "missing from this result" as "no longer open" (e.g.
+    check_exam_reminders' cache cleanup) can tell that apart from a real
+    closure and avoid re-notifying about it as if it had just reopened.
+    """
     referer = await _establish_stums_session(session)
 
     async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
@@ -379,6 +388,8 @@ async def get_open_exam_registrations(session) -> list[dict]:
                 periods = await _fetch_examination_periods(session, referer, unit["unit_id"], unit["period_id"])
             except Exception as e:
                 logging.warning(f"exam_reminder: failed to fetch detail for {unit['code']}: {e}")
+                if failed_codes is not None:
+                    failed_codes.add(unit["code"])
                 return
         for period in periods:
             if period["is_open"]:
@@ -780,8 +791,9 @@ async def check_exam_reminders(session, bot, broadcast_fn) -> None:
     `broadcast_fn` must be an async callable with signature (bot, text, parse_mode="HTML"),
     matching studip_bot.broadcast.
     """
+    failed_codes: set = set()
     try:
-        open_exams = await get_open_exam_registrations(session)
+        open_exams = await get_open_exam_registrations(session, failed_codes=failed_codes)
     except Exception as e:
         logging.error(f"exam_reminder: fetch failed: {e}")
         return
@@ -854,11 +866,19 @@ async def check_exam_reminders(session, bot, broadcast_fn) -> None:
 
     # A sitting missing from still_open_keys has either closed or its registration
     # window ended; clear its notification state so a future re-opening (e.g. a
-    # resit period) is treated as new again.
+    # resit period) is treated as new again. But if its unit's detail-page fetch
+    # simply failed this cycle (in failed_codes), we don't actually know it
+    # closed — purging it here would make the next successful check treat it
+    # as newly-opened again and resend the "registration open" notification
+    # for an exam that was never actually closed.
     for key in list(notified_open.keys()):
-        if key not in still_open_keys:
-            notified_open.pop(key, None)
-            notified_deadline.pop(key, None)
+        if key in still_open_keys:
+            continue
+        key_code = key.split(":", 1)[0]
+        if key_code in failed_codes:
+            continue
+        notified_open.pop(key, None)
+        notified_deadline.pop(key, None)
 
     cache["notified_open"] = notified_open
     cache["notified_deadline"] = notified_deadline
