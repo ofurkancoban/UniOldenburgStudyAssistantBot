@@ -47,6 +47,12 @@ ALLOWED_USER_IDS_ENV = os.getenv("ALLOWED_USER_IDS", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "cohere/north-mini-code:free")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# Dedicated text-to-speech models (a separate OpenRouter API surface from
+# chat/completions — see synthesize_speech). deepgram/flux-tts:free requires
+# an explicit "voice"; fish-audio/s2.1-pro-free:free doesn't need one.
+OPENROUTER_TTS_MODEL = os.getenv("OPENROUTER_TTS_MODEL", "deepgram/flux-tts:free")
+OPENROUTER_TTS_VOICE = os.getenv("OPENROUTER_TTS_VOICE", "flux-elise-en")
+OPENROUTER_TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
 BASE_URL = "https://elearning.uni-oldenburg.de"
 STUDIP_URL = "https://elearning.uni-oldenburg.de/dispatch.php/my_courses"
 last_full_check_time = None
@@ -2658,13 +2664,23 @@ async def send_morning_summary(bot, user_ids):
     for uid in user_ids:
         try:
             await bot.send_message(
-                chat_id=uid, 
-                text=final_text, 
+                chat_id=uid,
+                text=final_text,
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
         except Exception as e:
             logging.error(f"Failed to send summary to {uid}: {e}")
+
+    # 5. Automatic AI-narrated voice message — no "🔊 Listen" tap needed, and
+    # freshly improvised every morning rather than a fixed template (see
+    # build_ai_daily_plan_narration). A TTS/ffmpeg hiccup here just skips
+    # the voice message; the text summary above has already gone out.
+    try:
+        narration = await build_ai_daily_plan_narration(today_events, today_date) or build_daily_plan_speech_text(today_events, today_date)
+        await _send_voice_to_users(bot, user_ids, narration)
+    except Exception as e:
+        logging.error(f"Morning voice summary failed: {e}")
 
 
 
@@ -4622,6 +4638,9 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
         [
             InlineKeyboardButton("🔔 Upcoming", callback_data="upcoming_dashboard"),
         ],
+        [
+            InlineKeyboardButton("🔊 Listen", callback_data="calendar_today_voice"),
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -4771,6 +4790,27 @@ async def handle_calendar_today(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as e:
         logging.error(f"Calendar today error: {e}")
         await query.edit_message_text(f"❌ Error loading today's events: {str(e)[:200]}")
+
+
+async def handle_calendar_today_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle calendar_today_voice callback ("🔊 Listen" on the daily
+    schedule) — synthesize today's plan via OpenRouter TTS and send it as a
+    voice message."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    try:
+        today = datetime.now().date()
+        week_start = today - timedelta(days=today.weekday())
+        events = await get_calendar_events(session=global_session, week_start=week_start)
+        await send_daily_plan_voice(query.message, events, today)
+    except Exception as e:
+        logging.error(f"Calendar today voice error: {e}")
+        await query.message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
 
 
 async def handle_calendar_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6273,7 +6313,7 @@ VOICE_INTENTS = [
     "check_status", "show_menu", "set_food_preferences", "remove_food_preferences",
     "show_last_file", "list_course_files", "exam_dates_all", "upcoming_dashboard",
     "calendar_today", "calendar_weekly", "set_default_semester", "run_check",
-    "fastenroll_list", "unclear",
+    "fastenroll_list", "read_daily_plan", "unclear",
 ]
 
 # Friendly button labels for every real (non-"unclear") intent, used both by
@@ -6302,6 +6342,7 @@ INTENT_LABELS = {
     "set_default_semester": "📆 Set default semester",
     "run_check": "🔁 Run a manual sync",
     "fastenroll_list": "⚡ List Fast Enroll jobs",
+    "read_daily_plan": "🔊 Read today's plan aloud",
 }
 
 CLASSIFY_INTENT_SYSTEM_PROMPT = """You classify a spoken command (transcribed from Turkish or English) sent to a university assistant Telegram bot into exactly one intent.
@@ -6323,7 +6364,8 @@ Intents, each with example phrasings in both languages:
 - list_course_files: "Linear Algebra dersinin dosyalarını listele" / "list the files of Linear Algebra" / "show me all files for Computational Economics" — asks to see every file of a named course, not just the latest one
 - exam_dates_all: "tüm sınav tarihlerini göster" / "show every exam date" / "list all exams in the curriculum" — every exam across the whole curriculum, not just mine
 - upcoming_dashboard: "önümüzdeki günlerde neler var" / "what's coming up" / "show my upcoming schedule" — a combined view of tasks, exam dates and deadlines
-- calendar_today: "bugünkü derslerim neler" / "what's my schedule today" / "show today's lectures"
+- calendar_today: "bugünkü derslerim neler" / "what's my schedule today" / "show today's lectures" — wants to SEE today's schedule as text
+- read_daily_plan: "günlük planımı sesli oku" / "read me today's schedule" / "read my daily plan out loud" / "tell me what I have today" — specifically wants today's schedule spoken aloud as a voice message, not shown as text
 - calendar_weekly: "bu haftaki ders programımı göster" / "show this week's schedule" / "what's my week plan"
 - set_default_semester: "varsayılan dönemi ayarla" / "set my default semester" / "change my default semester" — opens the semester picker, doesn't require a semester to be named
 - run_check: "her şeyi manuel kontrol et" / "run a manual sync" / "check for updates now" — force-refreshes messages/announcements/files/forum right now
@@ -6337,11 +6379,18 @@ If — and only if — you pick "unclear", also set "alternatives" to an array o
 Respond with strict JSON only, no other text: {"intent": "<intent>", "query": "<name or null>", "alternatives": ["<intent>", ...]}"""
 
 
-async def _call_openrouter(system_prompt: str, user_text: str) -> Optional[str]:
+async def _call_openrouter(system_prompt: str, user_text: str, temperature: float = 0) -> Optional[str]:
     """POST one chat completion to OpenRouter's free tier and return the raw
     assistant text, or None on any failure (missing key, network error,
     timeout, non-2xx response). Callers must treat None as "couldn't
-    understand" and degrade gracefully rather than raising."""
+    understand" and degrade gracefully rather than raising.
+
+    `temperature` defaults to 0 (deterministic) for the structured-output
+    callers (intent classification, extraction) that need consistent JSON.
+    Pass a higher value (e.g. 1.0+) for free-form creative text like the
+    daily-plan narration, where 0 would make the model converge on the same
+    wording every time — deterministic sampling with the same prompt tends
+    to produce the same greedy completion."""
     if not OPENROUTER_API_KEY:
         return None
     try:
@@ -6351,7 +6400,7 @@ async def _call_openrouter(system_prompt: str, user_text: str) -> Optional[str]:
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
                 json={
                     "model": OPENROUTER_MODEL,
-                    "temperature": 0,
+                    "temperature": temperature,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_text},
@@ -6367,6 +6416,189 @@ async def _call_openrouter(system_prompt: str, user_text: str) -> Optional[str]:
     except Exception as e:
         logging.warning(f"OpenRouter call failed: {e}")
         return None
+
+
+async def synthesize_speech(text: str) -> Optional[tuple]:
+    """Convert text to speech via OpenRouter's free-tier TTS endpoint
+    (/api/v1/audio/speech — a separate API surface from chat/completions,
+    so it isn't listed in /api/v1/models and doesn't go through
+    _call_openrouter). Returns (pcm_bytes, sample_rate) — raw 16-bit mono
+    PCM, whose exact sample rate is read back from the response's
+    Content-Type (e.g. "audio/pcm;rate=24000;channels=1") rather than
+    assumed, since it can differ by model. Returns None on any failure
+    (missing key, network error, non-2xx) — callers must degrade
+    gracefully (e.g. fall back to sending the plain text)."""
+    if not OPENROUTER_API_KEY:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                OPENROUTER_TTS_URL,
+                headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
+                json={"model": OPENROUTER_TTS_MODEL, "input": text, "voice": OPENROUTER_TTS_VOICE},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.warning(f"TTS call failed: HTTP {resp.status}: {body[:200]}")
+                    return None
+                content_type = resp.headers.get("Content-Type", "")
+                sample_rate = 24000
+                m = re.search(r"rate=(\d+)", content_type)
+                if m:
+                    sample_rate = int(m.group(1))
+                pcm_bytes = await resp.read()
+                return pcm_bytes, sample_rate
+    except Exception as e:
+        logging.warning(f"TTS call failed: {e}")
+        return None
+
+
+async def _pcm_to_ogg_voice(pcm_bytes: bytes, sample_rate: int) -> Optional[str]:
+    """Convert raw 16-bit mono PCM audio to an OGG/Opus file via ffmpeg —
+    the format Telegram's send_voice needs for a proper voice-message
+    bubble (not just a generic audio attachment). Returns the temp file
+    path (caller must remove it when done), or None if ffmpeg is missing
+    or the conversion fails."""
+    pcm_path = os.path.join(tempfile.gettempdir(), f"tts_{uuid.uuid4().hex}.pcm")
+    ogg_path = pcm_path + ".ogg"
+    with open(pcm_path, "wb") as f:
+        f.write(pcm_bytes)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", pcm_path,
+            "-c:a", "libopus", "-b:a", "48k", "-y", ogg_path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        if proc.returncode != 0 or not os.path.exists(ogg_path):
+            logging.warning(f"_pcm_to_ogg_voice: ffmpeg exited {proc.returncode}")
+            return None
+        return ogg_path
+    except FileNotFoundError:
+        logging.warning("_pcm_to_ogg_voice: ffmpeg not installed")
+        return None
+    finally:
+        try:
+            os.remove(pcm_path)
+        except OSError:
+            pass
+
+
+def build_daily_plan_speech_text(events: list, target_date) -> str:
+    """Build a plain-English (no Markdown/HTML) description of one day's
+    schedule, suitable as TTS input — reuses the same event dicts
+    send_daily_calendar renders (title, time, location, status)."""
+    today_events = [ev for ev in events if ev["date_key"] == target_date]
+    if not today_events:
+        return f"You have no events scheduled on {target_date:%A, %B %d}. Enjoy your free day!"
+
+    parts = [f"Here is your schedule for {target_date:%A, %B %d}. You have {len(today_events)} event{'s' if len(today_events) != 1 else ''} today."]
+    for ev in today_events:
+        title = clean_course_title(ev.get("title", "")) or "an event"
+        time_range = ev.get("time", "")
+        location = _safe_loc(ev.get("location", ""))
+        sentence = f"{title} at {time_range}"
+        if location and location not in ("-", "TBA", "N/A"):
+            sentence += f", in {location}"
+        parts.append(sentence + ".")
+    return " ".join(parts)
+
+
+DAILY_PLAN_NARRATION_SYSTEM_PROMPT = """You are recording a short, warm, upbeat spoken morning briefing for a university student — it will be converted to speech and sent as a voice message, so write it exactly as you'd say it out loud, not as a written list.
+
+Structure:
+1. Open with a genuine, encouraging line about the day ahead — invent fresh wording every time, never reuse a stock phrase, make it feel spontaneous rather than a template.
+2. Naturally weave in today's schedule: what's on, roughly when, and where — like a friend casually telling them their day, not reading a bureaucratic agenda.
+3. Close with one short, warm line wishing them well.
+
+Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 90 words. Vary your phrasing and structure every time you're asked this, even for an identical schedule, since this repeats every single morning and must never sound canned or repetitive."""
+
+
+async def build_ai_daily_plan_narration(today_events: list, target_date) -> Optional[str]:
+    """Ask the chat LLM (OpenRouter) to write a warm, freshly-improvised
+    spoken narration of the day's schedule — deliberately not a fixed
+    template, so the opening line and phrasing differ every time this is
+    called, even for an identical schedule. Returns None on any failure;
+    callers should fall back to build_daily_plan_speech_text so the voice
+    message always has content."""
+    if today_events:
+        schedule_summary = "\n".join(
+            f"- {clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')} in {_safe_loc(ev.get('location', ''))}"
+            for ev in today_events
+        )
+    else:
+        schedule_summary = "No events scheduled — a free day."
+
+    user_prompt = f"Today is {target_date:%A, %B %d}.\nSchedule:\n{schedule_summary}"
+    narration = await _call_openrouter(DAILY_PLAN_NARRATION_SYSTEM_PROMPT, user_prompt, temperature=1.15)
+    return narration.strip() if narration else None
+
+
+async def _send_voice_to_users(bot, user_ids, text: str):
+    """Synthesize `text` once via OpenRouter TTS and send the resulting
+    voice message to every user_id, reusing the same converted file rather
+    than re-synthesizing per recipient. Used for the automatic morning
+    voice summary, which has no single "sender" to reply to and no text
+    fallback of its own to send — the text morning summary already went
+    out separately, so a TTS/ffmpeg failure here just logs and skips."""
+    result = await synthesize_speech(text)
+    if not result:
+        logging.warning("_send_voice_to_users: TTS unavailable, skipping voice message")
+        return
+    pcm_bytes, sample_rate = result
+
+    ogg_path = await _pcm_to_ogg_voice(pcm_bytes, sample_rate)
+    if not ogg_path:
+        logging.warning("_send_voice_to_users: ffmpeg conversion failed, skipping voice message")
+        return
+    try:
+        for uid in user_ids:
+            try:
+                with open(ogg_path, "rb") as f:
+                    await bot.send_voice(chat_id=uid, voice=f)
+            except Exception as e:
+                logging.error(f"_send_voice_to_users: failed to send to {uid}: {e}")
+    finally:
+        try:
+            os.remove(ogg_path)
+        except OSError:
+            pass
+
+
+async def send_daily_plan_voice(sender, events: list, target_date):
+    """Build today's schedule as a warm, freshly-improvised spoken
+    narration (falling back to a plain deterministic description if the
+    LLM call fails), synthesize it via OpenRouter TTS, and send it as a
+    Telegram voice message. Falls back to sending the text itself (never
+    silently does nothing) if TTS is unavailable, ffmpeg is missing, or
+    synthesis fails for any reason."""
+    today_events = [ev for ev in events if ev["date_key"] == target_date]
+    text = await build_ai_daily_plan_narration(today_events, target_date) or build_daily_plan_speech_text(events, target_date)
+    await _show_typing(sender, action=ChatAction.RECORD_VOICE)
+
+    result = await synthesize_speech(text)
+    if not result:
+        await sender.reply_text("⚠️ Couldn't generate voice right now (TTS unavailable) — here's the schedule as text instead:\n\n" + text)
+        return
+    pcm_bytes, sample_rate = result
+
+    ogg_path = await _pcm_to_ogg_voice(pcm_bytes, sample_rate)
+    if not ogg_path:
+        await sender.reply_text("⚠️ Couldn't convert the generated voice audio — here's the schedule as text instead:\n\n" + text)
+        return
+
+    try:
+        with open(ogg_path, "rb") as f:
+            await sender.reply_voice(voice=f)
+    except Exception as e:
+        logging.error(f"send_daily_plan_voice: failed to send voice message: {e}")
+        await sender.reply_text("⚠️ Couldn't send the voice message — here's the schedule as text instead:\n\n" + text)
+    finally:
+        try:
+            os.remove(ogg_path)
+        except OSError:
+            pass
 
 
 def _extract_json_object(raw: Optional[str]) -> Optional[dict]:
@@ -7049,6 +7281,17 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         await message.reply_text("🎙️ Sounds like you want this week's schedule:", reply_markup=keyboard)
         return
 
+    if intent == "read_daily_plan":
+        try:
+            today = datetime.now().date()
+            week_start = today - timedelta(days=today.weekday())
+            events = await get_calendar_events(session=global_session, week_start=week_start)
+            await send_daily_plan_voice(message, events, today)
+        except Exception as e:
+            logging.error(f"_route_voice_intent: read_daily_plan failed: {e}")
+            await message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
+        return
+
     if intent == "set_default_semester":
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")]])
         await message.reply_text("🎙️ Sounds like you want to set your default semester:", reply_markup=keyboard)
@@ -7412,6 +7655,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_examopen_cancel, pattern="^examopen_cancel$"))
         app.add_handler(CallbackQueryHandler(set_wa_group_handler, pattern="^set_wa_group\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_today, pattern="^calendar_today$"))
+        app.add_handler(CallbackQueryHandler(handle_calendar_today_voice, pattern="^calendar_today_voice$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_weekly, pattern="^calendar_weekly$"))
         app.add_handler(CallbackQueryHandler(handle_exam_dates_list, pattern="^exam_dates_list$"))
         app.add_handler(CallbackQueryHandler(handle_all_exam_dates, pattern="^exam_dates_all$"))

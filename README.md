@@ -33,6 +33,7 @@ This project offers two distinct ways to interact with Stud.IP. You can select y
 *   **Morning Summary (07:00 AM)**: Get a daily briefing delivered to your chat.
     *   **Today's Schedule**: A clean list of your lectures and locations.
     *   **Mensa Menu**: The full cafeteria menu with allergens and special labels (e.g., ⭐ Limited).
+    *   **🔊 Spoken briefing, automatically**: right after the text summary, a second message arrives as an actual voice note — a warm, upbeat narration of the day that a free OpenRouter LLM writes fresh every morning (not a fixed template — the opening line and phrasing are different every time), turned into speech by the same free TTS pipeline as **🔊 Listen** (see 🎙️ Voice Commands). No tap needed; if generation or conversion fails, it's skipped quietly and the text summary above still went out.
 *   **Lecture Reminders**: Automatically receive a notification **30 minutes before** each class starts. No more running late across campus!
 
 ### 📊 Real-time Monitoring (Unified Watcher)
@@ -103,15 +104,18 @@ Every voice note is transcribed first (via the free Google Web Speech API, no AP
     | "set my default semester" | Opens the semester picker used by **📆 Set Default Semester**. |
     | "run a manual sync" | Same as **🔁 Check** — force-refreshes messages/announcements/files/forum now. |
     | "list my scheduled fast enroll jobs" | Shows your pending **⚡ Fast Enroll** jobs. |
+    | "read me today's schedule out loud" | 🔊 Synthesizes today's plan into an actual voice message (see below) instead of showing it as text. |
     | anything else the bot can't place at all | Asks **"Want me to save it as a task instead?"** rather than silently guessing. |
     | something ambiguous between two known actions (e.g. just "exam") | Offers up to two **"did you mean...?"** buttons for the closest-matching actions, plus a plain-task fallback — tapping one runs that action exactly as if you'd said it clearly the first time. |
 
     Destructive actions (enroll, sign out, exam register/deregister) are **never** executed directly from voice — the bot only figures out which button you meant and presents it pre-selected; tapping it still goes through the normal confirmation.
 
+*   **🔊 Hear your daily plan**: tap **"🔊 Listen"** on the **📅 Today** schedule, or just say "read me today's schedule" — a free LLM (via OpenRouter) first writes a warm, freshly-improvised spoken narration of the day (never a fixed template), which is then turned into a real voice message via a free OpenRouter text-to-speech model (`deepgram/flux-tts:free` by default), converted to Telegram's voice-message format with `ffmpeg`. Falls back to a plain deterministic description (and, if TTS itself is unavailable, to plain text) so it never just does nothing. The same narration goes out automatically every morning alongside the Morning Summary — see 📅 Smart Scheduling & Reminders above.
+
 > [!NOTE]
 > Voice-note transcription requires **ffmpeg** on the server (`apt install ffmpeg` / `brew install ffmpeg`) to convert Telegram's audio format. `setup.sh` warns if it's missing.
 >
-> Intent routing requires an **`OPENROUTER_API_KEY`** (free to create at [openrouter.ai](https://openrouter.ai/keys)) — without one, every voice note just falls back to plain task creation, exactly like before this feature existed. OpenRouter's `:free` models cap free accounts at 50 requests/day; a one-time $10 credit purchase (never actually spent on `:free` models) permanently raises that to 1,000/day — worth doing once real usage picks up.
+> Intent routing (and 🔊 Listen's text-to-speech) requires an **`OPENROUTER_API_KEY`** (free to create at [openrouter.ai](https://openrouter.ai/keys)) — without one, every voice note just falls back to plain task creation, and 🔊 Listen falls back to plain text. OpenRouter's `:free` models cap free accounts at 50 requests/day; a one-time $10 credit purchase (never actually spent on `:free` models) permanently raises that to 1,000/day — worth doing once real usage picks up.
 
 ---
 
