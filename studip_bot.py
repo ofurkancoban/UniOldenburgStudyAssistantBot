@@ -10,6 +10,7 @@ from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKe
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import pyotp
 import uuid
+import random
 import hashlib
 import difflib
 from urllib.parse import unquote, urljoin
@@ -1329,9 +1330,7 @@ MEAT_CODES = {"G", "R", "L", "W", "F", "Fi"}  # Poultry (incl. turkey — no sep
 MEAL_RECOMMENDATION_BASE_AVOID_CODES = {"S", "Sch", "Su", "A", "RG", "SG"}  # Pork (all 3 codes), Alcohol, Beef/Pork Gelatin
 MEAL_RECOMMENDATION_BASE_AVOID_KEYWORDS = {"wine"}
 
-MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only — everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Prioritize a meat, chicken, turkey, or fish dish when one is available among the candidates; if none is, pick the best other option and say so honestly within the reasoning.
-
-Respond with strict JSON only, no other text: {"dish": "<the exact dish name, copied verbatim from the candidate list>", "reasoning": "<1-2 warm, casual sentences naming the dish naturally and explaining the pick — this will be read aloud as a voice message, so plain spoken-friendly text only: no markdown, no lists, no emojis>"}"""
+MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are writing a short, warm, casual recommendation for ONE specific dish already chosen for a student's lunch — don't second-guess or replace the choice, just explain why it's a good pick today, in 1-2 sentences that name the dish naturally. Vary your wording and angle every time you're asked this, even for the same dish, since this gets asked repeatedly and must never sound canned. Plain spoken-friendly text only: no markdown, no lists, no emojis — this will be read aloud as a voice message."""
 
 
 def _friendly_menu_category_label(category: str) -> str:
@@ -1349,15 +1348,25 @@ async def build_food_recommendation() -> Optional[dict]:
     """Fetch today's Mensa menu, filter out anything the student avoids
     (their food_preferences.json settings, unioned with a fixed
     pork/alcohol/wine/gelatine floor per their stated restriction), keep
-    only Counter/Culinarium items, and ask the chat LLM to pick ONE
-    recommended dish — meat/chicken prioritized when available.
+    only Counter/Culinarium items, and recommend ONE dish — meat/chicken/
+    turkey/fish prioritized when available.
+
+    The dish itself is picked with plain random.choice() among the
+    eligible candidates, not by asking the LLM to judge "the best" one —
+    an LLM asked to pick "the best" option from the same fixed candidate
+    list (today's menu doesn't change between asks) converges on the same
+    answer almost every time even at a fairly high temperature, which
+    defeats the point of a varied, repeatable "what should I eat" ask. The
+    LLM's job is just to write a fresh, natural reason for whichever dish
+    got picked (see MEAL_RECOMMENDATION_SYSTEM_PROMPT) — that part still
+    benefits from and gets real per-call variety.
 
     Returns {"dish", "category" (raw, e.g. "COUNTER TWO" — pass through
     _friendly_menu_category_label for display), "reasoning"}, or None on
-    any failure (no menu data reachable, or the LLM call itself failing).
-    If the menu loaded but nothing survived filtering, "category" is None
-    and "reasoning" carries an explanatory message instead of a real pick —
-    callers should still just speak/show "reasoning" either way.
+    any failure (no menu data reachable). If the menu loaded but nothing
+    survived filtering, "category" is None and "reasoning" carries an
+    explanatory message instead of a real pick — callers should still
+    just speak/show "reasoning" either way.
     """
     try:
         session = await login_studip()
@@ -1391,31 +1400,18 @@ async def build_food_recommendation() -> Optional[dict]:
             "reasoning": "Couldn't find anything on today's Counter or Culinarium menu that fits your preferences — check the full menu instead, there might be something elsewhere on it.",
         }
 
-    lines = []
-    for it in candidates:
-        meat_tags = sorted({ALLERGEN_CODE_NAMES.get(c, c) for c in it["codes"] if c in MEAT_CODES})
-        meat_note = f" [{', '.join(meat_tags)}]" if meat_tags else ""
-        desc_part = f": {it['description']}" if it["description"] else ""
-        lines.append(f"- {it['name']} ({it['category']}){meat_note}{desc_part}")
-    candidates_text = "\n".join(lines)
+    meat_candidates = [c for c in candidates if c["codes"] & MEAT_CODES]
+    chosen = random.choice(meat_candidates or candidates)
 
-    raw = await _call_openrouter(MEAL_RECOMMENDATION_SYSTEM_PROMPT, f"Today's candidates:\n{candidates_text}", temperature=0.8)
-    parsed = _extract_json_object(raw)
-    if not parsed or not parsed.get("dish"):
-        return None
+    meat_tags = sorted({ALLERGEN_CODE_NAMES.get(c, c) for c in chosen["codes"] if c in MEAT_CODES})
+    tag_note = f" [{', '.join(meat_tags)}]" if meat_tags else ""
+    desc_part = f": {chosen['description']}" if chosen["description"] else ""
+    dish_summary = f"{chosen['name']} ({chosen['category']}){tag_note}{desc_part}"
 
-    # Match back to the real candidate so "category" is the actual parsed
-    # value, not whatever the model might say — exact match first, fuzzy
-    # as a fallback in case it paraphrased the name slightly.
-    chosen = next((c for c in candidates if c["name"] == parsed["dish"]), None)
-    if not chosen:
-        chosen = _best_title_match(parsed["dish"], [(c["name"], c) for c in candidates])
+    reasoning = await _call_openrouter(MEAL_RECOMMENDATION_SYSTEM_PROMPT, f"Today's pick: {dish_summary}", temperature=1.1)
+    reasoning = (reasoning or "").strip() or f"I'd recommend the {chosen['name']} today."
 
-    return {
-        "dish": chosen["name"] if chosen else parsed["dish"],
-        "category": chosen["category"] if chosen else None,
-        "reasoning": (parsed.get("reasoning") or "").strip() or f"I'd recommend the {parsed['dish']}.",
-    }
+    return {"dish": chosen["name"], "category": chosen["category"], "reasoning": reasoning}
 
 
 async def _deliver_food_recommendation(sender, result: dict):
