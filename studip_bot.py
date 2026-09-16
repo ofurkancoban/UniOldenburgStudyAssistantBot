@@ -53,6 +53,12 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_TTS_MODEL = os.getenv("OPENROUTER_TTS_MODEL", "deepgram/flux-tts:free")
 OPENROUTER_TTS_VOICE = os.getenv("OPENROUTER_TTS_VOICE", "flux-elise-en")
 OPENROUTER_TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
+# University of Oldenburg's coordinates, for the daily-plan weather snapshot
+# (see get_weather_snapshot) — configurable in case the bot is ever reused
+# for a different campus.
+WEATHER_LATITUDE = os.getenv("WEATHER_LATITUDE", "53.1435")
+WEATHER_LONGITUDE = os.getenv("WEATHER_LONGITUDE", "8.2146")
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 BASE_URL = "https://elearning.uni-oldenburg.de"
 STUDIP_URL = "https://elearning.uni-oldenburg.de/dispatch.php/my_courses"
 last_full_check_time = None
@@ -2675,6 +2681,11 @@ async def send_morning_summary(bot, user_ids):
         logging.error(f"Summary schedule fetch error: {e}")
         today_events = []
 
+    # 1b. Weather for the morning commute window — omitted (not an empty
+    # section) if Open-Meteo is unreachable, so a fetch failure never blocks
+    # the rest of the summary.
+    weather = await get_weather_snapshot(today_date)
+
     # 2. Format Schedule
     if not today_events:
         schedule_text = "📅 <b>No classes today!</b> Enjoy your day. ✨"
@@ -2718,6 +2729,8 @@ async def send_morning_summary(bot, user_ids):
             task_lines.append(f"⏰ <code>{due.strftime('%H:%M')}</code> — {t['text']}{course_line}")
         tasks_text = "\n\n" + "\n".join(task_lines)
 
+    weather_text = f"\n\n{build_weather_text_line(weather)}" if weather else ""
+
     # 3. Final Message
     header = (
         "☀️ <b>GOOD MORNING!</b> ☀️\n"
@@ -2725,7 +2738,7 @@ async def send_morning_summary(bot, user_ids):
         "━━━━━━━━━━━━━━━━━━\n\n"
     )
 
-    final_text = f"{header}{schedule_text}{tasks_text}\n\n━━━━━━━━━━━━━━━━━━"
+    final_text = f"{header}{schedule_text}{weather_text}{tasks_text}\n\n━━━━━━━━━━━━━━━━━━"
     
     # 4. Keyboard for Mensa Menu
     keyboard = InlineKeyboardMarkup([
@@ -2748,7 +2761,7 @@ async def send_morning_summary(bot, user_ids):
     # build_ai_daily_plan_narration). A TTS/ffmpeg hiccup here just skips
     # the voice message; the text summary above has already gone out.
     try:
-        narration = await build_ai_daily_plan_narration(today_events, today_date, name=get_primary_user_name(), today_tasks=today_tasks) or build_daily_plan_speech_text(today_events, today_date)
+        narration = await build_ai_daily_plan_narration(today_events, today_date, name=get_primary_user_name(), today_tasks=today_tasks, weather=weather) or build_daily_plan_speech_text(today_events, today_date)
         await _send_voice_to_users(bot, user_ids, narration)
     except Exception as e:
         logging.error(f"Morning voice summary failed: {e}")
@@ -6644,6 +6657,113 @@ async def _pcm_to_ogg_voice(pcm_bytes: bytes, sample_rate: int) -> Optional[str]
             pass
 
 
+WEATHER_CODE_DESCRIPTIONS = {
+    0: ("clear sky", "☀️"), 1: ("mostly clear", "🌤️"), 2: ("partly cloudy", "⛅"), 3: ("overcast", "☁️"),
+    45: ("foggy", "🌫️"), 48: ("foggy with frost", "🌫️"),
+    51: ("light drizzle", "🌦️"), 53: ("drizzle", "🌦️"), 55: ("heavy drizzle", "🌧️"),
+    56: ("freezing drizzle", "🌧️"), 57: ("freezing drizzle", "🌧️"),
+    61: ("light rain", "🌦️"), 63: ("rain", "🌧️"), 65: ("heavy rain", "🌧️"),
+    66: ("freezing rain", "🌨️"), 67: ("freezing rain", "🌨️"),
+    71: ("light snow", "🌨️"), 73: ("snow", "❄️"), 75: ("heavy snow", "❄️"), 77: ("snow grains", "❄️"),
+    80: ("rain showers", "🌦️"), 81: ("rain showers", "🌧️"), 82: ("heavy rain showers", "⛈️"),
+    85: ("snow showers", "🌨️"), 86: ("heavy snow showers", "❄️"),
+    95: ("thunderstorm", "⛈️"), 96: ("thunderstorm with hail", "⛈️"), 99: ("severe thunderstorm", "⛈️"),
+}
+# WMO weather codes 51 and up are all some form of precipitation (drizzle,
+# rain, snow, showers, thunderstorm) — below that is dry (clear/cloudy/fog).
+WEATHER_WET_CODE_THRESHOLD = 51
+
+
+async def get_weather_snapshot(target_date=None) -> Optional[dict]:
+    """Fetch a concise weather snapshot for the university's location
+    (Oldenburg, Germany, by default — see WEATHER_LATITUDE/LONGITUDE) via
+    Open-Meteo (free, no API key needed).
+
+    Deliberately focused on the 8–11 AM "leaving home" window rather than a
+    whole-day aggregate — a stormy afternoon shouldn't make an otherwise
+    clear morning commute look bad, and vice versa. Picks the worst
+    (highest) weather code in that window, so a "will I get wet leaving
+    the house" read is conservative rather than averaged-away.
+
+    Returns {"description", "emoji", "is_wet", "precip_chance", "temp_min",
+    "temp_max"}, or None on any failure — callers should just omit the
+    weather section rather than block the rest of the message on it.
+    `target_date` defaults to today; only today/tomorrow are meaningfully
+    forecastable, so this isn't meant for the weekly plan.
+    """
+    target_date = target_date or datetime.now(TZ_BERLIN).date()
+    days_ahead = (target_date - datetime.now(TZ_BERLIN).date()).days
+    if not (0 <= days_ahead <= 1):
+        return None
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                WEATHER_URL,
+                params={
+                    "latitude": WEATHER_LATITUDE,
+                    "longitude": WEATHER_LONGITUDE,
+                    "hourly": "weathercode,precipitation_probability",
+                    "daily": "temperature_2m_max,temperature_2m_min",
+                    "timezone": "Europe/Berlin",
+                    "forecast_days": 2,
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    logging.warning(f"get_weather_snapshot: HTTP {resp.status}")
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        logging.warning(f"get_weather_snapshot: fetch failed: {e}")
+        return None
+
+    try:
+        target_iso = target_date.isoformat()
+        morning_codes = []
+        morning_precip = []
+        for t, code, precip in zip(data["hourly"]["time"], data["hourly"]["weathercode"], data["hourly"]["precipitation_probability"]):
+            if t.startswith(target_iso) and 8 <= int(t[11:13]) <= 11:
+                morning_codes.append(code)
+                morning_precip.append(precip)
+        if not morning_codes:
+            return None
+
+        code = max(morning_codes)  # worst-case in the window
+        desc, emoji = WEATHER_CODE_DESCRIPTIONS.get(code, ("unknown conditions", "🌡️"))
+        day_index = data["daily"]["time"].index(target_iso)
+        return {
+            "description": desc,
+            "emoji": emoji,
+            "is_wet": code >= WEATHER_WET_CODE_THRESHOLD,
+            "precip_chance": max(morning_precip),
+            "temp_min": data["daily"]["temperature_2m_min"][day_index],
+            "temp_max": data["daily"]["temperature_2m_max"][day_index],
+        }
+    except (KeyError, IndexError, ValueError) as e:
+        logging.warning(f"get_weather_snapshot: parse failed: {e}")
+        return None
+
+
+def build_weather_text_line(weather: dict) -> str:
+    """Short, deterministic weather + clothing line for the text message —
+    LLM-independent, so it's always available even when OpenRouter isn't.
+    The voice narration gets the raw snapshot instead and phrases its own
+    advice (see build_ai_daily_plan_narration)."""
+    tips = []
+    if weather["is_wet"]:
+        tips.append("bring an umbrella/waterproof jacket")
+    if weather["temp_min"] <= 5:
+        tips.append("dress warmly")
+    elif weather["temp_max"] >= 24:
+        tips.append("light clothing should do")
+    tip_text = ", ".join(tips) if tips else "no special prep needed"
+    return (
+        f"{weather['emoji']} Weather: {weather['description']}, {weather['temp_min']:.0f}–{weather['temp_max']:.0f}°C, "
+        f"{weather['precip_chance']}% chance of rain — {tip_text}"
+    )
+
+
 def build_daily_plan_speech_text(events: list, target_date) -> str:
     """Build a plain-English (no Markdown/HTML) description of one day's
     schedule, suitable as TTS input — reuses the same event dicts
@@ -6668,22 +6788,25 @@ DAILY_PLAN_NARRATION_SYSTEM_PROMPT = """You are recording a short, warm, upbeat 
 
 Structure:
 1. Open with a genuine, encouraging line about the day ahead — invent fresh wording every time, never reuse a stock phrase, make it feel spontaneous rather than a template.
-2. Naturally weave in today's schedule: what's on, roughly when, and where — like a friend casually telling them their day, not reading a bureaucratic agenda.
-3. If any tasks are due today, mention them too, woven into the same conversational flow — not as a separate announcement.
-4. Close with one short, warm line wishing them well.
+2. If weather data is given, mention what it'll actually be like stepping outside (dry/rainy/sunny etc — the precise temperature matters far less than that) and suggest what to bring or wear, naturally, as part of the flow — not a separate weather-report segment.
+3. Naturally weave in today's schedule: what's on, roughly when, and where — like a friend casually telling them their day, not reading a bureaucratic agenda.
+4. If any tasks are due today, mention them too, woven into the same conversational flow — not as a separate announcement.
+5. Close with one short, warm line wishing them well.
 
-Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 110 words (a bit more if there are tasks to mention too). Vary your phrasing and structure every time you're asked this, even for an identical schedule, since this repeats every single morning and must never sound canned or repetitive."""
+Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 130 words (a bit more if there's weather and/or tasks to mention too). Vary your phrasing and structure every time you're asked this, even for an identical schedule, since this repeats every single morning and must never sound canned or repetitive."""
 
 
-async def build_ai_daily_plan_narration(today_events: list, target_date, name: Optional[str] = None, today_tasks: Optional[list] = None) -> Optional[str]:
+async def build_ai_daily_plan_narration(today_events: list, target_date, name: Optional[str] = None, today_tasks: Optional[list] = None, weather: Optional[dict] = None) -> Optional[str]:
     """Ask the chat LLM (OpenRouter) to write a warm, freshly-improvised
-    spoken narration of the day's schedule and any tasks due today —
-    deliberately not a fixed template, so the opening line and phrasing
-    differ every time this is called, even for an identical schedule. If
-    `name` is given (see get_user_name/get_primary_user_name), the
-    narration addresses them by it. Returns None on any failure; callers
-    should fall back to build_daily_plan_speech_text so the voice message
-    always has content."""
+    spoken narration of the day's schedule, weather, and any tasks due
+    today — deliberately not a fixed template, so the opening line and
+    phrasing differ every time this is called, even for an identical
+    schedule. If `name` is given (see get_user_name/get_primary_user_name),
+    the narration addresses them by it. `weather` is a get_weather_snapshot()
+    dict — what matters for the narration is the condition (dry/rainy/etc),
+    not the exact temperature. Returns None on any failure; callers should
+    fall back to build_daily_plan_speech_text so the voice message always
+    has content."""
     if today_events:
         schedule_summary = "\n".join(
             f"- {clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')} in {_safe_loc(ev.get('location', ''))}"
@@ -6693,6 +6816,14 @@ async def build_ai_daily_plan_narration(today_events: list, target_date, name: O
         schedule_summary = "No events scheduled — a free day."
 
     user_prompt = f"Today is {target_date:%A, %B %d}.\nSchedule:\n{schedule_summary}"
+
+    if weather:
+        wet_note = "expect it to be wet (rain/drizzle/snow)" if weather["is_wet"] else "it should stay dry"
+        user_prompt += (
+            f"\n\nWeather around when they'll be heading out (8-11 AM): {weather['description']}, "
+            f"{wet_note}, roughly {weather['temp_min']:.0f}-{weather['temp_max']:.0f}°C. "
+            "Mention what to expect and suggest what to bring/wear."
+        )
 
     if today_tasks:
         tasks_summary = "\n".join(
@@ -6856,7 +6987,8 @@ async def send_daily_plan_voice(sender, events: list, target_date, user_id=None)
     except Exception as e:
         logging.warning(f"send_daily_plan_voice: tasks fetch failed: {e}")
         today_tasks = []
-    text = await build_ai_daily_plan_narration(today_events, target_date, name=name, today_tasks=today_tasks) or build_daily_plan_speech_text(events, target_date)
+    weather = await get_weather_snapshot(target_date)
+    text = await build_ai_daily_plan_narration(today_events, target_date, name=name, today_tasks=today_tasks, weather=weather) or build_daily_plan_speech_text(events, target_date)
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
 
     if not await _try_send_voice(sender, text):
