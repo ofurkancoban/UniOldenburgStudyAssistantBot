@@ -1330,7 +1330,66 @@ MEAT_CODES = {"G", "R", "L", "W", "F", "Fi"}  # Poultry (incl. turkey — no sep
 MEAL_RECOMMENDATION_BASE_AVOID_CODES = {"S", "Sch", "Su", "A", "RG", "SG"}  # Pork (all 3 codes), Alcohol, Beef/Pork Gelatin
 MEAL_RECOMMENDATION_BASE_AVOID_KEYWORDS = {"wine"}
 
-MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are writing a short, warm, casual recommendation for ONE specific dish already chosen for a student's lunch — don't second-guess or replace the choice, just explain why it's a good pick today, in 1-2 sentences that name the dish naturally. Vary your wording and angle every time you're asked this, even for the same dish, since this gets asked repeatedly and must never sound canned. Plain spoken-friendly text only: no markdown, no lists, no emojis — this will be read aloud as a voice message."""
+MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only — everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Weigh three things together: (1) prioritize a meat, chicken, turkey, or fish dish when one is available — the [tag] next to a candidate flags this; (2) how nutritious/filling it likely is, judged from its name and description (lean protein, vegetables, a balanced plate > something clearly just a light side or dessert-like); (3) price — a student budget, so don't default to the most expensive option without reason. None of these mechanically overrides the others; weigh the actual tradeoff for today's specific candidates.
+
+Respond with strict JSON only, no other text: {"dish": "<the exact dish name, copied verbatim from the candidate list>", "reasoning": "<1-2 warm, casual sentences naming the dish naturally and explaining the pick (you can mention price/value or how filling it is if that's genuinely part of why) — this will be read aloud as a voice message, so plain spoken-friendly text only: no markdown, no lists, no emojis>"}"""
+
+MENSA_PHOTO_AJAX_URL = "https://sw-oldenburg-spl56.maxmanager.xyz/inc/ajax-php_konnektor.inc.php"
+MENSA_PHOTO_BASE_URL = "https://sw-oldenburg-spl56.maxmanager.xyz/"
+
+
+async def fetch_dish_photo_url(dish_name: str, loc_id: str = "2") -> Optional[str]:
+    """Look up a photo for `dish_name` on the Studierendenwerk Oldenburg's
+    public Speiseplan widget (studierendenwerk-oldenburg.de/.../speiseplan-
+    uhlhornsweg) — a different source than the Stud.IP mensa widget the rest
+    of this bot's menu features scrape, but the same underlying canteen data,
+    so dish names match closely enough for fuzzy matching. loc_id="2" is
+    Uhlhornsweg, matching fetch_todays_menu_items' default sub_path="2/".
+    Returns an absolute image URL, or None if no photo was found/matched."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                MENSA_PHOTO_AJAX_URL,
+                data={
+                    "func": "make_spl",
+                    "locId": loc_id,
+                    "date": today,
+                    "lang": "en",
+                    "startThisWeek": today,
+                    "startNextWeek": today,
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                html = await resp.text()
+    except Exception as e:
+        logging.warning(f"fetch_dish_photo_url: request failed: {e}")
+        return None
+
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        candidates = []
+        for meal in soup.select(".splMeal"):
+            title_span = meal.select_one("span[style*='font-size:24px']")
+            img = meal.select_one("img.smallFoto")
+            if not title_span or not img or not img.get("src"):
+                continue
+            if "dummies/platzhalter" in img["src"]:
+                continue
+            title = (title_span.contents[0] if title_span.contents else "")
+            title = str(title).strip()
+            if not title:
+                continue
+            candidates.append((title, img["src"]))
+    except Exception as e:
+        logging.warning(f"fetch_dish_photo_url: parse failed: {e}")
+        return None
+
+    match = _best_title_match(dish_name, candidates, min_score=0.55)
+    if not match:
+        return None
+    return MENSA_PHOTO_BASE_URL + match.lstrip("/")
 
 
 def _friendly_menu_category_label(category: str) -> str:
@@ -1348,18 +1407,10 @@ async def build_food_recommendation() -> Optional[dict]:
     """Fetch today's Mensa menu, filter out anything the student avoids
     (their food_preferences.json settings, unioned with a fixed
     pork/alcohol/wine/gelatine floor per their stated restriction), keep
-    only Counter/Culinarium items, and recommend ONE dish — meat/chicken/
-    turkey/fish prioritized when available.
-
-    The dish itself is picked with plain random.choice() among the
-    eligible candidates, not by asking the LLM to judge "the best" one —
-    an LLM asked to pick "the best" option from the same fixed candidate
-    list (today's menu doesn't change between asks) converges on the same
-    answer almost every time even at a fairly high temperature, which
-    defeats the point of a varied, repeatable "what should I eat" ask. The
-    LLM's job is just to write a fresh, natural reason for whichever dish
-    got picked (see MEAL_RECOMMENDATION_SYSTEM_PROMPT) — that part still
-    benefits from and gets real per-call variety.
+    only Counter/Culinarium items, and ask the LLM to pick ONE dish,
+    weighing meat/chicken/turkey/fish priority, likely nutritional value,
+    and price together (see MEAL_RECOMMENDATION_SYSTEM_PROMPT) — not a
+    random pick, a real judged one.
 
     Returns {"dish", "category" (raw, e.g. "COUNTER TWO" — pass through
     _friendly_menu_category_label for display), "reasoning"}, or None on
@@ -1400,28 +1451,52 @@ async def build_food_recommendation() -> Optional[dict]:
             "reasoning": "Couldn't find anything on today's Counter or Culinarium menu that fits your preferences — check the full menu instead, there might be something elsewhere on it.",
         }
 
-    meat_candidates = [c for c in candidates if c["codes"] & MEAT_CODES]
-    chosen = random.choice(meat_candidates or candidates)
+    lines = []
+    lookup = []
+    for it in candidates:
+        meat_tags = sorted({ALLERGEN_CODE_NAMES.get(c, c) for c in it["codes"] if c in MEAT_CODES})
+        tag_note = f" [{', '.join(meat_tags)}]" if meat_tags else ""
+        price_part = f" — {it['price']}" if it["price"] else ""
+        desc_part = f": {it['description']}" if it["description"] else ""
+        lines.append(f"- {it['name']} ({it['category']}){tag_note}{price_part}{desc_part}")
+        lookup.append((it["name"], it))
 
-    meat_tags = sorted({ALLERGEN_CODE_NAMES.get(c, c) for c in chosen["codes"] if c in MEAT_CODES})
-    tag_note = f" [{', '.join(meat_tags)}]" if meat_tags else ""
-    desc_part = f": {chosen['description']}" if chosen["description"] else ""
-    dish_summary = f"{chosen['name']} ({chosen['category']}){tag_note}{desc_part}"
+    raw = await _call_openrouter(
+        MEAL_RECOMMENDATION_SYSTEM_PROMPT,
+        "Today's candidates:\n" + "\n".join(lines),
+        temperature=0.9,
+    )
+    parsed = _extract_json_object(raw)
+    chosen = None
+    if parsed and parsed.get("dish"):
+        chosen = _best_title_match(parsed["dish"], lookup, min_score=0.5)
+    if chosen is None:
+        meat_candidates = [c for c in candidates if c["codes"] & MEAT_CODES]
+        chosen = random.choice(meat_candidates or candidates)
 
-    reasoning = await _call_openrouter(MEAL_RECOMMENDATION_SYSTEM_PROMPT, f"Today's pick: {dish_summary}", temperature=1.1)
-    reasoning = (reasoning or "").strip() or f"I'd recommend the {chosen['name']} today."
+    reasoning = ((parsed or {}).get("reasoning") or "").strip() if chosen is not None else ""
+    reasoning = reasoning or f"I'd recommend the {chosen['name']} today."
 
     return {"dish": chosen["name"], "category": chosen["category"], "reasoning": reasoning}
 
 
 async def _deliver_food_recommendation(sender, result: dict):
     """Send a build_food_recommendation() result the way it's meant to be
-    read: the Counter/Culinarium location as its own short text message
-    (quick to glance at, no need to replay the audio for it), and the
-    actual pick + reasoning spoken as a full voice message — falling back
-    to text if TTS/ffmpeg is unavailable, so it's never silently dropped."""
-    if result["category"]:
-        await sender.reply_text(f"📍 {_friendly_menu_category_label(result['category'])}")
+    read: the Counter/Culinarium location + dish name as its own short text
+    message (quick to glance at, no need to replay the audio for it), a
+    photo of the dish when one can be matched on the Studierendenwerk's
+    public Speiseplan site, and the actual pick + reasoning spoken as a
+    full voice message — falling back to text if TTS/ffmpeg is
+    unavailable, so it's never silently dropped."""
+    if result["category"] and result["dish"]:
+        await sender.reply_text(f"📍 {_friendly_menu_category_label(result['category'])} — {result['dish']}")
+
+        photo_url = await fetch_dish_photo_url(result["dish"])
+        if photo_url:
+            try:
+                await sender.reply_photo(photo=photo_url)
+            except Exception as e:
+                logging.warning(f"_deliver_food_recommendation: photo send failed: {e}")
 
     spoken_text = result["reasoning"]
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
