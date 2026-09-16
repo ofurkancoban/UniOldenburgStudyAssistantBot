@@ -48,7 +48,7 @@ A beautiful, emoji-rich menu with:
 - Pricing for students/guests.
 - Full allergen and additive guide.
 - **Smart Filtering**: Identification of Vegan (🌿 V+), Vegetarian (🥗 V), and meat types.
-- **🚫 Food Preferences**: Tell the bot what you don't eat (by tapping **"⚙️ Food Preferences"** on the menu, or just saying it out loud — see 🎙️ Voice Commands below) and it hides matching dishes from every menu view from then on, checking both official allergen/ingredient codes (e.g. pork, fish, nuts) and free-text ingredients (e.g. "mushrooms") that aren't in the official code table.
+- **🚫 Food Preferences**: Tell the bot what you don't eat (by tapping **"⚙️ Food Preferences"** on the menu, or just saying it out loud — see 🎙️ Voice Commands below) and it hides matching dishes from every menu view from then on, checking both official allergen/ingredient codes (e.g. pork, fish, nuts) and free-text ingredients (e.g. "mushrooms") that aren't in the official code table. The same **"⚙️ Food Preferences"** screen lists everything currently avoided with a one-tap **"Allow again"** button per item (plus **"🗑 Clear all"**), or just say "I eat fish now" / "stop avoiding mushrooms" to undo it by voice.
 
 ### 🎓 Exam & Grade Intelligence (StuMS/HISinOne)
 The bot goes beyond Stud.IP and reverse-engineers the university's separate **StuMS/HISinOne** exam portal to close the entire loop — *register → remind → sit the exam → get the result*:
@@ -93,6 +93,7 @@ Every voice note is transcribed first (via the free Google Web Speech API, no AP
     | "what are my upcoming exams" | Opens **📚 My Exam Dates**. |
     | "what's on the menu today" | Shows today's Mensa menu (filtered per your food preferences). |
     | "I don't eat pork or mushrooms" | Saves those as food preferences (see 🍽️ Enhanced Mensa Menu above). |
+    | "I eat fish now" / "stop avoiding mushrooms" | Undoes an earlier food preference for that item. |
     | "show bot status" | Runs `/status`. |
     | "list the last file of Development Economics" | Finds that course's most recently uploaded file and offers a one-tap **📥 Download**. |
     | "list the files of Development Economics" | Lists every file/folder at that course's top level, each with its own tap-to-open/download button. |

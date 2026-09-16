@@ -1396,9 +1396,38 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Menu command error: {e}")
 
 
+def _food_preferences_management_view():
+    """Build the (text, reply_markup) pair for the food-preferences management
+    screen: one "allow again" button per currently-avoided item, plus Clear
+    All when there's more than one. Shared by the initial "⚙️ Food
+    Preferences" tap and by the remove/clear handlers, which re-render the
+    same view in place after acting so the list stays current."""
+    prefs = load_food_preferences()
+    items = [(code, ALLERGEN_CODE_NAMES.get(code, code)) for code in prefs["avoid_codes"]]
+    items += [(kw, kw) for kw in prefs["avoid_keywords"]]
+
+    if not items:
+        text = (
+            "🚫 <b>Food Preferences</b>\n"
+            "Nothing avoided yet. Tell me what you don't eat — typed or voice, "
+            "e.g. \"no pork, fish, or mushrooms\"."
+        )
+        return text, None
+
+    text = (
+        "🚫 <b>Food Preferences</b>\n"
+        "Currently avoiding — tap one to allow it again, or tell me more foods to avoid:"
+    )
+    keyboard = [[InlineKeyboardButton(f"✅ Allow {label} again", callback_data=f"foodpref_remove|{raw}")] for raw, label in items]
+    if len(items) > 1:
+        keyboard.append([InlineKeyboardButton("🗑 Clear all", callback_data="foodpref_clear_ask")])
+    return text, InlineKeyboardMarkup(keyboard)
+
+
 async def handle_menu_preferences_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle menu_prefs callback — ask what the user doesn't eat, then save
-    the answer (typed or voice) via extract_food_preferences."""
+    """Handle menu_prefs callback — show the management view (remove buttons
+    for anything already avoided) and set pending_step so a typed/voice
+    reply is still picked up as more foods to avoid."""
     query = update.callback_query
     await query.answer()
 
@@ -1407,11 +1436,54 @@ async def handle_menu_preferences_button(update: Update, context: ContextTypes.D
         return
 
     context.user_data["pending_step"] = "food_preferences"
+    text, keyboard = _food_preferences_management_view()
+    await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_foodpref_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tapped "Allow X again" — remove that one code/keyword and re-render
+    the management view in place. Low-risk (easily re-added), so no
+    confirmation step, unlike Clear All."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    value = query.data.split("|", 1)[1]
     prefs = load_food_preferences()
-    current = ", ".join(prefs["avoid_codes"] + prefs["avoid_keywords"]) or "none set"
-    await query.message.reply_text(
-        f"🚫 What don't you eat? (e.g. \"no pork, fish, or mushrooms\")\nCurrently avoiding: {current}"
-    )
+    codes = [c for c in prefs["avoid_codes"] if c != value]
+    keywords = [k for k in prefs["avoid_keywords"] if k != value]
+    save_food_preferences(codes, keywords)
+
+    text, keyboard = _food_preferences_management_view()
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_foodpref_clear_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, clear all", callback_data="foodpref_clear_confirm"),
+        InlineKeyboardButton("❌ Cancel", callback_data="foodpref_clear_cancel"),
+    ]])
+    await query.edit_message_text("🗑 Clear all food preferences? You'll see every dish again until you set new ones.", reply_markup=keyboard)
+
+
+async def handle_foodpref_clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Cleared")
+    save_food_preferences([], [])
+    text, keyboard = _food_preferences_management_view()
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_foodpref_clear_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Cancelled")
+    text, keyboard = _food_preferences_management_view()
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6198,10 +6270,10 @@ async def transcribe_voice_message(ogg_path: str) -> str:
 VOICE_INTENTS = [
     "create_task", "create_exam_reminder_task", "course_enroll", "course_deenroll",
     "exam_register", "exam_deregister", "check_grades", "check_exam_dates",
-    "check_status", "show_menu", "set_food_preferences", "show_last_file",
-    "list_course_files", "exam_dates_all", "upcoming_dashboard", "calendar_today",
-    "calendar_weekly", "set_default_semester", "run_check", "fastenroll_list",
-    "unclear",
+    "check_status", "show_menu", "set_food_preferences", "remove_food_preferences",
+    "show_last_file", "list_course_files", "exam_dates_all", "upcoming_dashboard",
+    "calendar_today", "calendar_weekly", "set_default_semester", "run_check",
+    "fastenroll_list", "unclear",
 ]
 
 # Friendly button labels for every real (non-"unclear") intent, used both by
@@ -6220,6 +6292,7 @@ INTENT_LABELS = {
     "check_status": "ℹ️ Show bot status",
     "show_menu": "🍽️ Show today's menu",
     "set_food_preferences": "🚫 Set food preferences",
+    "remove_food_preferences": "✅ Allow a food again",
     "show_last_file": "📄 Show a course's latest file",
     "list_course_files": "📁 List a course's files",
     "exam_dates_all": "📋 Show all exam dates",
@@ -6245,6 +6318,7 @@ Intents, each with example phrasings in both languages:
 - check_status: "bot durumunu göster" / "show bot status"
 - show_menu: "bugünün yemek menüsünü göster" / "what's on the menu today" / "yemekhanede ne var"
 - set_food_preferences: "domuz eti yemiyorum" / "I don't eat pork" / "mantar ve balık istemiyorum, menüde gösterme"
+- remove_food_preferences: "artık balık yiyorum" / "I eat fish now" / "stop avoiding mushrooms" / "domuz etini tekrar göster" — reverses an earlier set_food_preferences for the named food(s)
 - show_last_file: "Computational Intelligence dersinin son dosyasını göster" / "list the last file of Computational Intelligence" / "show me the latest file for Linear Algebra" — asks for only the single most recently uploaded file of a named course
 - list_course_files: "Linear Algebra dersinin dosyalarını listele" / "list the files of Linear Algebra" / "show me all files for Computational Economics" — asks to see every file of a named course, not just the latest one
 - exam_dates_all: "tüm sınav tarihlerini göster" / "show every exam date" / "list all exams in the curriculum" — every exam across the whole curriculum, not just mine
@@ -6867,6 +6941,19 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         await message.reply_text(f"🚫 Noted — won't show: {', '.join(named)}")
         return
 
+    if intent == "remove_food_preferences":
+        extracted = await extract_food_preferences(transcript)
+        if not extracted["avoid_codes"] and not extracted["avoid_keywords"]:
+            await message.reply_text("🤷 Couldn't pick out any specific ingredient from that — try naming foods directly, e.g. \"fish, mushrooms\".")
+            return
+        existing = load_food_preferences()
+        remaining_codes = sorted(set(existing["avoid_codes"]) - set(extracted["avoid_codes"]))
+        remaining_keywords = sorted(set(existing["avoid_keywords"]) - set(extracted["avoid_keywords"]))
+        save_food_preferences(remaining_codes, remaining_keywords)
+        named = [ALLERGEN_CODE_NAMES.get(c, c) for c in extracted["avoid_codes"]] + extracted["avoid_keywords"]
+        await message.reply_text(f"✅ Okay, showing again: {', '.join(named)}")
+        return
+
     if intent == "course_enroll":
         default = load_default_semester()
         if not default.get("id"):
@@ -7356,6 +7443,10 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern="^calendar_week\|.*$"))
         app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^menu_nav\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_menu_preferences_button, pattern="^menu_prefs$"))
+        app.add_handler(CallbackQueryHandler(handle_foodpref_remove, pattern="^foodpref_remove\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_foodpref_clear_ask, pattern="^foodpref_clear_ask$"))
+        app.add_handler(CallbackQueryHandler(handle_foodpref_clear_confirm, pattern="^foodpref_clear_confirm$"))
+        app.add_handler(CallbackQueryHandler(handle_foodpref_clear_cancel, pattern="^foodpref_clear_cancel$"))
         app.add_handler(CallbackQueryHandler(handle_selection))
 
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))
