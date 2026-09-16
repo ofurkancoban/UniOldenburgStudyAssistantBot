@@ -7815,7 +7815,20 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # feeding straight into handle_pending_step.
     step = context.user_data.get("pending_step") or None
 
-    context.user_data["pending_voice"] = {"step": step, "text": transcript}
+    # For read-only, instantly-answerable intents (currently just "what
+    # should I eat"), classify right away and skip the "Heard...Is this
+    # correct?" / "Understanding..." confirmation entirely — there's no
+    # destructive action or wizard step to protect here, and it reads
+    # oddly to interrupt a direct answer with an extra confirm step.
+    intent_result = None
+    if step is None:
+        intent_result = await classify_voice_intent(transcript)
+        if intent_result["intent"] == "recommend_meal":
+            await status_msg.delete()
+            await _route_voice_intent(update, context, intent_result, transcript)
+            return
+
+    context.user_data["pending_voice"] = {"step": step, "text": transcript, "intent_result": intent_result}
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Yes", callback_data="voice_confirm"),
         InlineKeyboardButton("✏️ Try again", callback_data="voice_reject"),
@@ -7849,7 +7862,7 @@ async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     await query.edit_message_text(f"🎙️ Heard: “{pending['text']}”\n\n🤔 Understanding...")
-    result = await classify_voice_intent(pending["text"])
+    result = pending.get("intent_result") or await classify_voice_intent(pending["text"])
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     await _route_voice_intent(update, context, result, pending["text"])
 
