@@ -6839,6 +6839,7 @@ async def get_weather_snapshot(target_date=None) -> Optional[dict]:
             "precip_chance": max(morning_precip),
             "temp_min": data["daily"]["temperature_2m_min"][day_index],
             "temp_max": data["daily"]["temperature_2m_max"][day_index],
+            "location_name": location["name"] if location else "Oldenburg",
         }
     except (KeyError, IndexError, ValueError) as e:
         logging.warning(f"get_weather_snapshot: parse failed: {e}")
@@ -6859,7 +6860,7 @@ def build_weather_text_line(weather: dict) -> str:
         tips.append("light clothing should do")
     tip_text = ", ".join(tips) if tips else "no special prep needed"
     return (
-        f"{weather['emoji']} Weather: {weather['description']}, {weather['temp_min']:.0f}–{weather['temp_max']:.0f}°C, "
+        f"{weather['emoji']} Weather in {weather['location_name']}: {weather['description']}, {weather['temp_min']:.0f}–{weather['temp_max']:.0f}°C, "
         f"{weather['precip_chance']}% chance of rain — {tip_text}"
     )
 
@@ -6920,9 +6921,9 @@ async def build_ai_daily_plan_narration(today_events: list, target_date, name: O
     if weather:
         wet_note = "expect it to be wet (rain/drizzle/snow)" if weather["is_wet"] else "it should stay dry"
         user_prompt += (
-            f"\n\nWeather around when they'll be heading out (8-11 AM): {weather['description']}, "
+            f"\n\nWeather in {weather['location_name']} around when they'll be heading out (8-11 AM): {weather['description']}, "
             f"{wet_note}, roughly {weather['temp_min']:.0f}-{weather['temp_max']:.0f}°C. "
-            "Mention what to expect and suggest what to bring/wear."
+            f"Mention the location name ({weather['location_name']}) naturally along with what to expect, and suggest what to bring/wear."
         )
 
     if today_tasks:
