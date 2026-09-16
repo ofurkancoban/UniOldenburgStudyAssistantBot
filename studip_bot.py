@@ -2847,6 +2847,19 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
 
         now = datetime.now(TZ_BERLIN)
 
+        # Only the day's *first* class gets the weather-based earlier
+        # heads-up — that's the actual leaving-home commute; later classes
+        # are typically just a walk across campus, where weather matters
+        # far less than a wet trip from home.
+        today_starts = [e["start_dt"] for e in events if e.get("start_dt") and e["start_dt"].date() == now.date()]
+        first_start_today = min(today_starts) if today_starts else None
+        first_class_weather = None
+        if first_start_today:
+            try:
+                first_class_weather = await get_weather_snapshot(first_start_today.date())
+            except Exception as e:
+                logging.warning(f"check_calendar_reminders: weather fetch failed: {e}")
+
         for event in events:
             if not event.get("start_dt") or not event.get("title") or event["title"] == "Untitled":
                 continue
@@ -2863,14 +2876,29 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
             diff = start_dt - now
             minutes_left = diff.total_seconds() / 60
 
-            # Reminder window: 25-35 minutes before the lesson starts
-            if 25 < minutes_left <= 35:
+            is_first_of_day = first_start_today is not None and start_dt == first_start_today
+            # Rainy/snowy first-class-of-the-day: widen the window so the
+            # heads-up lands ~15 minutes earlier, giving time to grab an
+            # umbrella/jacket and allow for a slower, wetter commute.
+            extra_lead = 15 if (is_first_of_day and first_class_weather and first_class_weather["is_wet"]) else 0
+            window_low, window_high = 25 + extra_lead, 35 + extra_lead
+
+            # Reminder window: 25-35 minutes before the lesson starts (wider,
+            # earlier, if today's first class starts in wet weather)
+            if window_low < minutes_left <= window_high:
+                weather_line = ""
+                if is_first_of_day and first_class_weather:
+                    if first_class_weather["is_wet"]:
+                        weather_line = f"\n{first_class_weather['emoji']} {first_class_weather['description'].capitalize()} expected — grab an umbrella and leave a bit early!"
+                    else:
+                        weather_line = f"\n{first_class_weather['emoji']} {first_class_weather['description'].capitalize()} out there, should be a fine walk over."
                 text = (
                     "🔔 <b>LECTURE REMINDER</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     f"📘 <b>{title}</b>\n"
                     f"🕒 Starting in <b>{int(minutes_left)} minutes</b>\n"
-                    f"📍 {location}\n"
+                    f"📍 {location}"
+                    f"{weather_line}\n"
                     "━━━━━━━━━━━━━━━━━━"
                 )
                 try:
@@ -4762,7 +4790,9 @@ async def get_calendar_events(session, week_start) -> list:
 async def send_daily_calendar(sender, events: list, target_date, week_start):
     """Send a specific day's schedule with a 'Week Plan' button. Matches backup UI."""
     today_events = [ev for ev in events if ev["date_key"] == target_date]
-    
+    weather = await get_weather_snapshot(target_date)
+    weather_block = f"\n\n{build_weather_text_line(weather)}" if weather else ""
+
     if not today_events:
         text = (
             "🎉 *No Events Today!*\n\n"
@@ -4771,6 +4801,7 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
             "🕒 Perfect time to catch up or relax!\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"🗓️ *{target_date:%A, %d %B %Y}*"
+            f"{weather_block}"
         )
     else:
         # Header
@@ -4799,7 +4830,7 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
             
         lines.append("\n\n".join(course_blocks))
         lines.append("━━━━━━━━━━━━━━━━━━")
-        text = "\n".join(lines)
+        text = "\n".join(lines) + weather_block
 
     keyboard = [
         [
@@ -7152,6 +7183,18 @@ async def build_qa_context(user_id=None) -> str:
     except Exception as e:
         logging.warning(f"build_qa_context: calendar failed: {e}")
 
+    try:
+        weather = await get_weather_snapshot(today)
+        if weather:
+            wet_note = "wet (rain/drizzle/snow expected)" if weather["is_wet"] else "dry"
+            parts.append(
+                f"Weather in {weather['location_name']} today, 8-11 AM (leaving-home window): "
+                f"{weather['description']}, {wet_note}, {weather['temp_min']:.0f}-{weather['temp_max']:.0f}°C, "
+                f"{weather['precip_chance']}% chance of precipitation."
+            )
+    except Exception as e:
+        logging.warning(f"build_qa_context: weather failed: {e}")
+
     if session:
         try:
             exams = await get_registered_exam_schedule(session)
@@ -7185,7 +7228,7 @@ async def build_qa_context(user_id=None) -> str:
     return "\n\n".join(parts) if parts else "No data could be loaded right now."
 
 
-QA_SYSTEM_PROMPT = """You are a helpful university assistant answering a spoken question from a student, using ONLY the data provided below the question — never invent facts that aren't in it. Answer conversationally and concisely (2-4 sentences), in plain spoken sentences suitable both for reading as a text message and for being read aloud as a voice message: no markdown, no bullet points, no emojis, no headers. If the data doesn't contain enough to answer, say so honestly rather than guessing."""
+QA_SYSTEM_PROMPT = """You are a helpful university assistant answering a spoken question from a student, using ONLY the data provided below the question — never invent facts that aren't in it. Answer conversationally and concisely (2-4 sentences), in plain spoken sentences suitable both for reading as a text message and for being read aloud as a voice message: no markdown, no bullet points, no emojis, no headers. If the data doesn't contain enough to answer, say so honestly rather than guessing. If weather data is given and the question is about the weather or what to wear/bring, answer using the condition (dry/rainy/etc — that matters more than the exact temperature) with a practical suggestion."""
 
 
 async def answer_question_with_context(question: str, context_data: str, name: Optional[str] = None) -> Optional[str]:
