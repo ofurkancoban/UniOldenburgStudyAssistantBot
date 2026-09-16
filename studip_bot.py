@@ -3063,6 +3063,19 @@ async def send_morning_summary(bot, user_ids):
 
     weather_text = f"\n\n{build_weather_text_line(weather)}" if weather else ""
 
+    # 2c. Lunch pick — best-effort, same AI-judged pick as the "🍽️ What
+    # should I eat?" button, just folded into the morning summary instead
+    # of requiring a separate ask. A menu-fetch failure just omits this
+    # section rather than blocking the rest of the summary.
+    try:
+        food = await build_food_recommendation()
+    except Exception as e:
+        logging.error(f"Summary food recommendation error: {e}")
+        food = None
+    food_text = ""
+    if food and food.get("dish") and food.get("category"):
+        food_text = f"\n\n🍽️ <b>Lunch pick:</b> {food['dish']} ({_friendly_menu_category_label(food['category'])})"
+
     # 3. Final Message
     header = (
         "☀️ <b>GOOD MORNING!</b> ☀️\n"
@@ -3070,8 +3083,8 @@ async def send_morning_summary(bot, user_ids):
         "━━━━━━━━━━━━━━━━━━\n\n"
     )
 
-    final_text = f"{header}{schedule_text}{weather_text}{tasks_text}\n\n━━━━━━━━━━━━━━━━━━"
-    
+    final_text = f"{header}{schedule_text}{weather_text}{tasks_text}{food_text}\n\n━━━━━━━━━━━━━━━━━━"
+
     # 4. Keyboard for Mensa Menu
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🍴 Today's Menu", callback_data="menu_nav|2/|new")]
@@ -3088,12 +3101,28 @@ async def send_morning_summary(bot, user_ids):
         except Exception as e:
             logging.error(f"Failed to send summary to {uid}: {e}")
 
+    # 4b. Photo of the lunch pick, when one can be matched on the
+    # Studierendenwerk's public Speiseplan site — same as the standalone
+    # "What should I eat?" delivery.
+    if food and food.get("dish"):
+        try:
+            photo_url = await fetch_dish_photo_url(food["dish"])
+        except Exception as e:
+            logging.warning(f"Summary food photo fetch error: {e}")
+            photo_url = None
+        if photo_url:
+            for uid in user_ids:
+                try:
+                    await bot.send_photo(chat_id=uid, photo=photo_url)
+                except Exception as e:
+                    logging.error(f"Failed to send lunch photo to {uid}: {e}")
+
     # 5. Automatic AI-narrated voice message — no "🔊 Listen" tap needed, and
     # freshly improvised every morning rather than a fixed template (see
     # build_ai_daily_plan_narration). A TTS/ffmpeg hiccup here just skips
     # the voice message; the text summary above has already gone out.
     try:
-        narration = await build_ai_daily_plan_narration(today_events, today_date, name=get_primary_user_name(), today_tasks=today_tasks, weather=weather) or build_daily_plan_speech_text(today_events, today_date)
+        narration = await build_ai_daily_plan_narration(today_events, today_date, name=get_primary_user_name(), today_tasks=today_tasks, weather=weather, food=food) or build_daily_plan_speech_text(today_events, today_date)
         await _send_voice_to_users(bot, user_ids, narration)
     except Exception as e:
         logging.error(f"Morning voice summary failed: {e}")
@@ -5146,6 +5175,45 @@ def _week_tasks_for_range(week_start, week_end) -> list:
     return tasks
 
 
+STUDY_GAP_MIN_MINUTES = 90  # shorter gaps aren't really worth flagging — barely time to settle in before the next class
+STUDY_GAP_MAX_MINUTES = 6 * 60  # an end-of-day/no-more-classes gap isn't "squeezed between commitments", just free time — not what this is for
+
+
+def find_weekly_study_gaps(events: list) -> list:
+    """Find free windows squeezed *between* two classes on the same day
+    that are long enough to be worth flagging as good study time (at
+    least STUDY_GAP_MIN_MINUTES, capped at STUDY_GAP_MAX_MINUTES so a
+    day's last class doesn't count the rest of the day as a "gap").
+    Returns a list of {"date_key", "start_dt", "end_dt", "duration_minutes",
+    "after", "before"} dicts, sorted chronologically."""
+    events_by_day: dict = {}
+    for ev in events:
+        if not ev.get("start_dt") or not ev.get("end_dt"):
+            continue
+        events_by_day.setdefault(ev["date_key"], []).append(ev)
+
+    gaps = []
+    for dk, day_events in events_by_day.items():
+        day_events = sorted(day_events, key=lambda e: e["start_dt"])
+        for i in range(len(day_events) - 1):
+            gap_start = day_events[i]["end_dt"]
+            gap_end = day_events[i + 1]["start_dt"]
+            minutes = (gap_end - gap_start).total_seconds() / 60
+            if minutes < STUDY_GAP_MIN_MINUTES or minutes > STUDY_GAP_MAX_MINUTES:
+                continue
+            gaps.append({
+                "date_key": dk,
+                "start_dt": gap_start,
+                "end_dt": gap_end,
+                "duration_minutes": int(minutes),
+                "after": clean_course_title(day_events[i].get("title", "")) or "your previous class",
+                "before": clean_course_title(day_events[i + 1].get("title", "")) or "your next class",
+            })
+
+    gaps.sort(key=lambda g: g["start_dt"])
+    return gaps
+
+
 async def send_weekly_calendar(sender, events: list, week_start):
     """Send the weekly schedule with navigation. Matches backup UI."""
     prev_week = week_start - timedelta(days=7)
@@ -5217,6 +5285,17 @@ async def send_weekly_calendar(sender, events: list, week_start):
             course_line = f" [{t['course']}]" if t.get("course") else ""
             task_lines.append(f"⏰ `{due.strftime('%a %d.%m %H:%M')}` — {t['text']}{course_line}")
         text += "\n" + "\n".join(task_lines)
+
+    study_gaps = find_weekly_study_gaps(events)
+    if study_gaps:
+        gap_lines = ["\n📚 *Good Times to Study*", "━━━━━━━━━━━━━━━━━━"]
+        for g in study_gaps:
+            hours = g["duration_minutes"] / 60
+            duration_text = f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
+            gap_lines.append(
+                f"🕒 `{g['start_dt']:%a %H:%M}–{g['end_dt']:%H:%M}` ({duration_text}) — between {g['after']} and {g['before']}"
+            )
+        text += "\n" + "\n".join(gap_lines)
 
     # Navigation buttons
     keyboard = [
@@ -7197,22 +7276,24 @@ Structure:
 2. If weather data is given, mention what it'll actually be like stepping outside (dry/rainy/sunny etc — the precise temperature matters far less than that) and suggest what to bring or wear, naturally, as part of the flow — not a separate weather-report segment.
 3. Naturally weave in today's schedule: what's on, roughly when, and where — like a friend casually telling them their day, not reading a bureaucratic agenda.
 4. If any tasks are due today, mention them too, woven into the same conversational flow — not as a separate announcement.
-5. Close with one short, warm line wishing them well.
+5. If a lunch pick is given, mention it naturally too — what it is and roughly where to get it — as part of the same flow, not a separate food-review segment.
+6. Close with one short, warm line wishing them well.
 
-Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 130 words (a bit more if there's weather and/or tasks to mention too). Vary your phrasing and structure every time you're asked this, even for an identical schedule, since this repeats every single morning and must never sound canned or repetitive."""
+Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 130 words (a bit more if there's weather, tasks, and/or a lunch pick to mention too). Vary your phrasing and structure every time you're asked this, even for an identical schedule, since this repeats every single morning and must never sound canned or repetitive."""
 
 
-async def build_ai_daily_plan_narration(today_events: list, target_date, name: Optional[str] = None, today_tasks: Optional[list] = None, weather: Optional[dict] = None) -> Optional[str]:
+async def build_ai_daily_plan_narration(today_events: list, target_date, name: Optional[str] = None, today_tasks: Optional[list] = None, weather: Optional[dict] = None, food: Optional[dict] = None) -> Optional[str]:
     """Ask the chat LLM (OpenRouter) to write a warm, freshly-improvised
-    spoken narration of the day's schedule, weather, and any tasks due
-    today — deliberately not a fixed template, so the opening line and
-    phrasing differ every time this is called, even for an identical
-    schedule. If `name` is given (see get_user_name/get_primary_user_name),
-    the narration addresses them by it. `weather` is a get_weather_snapshot()
-    dict — what matters for the narration is the condition (dry/rainy/etc),
-    not the exact temperature. Returns None on any failure; callers should
-    fall back to build_daily_plan_speech_text so the voice message always
-    has content."""
+    spoken narration of the day's schedule, weather, any tasks due today,
+    and a lunch pick — deliberately not a fixed template, so the opening
+    line and phrasing differ every time this is called, even for an
+    identical schedule. If `name` is given (see get_user_name/
+    get_primary_user_name), the narration addresses them by it. `weather`
+    is a get_weather_snapshot() dict — what matters for the narration is
+    the condition (dry/rainy/etc), not the exact temperature. `food` is a
+    build_food_recommendation() result. Returns None on any failure;
+    callers should fall back to build_daily_plan_speech_text so the voice
+    message always has content."""
     if today_events:
         schedule_summary = "\n".join(
             f"- {clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')} in {_safe_loc(ev.get('location', ''))}"
@@ -7237,6 +7318,12 @@ async def build_ai_daily_plan_narration(today_events: list, target_date, name: O
             for t in today_tasks
         )
         user_prompt += f"\n\nTasks due today:\n{tasks_summary}\nMention these naturally too, not as a separate rigid list."
+
+    if food and food.get("dish") and food.get("category"):
+        user_prompt += (
+            f"\n\nLunch pick for today: {food['dish']} at {_friendly_menu_category_label(food['category'])}. "
+            "Mention it naturally too, briefly."
+        )
 
     if name:
         user_prompt += f"\nAddress the listener by name at least once, naturally (their name is {name})."
@@ -7270,7 +7357,8 @@ Structure:
 1. Open with a genuine, encouraging line about the week ahead — invent fresh wording every time, never reuse a stock phrase, make it feel spontaneous rather than a template.
 2. Naturally walk through the week day by day (or group similar/light days together): what's on, roughly when — like a friend giving them the lay of the week, not reading a bureaucratic agenda. Call out the busiest day(s) and any noticeably free day(s) if that's genuinely useful.
 3. If any tasks are due during the week, mention them too, woven into the same conversational flow — not as a separate announcement.
-4. Close with one short, warm line wishing them a good week.
+4. If any good study windows (free gaps squeezed between two classes) are listed, mention the best one or two naturally, e.g. as a nudge for revision or homework — not a rigid list of every single one.
+5. Close with one short, warm line wishing them a good week.
 
 Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 160 words. Vary your phrasing and structure every time you're asked this, even for an identical week, since this must never sound canned or repetitive."""
 
@@ -7304,6 +7392,14 @@ async def build_ai_weekly_plan_narration(events: list, week_start, week_end, nam
             for t in week_tasks
         )
         user_prompt += f"\n\nTasks due this week:\n{tasks_summary}\nMention these naturally too, not as a separate rigid list."
+
+    study_gaps = find_weekly_study_gaps(events)
+    if study_gaps:
+        gaps_summary = "\n".join(
+            f"- {g['start_dt']:%A} {g['start_dt']:%H:%M}-{g['end_dt']:%H:%M} ({g['duration_minutes'] // 60}h{g['duration_minutes'] % 60:02d}m), between {g['after']} and {g['before']}"
+            for g in study_gaps
+        )
+        user_prompt += f"\n\nFree windows between classes this week, good for studying:\n{gaps_summary}\nMention the best one or two naturally as a nudge for revision/homework, not all of them, and not as a rigid list."
 
     if name:
         user_prompt += f"\nAddress the listener by name at least once, naturally (their name is {name})."
