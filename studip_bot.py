@@ -1325,11 +1325,11 @@ async def fetch_todays_menu_items(session, sub_path="2/") -> list:
         return []
 
 
-MEAT_CODES = {"G", "R", "L", "W"}  # Poultry, Beef, Lamb, Game — used to flag/prioritize meat dishes
+MEAT_CODES = {"G", "R", "L", "W", "F", "Fi"}  # Poultry (incl. turkey — no separate code for it), Beef, Lamb, Game, Fish (F and Fi both mean Fish in this Mensa's code table) — used to flag/prioritize meat/fish dishes
 MEAL_RECOMMENDATION_BASE_AVOID_CODES = {"S", "Sch", "Su", "A", "RG", "SG"}  # Pork (all 3 codes), Alcohol, Beef/Pork Gelatin
 MEAL_RECOMMENDATION_BASE_AVOID_KEYWORDS = {"wine"}
 
-MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only — everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Prioritize a meat or chicken dish when one is available among the candidates; if none is, pick the best other option and say so honestly within the reasoning.
+MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only — everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Prioritize a meat, chicken, turkey, or fish dish when one is available among the candidates; if none is, pick the best other option and say so honestly within the reasoning.
 
 Respond with strict JSON only, no other text: {"dish": "<the exact dish name, copied verbatim from the candidate list>", "reasoning": "<1-2 warm, casual sentences naming the dish naturally and explaining the pick — this will be read aloud as a voice message, so plain spoken-friendly text only: no markdown, no lists, no emojis>"}"""
 
@@ -1393,7 +1393,7 @@ async def build_food_recommendation() -> Optional[dict]:
 
     lines = []
     for it in candidates:
-        meat_tags = sorted(ALLERGEN_CODE_NAMES.get(c, c) for c in it["codes"] if c in MEAT_CODES)
+        meat_tags = sorted({ALLERGEN_CODE_NAMES.get(c, c) for c in it["codes"] if c in MEAT_CODES})
         meat_note = f" [{', '.join(meat_tags)}]" if meat_tags else ""
         desc_part = f": {it['description']}" if it["description"] else ""
         lines.append(f"- {it['name']} ({it['category']}){meat_note}{desc_part}")
