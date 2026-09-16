@@ -502,6 +502,66 @@ def save_user_name(user_id, name: str) -> None:
         logging.error(f"Could not save user name: {e}")
 
 
+WEATHER_LOCATION_CACHE_PATH = "weather_location.json"
+WEATHER_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+
+
+def load_weather_location() -> Optional[dict]:
+    """Return {"name", "country", "latitude", "longitude"} for the location
+    set via /status's "📍 Set Location", or None if unset — in which case
+    get_weather_snapshot falls back to WEATHER_LATITUDE/WEATHER_LONGITUDE
+    (Uni Oldenburg's coordinates by default)."""
+    if os.path.exists(WEATHER_LOCATION_CACHE_PATH):
+        try:
+            with open(WEATHER_LOCATION_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load weather location: {e}")
+    return None
+
+
+def save_weather_location(name: str, country: str, latitude: float, longitude: float) -> None:
+    try:
+        tmp = WEATHER_LOCATION_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"name": name, "country": country, "latitude": latitude, "longitude": longitude}, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, WEATHER_LOCATION_CACHE_PATH)
+    except Exception as e:
+        logging.error(f"Could not save weather location: {e}")
+
+
+async def geocode_location(query: str) -> Optional[dict]:
+    """Resolve a free-text place name to {"name", "country", "latitude",
+    "longitude"} via Open-Meteo's free, keyless geocoding API. Returns the
+    single best match, or None if nothing matched or the request failed —
+    callers should ask the user to try a different/more specific name
+    rather than silently keeping the old location."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                WEATHER_GEOCODING_URL,
+                params={"name": query, "count": 1, "language": "en", "format": "json"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except Exception as e:
+        logging.warning(f"geocode_location: fetch failed: {e}")
+        return None
+
+    results = data.get("results") or []
+    if not results:
+        return None
+    best = results[0]
+    return {
+        "name": best.get("name", query),
+        "country": best.get("country", ""),
+        "latitude": best["latitude"],
+        "longitude": best["longitude"],
+    }
+
+
 FOOD_PREFERENCES_CACHE_PATH = "food_preferences.json"
 
 
@@ -4501,6 +4561,23 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.effective_message.reply_text(f"👤 Got it — I'll call you {name}.", reply_markup=get_main_keyboard())
         return True
 
+    if step == "weather_location":
+        context.user_data.pop("pending_step", None)
+        query_text = text.strip()[:100]
+        if not query_text:
+            await update.effective_message.reply_text("🤷 That didn't look like a place name — try again from /status.")
+            return True
+        resolved = await geocode_location(query_text)
+        if not resolved:
+            await update.effective_message.reply_text(f"🤷 Couldn't find \"{query_text}\" — try a more specific city name, or check the spelling.")
+            return True
+        save_weather_location(resolved["name"], resolved["country"], resolved["latitude"], resolved["longitude"])
+        await update.effective_message.reply_text(
+            f"📍 Got it — checking weather for {resolved['name']}, {resolved['country']} from now on.",
+            reply_markup=get_main_keyboard(),
+        )
+        return True
+
     # Unknown/stale step — clear it so the user isn't stuck.
     context.user_data.pop("pending_step", None)
     return False
@@ -6266,6 +6343,24 @@ async def handle_set_user_name(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.message.reply_text(prompt)
 
 
+async def handle_set_weather_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle set_weather_location callback (from /status) — ask for a
+    place name, geocoded via Open-Meteo (see geocode_location) and stored
+    for get_weather_snapshot to use instead of the WEATHER_LATITUDE/
+    WEATHER_LONGITUDE default."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    context.user_data["pending_step"] = "weather_location"
+    current = load_weather_location()
+    current_line = f"\nCurrently: {current['name']}, {current['country']}" if current else ""
+    await query.message.reply_text(f"📍 Where should I check the weather for? (city or place name){current_line}")
+
+
 async def handle_set_default_semester(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle set_default_semester callback (from /status) — show a semester
     picker; picking one makes Files, Browse Courses (enroll), and Sign Out
@@ -6675,9 +6770,10 @@ WEATHER_WET_CODE_THRESHOLD = 51
 
 
 async def get_weather_snapshot(target_date=None) -> Optional[dict]:
-    """Fetch a concise weather snapshot for the university's location
-    (Oldenburg, Germany, by default — see WEATHER_LATITUDE/LONGITUDE) via
-    Open-Meteo (free, no API key needed).
+    """Fetch a concise weather snapshot for the location set via /status's
+    "📍 Set Location" (see load_weather_location), falling back to
+    WEATHER_LATITUDE/WEATHER_LONGITUDE (Uni Oldenburg's coordinates by
+    default) if none is set, via Open-Meteo (free, no API key needed).
 
     Deliberately focused on the 8–11 AM "leaving home" window rather than a
     whole-day aggregate — a stormy afternoon shouldn't make an otherwise
@@ -6696,13 +6792,17 @@ async def get_weather_snapshot(target_date=None) -> Optional[dict]:
     if not (0 <= days_ahead <= 1):
         return None
 
+    location = load_weather_location()
+    latitude = location["latitude"] if location else WEATHER_LATITUDE
+    longitude = location["longitude"] if location else WEATHER_LONGITUDE
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
                 WEATHER_URL,
                 params={
-                    "latitude": WEATHER_LATITUDE,
-                    "longitude": WEATHER_LONGITUDE,
+                    "latitude": latitude,
+                    "longitude": longitude,
                     "hourly": "weathercode,precipitation_probability",
                     "daily": "temperature_2m_max,temperature_2m_min",
                     "timezone": "Europe/Berlin",
@@ -8075,8 +8175,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     display_name = get_user_name(user_id_for_name) if user_id_for_name else None
     text += f"\n👤 Your Name: {display_name or 'Not set'}"
 
+    weather_location = load_weather_location()
+    weather_location_label = f"{weather_location['name']}, {weather_location['country']}" if weather_location else "Uni Oldenburg (default)"
+    text += f"\n📍 Weather Location: {weather_location_label}"
+
     keyboard = [
         [InlineKeyboardButton("👤 Set Your Name", callback_data="set_user_name")],
+        [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
         [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
         [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
         [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
@@ -8213,6 +8318,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_enrollment_menu, pattern="^enrollment_menu$"))
         app.add_handler(CallbackQueryHandler(handle_set_default_semester, pattern="^set_default_semester$"))
         app.add_handler(CallbackQueryHandler(handle_set_user_name, pattern="^set_user_name$"))
+        app.add_handler(CallbackQueryHandler(handle_set_weather_location, pattern="^set_weather_location$"))
         app.add_handler(CallbackQueryHandler(handle_default_semester_pick, pattern="^default_sem\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_default_semester_clear, pattern="^default_sem_clear$"))
         app.add_handler(CallbackQueryHandler(handle_change_semester, pattern="^change_sem\\|.*$"))
