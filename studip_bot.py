@@ -447,6 +447,55 @@ def clear_default_semester() -> None:
         logging.error(f"Could not clear default semester: {e}")
 
 
+USER_NAMES_CACHE_PATH = "user_names.json"
+
+
+def load_user_names() -> dict:
+    """Return {"<user_id>": "Display Name"} for every user who's set a name
+    via /status's "👤 Set Your Name" — keyed per user_id (not global) since
+    ALLOWED_USER_IDS can list more than one person, and the AI-narrated
+    daily-plan voice message (see build_ai_daily_plan_narration) addresses
+    each of them by their own name."""
+    if os.path.exists(USER_NAMES_CACHE_PATH):
+        try:
+            with open(USER_NAMES_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load user names: {e}")
+    return {}
+
+
+def get_user_name(user_id) -> Optional[str]:
+    return load_user_names().get(str(user_id))
+
+
+def get_primary_user_name() -> Optional[str]:
+    """Return whichever name is set across ALLOWED_USER_IDS. Currently every
+    allowed user_id is the same person on a different device, so one shared
+    name personalizes the daily-plan narration for all of them rather than
+    generating a separate one per recipient — see send_morning_summary and
+    send_daily_plan_voice, both of which fall back to this when no specific
+    user_id is available."""
+    names = load_user_names()
+    for uid in ALLOWED_USER_IDS:
+        name = names.get(str(uid))
+        if name:
+            return name
+    return None
+
+
+def save_user_name(user_id, name: str) -> None:
+    names = load_user_names()
+    names[str(user_id)] = name
+    try:
+        tmp = USER_NAMES_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(names, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, USER_NAMES_CACHE_PATH)
+    except Exception as e:
+        logging.error(f"Could not save user name: {e}")
+
+
 FOOD_PREFERENCES_CACHE_PATH = "food_preferences.json"
 
 
@@ -2677,7 +2726,7 @@ async def send_morning_summary(bot, user_ids):
     # build_ai_daily_plan_narration). A TTS/ffmpeg hiccup here just skips
     # the voice message; the text summary above has already gone out.
     try:
-        narration = await build_ai_daily_plan_narration(today_events, today_date) or build_daily_plan_speech_text(today_events, today_date)
+        narration = await build_ai_daily_plan_narration(today_events, today_date, name=get_primary_user_name()) or build_daily_plan_speech_text(today_events, today_date)
         await _send_voice_to_users(bot, user_ids, narration)
     except Exception as e:
         logging.error(f"Morning voice summary failed: {e}")
@@ -4378,7 +4427,7 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         dotenv.set_key(env_path, "WHATSAPP_GROUP_NAME", new_group)
         os.environ["WHATSAPP_GROUP_NAME"] = new_group
         context.user_data.pop("pending_step", None)
-        await update.message.reply_text(f"✅ WhatsApp group successfully updated: {new_group}", reply_markup=get_main_keyboard())
+        await update.effective_message.reply_text(f"✅ WhatsApp group successfully updated: {new_group}", reply_markup=get_main_keyboard())
         return True
 
     if step == "ical_link":
@@ -4388,21 +4437,33 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         dotenv.set_key(env_path, "STUDIP_ICAL_URL", new_link)
         os.environ["STUDIP_ICAL_URL"] = new_link
         context.user_data.pop("pending_step", None)
-        await update.message.reply_text("✅ iCal link successfully updated!", reply_markup=get_main_keyboard())
+        await update.effective_message.reply_text("✅ iCal link successfully updated!", reply_markup=get_main_keyboard())
         return True
 
     if step == "food_preferences":
         context.user_data.pop("pending_step", None)
         result = await extract_food_preferences(text)
         if not result["avoid_codes"] and not result["avoid_keywords"]:
-            await update.message.reply_text("🤷 Couldn't pick out any specific ingredient from that — try naming foods directly, e.g. \"pork, fish, mushrooms\".")
+            await update.effective_message.reply_text("🤷 Couldn't pick out any specific ingredient from that — try naming foods directly, e.g. \"pork, fish, mushrooms\".")
             return True
         existing = load_food_preferences()
         merged_codes = sorted(set(existing["avoid_codes"]) | set(result["avoid_codes"]))
         merged_keywords = sorted(set(existing["avoid_keywords"]) | set(result["avoid_keywords"]))
         save_food_preferences(merged_codes, merged_keywords)
         named = [ALLERGEN_CODE_NAMES.get(c, c) for c in result["avoid_codes"]] + result["avoid_keywords"]
-        await update.message.reply_text(f"🚫 Noted — won't show: {', '.join(named)}", reply_markup=get_main_keyboard())
+        await update.effective_message.reply_text(f"🚫 Noted — won't show: {', '.join(named)}", reply_markup=get_main_keyboard())
+        return True
+
+    if step == "user_name":
+        context.user_data.pop("pending_step", None)
+        name = text.strip()[:50]
+        if not name:
+            await update.effective_message.reply_text("🤷 That didn't look like a name — try again from /status.")
+            return True
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id is not None:
+            save_user_name(user_id, name)
+        await update.effective_message.reply_text(f"👤 Got it — I'll call you {name}.", reply_markup=get_main_keyboard())
         return True
 
     # Unknown/stale step — clear it so the user isn't stuck.
@@ -4807,7 +4868,7 @@ async def handle_calendar_today_voice(update: Update, context: ContextTypes.DEFA
         today = datetime.now().date()
         week_start = today - timedelta(days=today.weekday())
         events = await get_calendar_events(session=global_session, week_start=week_start)
-        await send_daily_plan_voice(query.message, events, today)
+        await send_daily_plan_voice(query.message, events, today, user_id=user_id)
     except Exception as e:
         logging.error(f"Calendar today voice error: {e}")
         await query.message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
@@ -6098,6 +6159,23 @@ async def handle_enrollment_menu(update: Update, context: ContextTypes.DEFAULT_T
     await query.message.reply_text("🎓 Course Enrollment:", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+async def handle_set_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle set_user_name callback (from /status) — ask for a display name,
+    stored per user_id (see save_user_name) so the AI-narrated daily-plan
+    voice message can address each allowed user by their own name."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    context.user_data["pending_step"] = "user_name"
+    current = get_user_name(user_id)
+    prompt = f"👤 What should I call you? (Currently: {current})" if current else "👤 What should I call you?"
+    await query.message.reply_text(prompt)
+
+
 async def handle_set_default_semester(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle set_default_semester callback (from /status) — show a semester
     picker; picking one makes Files, Browse Courses (enroll), and Sign Out
@@ -6515,13 +6593,14 @@ Structure:
 Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 90 words. Vary your phrasing and structure every time you're asked this, even for an identical schedule, since this repeats every single morning and must never sound canned or repetitive."""
 
 
-async def build_ai_daily_plan_narration(today_events: list, target_date) -> Optional[str]:
+async def build_ai_daily_plan_narration(today_events: list, target_date, name: Optional[str] = None) -> Optional[str]:
     """Ask the chat LLM (OpenRouter) to write a warm, freshly-improvised
     spoken narration of the day's schedule — deliberately not a fixed
     template, so the opening line and phrasing differ every time this is
-    called, even for an identical schedule. Returns None on any failure;
-    callers should fall back to build_daily_plan_speech_text so the voice
-    message always has content."""
+    called, even for an identical schedule. If `name` is given (see
+    get_user_name/get_primary_user_name), the narration addresses them by
+    it. Returns None on any failure; callers should fall back to
+    build_daily_plan_speech_text so the voice message always has content."""
     if today_events:
         schedule_summary = "\n".join(
             f"- {clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')} in {_safe_loc(ev.get('location', ''))}"
@@ -6531,6 +6610,8 @@ async def build_ai_daily_plan_narration(today_events: list, target_date) -> Opti
         schedule_summary = "No events scheduled — a free day."
 
     user_prompt = f"Today is {target_date:%A, %B %d}.\nSchedule:\n{schedule_summary}"
+    if name:
+        user_prompt += f"\nAddress the listener by name at least once, naturally (their name is {name})."
     narration = await _call_openrouter(DAILY_PLAN_NARRATION_SYSTEM_PROMPT, user_prompt, temperature=1.15)
     return narration.strip() if narration else None
 
@@ -6566,15 +6647,21 @@ async def _send_voice_to_users(bot, user_ids, text: str):
             pass
 
 
-async def send_daily_plan_voice(sender, events: list, target_date):
+async def send_daily_plan_voice(sender, events: list, target_date, user_id=None):
     """Build today's schedule as a warm, freshly-improvised spoken
     narration (falling back to a plain deterministic description if the
     LLM call fails), synthesize it via OpenRouter TTS, and send it as a
     Telegram voice message. Falls back to sending the text itself (never
     silently does nothing) if TTS is unavailable, ffmpeg is missing, or
-    synthesis fails for any reason."""
+    synthesis fails for any reason.
+
+    `user_id` personalizes the narration with that user's name (see
+    get_user_name); falls back to get_primary_user_name() if not given or
+    unset, since ALLOWED_USER_IDS is currently the same person on
+    different devices."""
     today_events = [ev for ev in events if ev["date_key"] == target_date]
-    text = await build_ai_daily_plan_narration(today_events, target_date) or build_daily_plan_speech_text(events, target_date)
+    name = (get_user_name(user_id) if user_id is not None else None) or get_primary_user_name()
+    text = await build_ai_daily_plan_narration(today_events, target_date, name=name) or build_daily_plan_speech_text(events, target_date)
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
 
     result = await synthesize_speech(text)
@@ -7286,7 +7373,8 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
             today = datetime.now().date()
             week_start = today - timedelta(days=today.weekday())
             events = await get_calendar_events(session=global_session, week_start=week_start)
-            await send_daily_plan_voice(message, events, today)
+            voice_user_id = update.effective_user.id if update.effective_user else None
+            await send_daily_plan_voice(message, events, today, user_id=voice_user_id)
         except Exception as e:
             logging.error(f"_route_voice_intent: read_daily_plan failed: {e}")
             await message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
@@ -7542,7 +7630,12 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     default_semester_label = default_semester.get("label") or "Not set (always asks)"
     text += f"\n\n📆 Default Semester: {default_semester_label}"
 
+    user_id_for_name = update.effective_user.id if update.effective_user else None
+    display_name = get_user_name(user_id_for_name) if user_id_for_name else None
+    text += f"\n👤 Your Name: {display_name or 'Not set'}"
+
     keyboard = [
+        [InlineKeyboardButton("👤 Set Your Name", callback_data="set_user_name")],
         [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
         [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
         [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
@@ -7678,6 +7771,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_files_semester_pick, pattern="^files_sem\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_enrollment_menu, pattern="^enrollment_menu$"))
         app.add_handler(CallbackQueryHandler(handle_set_default_semester, pattern="^set_default_semester$"))
+        app.add_handler(CallbackQueryHandler(handle_set_user_name, pattern="^set_user_name$"))
         app.add_handler(CallbackQueryHandler(handle_default_semester_pick, pattern="^default_sem\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_default_semester_clear, pattern="^default_sem_clear$"))
         app.add_handler(CallbackQueryHandler(handle_change_semester, pattern="^change_sem\\|.*$"))
