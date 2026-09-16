@@ -4736,11 +4736,29 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
     await sender.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
 
+def _week_tasks_for_range(week_start, week_end) -> list:
+    """Return personal tasks due within [week_start, week_end] (inclusive),
+    sorted by due time — regardless of which ALLOWED_USER_IDS entry created
+    them, same reasoning as send_morning_summary's today_tasks (they're the
+    same person's other devices)."""
+    try:
+        tasks = [
+            t for t in load_tasks()
+            if t.get("due_time") and week_start <= datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() <= week_end
+        ]
+    except Exception as e:
+        logging.warning(f"_week_tasks_for_range: tasks fetch failed: {e}")
+        return []
+    tasks.sort(key=lambda t: t["due_time"])
+    return tasks
+
+
 async def send_weekly_calendar(sender, events: list, week_start):
     """Send the weekly schedule with navigation. Matches backup UI."""
     prev_week = week_start - timedelta(days=7)
     next_week = week_start + timedelta(days=7)
     week_end = week_start + timedelta(days=6)
+    week_tasks = _week_tasks_for_range(week_start, week_end)
 
     if not events:
         text = (
@@ -4799,13 +4817,24 @@ async def send_weekly_calendar(sender, events: list, week_start):
         lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         text = "\n".join(lines)
 
+    if week_tasks:
+        task_lines = ["\n✅ *Tasks This Week*", "━━━━━━━━━━━━━━━━━━"]
+        for t in week_tasks:
+            due = datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN)
+            course_line = f" [{t['course']}]" if t.get("course") else ""
+            task_lines.append(f"⏰ `{due.strftime('%a %d.%m %H:%M')}` — {t['text']}{course_line}")
+        text += "\n" + "\n".join(task_lines)
+
     # Navigation buttons
     keyboard = [
         [
             InlineKeyboardButton("⬅️ Prev Week", callback_data=f"calendar_week|{prev_week.isoformat()}"),
             InlineKeyboardButton("🗓️ This Week", callback_data=f"calendar_week|{(datetime.now().date() - timedelta(days=datetime.now().weekday())).isoformat()}"),
             InlineKeyboardButton("➡️ Next Week", callback_data=f"calendar_week|{next_week.isoformat()}"),
-        ]
+        ],
+        [
+            InlineKeyboardButton("🔊 Listen", callback_data=f"calendar_weekly_voice|{week_start.isoformat()}"),
+        ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -4893,6 +4922,32 @@ async def handle_calendar_today_voice(update: Update, context: ContextTypes.DEFA
         await send_daily_plan_voice(query.message, events, today, user_id=user_id)
     except Exception as e:
         logging.error(f"Calendar today voice error: {e}")
+        await query.message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
+
+
+async def handle_calendar_weekly_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle calendar_weekly_voice|YYYY-MM-DD callback ("🔊 Listen" on the
+    weekly schedule) — synthesize that week's plan via OpenRouter TTS and
+    send it as a voice message."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    try:
+        _, date_str = query.data.split("|")
+        week_start = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except Exception:
+        today = datetime.now().date()
+        week_start = today - timedelta(days=today.weekday())
+
+    try:
+        events = await get_calendar_events(session=global_session, week_start=week_start)
+        await send_weekly_plan_voice(query.message, events, week_start, user_id=user_id)
+    except Exception as e:
+        logging.error(f"Calendar weekly voice error: {e}")
         await query.message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
 
 
@@ -6413,7 +6468,7 @@ VOICE_INTENTS = [
     "check_status", "show_menu", "set_food_preferences", "remove_food_preferences",
     "show_last_file", "list_course_files", "exam_dates_all", "upcoming_dashboard",
     "calendar_today", "calendar_weekly", "set_default_semester", "run_check",
-    "fastenroll_list", "read_daily_plan", "ask_question", "unclear",
+    "fastenroll_list", "read_daily_plan", "read_weekly_plan", "ask_question", "unclear",
 ]
 
 # Friendly button labels for every real (non-"unclear") intent, used both by
@@ -6443,6 +6498,7 @@ INTENT_LABELS = {
     "run_check": "🔁 Run a manual sync",
     "fastenroll_list": "⚡ List Fast Enroll jobs",
     "read_daily_plan": "🔊 Read today's plan aloud",
+    "read_weekly_plan": "🔊 Read this week's plan aloud",
     "ask_question": "💬 Ask a question about my studies",
 }
 
@@ -6467,6 +6523,7 @@ Intents, each with example phrasings in both languages:
 - upcoming_dashboard: "önümüzdeki günlerde neler var" / "what's coming up" / "show my upcoming schedule" — a combined view of tasks, exam dates and deadlines
 - calendar_today: "bugünkü derslerim neler" / "what's my schedule today" / "show today's lectures" — wants to SEE today's schedule as text
 - read_daily_plan: "günlük planımı sesli oku" / "read me today's schedule" / "read my daily plan out loud" / "tell me what I have today" — specifically wants today's schedule spoken aloud as a voice message, not shown as text
+- read_weekly_plan: "haftalık planımı sesli oku" / "read me this week's schedule" / "read my week out loud" — same, but for the whole week
 - ask_question: "toplam kaç kredim var" / "what's my GPA" / "when is my next exam" / "do I have any free time this week" / "kaç görevim kaldı" — an open-ended question that needs combining or reasoning over their data, not a direct "show me X" request matching one of the other intents above (prefer the specific intent when one clearly fits, e.g. a plain "what's my schedule today" is calendar_today, not this)
 - calendar_weekly: "bu haftaki ders programımı göster" / "show this week's schedule" / "what's my week plan"
 - set_default_semester: "varsayılan dönemi ayarla" / "set my default semester" / "change my default semester" — opens the semester picker, doesn't require a semester to be named
@@ -6650,6 +6707,73 @@ async def build_ai_daily_plan_narration(today_events: list, target_date, name: O
     return narration.strip() if narration else None
 
 
+def build_weekly_plan_speech_text(events: list, week_start, week_end) -> str:
+    """Build a plain-English (no Markdown/HTML) description of one week's
+    schedule, suitable as TTS input — the deterministic fallback for
+    build_ai_weekly_plan_narration, same role as build_daily_plan_speech_text
+    for the daily version."""
+    if not events:
+        return f"You have no events scheduled for the week of {week_start:%B %d} to {week_end:%B %d}. Enjoy the free week!"
+
+    events_by_day: dict = {}
+    for ev in events:
+        events_by_day.setdefault(ev["date_key"], []).append(ev)
+
+    parts = [f"Here is your schedule for the week of {week_start:%B %d} to {week_end:%B %d}."]
+    for dk in sorted(events_by_day.keys()):
+        day_name = dk.strftime("%A")
+        titles = ", ".join(clean_course_title(ev.get("title", "")) or "an event" for ev in events_by_day[dk])
+        parts.append(f"On {day_name}, you have {titles}.")
+    return " ".join(parts)
+
+
+WEEKLY_PLAN_NARRATION_SYSTEM_PROMPT = """You are recording a short, warm, upbeat spoken weekly briefing for a university student — it will be converted to speech and sent as a voice message, so write it exactly as you'd say it out loud, not as a written list.
+
+Structure:
+1. Open with a genuine, encouraging line about the week ahead — invent fresh wording every time, never reuse a stock phrase, make it feel spontaneous rather than a template.
+2. Naturally walk through the week day by day (or group similar/light days together): what's on, roughly when — like a friend giving them the lay of the week, not reading a bureaucratic agenda. Call out the busiest day(s) and any noticeably free day(s) if that's genuinely useful.
+3. If any tasks are due during the week, mention them too, woven into the same conversational flow — not as a separate announcement.
+4. Close with one short, warm line wishing them a good week.
+
+Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 160 words. Vary your phrasing and structure every time you're asked this, even for an identical week, since this must never sound canned or repetitive."""
+
+
+async def build_ai_weekly_plan_narration(events: list, week_start, week_end, name: Optional[str] = None, week_tasks: Optional[list] = None) -> Optional[str]:
+    """Ask the chat LLM (OpenRouter) to write a warm, freshly-improvised
+    spoken narration of the week's schedule and any tasks due that week —
+    the weekly counterpart of build_ai_daily_plan_narration. Returns None
+    on any failure; callers should fall back to build_weekly_plan_speech_text
+    so the voice message always has content."""
+    if events:
+        events_by_day: dict = {}
+        for ev in events:
+            events_by_day.setdefault(ev["date_key"], []).append(ev)
+        schedule_lines = []
+        for dk in sorted(events_by_day.keys()):
+            day_events = ", ".join(
+                f"{clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')}"
+                for ev in events_by_day[dk]
+            )
+            schedule_lines.append(f"- {dk.strftime('%A')}: {day_events}")
+        schedule_summary = "\n".join(schedule_lines)
+    else:
+        schedule_summary = "No events scheduled — a free week."
+
+    user_prompt = f"Week of {week_start:%B %d} to {week_end:%B %d}.\nSchedule:\n{schedule_summary}"
+
+    if week_tasks:
+        tasks_summary = "\n".join(
+            f"- {t['text']}" + (f" (due {datetime.fromisoformat(t['due_time']).astimezone(TZ_BERLIN).strftime('%A %H:%M')})" if t.get("due_time") else "")
+            for t in week_tasks
+        )
+        user_prompt += f"\n\nTasks due this week:\n{tasks_summary}\nMention these naturally too, not as a separate rigid list."
+
+    if name:
+        user_prompt += f"\nAddress the listener by name at least once, naturally (their name is {name})."
+    narration = await _call_openrouter(WEEKLY_PLAN_NARRATION_SYSTEM_PROMPT, user_prompt, temperature=1.15)
+    return narration.strip() if narration else None
+
+
 async def _send_voice_to_users(bot, user_ids, text: str):
     """Synthesize `text` once via OpenRouter TTS and send the resulting
     voice message to every user_id, reusing the same converted file rather
@@ -6674,6 +6798,35 @@ async def _send_voice_to_users(bot, user_ids, text: str):
                     await bot.send_voice(chat_id=uid, voice=f)
             except Exception as e:
                 logging.error(f"_send_voice_to_users: failed to send to {uid}: {e}")
+    finally:
+        try:
+            os.remove(ogg_path)
+        except OSError:
+            pass
+
+
+async def _try_send_voice(sender, text: str) -> bool:
+    """Best-effort: synthesize `text` via OpenRouter TTS, convert to
+    OGG/Opus, and send it as a voice message on `sender`. Returns True on
+    success, False on any failure (TTS unavailable, ffmpeg missing/failed,
+    or the send itself raising) — callers decide what, if anything, to do
+    about a False result (e.g. fall back to sending the text)."""
+    result = await synthesize_speech(text)
+    if not result:
+        return False
+    pcm_bytes, sample_rate = result
+
+    ogg_path = await _pcm_to_ogg_voice(pcm_bytes, sample_rate)
+    if not ogg_path:
+        return False
+
+    try:
+        with open(ogg_path, "rb") as f:
+            await sender.reply_voice(voice=f)
+        return True
+    except Exception as e:
+        logging.error(f"_try_send_voice: failed to send voice message: {e}")
+        return False
     finally:
         try:
             os.remove(ogg_path)
@@ -6706,28 +6859,24 @@ async def send_daily_plan_voice(sender, events: list, target_date, user_id=None)
     text = await build_ai_daily_plan_narration(today_events, target_date, name=name, today_tasks=today_tasks) or build_daily_plan_speech_text(events, target_date)
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
 
-    result = await synthesize_speech(text)
-    if not result:
-        await sender.reply_text("⚠️ Couldn't generate voice right now (TTS unavailable) — here's the schedule as text instead:\n\n" + text)
-        return
-    pcm_bytes, sample_rate = result
+    if not await _try_send_voice(sender, text):
+        await sender.reply_text("⚠️ Couldn't generate voice right now — here's the schedule as text instead:\n\n" + text)
 
-    ogg_path = await _pcm_to_ogg_voice(pcm_bytes, sample_rate)
-    if not ogg_path:
-        await sender.reply_text("⚠️ Couldn't convert the generated voice audio — here's the schedule as text instead:\n\n" + text)
-        return
 
-    try:
-        with open(ogg_path, "rb") as f:
-            await sender.reply_voice(voice=f)
-    except Exception as e:
-        logging.error(f"send_daily_plan_voice: failed to send voice message: {e}")
-        await sender.reply_text("⚠️ Couldn't send the voice message — here's the schedule as text instead:\n\n" + text)
-    finally:
-        try:
-            os.remove(ogg_path)
-        except OSError:
-            pass
+async def send_weekly_plan_voice(sender, events: list, week_start, user_id=None):
+    """Same idea as send_daily_plan_voice, but for the whole week — a warm,
+    freshly-improvised narration of the week's schedule and any tasks due
+    that week, synthesized and sent as a voice message. Falls back to a
+    plain deterministic description, and further to plain text, on any
+    failure."""
+    week_end = week_start + timedelta(days=6)
+    name = (get_user_name(user_id) if user_id is not None else None) or get_primary_user_name()
+    week_tasks = _week_tasks_for_range(week_start, week_end)
+    text = await build_ai_weekly_plan_narration(events, week_start, week_end, name=name, week_tasks=week_tasks) or build_weekly_plan_speech_text(events, week_start, week_end)
+    await _show_typing(sender, action=ChatAction.RECORD_VOICE)
+
+    if not await _try_send_voice(sender, text):
+        await sender.reply_text("⚠️ Couldn't generate voice right now — here's the week as text instead:\n\n" + text)
 
 
 async def send_text_and_voice(sender, text: str):
@@ -6738,25 +6887,7 @@ async def send_text_and_voice(sender, text: str):
     shouldn't have to handle a second failure mode on top of their own."""
     await sender.reply_text(text)
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
-
-    result = await synthesize_speech(text)
-    if not result:
-        return
-    pcm_bytes, sample_rate = result
-
-    ogg_path = await _pcm_to_ogg_voice(pcm_bytes, sample_rate)
-    if not ogg_path:
-        return
-    try:
-        with open(ogg_path, "rb") as f:
-            await sender.reply_voice(voice=f)
-    except Exception as e:
-        logging.error(f"send_text_and_voice: failed to send voice message: {e}")
-    finally:
-        try:
-            os.remove(ogg_path)
-        except OSError:
-            pass
+    await _try_send_voice(sender, text)
 
 
 async def build_qa_context(user_id=None) -> str:
@@ -7529,6 +7660,18 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
             await message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
         return
 
+    if intent == "read_weekly_plan":
+        try:
+            today = datetime.now().date()
+            week_start = today - timedelta(days=today.weekday())
+            events = await get_calendar_events(session=global_session, week_start=week_start)
+            voice_user_id = update.effective_user.id if update.effective_user else None
+            await send_weekly_plan_voice(message, events, week_start, user_id=voice_user_id)
+        except Exception as e:
+            logging.error(f"_route_voice_intent: read_weekly_plan failed: {e}")
+            await message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
+        return
+
     if intent == "ask_question":
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
         qa_user_id = update.effective_user.id if update.effective_user else None
@@ -7945,6 +8088,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_course_deenroll_confirm, pattern="^course_deenroll_confirm\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_deenroll_cancel, pattern="^course_deenroll_cancel$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern="^calendar_week\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_calendar_weekly_voice, pattern="^calendar_weekly_voice\\|.*$"))
         app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^menu_nav\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_menu_preferences_button, pattern="^menu_prefs$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_remove, pattern="^foodpref_remove\\|.*$"))
