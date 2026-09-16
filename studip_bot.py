@@ -1329,17 +1329,36 @@ MEAT_CODES = {"G", "R", "L", "W"}  # Poultry, Beef, Lamb, Game — used to flag/
 MEAL_RECOMMENDATION_BASE_AVOID_CODES = {"S", "Sch", "Su", "A", "RG", "SG"}  # Pork (all 3 codes), Alcohol, Beef/Pork Gelatin
 MEAL_RECOMMENDATION_BASE_AVOID_KEYWORDS = {"wine"}
 
-MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only — everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Prioritize a meat or chicken dish when one is available among the candidates; if none is, pick the best other option and say so honestly. Name the dish clearly, then explain the pick in 1-2 warm, casual sentences — plain spoken-friendly text, no markdown, no lists, no emojis."""
+MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only — everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Prioritize a meat or chicken dish when one is available among the candidates; if none is, pick the best other option and say so honestly within the reasoning.
+
+Respond with strict JSON only, no other text: {"dish": "<the exact dish name, copied verbatim from the candidate list>", "reasoning": "<1-2 warm, casual sentences naming the dish naturally and explaining the pick — this will be read aloud as a voice message, so plain spoken-friendly text only: no markdown, no lists, no emojis>"}"""
 
 
-async def build_food_recommendation() -> Optional[str]:
+def _friendly_menu_category_label(category: str) -> str:
+    """Human-friendly label for a raw Mensa category name, e.g. "COUNTER
+    TWO" -> "Counter 2"; Culinarium categories are already reasonably
+    formatted and pass through as-is."""
+    counter_labels = {
+        "COUNTER ONE": "Counter 1", "COUNTER TWO": "Counter 2",
+        "COUNTER THREE": "Counter 3", "COUNTER FOUR": "Counter 4",
+    }
+    return counter_labels.get(category, category)
+
+
+async def build_food_recommendation() -> Optional[dict]:
     """Fetch today's Mensa menu, filter out anything the student avoids
     (their food_preferences.json settings, unioned with a fixed
     pork/alcohol/wine/gelatine floor per their stated restriction), keep
     only Counter/Culinarium items, and ask the chat LLM to pick ONE
-    recommended dish — meat/chicken prioritized when available. Returns
-    None on any failure (no menu data reachable) or a plain "nothing
-    fits" message if the menu loaded but nothing survived filtering."""
+    recommended dish — meat/chicken prioritized when available.
+
+    Returns {"dish", "category" (raw, e.g. "COUNTER TWO" — pass through
+    _friendly_menu_category_label for display), "reasoning"}, or None on
+    any failure (no menu data reachable, or the LLM call itself failing).
+    If the menu loaded but nothing survived filtering, "category" is None
+    and "reasoning" carries an explanatory message instead of a real pick —
+    callers should still just speak/show "reasoning" either way.
+    """
     try:
         session = await login_studip()
         items = await fetch_todays_menu_items(session)
@@ -1366,7 +1385,11 @@ async def build_food_recommendation() -> Optional[str]:
         candidates.append(it)
 
     if not candidates:
-        return "😕 Couldn't find anything on today's Counter/Culinarium menu that fits your preferences — check the full 🍽️ Menu instead, there might be something elsewhere on it."
+        return {
+            "dish": None,
+            "category": None,
+            "reasoning": "Couldn't find anything on today's Counter or Culinarium menu that fits your preferences — check the full menu instead, there might be something elsewhere on it.",
+        }
 
     lines = []
     for it in candidates:
@@ -1376,8 +1399,38 @@ async def build_food_recommendation() -> Optional[str]:
         lines.append(f"- {it['name']} ({it['category']}){meat_note}{desc_part}")
     candidates_text = "\n".join(lines)
 
-    recommendation = await _call_openrouter(MEAL_RECOMMENDATION_SYSTEM_PROMPT, f"Today's candidates:\n{candidates_text}", temperature=0.8)
-    return recommendation.strip() if recommendation else None
+    raw = await _call_openrouter(MEAL_RECOMMENDATION_SYSTEM_PROMPT, f"Today's candidates:\n{candidates_text}", temperature=0.8)
+    parsed = _extract_json_object(raw)
+    if not parsed or not parsed.get("dish"):
+        return None
+
+    # Match back to the real candidate so "category" is the actual parsed
+    # value, not whatever the model might say — exact match first, fuzzy
+    # as a fallback in case it paraphrased the name slightly.
+    chosen = next((c for c in candidates if c["name"] == parsed["dish"]), None)
+    if not chosen:
+        chosen = _best_title_match(parsed["dish"], [(c["name"], c) for c in candidates])
+
+    return {
+        "dish": chosen["name"] if chosen else parsed["dish"],
+        "category": chosen["category"] if chosen else None,
+        "reasoning": (parsed.get("reasoning") or "").strip() or f"I'd recommend the {parsed['dish']}.",
+    }
+
+
+async def _deliver_food_recommendation(sender, result: dict):
+    """Send a build_food_recommendation() result the way it's meant to be
+    read: the Counter/Culinarium location as its own short text message
+    (quick to glance at, no need to replay the audio for it), and the
+    actual pick + reasoning spoken as a full voice message — falling back
+    to text if TTS/ffmpeg is unavailable, so it's never silently dropped."""
+    if result["category"]:
+        await sender.reply_text(f"📍 {_friendly_menu_category_label(result['category'])}")
+
+    spoken_text = result["reasoning"]
+    await _show_typing(sender, action=ChatAction.RECORD_VOICE)
+    if not await _try_send_voice(sender, spoken_text):
+        await sender.reply_text(f"🍽️ {spoken_text}")
 
 
 async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avoid_keywords=None):
@@ -1699,14 +1752,14 @@ async def handle_menu_recommend_button(update: Update, context: ContextTypes.DEF
     status_msg = await query.message.reply_text("🍽️ Picking something for you...", disable_notification=True)
     stop_evt, anim_task = _start_loading_animation(status_msg, "Picking something for you...")
     try:
-        recommendation = await build_food_recommendation()
+        result = await build_food_recommendation()
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
 
-    if not recommendation:
+    if not result:
         await query.message.reply_text("❌ Couldn't reach the Mensa menu right now — try again in a bit.")
         return
-    await query.message.reply_text(f"🍽️ {recommendation}")
+    await _deliver_food_recommendation(query.message, result)
 
 
 async def handle_foodpref_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7963,11 +8016,11 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if intent == "recommend_meal":
         await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-        recommendation = await build_food_recommendation()
-        if not recommendation:
+        result = await build_food_recommendation()
+        if not result:
             await message.reply_text("❌ Couldn't reach the Mensa menu right now — try again in a bit.")
             return
-        await message.reply_text(f"🍽️ {recommendation}")
+        await _deliver_food_recommendation(message, result)
         return
 
     if intent == "set_food_preferences":
