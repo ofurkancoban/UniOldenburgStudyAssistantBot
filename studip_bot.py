@@ -6391,7 +6391,7 @@ VOICE_INTENTS = [
     "check_status", "show_menu", "set_food_preferences", "remove_food_preferences",
     "show_last_file", "list_course_files", "exam_dates_all", "upcoming_dashboard",
     "calendar_today", "calendar_weekly", "set_default_semester", "run_check",
-    "fastenroll_list", "read_daily_plan", "unclear",
+    "fastenroll_list", "read_daily_plan", "ask_question", "unclear",
 ]
 
 # Friendly button labels for every real (non-"unclear") intent, used both by
@@ -6421,6 +6421,7 @@ INTENT_LABELS = {
     "run_check": "🔁 Run a manual sync",
     "fastenroll_list": "⚡ List Fast Enroll jobs",
     "read_daily_plan": "🔊 Read today's plan aloud",
+    "ask_question": "💬 Ask a question about my studies",
 }
 
 CLASSIFY_INTENT_SYSTEM_PROMPT = """You classify a spoken command (transcribed from Turkish or English) sent to a university assistant Telegram bot into exactly one intent.
@@ -6444,6 +6445,7 @@ Intents, each with example phrasings in both languages:
 - upcoming_dashboard: "önümüzdeki günlerde neler var" / "what's coming up" / "show my upcoming schedule" — a combined view of tasks, exam dates and deadlines
 - calendar_today: "bugünkü derslerim neler" / "what's my schedule today" / "show today's lectures" — wants to SEE today's schedule as text
 - read_daily_plan: "günlük planımı sesli oku" / "read me today's schedule" / "read my daily plan out loud" / "tell me what I have today" — specifically wants today's schedule spoken aloud as a voice message, not shown as text
+- ask_question: "toplam kaç kredim var" / "what's my GPA" / "when is my next exam" / "do I have any free time this week" / "kaç görevim kaldı" — an open-ended question that needs combining or reasoning over their data, not a direct "show me X" request matching one of the other intents above (prefer the specific intent when one clearly fits, e.g. a plain "what's my schedule today" is calendar_today, not this)
 - calendar_weekly: "bu haftaki ders programımı göster" / "show this week's schedule" / "what's my week plan"
 - set_default_semester: "varsayılan dönemi ayarla" / "set my default semester" / "change my default semester" — opens the semester picker, doesn't require a semester to be named
 - run_check: "her şeyi manuel kontrol et" / "run a manual sync" / "check for updates now" — force-refreshes messages/announcements/files/forum right now
@@ -6686,6 +6688,113 @@ async def send_daily_plan_voice(sender, events: list, target_date, user_id=None)
             os.remove(ogg_path)
         except OSError:
             pass
+
+
+async def send_text_and_voice(sender, text: str):
+    """Send `text` as a normal message, then also synthesize and send it as
+    a voice message via the same free OpenRouter TTS pipeline as 🔊 Listen.
+    Best-effort for the voice half — a TTS/ffmpeg failure just means no
+    voice note follows, since the text has already gone out and callers
+    shouldn't have to handle a second failure mode on top of their own."""
+    await sender.reply_text(text)
+    await _show_typing(sender, action=ChatAction.RECORD_VOICE)
+
+    result = await synthesize_speech(text)
+    if not result:
+        return
+    pcm_bytes, sample_rate = result
+
+    ogg_path = await _pcm_to_ogg_voice(pcm_bytes, sample_rate)
+    if not ogg_path:
+        return
+    try:
+        with open(ogg_path, "rb") as f:
+            await sender.reply_voice(voice=f)
+    except Exception as e:
+        logging.error(f"send_text_and_voice: failed to send voice message: {e}")
+    finally:
+        try:
+            os.remove(ogg_path)
+        except OSError:
+            pass
+
+
+async def build_qa_context(user_id=None) -> str:
+    """Gather a compact plain-text snapshot of the student's current
+    academic data — this week's schedule, registered upcoming exams,
+    transcript summary, personal tasks — for the free-form ask_question
+    intent to answer against. Each source is independently best-effort
+    (fetched inside its own try/except): one failing (e.g. a slow StuMS
+    page) just leaves that section out of the context rather than blocking
+    the others or the whole answer."""
+    parts = []
+
+    session = None
+    try:
+        session = await login_studip()
+    except Exception as e:
+        logging.warning(f"build_qa_context: login failed: {e}")
+
+    try:
+        today = datetime.now().date()
+        week_start = today - timedelta(days=today.weekday())
+        events = await get_calendar_events(session=global_session, week_start=week_start)
+        if events:
+            lines = [
+                f"- {ev.get('date_key')}: {clean_course_title(ev.get('title', '')) or 'event'} at {ev.get('time', '')}"
+                for ev in sorted(events, key=lambda e: (e.get("date_key") or today, e.get("time") or ""))
+            ]
+            parts.append("This week's schedule:\n" + "\n".join(lines))
+    except Exception as e:
+        logging.warning(f"build_qa_context: calendar failed: {e}")
+
+    if session:
+        try:
+            exams = await get_registered_exam_schedule(session)
+            if exams:
+                lines = [f"- {e['title']}: {e.get('date_line') or e.get('date')}" for e in exams]
+                parts.append("Registered upcoming exams:\n" + "\n".join(lines))
+        except Exception as e:
+            logging.warning(f"build_qa_context: registered exams failed: {e}")
+
+        try:
+            grades = await get_grades(session)
+            summary = compute_transcript_summary(grades)
+            gpa_text = summary["gpa"] if summary["gpa"] is not None else "not yet available"
+            parts.append(
+                f"Transcript: weighted average grade {gpa_text}, total credits earned {summary['total_credits']}, "
+                f"{len(summary['passed'])} module(s) passed, {len(summary['failed'])} module(s) failed."
+            )
+        except Exception as e:
+            logging.warning(f"build_qa_context: transcript failed: {e}")
+
+    try:
+        tasks = load_tasks()
+        if user_id is not None:
+            tasks = [t for t in tasks if t.get("user_id") == user_id]
+        if tasks:
+            lines = [f"- {t['text']}" + (f" (due {t['due_time']})" if t.get("due_time") else "") for t in tasks]
+            parts.append("Personal tasks:\n" + "\n".join(lines))
+    except Exception as e:
+        logging.warning(f"build_qa_context: tasks failed: {e}")
+
+    return "\n\n".join(parts) if parts else "No data could be loaded right now."
+
+
+QA_SYSTEM_PROMPT = """You are a helpful university assistant answering a spoken question from a student, using ONLY the data provided below the question — never invent facts that aren't in it. Answer conversationally and concisely (2-4 sentences), in plain spoken sentences suitable both for reading as a text message and for being read aloud as a voice message: no markdown, no bullet points, no emojis, no headers. If the data doesn't contain enough to answer, say so honestly rather than guessing."""
+
+
+async def answer_question_with_context(question: str, context_data: str, name: Optional[str] = None) -> Optional[str]:
+    """Ask the chat LLM (OpenRouter) to answer a free-form spoken question
+    using the snapshot from build_qa_context. Returns None on any failure —
+    callers should tell the user to try again rather than send a blank or
+    made-up answer."""
+    system_prompt = QA_SYSTEM_PROMPT
+    if name:
+        system_prompt += f" The student's name is {name} — you may address them by it naturally, but don't force it into every sentence."
+    user_prompt = f"Data:\n{context_data}\n\nQuestion: {question}"
+    answer = await _call_openrouter(system_prompt, user_prompt, temperature=0.7)
+    return answer.strip() if answer else None
 
 
 def _extract_json_object(raw: Optional[str]) -> Optional[dict]:
@@ -7378,6 +7487,23 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logging.error(f"_route_voice_intent: read_daily_plan failed: {e}")
             await message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
+        return
+
+    if intent == "ask_question":
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+        qa_user_id = update.effective_user.id if update.effective_user else None
+        try:
+            context_data = await build_qa_context(user_id=qa_user_id)
+            name = (get_user_name(qa_user_id) if qa_user_id is not None else None) or get_primary_user_name()
+            answer = await answer_question_with_context(transcript, context_data, name=name)
+        except Exception as e:
+            logging.error(f"_route_voice_intent: ask_question failed: {e}")
+            await message.reply_text(f"❌ Error answering that: {str(e)[:200]}")
+            return
+        if not answer:
+            await message.reply_text("🤷 Couldn't come up with an answer right now — try again in a bit.")
+            return
+        await send_text_and_voice(message, answer)
         return
 
     if intent == "set_default_semester":

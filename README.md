@@ -105,6 +105,7 @@ Every voice note is transcribed first (via the free Google Web Speech API, no AP
     | "run a manual sync" | Same as **🔁 Check** — force-refreshes messages/announcements/files/forum now. |
     | "list my scheduled fast enroll jobs" | Shows your pending **⚡ Fast Enroll** jobs. |
     | "read me today's schedule out loud" | 🔊 Synthesizes today's plan into an actual voice message (see below) instead of showing it as text. |
+    | "what's my GPA" / "how many credits do I have left" / "am I free this week" | 💬 Open-ended questions get a real answer — see **Voice Q&A** below — rather than being forced into one of the fixed actions above. |
     | anything else the bot can't place at all | Asks **"Want me to save it as a task instead?"** rather than silently guessing. |
     | something ambiguous between two known actions (e.g. just "exam") | Offers up to two **"did you mean...?"** buttons for the closest-matching actions, plus a plain-task fallback — tapping one runs that action exactly as if you'd said it clearly the first time. |
 
@@ -112,6 +113,7 @@ Every voice note is transcribed first (via the free Google Web Speech API, no AP
 
 *   **🔊 Hear your daily plan**: tap **"🔊 Listen"** on the **📅 Today** schedule, or just say "read me today's schedule" — a free LLM (via OpenRouter) first writes a warm, freshly-improvised spoken narration of the day (never a fixed template), which is then turned into a real voice message via a free OpenRouter text-to-speech model (`deepgram/flux-tts:free` by default), converted to Telegram's voice-message format with `ffmpeg`. Falls back to a plain deterministic description (and, if TTS itself is unavailable, to plain text) so it never just does nothing. The same narration goes out automatically every morning alongside the Morning Summary — see 📅 Smart Scheduling & Reminders above.
 *   **👤 Personalized by name**: set your name once via **/status → "👤 Set Your Name"** and every narration — manual or automatic — greets you by it. All `ALLOWED_USER_IDS` share one name (they're the same person's other devices); if that ever changes, each stores its own separately (`get_user_name`).
+*   **💬 Voice Q&A**: ask an open-ended question — "what's my GPA", "how many credits do I have left", "am I free this week", "kaç görevim kaldı" — and the bot pulls together a live snapshot of your actual schedule, registered exams, transcript, and personal tasks, hands it to a free OpenRouter LLM, and answers using only that data (it says so honestly if the answer isn't in there rather than guessing). The answer arrives **both as a text message and as a spoken voice note**. Prefers a specific action (e.g. **📅 Today**, **📜 Transcript**) when the question is really just "show me X"; this is for questions that need combining or reasoning across your data instead.
 
 > [!NOTE]
 > Voice-note transcription requires **ffmpeg** on the server (`apt install ffmpeg` / `brew install ffmpeg`) to convert Telegram's audio format. `setup.sh` warns if it's missing.
