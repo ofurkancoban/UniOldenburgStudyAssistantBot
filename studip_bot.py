@@ -2686,7 +2686,7 @@ async def send_morning_summary(bot, user_ids):
             display_title = clean_course_title(ev.get("title", ""))
             duration = ev["time"]
             loc_icon = _get_location_emoji(ev.get("location", ""))
-            
+
             block = (
                 f"{course_icon} <b>{display_title}</b>\n"
                 f"   🕒 <code>{duration}</code>\n"
@@ -2696,14 +2696,36 @@ async def send_morning_summary(bot, user_ids):
         lines.append("\n\n".join(course_blocks))
         schedule_text = "\n".join(lines)
 
+    # 2b. Today's tasks (reminders due today, regardless of which
+    # ALLOWED_USER_IDS entry created them — they're the same person's
+    # other devices, see get_primary_user_name).
+    try:
+        today_tasks = [
+            t for t in load_tasks()
+            if t.get("due_time") and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == today_date
+        ]
+    except Exception as e:
+        logging.error(f"Summary tasks fetch error: {e}")
+        today_tasks = []
+
+    tasks_text = ""
+    if today_tasks:
+        today_tasks.sort(key=lambda t: t["due_time"])
+        task_lines = ["✅ <b>Today's Tasks:</b>"]
+        for t in today_tasks:
+            due = datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN)
+            course_line = f" [{t['course']}]" if t.get("course") else ""
+            task_lines.append(f"⏰ <code>{due.strftime('%H:%M')}</code> — {t['text']}{course_line}")
+        tasks_text = "\n\n" + "\n".join(task_lines)
+
     # 3. Final Message
     header = (
         "☀️ <b>GOOD MORNING!</b> ☀️\n"
         f"🗓️ <b>Today:</b> {now:%d %B %Y, %A}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
     )
-    
-    final_text = f"{header}{schedule_text}\n\n━━━━━━━━━━━━━━━━━━"
+
+    final_text = f"{header}{schedule_text}{tasks_text}\n\n━━━━━━━━━━━━━━━━━━"
     
     # 4. Keyboard for Mensa Menu
     keyboard = InlineKeyboardMarkup([
@@ -2726,7 +2748,7 @@ async def send_morning_summary(bot, user_ids):
     # build_ai_daily_plan_narration). A TTS/ffmpeg hiccup here just skips
     # the voice message; the text summary above has already gone out.
     try:
-        narration = await build_ai_daily_plan_narration(today_events, today_date, name=get_primary_user_name()) or build_daily_plan_speech_text(today_events, today_date)
+        narration = await build_ai_daily_plan_narration(today_events, today_date, name=get_primary_user_name(), today_tasks=today_tasks) or build_daily_plan_speech_text(today_events, today_date)
         await _send_voice_to_users(bot, user_ids, narration)
     except Exception as e:
         logging.error(f"Morning voice summary failed: {e}")
@@ -6590,19 +6612,21 @@ DAILY_PLAN_NARRATION_SYSTEM_PROMPT = """You are recording a short, warm, upbeat 
 Structure:
 1. Open with a genuine, encouraging line about the day ahead — invent fresh wording every time, never reuse a stock phrase, make it feel spontaneous rather than a template.
 2. Naturally weave in today's schedule: what's on, roughly when, and where — like a friend casually telling them their day, not reading a bureaucratic agenda.
-3. Close with one short, warm line wishing them well.
+3. If any tasks are due today, mention them too, woven into the same conversational flow — not as a separate announcement.
+4. Close with one short, warm line wishing them well.
 
-Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 90 words. Vary your phrasing and structure every time you're asked this, even for an identical schedule, since this repeats every single morning and must never sound canned or repetitive."""
+Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 110 words (a bit more if there are tasks to mention too). Vary your phrasing and structure every time you're asked this, even for an identical schedule, since this repeats every single morning and must never sound canned or repetitive."""
 
 
-async def build_ai_daily_plan_narration(today_events: list, target_date, name: Optional[str] = None) -> Optional[str]:
+async def build_ai_daily_plan_narration(today_events: list, target_date, name: Optional[str] = None, today_tasks: Optional[list] = None) -> Optional[str]:
     """Ask the chat LLM (OpenRouter) to write a warm, freshly-improvised
-    spoken narration of the day's schedule — deliberately not a fixed
-    template, so the opening line and phrasing differ every time this is
-    called, even for an identical schedule. If `name` is given (see
-    get_user_name/get_primary_user_name), the narration addresses them by
-    it. Returns None on any failure; callers should fall back to
-    build_daily_plan_speech_text so the voice message always has content."""
+    spoken narration of the day's schedule and any tasks due today —
+    deliberately not a fixed template, so the opening line and phrasing
+    differ every time this is called, even for an identical schedule. If
+    `name` is given (see get_user_name/get_primary_user_name), the
+    narration addresses them by it. Returns None on any failure; callers
+    should fall back to build_daily_plan_speech_text so the voice message
+    always has content."""
     if today_events:
         schedule_summary = "\n".join(
             f"- {clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')} in {_safe_loc(ev.get('location', ''))}"
@@ -6612,6 +6636,14 @@ async def build_ai_daily_plan_narration(today_events: list, target_date, name: O
         schedule_summary = "No events scheduled — a free day."
 
     user_prompt = f"Today is {target_date:%A, %B %d}.\nSchedule:\n{schedule_summary}"
+
+    if today_tasks:
+        tasks_summary = "\n".join(
+            f"- {t['text']}" + (f" (due {datetime.fromisoformat(t['due_time']).astimezone(TZ_BERLIN).strftime('%H:%M')})" if t.get("due_time") else "")
+            for t in today_tasks
+        )
+        user_prompt += f"\n\nTasks due today:\n{tasks_summary}\nMention these naturally too, not as a separate rigid list."
+
     if name:
         user_prompt += f"\nAddress the listener by name at least once, naturally (their name is {name})."
     narration = await _call_openrouter(DAILY_PLAN_NARRATION_SYSTEM_PROMPT, user_prompt, temperature=1.15)
@@ -6663,7 +6695,15 @@ async def send_daily_plan_voice(sender, events: list, target_date, user_id=None)
     different devices."""
     today_events = [ev for ev in events if ev["date_key"] == target_date]
     name = (get_user_name(user_id) if user_id is not None else None) or get_primary_user_name()
-    text = await build_ai_daily_plan_narration(today_events, target_date, name=name) or build_daily_plan_speech_text(events, target_date)
+    try:
+        today_tasks = [
+            t for t in load_tasks()
+            if t.get("due_time") and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == target_date
+        ]
+    except Exception as e:
+        logging.warning(f"send_daily_plan_voice: tasks fetch failed: {e}")
+        today_tasks = []
+    text = await build_ai_daily_plan_narration(today_events, target_date, name=name, today_tasks=today_tasks) or build_daily_plan_speech_text(events, target_date)
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
 
     result = await synthesize_speech(text)

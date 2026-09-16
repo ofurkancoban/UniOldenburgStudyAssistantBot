@@ -32,8 +32,9 @@ This project offers two distinct ways to interact with Stud.IP. You can select y
 ### 📅 Smart Scheduling & Reminders
 *   **Morning Summary (07:00 AM)**: Get a daily briefing delivered to your chat.
     *   **Today's Schedule**: A clean list of your lectures and locations.
+    *   **✅ Today's Tasks**: Any personal task/reminder due today (see ✅ Personal Tasks & Reminders below) is listed right alongside the schedule — only shown when there's actually one due that day.
     *   **Mensa Menu**: The full cafeteria menu with allergens and special labels (e.g., ⭐ Limited).
-    *   **🔊 Spoken briefing, automatically**: right after the text summary, a second message arrives as an actual voice note — a warm, upbeat narration of the day that a free OpenRouter LLM writes fresh every morning (not a fixed template — the opening line and phrasing are different every time), turned into speech by the same free TTS pipeline as **🔊 Listen** (see 🎙️ Voice Commands). No tap needed; if generation or conversion fails, it's skipped quietly and the text summary above still went out. If you've set your name via **/status → "👤 Set Your Name"**, the narration greets you by it.
+    *   **🔊 Spoken briefing, automatically**: right after the text summary, a second message arrives as an actual voice note — a warm, upbeat narration of the day (schedule *and* today's tasks, woven in naturally) that a free OpenRouter LLM writes fresh every morning (not a fixed template — the opening line and phrasing are different every time), turned into speech by the same free TTS pipeline as **🔊 Listen** (see 🎙️ Voice Commands). No tap needed; if generation or conversion fails, it's skipped quietly and the text summary above still went out. If you've set your name via **/status → "👤 Set Your Name"**, the narration greets you by it.
 *   **Lecture Reminders**: Automatically receive a notification **30 minutes before** each class starts. No more running late across campus!
 
 ### 📊 Real-time Monitoring (Unified Watcher)
