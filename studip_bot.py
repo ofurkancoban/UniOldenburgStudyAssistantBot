@@ -6663,7 +6663,7 @@ Intents, each with example phrasings in both languages:
 - calendar_today: "bugünkü derslerim neler" / "what's my schedule today" / "show today's lectures" — wants to SEE today's schedule as text
 - read_daily_plan: "günlük planımı sesli oku" / "read me today's schedule" / "read my daily plan out loud" / "tell me what I have today" — specifically wants today's schedule spoken aloud as a voice message, not shown as text
 - read_weekly_plan: "haftalık planımı sesli oku" / "read me this week's schedule" / "read my week out loud" — same, but for the whole week
-- ask_question: "toplam kaç kredim var" / "what's my GPA" / "when is my next exam" / "do I have any free time this week" / "kaç görevim kaldı" — an open-ended question that needs combining or reasoning over their data, not a direct "show me X" request matching one of the other intents above (prefer the specific intent when one clearly fits, e.g. a plain "what's my schedule today" is calendar_today, not this)
+- ask_question: "toplam kaç kredim var" / "what's my GPA" / "when is my next exam" / "do I have any free time this week" / "kaç görevim kaldı" / "what should I wear today" / "is it going to rain" / "bugün şemsiye alsam mı" / "do I need a jacket today" — an open-ended question that needs combining, reasoning, or judgment over their data (including weather), not a direct "show me X" request matching one of the other intents above. This is its own clear intent, not something to hedge into "unclear" — weather/clothing questions ALWAYS belong here even though the word "today" appears in them (that alone doesn't make it calendar_today, which is specifically for wanting to see the schedule as text)
 - calendar_weekly: "bu haftaki ders programımı göster" / "show this week's schedule" / "what's my week plan"
 - set_default_semester: "varsayılan dönemi ayarla" / "set my default semester" / "change my default semester" — opens the semester picker, doesn't require a semester to be named
 - run_check: "her şeyi manuel kontrol et" / "run a manual sync" / "check for updates now" — force-refreshes messages/announcements/files/forum right now
@@ -7268,13 +7268,21 @@ async def classify_voice_intent(transcript: str) -> dict:
     falls back to {"intent": "unclear", "query": None, "alternatives": []}
     on any failure. "alternatives" is only ever non-empty when "intent" is
     "unclear" — see _route_voice_intent for how those become "did you
-    mean...?" buttons instead of silently defaulting to task creation."""
-    raw = await _call_openrouter(CLASSIFY_INTENT_SYSTEM_PROMPT, transcript)
-    parsed = _extract_json_object(raw)
-    if not parsed or parsed.get("intent") not in VOICE_INTENTS:
-        return {"intent": "unclear", "query": None, "alternatives": []}
-    alternatives = [a for a in (parsed.get("alternatives") or []) if a in INTENT_LABELS]
-    return {"intent": parsed["intent"], "query": parsed.get("query"), "alternatives": alternatives[:2]}
+    mean...?" buttons instead of silently defaulting to task creation.
+
+    Retries once on a malformed/unparseable response before giving up —
+    the free-tier model occasionally returns something _extract_json_object
+    can't parse (truncated, prose-wrapped, etc), and a single retry clears
+    most of those without meaningfully hurting latency."""
+    for attempt in range(2):
+        raw = await _call_openrouter(CLASSIFY_INTENT_SYSTEM_PROMPT, transcript)
+        parsed = _extract_json_object(raw)
+        if parsed and parsed.get("intent") in VOICE_INTENTS:
+            alternatives = [a for a in (parsed.get("alternatives") or []) if a in INTENT_LABELS]
+            return {"intent": parsed["intent"], "query": parsed.get("query"), "alternatives": alternatives[:2]}
+        if attempt == 0:
+            logging.warning(f"classify_voice_intent: unparseable response, retrying: {raw!r}")
+    return {"intent": "unclear", "query": None, "alternatives": []}
 
 
 def _food_preferences_system_prompt() -> str:
