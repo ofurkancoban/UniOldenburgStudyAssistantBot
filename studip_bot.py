@@ -1258,6 +1258,128 @@ def translate_food_codes(text):
     return text
 
 
+async def fetch_todays_menu_items(session, sub_path="2/") -> list:
+    """Fetch today's Mensa menu and return structured dish items — a
+    lighter-weight sibling to get_todays_menu_enhanced() (which builds a
+    formatted HTML string for display) for callers that need the raw data
+    instead, like build_food_recommendation(). Deliberately a separate,
+    small parser rather than refactoring get_todays_menu_enhanced to share
+    it, so this stays low-risk to the actively-used menu display.
+
+    Each item: {"category", "name", "description", "price", "codes" (a set
+    of allergen/ingredient codes)}. Returns [] on any failure."""
+    try:
+        if "mensawidget/menu/" in sub_path:
+            sub_path = sub_path.split("mensawidget/menu/")[-1]
+        url = f"{BASE_URL}/plugins.php/mensawidget/menu/{sub_path}"
+        async with await session.get(url) as r:
+            html_content = await r.text()
+    except Exception as e:
+        logging.warning(f"fetch_todays_menu_items: fetch failed: {e}")
+        return []
+
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+        items = []
+        for category_table in soup.find_all('table', class_='default'):
+            th = category_table.find('th')
+            category_name = th.get_text(strip=True) if th else ""
+
+            for row in category_table.find_all('tr')[1:]:
+                cols = row.find_all('td')
+                if len(cols) < 2:
+                    continue
+                name_cell, price_cell = cols[0], cols[1]
+
+                temp_cell = BeautifulSoup(str(name_cell), 'html.parser')
+                codes = set()
+                for span in temp_cell.find_all('span', class_='attributes'):
+                    span_text = span.get_text(strip=True)
+                    if span_text:
+                        codes.update(c.strip() for c in span_text.split(','))
+                    span.decompose()
+                for abbr in temp_cell.find_all('abbr'):
+                    abbr.decompose()
+
+                lines = [l.strip() for l in temp_cell.get_text("\n", strip=True).split('\n') if l.strip()]
+                if not lines:
+                    continue
+                name_text = re.sub(r'\([^)]*\)$', '', re.sub(r'[1-9][0-9]*[A-Za-z,+\s]*$', '', lines[0]).strip()).strip()
+                if not name_text:
+                    continue
+                description = ' '.join(lines[1:]) if len(lines) > 1 else ""
+
+                if not category_name.strip() and "pizza" in name_text.lower():
+                    category_name = "PIZZA"
+
+                items.append({
+                    "category": category_name or "Other",
+                    "name": name_text,
+                    "description": description,
+                    "price": price_cell.get_text(strip=True).replace("&euro;", "€").strip(),
+                    "codes": codes,
+                })
+        return items
+    except Exception as e:
+        logging.warning(f"fetch_todays_menu_items: parse failed: {e}")
+        return []
+
+
+MEAT_CODES = {"G", "R", "L", "W"}  # Poultry, Beef, Lamb, Game — used to flag/prioritize meat dishes
+MEAL_RECOMMENDATION_BASE_AVOID_CODES = {"S", "Sch", "Su", "A", "RG", "SG"}  # Pork (all 3 codes), Alcohol, Beef/Pork Gelatin
+MEAL_RECOMMENDATION_BASE_AVOID_KEYWORDS = {"wine"}
+
+MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only — everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Prioritize a meat or chicken dish when one is available among the candidates; if none is, pick the best other option and say so honestly. Name the dish clearly, then explain the pick in 1-2 warm, casual sentences — plain spoken-friendly text, no markdown, no lists, no emojis."""
+
+
+async def build_food_recommendation() -> Optional[str]:
+    """Fetch today's Mensa menu, filter out anything the student avoids
+    (their food_preferences.json settings, unioned with a fixed
+    pork/alcohol/wine/gelatine floor per their stated restriction), keep
+    only Counter/Culinarium items, and ask the chat LLM to pick ONE
+    recommended dish — meat/chicken prioritized when available. Returns
+    None on any failure (no menu data reachable) or a plain "nothing
+    fits" message if the menu loaded but nothing survived filtering."""
+    try:
+        session = await login_studip()
+        items = await fetch_todays_menu_items(session)
+    except Exception as e:
+        logging.warning(f"build_food_recommendation: menu fetch failed: {e}")
+        return None
+    if not items:
+        return None
+
+    prefs = load_food_preferences()
+    avoid_codes = set(prefs["avoid_codes"]) | MEAL_RECOMMENDATION_BASE_AVOID_CODES
+    avoid_keywords = {k.lower() for k in prefs["avoid_keywords"]} | MEAL_RECOMMENDATION_BASE_AVOID_KEYWORDS
+
+    candidates = []
+    for it in items:
+        category_lower = it["category"].lower()
+        if "counter" not in category_lower and "culinarium" not in category_lower:
+            continue
+        if it["codes"] & avoid_codes:
+            continue
+        haystack = f"{it['name']} {it['description']}".lower()
+        if any(kw in haystack for kw in avoid_keywords):
+            continue
+        candidates.append(it)
+
+    if not candidates:
+        return "😕 Couldn't find anything on today's Counter/Culinarium menu that fits your preferences — check the full 🍽️ Menu instead, there might be something elsewhere on it."
+
+    lines = []
+    for it in candidates:
+        meat_tags = sorted(ALLERGEN_CODE_NAMES.get(c, c) for c in it["codes"] if c in MEAT_CODES)
+        meat_note = f" [{', '.join(meat_tags)}]" if meat_tags else ""
+        desc_part = f": {it['description']}" if it["description"] else ""
+        lines.append(f"- {it['name']} ({it['category']}){meat_note}{desc_part}")
+    candidates_text = "\n".join(lines)
+
+    recommendation = await _call_openrouter(MEAL_RECOMMENDATION_SYSTEM_PROMPT, f"Today's candidates:\n{candidates_text}", temperature=0.8)
+    return recommendation.strip() if recommendation else None
+
+
 async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avoid_keywords=None):
     """Enhanced menu fetching with dynamic allergen guide and navigation links.
 
@@ -1478,8 +1600,9 @@ def get_menu_navigation_keyboard(prev_path=None, next_path=None):
         row.append(InlineKeyboardButton("Next ➡️", callback_data=f"menu_nav|{next_path}"))
 
     prefs_row = [InlineKeyboardButton("⚙️ Food Preferences", callback_data="menu_prefs")]
+    recommend_row = [InlineKeyboardButton("🍽️ What should I eat?", callback_data="menu_recommend")]
 
-    return InlineKeyboardMarkup([row, prefs_row])
+    return InlineKeyboardMarkup([row, prefs_row, recommend_row])
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1559,6 +1682,31 @@ async def handle_menu_preferences_button(update: Update, context: ContextTypes.D
     context.user_data["pending_step"] = "food_preferences"
     text, keyboard = _food_preferences_management_view()
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_menu_recommend_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle menu_recommend callback ("🍽️ What should I eat?") — ask the
+    chat LLM to pick one recommended dish from today's Counter/Culinarium
+    options via build_food_recommendation()."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    await _show_typing(query)
+    status_msg = await query.message.reply_text("🍽️ Picking something for you...", disable_notification=True)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Picking something for you...")
+    try:
+        recommendation = await build_food_recommendation()
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
+
+    if not recommendation:
+        await query.message.reply_text("❌ Couldn't reach the Mensa menu right now — try again in a bit.")
+        return
+    await query.message.reply_text(f"🍽️ {recommendation}")
 
 
 async def handle_foodpref_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6607,7 +6755,7 @@ VOICE_INTENTS = [
     "check_status", "show_menu", "set_food_preferences", "remove_food_preferences",
     "show_last_file", "list_course_files", "exam_dates_all", "upcoming_dashboard",
     "calendar_today", "calendar_weekly", "set_default_semester", "run_check",
-    "fastenroll_list", "read_daily_plan", "read_weekly_plan", "ask_question", "unclear",
+    "fastenroll_list", "read_daily_plan", "read_weekly_plan", "ask_question", "recommend_meal", "unclear",
 ]
 
 # Friendly button labels for every real (non-"unclear") intent, used both by
@@ -6625,6 +6773,7 @@ INTENT_LABELS = {
     "check_exam_dates": "📚 Show my upcoming exam dates",
     "check_status": "ℹ️ Show bot status",
     "show_menu": "🍽️ Show today's menu",
+    "recommend_meal": "🍽️ Recommend something to eat",
     "set_food_preferences": "🚫 Set food preferences",
     "remove_food_preferences": "✅ Allow a food again",
     "show_last_file": "📄 Show a course's latest file",
@@ -6653,7 +6802,8 @@ Intents, each with example phrasings in both languages:
 - check_grades: "notlarımı göster" / "show me my grades" / "transkriptimi göster"
 - check_exam_dates: "yaklaşan sınavlarım neler" / "what are my upcoming exams" — only MY registered exams
 - check_status: "bot durumunu göster" / "show bot status"
-- show_menu: "bugünün yemek menüsünü göster" / "what's on the menu today" / "yemekhanede ne var"
+- show_menu: "bugünün yemek menüsünü göster" / "what's on the menu today" / "yemekhanede ne var" — wants to see the full menu
+- recommend_meal: "bugün ne yesem" / "what should I eat today" / "recommend me something for lunch" / "yemekhaneden ne önerirsin" — wants ONE dish picked for them, not the full menu
 - set_food_preferences: "domuz eti yemiyorum" / "I don't eat pork" / "mantar ve balık istemiyorum, menüde gösterme"
 - remove_food_preferences: "artık balık yiyorum" / "I eat fish now" / "stop avoiding mushrooms" / "domuz etini tekrar göster" — reverses an earlier set_food_preferences for the named food(s)
 - show_last_file: "Computational Intelligence dersinin son dosyasını göster" / "list the last file of Computational Intelligence" / "show me the latest file for Linear Algebra" — asks for only the single most recently uploaded file of a named course
@@ -7811,6 +7961,15 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
             await message.reply_text(f"❌ Error loading menu: {str(e)[:200]}")
         return
 
+    if intent == "recommend_meal":
+        await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
+        recommendation = await build_food_recommendation()
+        if not recommendation:
+            await message.reply_text("❌ Couldn't reach the Mensa menu right now — try again in a bit.")
+            return
+        await message.reply_text(f"🍽️ {recommendation}")
+        return
+
     if intent == "set_food_preferences":
         extracted = await extract_food_preferences(transcript)
         if not extracted["avoid_codes"] and not extracted["avoid_keywords"]:
@@ -8381,6 +8540,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_calendar_weekly_voice, pattern="^calendar_weekly_voice\\|.*$"))
         app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^menu_nav\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_menu_preferences_button, pattern="^menu_prefs$"))
+        app.add_handler(CallbackQueryHandler(handle_menu_recommend_button, pattern="^menu_recommend$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_remove, pattern="^foodpref_remove\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_ask, pattern="^foodpref_clear_ask$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_confirm, pattern="^foodpref_clear_confirm$"))
