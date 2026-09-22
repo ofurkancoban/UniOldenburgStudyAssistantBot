@@ -296,9 +296,21 @@ app.post('/send', async (req, res) => {
     } catch (err) {
         console.error('Error sending message:', err);
         
-        // Self-healing for Puppeteer evaluation errors (like "r" or Context lost)
+        // Self-healing for Puppeteer evaluation errors (stale page/frame/context
+        // references left over after WhatsApp Web reloads the page internally,
+        // or the underlying Chromium tab/session dies) - a plain retry can't
+        // fix these since the handles themselves are gone, only a full
+        // destroy+reinitialize gets a fresh page.
         const errorString = err && err.message ? err.message : String(err);
-        if (errorString === 'r' || errorString.includes('r: r') || errorString.includes('Evaluation failed') || errorString.includes('Session closed')) {
+        const isBrokenPageError = errorString === 'r'
+            || errorString.includes('r: r')
+            || errorString.includes('Evaluation failed')
+            || errorString.includes('Session closed')
+            || errorString.includes('detached Frame')
+            || errorString.includes('Execution context was destroyed')
+            || errorString.includes('Target closed')
+            || errorString.includes('Protocol error');
+        if (isBrokenPageError) {
             console.log("WhatsApp Web client seems broken. Triggering self-healing restart...");
             reconnectClient(`send failure: ${errorString}`);
             return res.status(500).json({ error: 'WhatsApp client error. Re-initializing automatically. Please try again in 30 seconds.' });
