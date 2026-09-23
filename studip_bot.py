@@ -2616,7 +2616,14 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
                         await session.login(force=True)
                         return course_name, cid, []
 
-                    soup = BeautifulSoup(html_text, "html.parser")
+                    # lxml, not html.parser: this page embeds inline SVG icons with
+                    # XML-style self-closing tags (e.g. <path .../>), which
+                    # html.parser doesn't recognize as self-closing (it only knows
+                    # a fixed list of HTML void elements) - it leaves them "open",
+                    # corrupting the parse tree for everything after, including the
+                    # announcement body's <br> tags further down the page. This
+                    # silently truncated announcement text to just its first line.
+                    soup = BeautifulSoup(html_text, "lxml")
                     ann_container = None
                     for art in soup.select("article.studip"):
                         h = art.select_one("header h1")
@@ -2709,7 +2716,9 @@ async def fetch_message_body(session, message_url):
                 return f"[HTTP Error: {resp.status}]"
             html = await resp.text()
 
-        soup = BeautifulSoup(html, "html.parser")
+        # lxml, not html.parser — see the comment in check_new_announcements_parallel
+        # on the same inline-SVG-icon parse-tree corruption bug.
+        soup = BeautifulSoup(html, "lxml")
 
         # Try different content containers
         content_selectors = [
@@ -3384,7 +3393,9 @@ async def check_new_messages(bot, chat_id, silent: bool = False):
         async with await session.get(url) as resp:
             html_text = await resp.text()
 
-        soup = BeautifulSoup(html_text, "html.parser")
+        # lxml, not html.parser — see the comment in check_new_announcements_parallel
+        # on the same inline-SVG-icon parse-tree corruption bug.
+        soup = BeautifulSoup(html_text, "lxml")
         rows = soup.select("table#messages tbody tr[id^='message_']")
         all_messages = []
         for tr in rows:
@@ -4901,7 +4912,9 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with await global_session.get(msg_url) as resp:
                 html = await resp.text()
 
-            soup = BeautifulSoup(html, "html.parser")
+            # lxml, not html.parser — see the comment in check_new_announcements_parallel
+            # on the same inline-SVG-icon parse-tree corruption bug.
+            soup = BeautifulSoup(html, "lxml")
 
             # Extract information
             subject_tag = soup.select_one("#ui-id-7, .message-subject, h1")
