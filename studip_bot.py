@@ -1448,6 +1448,55 @@ async def _send_menu_dish_photos(sender, dish_names: list, target_date=None):
         logging.warning(f"_send_menu_dish_photos: send failed: {e}")
 
 
+def _format_menu_item_html(item: dict) -> str:
+    """Build the HTML caption/message text for one dish_items entry (see
+    get_todays_menu_enhanced) — name, which Counter/Culinarium it's at,
+    description, allergens, and price, in the compact layout used for
+    both a photo caption (1024-char Telegram limit) and the no-photo
+    text fallback."""
+    star = " ⭐" if item["is_limited"] else ""
+    lines = [f"🍽 <b>{html.escape(item['name'])}</b>{star}", f"📍 {html.escape(item['category'])}"]
+    if item["description"]:
+        lines.append(html.escape(item["description"]))
+    if item["allergens_text"]:
+        lines.append(f"{translate_food_codes(item['allergens_text'])} <i>({html.escape(item['allergens_text'])})</i>")
+    if item["price"]:
+        lines.append(f"💶 {item['price']}")
+    return "\n".join(lines)
+
+
+async def _send_menu_items_individually(sender, dish_items: list, target_date=None):
+    """Send every dish in `dish_items` (see get_todays_menu_enhanced) as
+    its own message — name, Counter/Culinarium location, description,
+    allergens, and price, with a photo attached when one can be matched
+    on the Studierendenwerk's public Speiseplan site (plain text
+    otherwise). This is the detailed, one-message-per-dish alternative to
+    the combined text menu + unlabeled photo album (_send_menu_dish_photos)
+    — meant for the initial menu view, not repeated day-navigation taps,
+    since it's a lot more messages. Best-effort: a photo-fetch failure
+    just means every dish falls back to text, never a hard error."""
+    if not dish_items:
+        return
+    try:
+        candidates = await fetch_dish_photo_candidates(target_date=target_date)
+    except Exception as e:
+        logging.warning(f"_send_menu_items_individually: photo fetch failed: {e}")
+        candidates = []
+
+    for item in dish_items:
+        caption = _format_menu_item_html(item)
+        photo_url = None
+        if candidates and len(item["name"].strip()) >= 4:
+            photo_url = _best_title_match(item["name"], candidates, min_score=0.55)
+        try:
+            if photo_url:
+                await sender.reply_photo(photo=photo_url, caption=caption, parse_mode="HTML")
+            else:
+                await sender.reply_text(caption, parse_mode="HTML")
+        except Exception as e:
+            logging.warning(f"_send_menu_items_individually: send failed for {item['name']!r}: {e}")
+
+
 def _friendly_menu_category_label(category: str) -> str:
     """Human-friendly label for a raw Mensa category name, e.g. "COUNTER
     TWO" -> "Counter 2"; Culinarium categories are already reasonably
@@ -1570,13 +1619,21 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
     against the dish's name/description text.
 
     Returns (menu_text, prev_link, next_link, visible_dish_names,
-    effective_date) — visible_dish_names/effective_date let a caller fetch
-    and attach dish photos (see fetch_dish_photo_candidates /
-    _send_menu_dish_photos) for the same day being displayed. On failure,
-    visible_dish_names is [] and effective_date is None."""
+    effective_date, dish_items, header_text) — visible_dish_names/
+    effective_date let a caller fetch and attach dish photos (see
+    fetch_dish_photo_candidates / _send_menu_dish_photos) for the same day
+    being displayed; dish_items is the same data structured per-dish
+    (name/category/description/allergens_text/price/is_limited,
+    category-priority order) for callers that send each dish as its own
+    message instead (see _send_menu_items_individually) — header_text
+    (just the date/title line, no per-category listing) is meant to pair
+    with that path, so the day isn't described twice. On failure,
+    visible_dish_names/dish_items are [] and effective_date/header_text
+    are None."""
     avoid_codes = set(avoid_codes or [])
     avoid_keywords = [kw.lower() for kw in (avoid_keywords or [])]
     visible_dish_names = []
+    dish_items = []
     hidden_count = 0
     try:
         # If sub_path is a full URL, extract the part after menu/
@@ -1617,13 +1674,13 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
         prev_link = f"2/{effective_ts}/previous"
         next_link = f"2/{effective_ts}/next"
 
-        menu_text = f"🍽️ <b>{html.escape(date_text)}</b> 🍽️\n"
-        menu_text += "🏛️ Mensa Uni Oldenburg\n\n"
+        header_text = f"🍽️ <b>{html.escape(date_text)}</b> 🍽️\n🏛️ Mensa Uni Oldenburg"
+        menu_text = header_text + "\n\n"
 
         # Process all categories
         categories = soup.find_all('table', class_='default')
         if not categories:
-            return "🍽️ <b>Mensa Uni Oldenburg</b>\n\n❌ No dishes found for this date. The Mensa might be closed.", prev_link, next_link, [], None
+            return "🍽️ <b>Mensa Uni Oldenburg</b>\n\n❌ No dishes found for this date. The Mensa might be closed.", prev_link, next_link, [], None, [], None
 
         categories_data = []
         all_allergens_used = set()
@@ -1720,6 +1777,23 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
                         if name_text and not is_hidden:
                             items_found = True
                             visible_dish_names.append(name_text)
+
+                            clean_price = price.replace("&euro;", "€").replace("€", "€").strip().replace('.', ',')
+                            if clean_price and clean_price != "€":
+                                if "€" not in clean_price: clean_price += "€"
+                            else:
+                                clean_price = ""
+
+                            dish_items.append({
+                                "priority": category_priority.get(original_category_name, 100),
+                                "name": name_text,
+                                "category": display_name,
+                                "description": description,
+                                "allergens_text": allergens_text,
+                                "price": clean_price,
+                                "is_limited": '⭐' in name_text or 'limited' in name_text.lower(),
+                            })
+
                             cat_chunk += f"• <b>{html.escape(name_text)}</b>"
                             if '⭐' in name_text or 'limited' in name_text.lower(): cat_chunk += " ⭐"
                             cat_chunk += "\n"
@@ -1727,10 +1801,7 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
                             if allergens_text:
                                 cat_chunk += f"  {translate_food_codes(allergens_text)}\n"
                                 cat_chunk += f"  <i>({html.escape(allergens_text)})</i>\n"
-                            
-                            clean_price = price.replace("&euro;", "€").replace("€", "€").strip().replace('.', ',')
-                            if clean_price and clean_price != "€":
-                                if "€" not in clean_price: clean_price += "€"
+                            if clean_price:
                                 cat_chunk += f"  💶 {clean_price}\n\n"
                             else: cat_chunk += "\n"
 
@@ -1767,11 +1838,12 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
         if hidden_count:
             menu_text += f"\n🚫 {hidden_count} dish(es) hidden based on your food preferences"
 
-        return menu_text, prev_link, next_link, visible_dish_names, datetime.fromtimestamp(effective_ts).date()
+        dish_items.sort(key=lambda d: d["priority"])
+        return menu_text, prev_link, next_link, visible_dish_names, datetime.fromtimestamp(effective_ts).date(), dish_items, header_text
 
     except Exception as e:
         logging.error(f"Enhanced menu fetch error: {e}")
-        return "❌ Menu could not be loaded. Please try again later.", None, None, [], None
+        return "❌ Menu could not be loaded. Please try again later.", None, None, [], None, [], None
 
 
 # ── menu commands ────────────────────────────────────────────────────────────
@@ -1808,17 +1880,21 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Fetch menu, filtered per any saved food preferences
         prefs = load_food_preferences()
-        menu_text, prev, next_, dish_names, menu_date = await get_todays_menu_enhanced(
+        menu_text, prev, next_, dish_names, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
             global_session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
         )
 
-        # Send menu with navigation buttons
+        # When sending each dish as its own message below, a short header is
+        # enough here — the full category-by-category listing would just
+        # repeat what those messages already say. Falls back to the full
+        # menu_text (which also carries the "no dishes"/error copy) when
+        # there's nothing to send individually.
         await update.message.reply_text(
-            menu_text,
+            header_text or menu_text,
             parse_mode="HTML",
             reply_markup=get_menu_navigation_keyboard(prev, next_)
         )
-        await _send_menu_dish_photos(update.message, dish_names, menu_date)
+        await _send_menu_items_individually(update.message, dish_items, menu_date)
 
     except Exception as e:
         error_msg = f"❌ Error loading menu:\n{str(e)}"
@@ -1973,7 +2049,7 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         session = await login_studip()
 
         prefs = load_food_preferences()
-        menu_text, prev, next_, dish_names, menu_date = await get_todays_menu_enhanced(
+        menu_text, prev, next_, dish_names, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
             session, sub_path=sub_path, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
         )
 
@@ -8251,11 +8327,11 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             session = await login_studip()
             prefs = load_food_preferences()
-            menu_text, prev, next_, dish_names, menu_date = await get_todays_menu_enhanced(
+            menu_text, prev, next_, dish_names, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
                 session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
             )
-            await message.reply_text(menu_text, parse_mode="HTML", reply_markup=get_menu_navigation_keyboard(prev, next_))
-            await _send_menu_dish_photos(message, dish_names, menu_date)
+            await message.reply_text(header_text or menu_text, parse_mode="HTML", reply_markup=get_menu_navigation_keyboard(prev, next_))
+            await _send_menu_items_individually(message, dish_items, menu_date)
         except Exception as e:
             logging.error(f"_route_voice_intent: show_menu failed: {e}")
             await message.reply_text(f"❌ Error loading menu: {str(e)[:200]}")
