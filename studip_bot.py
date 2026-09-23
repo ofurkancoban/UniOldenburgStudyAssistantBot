@@ -1465,16 +1465,23 @@ def _format_menu_item_html(item: dict) -> str:
     return "\n".join(lines)
 
 
-async def _send_menu_items_individually(sender, dish_items: list, target_date=None):
+async def _send_menu_items_individually(sender, dish_items: list, target_date=None, skip_unmatched: bool = False):
     """Send every dish in `dish_items` (see get_todays_menu_enhanced) as
     its own message — name, Counter/Culinarium location, description,
     allergens, and price, with a photo attached when one can be matched
-    on the Studierendenwerk's public Speiseplan site (plain text
-    otherwise). This is the detailed, one-message-per-dish alternative to
-    the combined text menu + unlabeled photo album (_send_menu_dish_photos)
-    — meant for the initial menu view, not repeated day-navigation taps,
-    since it's a lot more messages. Best-effort: a photo-fetch failure
-    just means every dish falls back to text, never a hard error."""
+    on the Studierendenwerk's public Speiseplan site.
+
+    skip_unmatched=False (default): a dish with no matched photo still
+    gets sent as a plain text message with the same info — use this when
+    these messages ARE the menu listing (nothing else already showed the
+    text). skip_unmatched=True: dishes with no matched photo are skipped
+    entirely instead — use this when the full text menu was already sent
+    separately, so this call is purely "here are photos for what could be
+    matched", not a second listing.
+
+    Best-effort throughout: a photo-fetch failure just means every dish
+    is treated as unmatched (falls back to text, or is skipped, per
+    skip_unmatched), never a hard error."""
     if not dish_items:
         return
     try:
@@ -1484,10 +1491,12 @@ async def _send_menu_items_individually(sender, dish_items: list, target_date=No
         candidates = []
 
     for item in dish_items:
-        caption = _format_menu_item_html(item)
         photo_url = None
         if candidates and len(item["name"].strip()) >= 4:
             photo_url = _best_title_match(item["name"], candidates, min_score=0.55)
+        if not photo_url and skip_unmatched:
+            continue
+        caption = _format_menu_item_html(item)
         try:
             if photo_url:
                 await sender.reply_photo(photo=photo_url, caption=caption, parse_mode="HTML")
@@ -1884,17 +1893,16 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             global_session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
         )
 
-        # When sending each dish as its own message below, a short header is
-        # enough here — the full category-by-category listing would just
-        # repeat what those messages already say. Falls back to the full
-        # menu_text (which also carries the "no dishes"/error copy) when
-        # there's nothing to send individually.
+        # Full text menu first, same as before, then photos for whatever
+        # could be matched follow as their own labeled messages (name +
+        # Counter/Culinarium already in the caption too, in case one gets
+        # viewed on its own).
         await update.message.reply_text(
-            header_text or menu_text,
+            menu_text,
             parse_mode="HTML",
             reply_markup=get_menu_navigation_keyboard(prev, next_)
         )
-        await _send_menu_items_individually(update.message, dish_items, menu_date)
+        await _send_menu_items_individually(update.message, dish_items, menu_date, skip_unmatched=True)
 
     except Exception as e:
         error_msg = f"❌ Error loading menu:\n{str(e)}"
@@ -8330,8 +8338,8 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
             menu_text, prev, next_, dish_names, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
                 session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
             )
-            await message.reply_text(header_text or menu_text, parse_mode="HTML", reply_markup=get_menu_navigation_keyboard(prev, next_))
-            await _send_menu_items_individually(message, dish_items, menu_date)
+            await message.reply_text(menu_text, parse_mode="HTML", reply_markup=get_menu_navigation_keyboard(prev, next_))
+            await _send_menu_items_individually(message, dish_items, menu_date, skip_unmatched=True)
         except Exception as e:
             logging.error(f"_route_voice_intent: show_menu failed: {e}")
             await message.reply_text(f"❌ Error loading menu: {str(e)[:200]}")
