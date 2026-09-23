@@ -6,7 +6,7 @@ try:
     load_dotenv()
 except ImportError:
     pass
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, InputMediaPhoto
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import pyotp
 import uuid
@@ -1338,15 +1338,20 @@ MENSA_PHOTO_AJAX_URL = "https://sw-oldenburg-spl56.maxmanager.xyz/inc/ajax-php_k
 MENSA_PHOTO_BASE_URL = "https://sw-oldenburg-spl56.maxmanager.xyz/"
 
 
-async def fetch_dish_photo_url(dish_name: str, loc_id: str = "2") -> Optional[str]:
-    """Look up a photo for `dish_name` on the Studierendenwerk Oldenburg's
-    public Speiseplan widget (studierendenwerk-oldenburg.de/.../speiseplan-
-    uhlhornsweg) — a different source than the Stud.IP mensa widget the rest
-    of this bot's menu features scrape, but the same underlying canteen data,
-    so dish names match closely enough for fuzzy matching. loc_id="2" is
+async def fetch_dish_photo_candidates(target_date=None, loc_id: str = "2") -> list:
+    """Fetch every dish photo available for `target_date` (defaults to
+    today) on the Studierendenwerk Oldenburg's public Speiseplan widget
+    (studierendenwerk-oldenburg.de/.../speiseplan-uhlhornsweg) — a
+    different source than the Stud.IP mensa widget the rest of this bot's
+    menu features scrape, but the same underlying canteen data, so dish
+    names match closely enough for fuzzy matching. loc_id="2" is
     Uhlhornsweg, matching fetch_todays_menu_items' default sub_path="2/".
-    Returns an absolute image URL, or None if no photo was found/matched."""
-    today = datetime.now().strftime("%Y-%m-%d")
+    One fetch covers the whole day's menu, so callers matching several
+    dish names against the same day should call this once and reuse the
+    result rather than looking each dish up individually.
+    Returns a list of (title, absolute_image_url) tuples, or [] on any
+    failure (unreachable, no photos for that day, parse error)."""
+    date_str = (target_date or datetime.now().date()).strftime("%Y-%m-%d")
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -1354,18 +1359,18 @@ async def fetch_dish_photo_url(dish_name: str, loc_id: str = "2") -> Optional[st
                 data={
                     "func": "make_spl",
                     "locId": loc_id,
-                    "date": today,
+                    "date": date_str,
                     "lang": "en",
-                    "startThisWeek": today,
-                    "startNextWeek": today,
+                    "startThisWeek": date_str,
+                    "startNextWeek": date_str,
                 },
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 html = await resp.text()
     except Exception as e:
-        logging.warning(f"fetch_dish_photo_url: request failed: {e}")
-        return None
+        logging.warning(f"fetch_dish_photo_candidates: request failed: {e}")
+        return []
 
     try:
         soup = BeautifulSoup(html, "html.parser")
@@ -1381,15 +1386,66 @@ async def fetch_dish_photo_url(dish_name: str, loc_id: str = "2") -> Optional[st
             title = str(title).strip()
             if not title:
                 continue
-            candidates.append((title, img["src"]))
+            candidates.append((title, MENSA_PHOTO_BASE_URL + img["src"].lstrip("/")))
+        return candidates
     except Exception as e:
-        logging.warning(f"fetch_dish_photo_url: parse failed: {e}")
-        return None
+        logging.warning(f"fetch_dish_photo_candidates: parse failed: {e}")
+        return []
 
-    match = _best_title_match(dish_name, candidates, min_score=0.55)
-    if not match:
-        return None
-    return MENSA_PHOTO_BASE_URL + match.lstrip("/")
+
+async def fetch_dish_photo_url(dish_name: str, loc_id: str = "2", target_date=None) -> Optional[str]:
+    """Look up a photo for a single `dish_name` (see
+    fetch_dish_photo_candidates) — convenience wrapper for callers that
+    only need one dish; callers matching several dishes for the same day
+    should call fetch_dish_photo_candidates once and match against it
+    directly instead, to avoid a redundant fetch per dish."""
+    candidates = await fetch_dish_photo_candidates(target_date=target_date, loc_id=loc_id)
+    return _best_title_match(dish_name, candidates, min_score=0.55)
+
+
+async def _send_menu_dish_photos(sender, dish_names: list, target_date=None):
+    """Best-effort: match every name in `dish_names` (see
+    get_todays_menu_enhanced's visible_dish_names) against that day's
+    photos on the Studierendenwerk's public Speiseplan site, and send
+    whatever's found as one or more photo albums (Telegram caps a single
+    album at 10 items, so more than that is split across several).
+    Silently does nothing if no photos are reachable/matched — this is a
+    visual extra on top of the text menu, never something callers should
+    block or error on."""
+    if not dish_names:
+        return
+    try:
+        candidates = await fetch_dish_photo_candidates(target_date=target_date)
+    except Exception as e:
+        logging.warning(f"_send_menu_dish_photos: fetch failed: {e}")
+        return
+    if not candidates:
+        return
+
+    seen_urls = set()
+    photo_urls = []
+    for name in dish_names:
+        # Guard against very short/truncated names (a rare text-menu parsing
+        # artifact, e.g. a mangled half-portion label) fuzzy-matching a
+        # real photo purely by chance.
+        if len(name.strip()) < 4:
+            continue
+        url = _best_title_match(name, candidates, min_score=0.55)
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            photo_urls.append(url)
+    if not photo_urls:
+        return
+
+    try:
+        for i in range(0, len(photo_urls), 10):
+            chunk = photo_urls[i:i + 10]
+            if len(chunk) == 1:
+                await sender.reply_photo(photo=chunk[0])
+            else:
+                await sender.reply_media_group(media=[InputMediaPhoto(u) for u in chunk])
+    except Exception as e:
+        logging.warning(f"_send_menu_dish_photos: send failed: {e}")
 
 
 def _friendly_menu_category_label(category: str) -> str:
@@ -1511,9 +1567,16 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
     load_food_preferences) hide dishes matching the user's stated food
     preferences: avoid_codes against each dish's parsed allergen/ingredient
     codes (exact), avoid_keywords as a case-insensitive substring match
-    against the dish's name/description text."""
+    against the dish's name/description text.
+
+    Returns (menu_text, prev_link, next_link, visible_dish_names,
+    effective_date) — visible_dish_names/effective_date let a caller fetch
+    and attach dish photos (see fetch_dish_photo_candidates /
+    _send_menu_dish_photos) for the same day being displayed. On failure,
+    visible_dish_names is [] and effective_date is None."""
     avoid_codes = set(avoid_codes or [])
     avoid_keywords = [kw.lower() for kw in (avoid_keywords or [])]
+    visible_dish_names = []
     hidden_count = 0
     try:
         # If sub_path is a full URL, extract the part after menu/
@@ -1560,7 +1623,7 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
         # Process all categories
         categories = soup.find_all('table', class_='default')
         if not categories:
-            return "🍽️ <b>Mensa Uni Oldenburg</b>\n\n❌ No dishes found for this date. The Mensa might be closed.", prev_link, next_link
+            return "🍽️ <b>Mensa Uni Oldenburg</b>\n\n❌ No dishes found for this date. The Mensa might be closed.", prev_link, next_link, [], None
 
         categories_data = []
         all_allergens_used = set()
@@ -1656,6 +1719,7 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
 
                         if name_text and not is_hidden:
                             items_found = True
+                            visible_dish_names.append(name_text)
                             cat_chunk += f"• <b>{html.escape(name_text)}</b>"
                             if '⭐' in name_text or 'limited' in name_text.lower(): cat_chunk += " ⭐"
                             cat_chunk += "\n"
@@ -1703,11 +1767,11 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
         if hidden_count:
             menu_text += f"\n🚫 {hidden_count} dish(es) hidden based on your food preferences"
 
-        return menu_text, prev_link, next_link
+        return menu_text, prev_link, next_link, visible_dish_names, datetime.fromtimestamp(effective_ts).date()
 
     except Exception as e:
         logging.error(f"Enhanced menu fetch error: {e}")
-        return "❌ Menu could not be loaded. Please try again later.", None, None
+        return "❌ Menu could not be loaded. Please try again later.", None, None, [], None
 
 
 # ── menu commands ────────────────────────────────────────────────────────────
@@ -1744,7 +1808,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Fetch menu, filtered per any saved food preferences
         prefs = load_food_preferences()
-        menu_text, prev, next_ = await get_todays_menu_enhanced(
+        menu_text, prev, next_, dish_names, menu_date = await get_todays_menu_enhanced(
             global_session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
         )
 
@@ -1754,6 +1818,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=get_menu_navigation_keyboard(prev, next_)
         )
+        await _send_menu_dish_photos(update.message, dish_names, menu_date)
 
     except Exception as e:
         error_msg = f"❌ Error loading menu:\n{str(e)}"
@@ -1908,10 +1973,10 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         session = await login_studip()
 
         prefs = load_food_preferences()
-        menu_text, prev, next_ = await get_todays_menu_enhanced(
+        menu_text, prev, next_, dish_names, menu_date = await get_todays_menu_enhanced(
             session, sub_path=sub_path, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
         )
-        
+
         if should_reply:
             await query.message.reply_text(
                 menu_text,
@@ -1920,10 +1985,11 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
         else:
             await query.edit_message_text(
-                menu_text, 
+                menu_text,
                 parse_mode="HTML",
                 reply_markup=get_menu_navigation_keyboard(prev, next_)
             )
+        await _send_menu_dish_photos(query.message, dish_names, menu_date)
 
     except Exception as e:
         error_str = str(e)
@@ -8185,10 +8251,11 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             session = await login_studip()
             prefs = load_food_preferences()
-            menu_text, prev, next_ = await get_todays_menu_enhanced(
+            menu_text, prev, next_, dish_names, menu_date = await get_todays_menu_enhanced(
                 session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
             )
             await message.reply_text(menu_text, parse_mode="HTML", reply_markup=get_menu_navigation_keyboard(prev, next_))
+            await _send_menu_dish_photos(message, dish_names, menu_date)
         except Exception as e:
             logging.error(f"_route_voice_intent: show_menu failed: {e}")
             await message.reply_text(f"❌ Error loading menu: {str(e)[:200]}")
