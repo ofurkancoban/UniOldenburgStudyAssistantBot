@@ -1403,50 +1403,6 @@ async def fetch_dish_photo_url(dish_name: str, loc_id: str = "2", target_date=No
     return _best_title_match(dish_name, candidates, min_score=0.55)
 
 
-async def _send_menu_dish_photos(sender, dish_names: list, target_date=None):
-    """Best-effort: match every name in `dish_names` (see
-    get_todays_menu_enhanced's visible_dish_names) against that day's
-    photos on the Studierendenwerk's public Speiseplan site, and send
-    whatever's found as one or more photo albums (Telegram caps a single
-    album at 10 items, so more than that is split across several).
-    Silently does nothing if no photos are reachable/matched — this is a
-    visual extra on top of the text menu, never something callers should
-    block or error on."""
-    if not dish_names:
-        return
-    try:
-        candidates = await fetch_dish_photo_candidates(target_date=target_date)
-    except Exception as e:
-        logging.warning(f"_send_menu_dish_photos: fetch failed: {e}")
-        return
-    if not candidates:
-        return
-
-    seen_urls = set()
-    photo_urls = []
-    for name in dish_names:
-        # Guard against very short/truncated names (a rare text-menu parsing
-        # artifact, e.g. a mangled half-portion label) fuzzy-matching a
-        # real photo purely by chance.
-        if len(name.strip()) < 4:
-            continue
-        url = _best_title_match(name, candidates, min_score=0.55)
-        if url and url not in seen_urls:
-            seen_urls.add(url)
-            photo_urls.append(url)
-    if not photo_urls:
-        return
-
-    try:
-        for i in range(0, len(photo_urls), 10):
-            chunk = photo_urls[i:i + 10]
-            if len(chunk) == 1:
-                await sender.reply_photo(photo=chunk[0])
-            else:
-                await sender.reply_media_group(media=[InputMediaPhoto(u) for u in chunk])
-    except Exception as e:
-        logging.warning(f"_send_menu_dish_photos: send failed: {e}")
-
 
 def _format_menu_item_html(item: dict) -> str:
     """Build the HTML caption/message text for one dish_items entry (see
@@ -1627,21 +1583,18 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
     codes (exact), avoid_keywords as a case-insensitive substring match
     against the dish's name/description text.
 
-    Returns (menu_text, prev_link, next_link, visible_dish_names,
-    effective_date, dish_items, header_text) — visible_dish_names/
-    effective_date let a caller fetch and attach dish photos (see
-    fetch_dish_photo_candidates / _send_menu_dish_photos) for the same day
-    being displayed; dish_items is the same data structured per-dish
-    (name/category/description/allergens_text/price/is_limited,
-    category-priority order) for callers that send each dish as its own
-    message instead (see _send_menu_items_individually) — header_text
-    (just the date/title line, no per-category listing) is meant to pair
-    with that path, so the day isn't described twice. On failure,
-    visible_dish_names/dish_items are [] and effective_date/header_text
-    are None."""
+    Returns (menu_text, prev_link, next_link, effective_date, dish_items,
+    header_text) — effective_date lets a caller fetch dish photos for the
+    same day being displayed (see fetch_dish_photo_candidates); dish_items
+    is the menu structured per-dish (name/category/description/
+    allergens_text/price/is_limited, category-priority order) for callers
+    that send each dish as its own message (see
+    _send_menu_items_individually) — header_text (just the date/title
+    line, no per-category listing) is meant to pair with that path, so
+    the day isn't described twice. On failure, dish_items is [] and
+    effective_date/header_text are None."""
     avoid_codes = set(avoid_codes or [])
     avoid_keywords = [kw.lower() for kw in (avoid_keywords or [])]
-    visible_dish_names = []
     dish_items = []
     hidden_count = 0
     try:
@@ -1689,7 +1642,7 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
         # Process all categories
         categories = soup.find_all('table', class_='default')
         if not categories:
-            return "🍽️ <b>Mensa Uni Oldenburg</b>\n\n❌ No dishes found for this date. The Mensa might be closed.", prev_link, next_link, [], None, [], None
+            return "🍽️ <b>Mensa Uni Oldenburg</b>\n\n❌ No dishes found for this date. The Mensa might be closed.", prev_link, next_link, None, [], None
 
         categories_data = []
         all_allergens_used = set()
@@ -1785,7 +1738,6 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
 
                         if name_text and not is_hidden:
                             items_found = True
-                            visible_dish_names.append(name_text)
 
                             clean_price = price.replace("&euro;", "€").replace("€", "€").strip().replace('.', ',')
                             if clean_price and clean_price != "€":
@@ -1848,17 +1800,20 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
             menu_text += f"\n🚫 {hidden_count} dish(es) hidden based on your food preferences"
 
         dish_items.sort(key=lambda d: d["priority"])
-        return menu_text, prev_link, next_link, visible_dish_names, datetime.fromtimestamp(effective_ts).date(), dish_items, header_text
+        return menu_text, prev_link, next_link, datetime.fromtimestamp(effective_ts).date(), dish_items, header_text
 
     except Exception as e:
         logging.error(f"Enhanced menu fetch error: {e}")
-        return "❌ Menu could not be loaded. Please try again later.", None, None, [], None, [], None
+        return "❌ Menu could not be loaded. Please try again later.", None, None, None, [], None
 
 
 # ── menu commands ────────────────────────────────────────────────────────────
 
-def get_menu_navigation_keyboard(prev_path=None, next_path=None):
-    """Create navigation keyboard for Mensa menu"""
+def get_menu_navigation_keyboard(prev_path=None, next_path=None, current_path="2/"):
+    """Create navigation keyboard for Mensa menu. `current_path` is the
+    sub_path of the day currently being shown (matching menu_nav's own
+    path format) — needed so the "📸 Show Dish Photos" button re-fetches
+    photos for the right day rather than always today's."""
     row = []
     if prev_path:
         row.append(InlineKeyboardButton("⬅️ Previous", callback_data=f"menu_nav|{prev_path}"))
@@ -1868,10 +1823,11 @@ def get_menu_navigation_keyboard(prev_path=None, next_path=None):
     if next_path:
         row.append(InlineKeyboardButton("Next ➡️", callback_data=f"menu_nav|{next_path}"))
 
+    photos_row = [InlineKeyboardButton("📸 Show Dish Photos", callback_data=f"menu_photos|{current_path}")]
     prefs_row = [InlineKeyboardButton("⚙️ Food Preferences", callback_data="menu_prefs")]
     recommend_row = [InlineKeyboardButton("🍽️ What should I eat?", callback_data="menu_recommend")]
 
-    return InlineKeyboardMarkup([row, prefs_row, recommend_row])
+    return InlineKeyboardMarkup([row, photos_row, prefs_row, recommend_row])
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1889,20 +1845,17 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Fetch menu, filtered per any saved food preferences
         prefs = load_food_preferences()
-        menu_text, prev, next_, dish_names, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
+        menu_text, prev, next_, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
             global_session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
         )
 
-        # Full text menu first, same as before, then photos for whatever
-        # could be matched follow as their own labeled messages (name +
-        # Counter/Culinarium already in the caption too, in case one gets
-        # viewed on its own).
+        # Dish photos are opt-in via the "📸 Show Dish Photos" button below,
+        # not sent automatically — see handle_menu_photos_button.
         await update.message.reply_text(
             menu_text,
             parse_mode="HTML",
             reply_markup=get_menu_navigation_keyboard(prev, next_)
         )
-        await _send_menu_items_individually(update.message, dish_items, menu_date, skip_unmatched=True)
 
     except Exception as e:
         error_msg = f"❌ Error loading menu:\n{str(e)}"
@@ -1955,6 +1908,36 @@ async def handle_menu_preferences_button(update: Update, context: ContextTypes.D
     context.user_data["pending_step"] = "food_preferences"
     text, keyboard = _food_preferences_management_view()
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_menu_photos_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle menu_photos|<sub_path> callback ("📸 Show Dish Photos") — opt-in
+    photos for the day currently being viewed, re-fetching that day's menu
+    to get dish_items/menu_date (not carried in the button itself) and
+    sending one labeled message per dish that has a matched photo."""
+    query = update.callback_query
+    await query.answer("Loading photos...")
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    parts = query.data.split("|")
+    sub_path = parts[1] if len(parts) > 1 else "2/"
+
+    try:
+        session = await login_studip()
+        prefs = load_food_preferences()
+        _, _, _, menu_date, dish_items, _ = await get_todays_menu_enhanced(
+            session, sub_path=sub_path, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
+        )
+        if not dish_items:
+            await query.message.reply_text("❌ No dishes to show photos for.")
+            return
+        await _send_menu_items_individually(query.message, dish_items, menu_date, skip_unmatched=True)
+    except Exception as e:
+        logging.error(f"handle_menu_photos_button error: {e}")
+        await query.message.reply_text(f"❌ Error loading photos: {str(e)[:200]}")
 
 
 async def handle_menu_recommend_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2057,7 +2040,7 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         session = await login_studip()
 
         prefs = load_food_preferences()
-        menu_text, prev, next_, dish_names, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
+        menu_text, prev, next_, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
             session, sub_path=sub_path, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
         )
 
@@ -2065,15 +2048,14 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_text(
                 menu_text,
                 parse_mode="HTML",
-                reply_markup=get_menu_navigation_keyboard(prev, next_)
+                reply_markup=get_menu_navigation_keyboard(prev, next_, current_path=sub_path)
             )
         else:
             await query.edit_message_text(
                 menu_text,
                 parse_mode="HTML",
-                reply_markup=get_menu_navigation_keyboard(prev, next_)
+                reply_markup=get_menu_navigation_keyboard(prev, next_, current_path=sub_path)
             )
-        await _send_menu_dish_photos(query.message, dish_names, menu_date)
 
     except Exception as e:
         error_str = str(e)
@@ -8348,11 +8330,10 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             session = await login_studip()
             prefs = load_food_preferences()
-            menu_text, prev, next_, dish_names, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
+            menu_text, prev, next_, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
                 session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
             )
             await message.reply_text(menu_text, parse_mode="HTML", reply_markup=get_menu_navigation_keyboard(prev, next_))
-            await _send_menu_items_individually(message, dish_items, menu_date, skip_unmatched=True)
         except Exception as e:
             logging.error(f"_route_voice_intent: show_menu failed: {e}")
             await message.reply_text(f"❌ Error loading menu: {str(e)[:200]}")
@@ -8938,6 +8919,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^menu_nav\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_menu_preferences_button, pattern="^menu_prefs$"))
         app.add_handler(CallbackQueryHandler(handle_menu_recommend_button, pattern="^menu_recommend$"))
+        app.add_handler(CallbackQueryHandler(handle_menu_photos_button, pattern=r"^menu_photos\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_remove, pattern="^foodpref_remove\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_ask, pattern="^foodpref_clear_ask$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_confirm, pattern="^foodpref_clear_confirm$"))
