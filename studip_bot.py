@@ -6371,6 +6371,24 @@ async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAUL
     state = context.user_data.setdefault("task_wizard", {})
 
     if step == "task_text":
+        try:
+            extracted = await extract_task_from_text(text)
+        except Exception as e:
+            logging.warning(f"extract_task_from_text failed: {e}")
+            extracted = None
+
+        if extracted and extracted.get("due_time"):
+            # A date/time was already stated in the same message (e.g.
+            # "yarın rapor teslim et saat 15:00'te") - skip the separate
+            # "when is this due?" question entirely.
+            state["text"] = extracted["text"]
+            state["due_time"] = extracted["due_time"]
+            context.user_data.pop("pending_step", None)
+            await _send_task_course_picker(update.effective_message, context)
+            return True
+
+        # No date found (or extraction unavailable) - fall back to the
+        # original text and the explicit follow-up question, unchanged.
         state["text"] = text
         context.user_data["pending_step"] = "task_time"
         await update.effective_message.reply_text(TASK_ASK_TIME, reply_markup=get_main_keyboard())
@@ -8018,6 +8036,31 @@ async def convert_announcement_to_task(course_name: str, subject: Optional[str],
     today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
     user_text = f"Today is {today_str}.\nCourse: {course_name}\n" + (f"Subject: {subject}\n" if subject else "") + f"\n{body_text}"
     raw = await _call_openrouter(ANNOUNCEMENT_TO_TASK_SYSTEM_PROMPT, user_text)
+    parsed = _extract_json_object(raw)
+    if not parsed or not parsed.get("task_text"):
+        return None
+    return {"text": str(parsed["task_text"])[:200], "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
+
+
+TASK_FROM_TEXT_SYSTEM_PROMPT = """You read a person's own task/to-do request (typed or spoken, Turkish or English) for a university assistant bot's task list, and extract a clean task description plus a due date/time — but only if they actually stated one in the same sentence.
+
+Respond with strict JSON only, no other text: {"task_text": "<short, clean task description, same language as the request, just tidied up — e.g. 'yarın rapor teslim et' -> 'Rapor teslim et', 'add a task submit the report tomorrow' -> 'Submit the report'>", "due_date": "<YYYY-MM-DD>" or null, "due_time": "<HH:MM 24h>" or null}.
+
+due_date/due_time are ONLY set if the person stated an actual date/time themselves (e.g. "tomorrow", "yarın 15:00", "next Friday", "20 Ekim", "in 3 days"); if they only described the task with no date at all, both must be null — never invent one. Resolve relative dates against today's date, given in the prompt."""
+
+
+async def extract_task_from_text(text: str) -> Optional[dict]:
+    """Ask the LLM to clean up a task description and pull out a due
+    date/time if one was actually stated in the same sentence (e.g. "yarın
+    rapor teslim et saat 15:00'te") — lets task creation (voice or typed,
+    see _handle_task_wizard_reply's "task_text" step) skip the separate
+    "when is this due?" question when the date was already given upfront,
+    the same way create_exam_reminder_task already resolves an exam's date
+    in one shot instead of asking a follow-up. Returns {"text", "due_time"}
+    (due_time ISO or None), or None on any failure — callers should fall
+    back to the existing explicit ask-for-time step in that case."""
+    today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
+    raw = await _call_openrouter(TASK_FROM_TEXT_SYSTEM_PROMPT, f"Today is {today_str}.\n\n{text}")
     parsed = _extract_json_object(raw)
     if not parsed or not parsed.get("task_text"):
         return None

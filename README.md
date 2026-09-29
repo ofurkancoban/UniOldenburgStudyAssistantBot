@@ -77,7 +77,7 @@ Manage your own Stud.IP course enrolments (Veranstaltungsanmeldung) directly fro
 
 ### ✅ Personal Tasks & Reminders
 A lightweight to-do list that lives inside the bot:
-*   Add a plain **to-do** or a **timed reminder** in free text — `tomorrow 15:00`, `in 2 hours`, `20.09 09:00`.
+*   Add a plain **to-do** or a **timed reminder** in free text. If the date/time is already in the same message (typed or spoken — e.g. "yarın rapor teslim et saat 15:00", "submit the report by next Friday"), a free OpenRouter LLM picks it up in one shot and skips the follow-up question entirely; otherwise you're asked "when is this due?" with the plain formats — `tomorrow 15:00`, `in 2 hours`, `20.09 09:00`.
 *   **📘 Course tagging**: after setting the text and time, optionally tag the task to one of your currently-enrolled Stud.IP courses — shown in the task list as `[Course Name]`.
 *   **📘 By Course**: pick a course to see its tagged tasks and upcoming StuMS exam dates together in one view.
 *   Manage everything from **"📋 My Tasks"**: mark done, delete, or cancel a pending reminder.
