@@ -76,6 +76,7 @@ global_announcement_watcher = None
 link_cache = {}  # short_id -> { url, cid, name?, action?, user_id?, current_url?, ts }
 exam_action_cache = {}  # short_id -> { unit_id, action_type ("anmelden"|"abmelden"), title, ts }
 task_suggestion_cache = {}  # short_id -> { text, due_time (ISO or None), course }
+announcement_task_cache = {}  # short_id -> { course, subject, body } — raw announcement, converted to a task on demand when "📝 Add as Task" is tapped
 nav_stack = {}  # user_id -> [url1, url2, ...]
 nav_names = {}  # user_id -> [name1, name2, ...]  (for breadcrumb)
 user_courses = {}  # user_id -> cid
@@ -2669,16 +2670,12 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
                     f"{ann['body']}\n"
                     "━━━━━━━━━━━━━━━━━"
                 )
-                buttons = [[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]]
-                try:
-                    suggestion = await extract_task_suggestion(ann['course'], ann['subject'], ann['body'])
-                except Exception as e:
-                    logging.warning(f"Task suggestion extraction failed for announcement: {e}")
-                    suggestion = None
-                if suggestion:
-                    sid = _short_id()
-                    task_suggestion_cache[sid] = {**suggestion, "course": ann['course']}
-                    buttons.append([InlineKeyboardButton(f"📝 Add as task: {suggestion['text'][:40]}", callback_data=f"tasksug_add|{sid}")])
+                sid = _short_id()
+                announcement_task_cache[sid] = {"course": ann['course'], "subject": ann['subject'], "body": ann['body']}
+                buttons = [
+                    [InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")],
+                    [InlineKeyboardButton("📝 Add as Task", callback_data=f"ann_to_task|{sid}")],
+                ]
                 markup = InlineKeyboardMarkup(buttons)
                 await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup)
         elif not silent:
@@ -6465,12 +6462,36 @@ async def handle_task_course_pick(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(f"✅ Task added: {task['text']}{course_line}")
 
 
+def _save_task_and_confirmation_text(user_id: int, text: str, due_time: Optional[str], course: Optional[str]) -> str:
+    """Save a task built from an AI extraction/conversion (announcement or
+    forum suggestion) and return the confirmation line to show the user.
+    Shared by handle_task_suggestion_add and handle_announcement_to_task."""
+    task = {
+        "id": str(uuid.uuid4())[:8],
+        "user_id": user_id,
+        "text": text,
+        "due_time": due_time,
+        "course": course,
+        "created_at": datetime.now(TZ_BERLIN).isoformat(),
+        "notified": False,
+    }
+    tasks = load_tasks()
+    tasks.append(task)
+    save_tasks(tasks)
+
+    course_line = f" [{course}]" if course else ""
+    if due_time:
+        due_dt = datetime.fromisoformat(due_time)
+        return f"✅ Reminder set: {due_dt.strftime('%d.%m.%Y %H:%M')} — {text}{course_line}"
+    return f"✅ Task added: {text}{course_line}"
+
+
 async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle tasksug_add|<sid> — save the task the "📝 Add as task?" button
-    on a new announcement/forum notification suggested (see
-    extract_task_suggestion / task_suggestion_cache). The course is already
-    known from the source announcement/post, so this saves directly with no
-    course-picker step, unlike the ➕ Add Task wizard."""
+    on a new forum notification suggested (see extract_task_suggestion /
+    task_suggestion_cache). The course is already known from the source
+    post, so this saves directly with no course-picker step, unlike the
+    ➕ Add Task wizard."""
     query = update.callback_query
     await query.answer()
 
@@ -6484,28 +6505,49 @@ async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAU
         await query.answer("This suggestion has expired.", show_alert=True)
         return
 
-    task = {
-        "id": str(uuid.uuid4())[:8],
-        "user_id": user_id,
-        "text": info["text"],
-        "due_time": info.get("due_time"),
-        "course": info.get("course"),
-        "created_at": datetime.now(TZ_BERLIN).isoformat(),
-        "notified": False,
-    }
-    tasks = load_tasks()
-    tasks.append(task)
-    save_tasks(tasks)
-
-    course_line = f" [{task['course']}]" if task["course"] else ""
-    if task["due_time"]:
-        due_dt = datetime.fromisoformat(task["due_time"])
-        confirmation = f"✅ Reminder set: {due_dt.strftime('%d.%m.%Y %H:%M')} — {task['text']}{course_line}"
-    else:
-        confirmation = f"✅ Task added: {task['text']}{course_line}"
-
+    confirmation = _save_task_and_confirmation_text(user_id, info["text"], info.get("due_time"), info.get("course"))
     try:
         await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.message.reply_text(confirmation)
+
+
+async def handle_announcement_to_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle ann_to_task|<sid> — the always-present "📝 Add as Task" button
+    on announcement notifications. Unlike the forum suggestion button (pre-
+    computed, only shown when a deadline was already detected), this button
+    is always there and the LLM conversion (convert_announcement_to_task)
+    runs on tap, since it's only worth the call when the student actually
+    wants it."""
+    query = update.callback_query
+    await query.answer("Converting to task...")
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    sid = query.data.split("|", 1)[1]
+    info = announcement_task_cache.pop(sid, None)
+    if not info:
+        await query.answer("This announcement has expired.", show_alert=True)
+        return
+
+    try:
+        result = await convert_announcement_to_task(info["course"], info.get("subject"), info["body"])
+    except Exception as e:
+        logging.warning(f"convert_announcement_to_task failed: {e}")
+        result = None
+
+    if not result:
+        await query.message.reply_text("⚠️ Couldn't convert this to a task right now — try again in a bit, or add it manually via ➕ Add Task.")
+        return
+
+    confirmation = _save_task_and_confirmation_text(user_id, result["text"], result.get("due_time"), info["course"])
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+        )
     except Exception:
         pass
     await query.message.reply_text(confirmation)
@@ -7928,31 +7970,58 @@ Respond with strict JSON only, no other text: {"has_task": true/false, "task_tex
 If has_task is false, every other field must be null. If a date is mentioned but no specific time, leave due_time null. Resolve relative dates ("by Friday", "next Monday", "in two weeks") against today's date, which you're given in the prompt."""
 
 
+def _resolve_task_due_time(due_date: Optional[str], due_time_str: Optional[str]) -> Optional[str]:
+    """Combine a YYYY-MM-DD date and optional HH:MM time (from an LLM
+    task-extraction JSON response) into an ISO due_time string, defaulting
+    to 09:00 if a date was given with no specific time. Returns None if
+    due_date is missing or unparseable."""
+    if not due_date:
+        return None
+    try:
+        time_part = due_time_str or "09:00"
+        due_dt = datetime.strptime(f"{due_date} {time_part}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ_BERLIN)
+        return due_dt.isoformat()
+    except ValueError:
+        return None
+
+
 async def extract_task_suggestion(course_name: str, thread_title: Optional[str], body_text: str) -> Optional[dict]:
     """Ask the LLM whether an announcement/forum post body mentions an
     actionable deadline/task, for the "📝 Add as task?" suggestion button
-    on new announcement/forum notifications. Returns {"text", "due_time"}
-    (due_time is an ISO string or None) on a detected task, or None if no
-    task was found or the call/parse failed — callers should just skip
-    the suggestion button in that case, never treat it as an error."""
+    on new forum notifications. Returns {"text", "due_time"} (due_time is
+    an ISO string or None) on a detected task, or None if no task was
+    found or the call/parse failed — callers should just skip the
+    suggestion button in that case, never treat it as an error."""
     today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
     user_text = f"Today is {today_str}.\nCourse: {course_name}\n" + (f"Thread: {thread_title}\n" if thread_title else "") + f"\n{body_text}"
     raw = await _call_openrouter(TASK_SUGGESTION_SYSTEM_PROMPT, user_text)
     parsed = _extract_json_object(raw)
     if not parsed or not parsed.get("has_task") or not parsed.get("task_text"):
         return None
+    return {"text": str(parsed["task_text"])[:200], "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
 
-    due_time = None
-    due_date = parsed.get("due_date")
-    if due_date:
-        try:
-            time_part = parsed.get("due_time") or "09:00"
-            due_dt = datetime.strptime(f"{due_date} {time_part}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ_BERLIN)
-            due_time = due_dt.isoformat()
-        except ValueError:
-            due_time = None
 
-    return {"text": str(parsed["task_text"])[:200], "due_time": due_time}
+ANNOUNCEMENT_TO_TASK_SYSTEM_PROMPT = """You convert a university course announcement into a short, actionable personal to-do for the student reading it — rephrase it in task language ("Review ...", "Submit ...", "Prepare ...", "Read ...", "Bring ...") rather than restating the announcement. Always produce a task_text, even for a purely informational announcement with no deadline (e.g. "Review posted lecture slides for <course>") — this button is tapped deliberately by the student, so there's always something reasonable to turn it into.
+
+If the announcement clearly mentions a concrete date/deadline (a submission date, an exam date, a specific day something is due), extract it; otherwise leave due_date/due_time null — not every announcement has one, and that's fine, it just becomes a plain to-do with no reminder time.
+
+Respond with strict JSON only, no other text: {"task_text": "<short actionable task>", "due_date": "<YYYY-MM-DD>" or null, "due_time": "<HH:MM 24h>" or null}. Resolve relative dates ("by Friday", "next Monday") against today's date, which you're given in the prompt."""
+
+
+async def convert_announcement_to_task(course_name: str, subject: Optional[str], body_text: str) -> Optional[dict]:
+    """Ask the LLM to rephrase an announcement as a task, for the always-
+    present "📝 Add as Task" button on announcement notifications (unlike
+    extract_task_suggestion, this doesn't gate on whether a deadline was
+    found — it's only called when the student deliberately taps the
+    button, so it always tries to produce something). Returns
+    {"text", "due_time"}, or None if the call/parse failed."""
+    today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
+    user_text = f"Today is {today_str}.\nCourse: {course_name}\n" + (f"Subject: {subject}\n" if subject else "") + f"\n{body_text}"
+    raw = await _call_openrouter(ANNOUNCEMENT_TO_TASK_SYSTEM_PROMPT, user_text)
+    parsed = _extract_json_object(raw)
+    if not parsed or not parsed.get("task_text"):
+        return None
+    return {"text": str(parsed["task_text"])[:200], "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
 
 
 EXAM_REMINDER_TASK_SYSTEM_PROMPT = """You extract the details of an exam reminder request (spoken in Turkish or English) for a university assistant bot. The user wants a task/reminder created some amount of time before a named exam.
@@ -9046,6 +9115,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_voice_clarify, pattern="^voice_clarify\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_task_course_pick, pattern="^(task_course\\|.*|task_course_skip)$"))
         app.add_handler(CallbackQueryHandler(handle_task_suggestion_add, pattern=r"^tasksug_add\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_announcement_to_task, pattern=r"^ann_to_task\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_view, pattern="^course_view\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_browse_courses, pattern="^browse_courses$"))
         app.add_handler(CallbackQueryHandler(handle_course_noop, pattern="^course_noop$"))
