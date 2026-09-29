@@ -98,12 +98,18 @@ let isReconnecting = false;
 const announcedGroupIds = new Set();
 const discoveredGroups = new Map(); // groupId -> { name, lastSeen }
 
+// Tracks whether a "🔴 disconnected" alert is currently outstanding, so the
+// matching "🟢 reconnected" only fires after a real outage (not on the very
+// first startup) and repeated disconnect events while already down don't
+// spam a fresh alert each time.
+let disconnectAlertPending = false;
+
 client.on('qr', (qr) => {
     lastQrCode = qr;
     // Generate and scan this code with your phone
     console.log('QR Code received, scan please:');
     qrcodeTerminal.generate(qr, { small: true });
-    
+
     // Also send to Telegram
     sendQRToTelegram(qr);
 });
@@ -113,6 +119,10 @@ client.on('ready', () => {
     isAuthenticated = true;
     isReconnecting = false;
     lastQrCode = null;
+    if (disconnectAlertPending) {
+        disconnectAlertPending = false;
+        sendTextToTelegram('🟢 WhatsApp reconnected — forwarding is back up.');
+    }
 });
 
 // Destroys and re-initializes the client. Guarded against overlapping calls so a
@@ -154,11 +164,21 @@ async function reconnectClient(reason, { forceLogout = false } = {}) {
     } catch (err) {
         console.error('Error re-initializing client:', err);
         isReconnecting = false;
+        sendTextToTelegram(`🔴 WhatsApp reconnect attempt failed (${reason}): ${err && err.message ? err.message : String(err)}\n\nWon't retry automatically until another trigger (a send attempt, or tap "📲 Request WA QR" in /status).`);
     }
 }
 
 client.on('disconnected', (reason) => {
     console.log('WhatsApp client disconnected:', reason);
+    // Proactive alert instead of only showing up passively in /status - an
+    // outage could otherwise go unnoticed for hours. Only the first event
+    // of an outage alerts (see disconnectAlertPending); reconnectClient's
+    // own isReconnecting guard already prevents duplicate reconnect
+    // attempts if 'disconnected' fires more than once while already down.
+    if (!disconnectAlertPending) {
+        disconnectAlertPending = true;
+        sendTextToTelegram(`🔴 WhatsApp disconnected (${reason}) — attempting to reconnect automatically. Forwarding won't work until this recovers.`);
+    }
     reconnectClient(`disconnected: ${reason}`);
 });
 
