@@ -223,6 +223,14 @@ async function findGroupByName(name) {
 // seen via the message_create log and forgets them on every restart),
 // this asks WhatsApp Web itself, so it works even for a group the service
 // has never logged a message from in its current run.
+//
+// Deliberately NOT client.getChatById() - that calls whatsapp-web.js's
+// getChatModel() internally, which throws a generic, unhelpful "r" error
+// on the WhatsApp Web version this was tested against (something inside
+// its model-building code doesn't match what the live app now returns).
+// sendMessage() sidesteps this same trap by fetching the chat with
+// getAsModel: false; this does the same, going straight at the raw chat
+// collection instead of the broken model-building wrapper.
 app.get('/group_name', async (req, res) => {
     if (!isAuthenticated) {
         return res.status(503).json({ error: 'WhatsApp client is not ready yet.' });
@@ -232,11 +240,15 @@ app.get('/group_name', async (req, res) => {
         return res.status(400).json({ error: 'Missing groupId query param' });
     }
     try {
-        const chat = await client.getChatById(groupId);
-        if (!chat) {
+        const name = await client.pupPage.evaluate(async (id) => {
+            const chatWid = window.require('WAWebWidFactory').createWid(id);
+            const chat = window.require('WAWebCollections').Chat.get(chatWid);
+            return chat ? (chat.name || chat.formattedTitle || null) : null;
+        }, groupId);
+        if (!name) {
             return res.status(404).json({ error: 'Group not found' });
         }
-        res.json({ name: chat.name || null });
+        res.json({ name });
     } catch (err) {
         console.error('Error resolving group name:', err);
         res.status(500).json({ error: `Internal server error: ${err && err.message ? err.message : String(err)}` });
