@@ -8697,9 +8697,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wa_group_id = os.getenv("WA_GROUP_ID", "").strip()
 
     # Check WA Connection Status, and resolve the active group's display
-    # name from the microservice's discovered-groups log (the group is
-    # always set by exact ID via "🔍 Detect WA Groups" now — this is just
-    # a friendlier label for it here).
+    # name (the group is always set by exact ID via "🔍 Detect WA Groups"
+    # now — this is just a friendlier label for it here). Tries /group_name
+    # first (asks WhatsApp directly by ID via getChatById, so it works even
+    # right after a service restart), falling back to the discovered-groups
+    # log (names seen via message_create) if that's unreachable.
     wa_status = "🔴 Offline / Not Connected"
     wa_group_label = "⚠️ Not set — use 📱 WhatsApp → 🔍 Detect WA Groups" if not wa_group_id else wa_group_id
     try:
@@ -8710,13 +8712,24 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     data = await resp.json()
                     wa_status = "🟢 Connected" if data.get("isAuthenticated") else "🟡 Waiting for QR Scan"
             if wa_group_id:
-                async with session.get("http://localhost:3838/discovered_groups", timeout=2) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        for g in data.get("groups", []):
-                            if g.get("groupId") == wa_group_id and g.get("name"):
-                                wa_group_label = g["name"]
-                                break
+                resolved = False
+                try:
+                    async with session.get("http://localhost:3838/group_name", params={"groupId": wa_group_id}, timeout=3) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if data.get("name"):
+                                wa_group_label = data["name"]
+                                resolved = True
+                except Exception:
+                    pass
+                if not resolved:
+                    async with session.get("http://localhost:3838/discovered_groups", timeout=2) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            for g in data.get("groups", []):
+                                if g.get("groupId") == wa_group_id and g.get("name"):
+                                    wa_group_label = g["name"]
+                                    break
     except Exception:
         pass
 

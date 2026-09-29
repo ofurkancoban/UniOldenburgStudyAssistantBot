@@ -218,6 +218,31 @@ async function findGroupByName(name) {
     return groups.find(group => group.name === name);
 }
 
+// API endpoint to resolve a group's current display name directly from
+// WhatsApp by its ID - unlike /discovered_groups (which only knows names
+// seen via the message_create log and forgets them on every restart),
+// this asks WhatsApp Web itself, so it works even for a group the service
+// has never logged a message from in its current run.
+app.get('/group_name', async (req, res) => {
+    if (!isAuthenticated) {
+        return res.status(503).json({ error: 'WhatsApp client is not ready yet.' });
+    }
+    const groupId = req.query.groupId;
+    if (!groupId) {
+        return res.status(400).json({ error: 'Missing groupId query param' });
+    }
+    try {
+        const chat = await client.getChatById(groupId);
+        if (!chat) {
+            return res.status(404).json({ error: 'Group not found' });
+        }
+        res.json({ name: chat.name || null });
+    } catch (err) {
+        console.error('Error resolving group name:', err);
+        res.status(500).json({ error: `Internal server error: ${err && err.message ? err.message : String(err)}` });
+    }
+});
+
 // Log incoming AND outgoing messages so the user can easily discover Group IDs
 // message_create fires even when you send a message from your own phone!
 client.on('message_create', async msg => {
