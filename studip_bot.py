@@ -3226,22 +3226,25 @@ async def send_morning_summary(bot, user_ids):
     if food and food.get("dish") and food.get("category"):
         food_text = f"\n\n🍽️ <b>Lunch pick:</b> {food['dish']} ({_friendly_menu_category_label(food['category'])})"
 
-    # 2d. Countdown to the next registered exam — lives inside this same
-    # pinned message (see the pin/unpin block below) so it updates once a
-    # day along with everything else, rather than needing its own separate
-    # edit schedule.
+    # 2d. Countdown to every still-upcoming registered exam, not just the
+    # nearest one — lives inside this same pinned message (see the
+    # pin/unpin block below) so it updates once a day along with
+    # everything else, rather than needing its own separate edit schedule.
     countdown_text = ""
     try:
-        exam_title, exam_dt = await _next_upcoming_exam(session)
-        if exam_title and exam_dt:
-            days_left = (exam_dt.date() - today_date).days
-            if days_left <= 0:
-                day_label = "today"
-            elif days_left == 1:
-                day_label = "tomorrow"
-            else:
-                day_label = f"in {days_left} days"
-            countdown_text = f"\n\n⏳ <b>{html.escape(exam_title)}</b> {day_label} ({exam_dt:%d.%m.%Y})"
+        exams = await _upcoming_exams(session)
+        if exams:
+            lines = ["⏳ <b>Upcoming Exams</b>"]
+            for exam_title, exam_dt in exams:
+                days_left = (exam_dt.date() - today_date).days
+                if days_left <= 0:
+                    day_label = "today"
+                elif days_left == 1:
+                    day_label = "tomorrow"
+                else:
+                    day_label = f"in {days_left} days"
+                lines.append(f"• <b>{html.escape(exam_title)}</b> {day_label} ({exam_dt:%d.%m.%Y})")
+            countdown_text = "\n\n" + "\n".join(lines)
     except Exception as e:
         logging.error(f"Summary exam countdown error: {e}")
 
@@ -8206,18 +8209,19 @@ async def extract_exam_reminder_task(transcript: str) -> dict:
     }
 
 
-async def _next_upcoming_exam(session):
-    """Return (title, exam_datetime) for the soonest still-upcoming exam
+async def _upcoming_exams(session):
+    """Return [(title, exam_datetime), ...] for every still-upcoming exam
     among the student's own registered exams (get_registered_exam_schedule
     — deliberately not the full curriculum's exam dates, since a countdown
-    should reflect what the student is actually sitting), or (None, None)
-    if there isn't one / the fetch failed. Used for the morning summary's
-    "⏳ N days until <exam>" countdown line."""
+    should reflect what the student is actually sitting), sorted
+    soonest-first. [] if there are none / the fetch failed. Used for the
+    morning summary's "⏳ N days until <exam>" countdown lines (one per
+    upcoming exam, not just the nearest)."""
     try:
         registered = await get_registered_exam_schedule(session)
     except Exception as e:
-        logging.warning(f"_next_upcoming_exam: fetch failed: {e}")
-        return None, None
+        logging.warning(f"_upcoming_exams: fetch failed: {e}")
+        return []
 
     now = datetime.now()
     upcoming = []
@@ -8231,10 +8235,8 @@ async def _next_upcoming_exam(session):
         if dt >= now:
             upcoming.append((e["title"], dt))
 
-    if not upcoming:
-        return None, None
     upcoming.sort(key=lambda x: x[1])
-    return upcoming[0]
+    return upcoming
 
 
 async def _find_exam_datetime(session, query_text: Optional[str]):
