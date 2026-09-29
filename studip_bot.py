@@ -77,6 +77,7 @@ link_cache = {}  # short_id -> { url, cid, name?, action?, user_id?, current_url
 exam_action_cache = {}  # short_id -> { unit_id, action_type ("anmelden"|"abmelden"), title, ts }
 task_suggestion_cache = {}  # short_id -> { text, due_time (ISO or None), course }
 announcement_task_cache = {}  # short_id -> { course, subject, body } — raw announcement, converted to a task on demand when "📝 Add as Task" is tapped
+task_reminder_cache = {}  # task_id -> full task dict — a fired reminder, kept around so its Done/Snooze buttons still work after the task's removed from tasks_cache.json
 nav_stack = {}  # user_id -> [url1, url2, ...]
 nav_names = {}  # user_id -> [name1, name2, ...]  (for breadcrumb)
 user_courses = {}  # user_id -> cid
@@ -3225,6 +3226,25 @@ async def send_morning_summary(bot, user_ids):
     if food and food.get("dish") and food.get("category"):
         food_text = f"\n\n🍽️ <b>Lunch pick:</b> {food['dish']} ({_friendly_menu_category_label(food['category'])})"
 
+    # 2d. Countdown to the next registered exam — lives inside this same
+    # pinned message (see the pin/unpin block below) so it updates once a
+    # day along with everything else, rather than needing its own separate
+    # edit schedule.
+    countdown_text = ""
+    try:
+        exam_title, exam_dt = await _next_upcoming_exam(session)
+        if exam_title and exam_dt:
+            days_left = (exam_dt.date() - today_date).days
+            if days_left <= 0:
+                day_label = "today"
+            elif days_left == 1:
+                day_label = "tomorrow"
+            else:
+                day_label = f"in {days_left} days"
+            countdown_text = f"\n\n⏳ <b>{html.escape(exam_title)}</b> {day_label} ({exam_dt:%d.%m.%Y})"
+    except Exception as e:
+        logging.error(f"Summary exam countdown error: {e}")
+
     # 3. Final Message
     header = (
         "☀️ <b>GOOD MORNING!</b> ☀️\n"
@@ -3232,7 +3252,7 @@ async def send_morning_summary(bot, user_ids):
         "━━━━━━━━━━━━━━━━━━\n\n"
     )
 
-    final_text = f"{header}{schedule_text}{weather_text}{tasks_text}{food_text}\n\n━━━━━━━━━━━━━━━━━━"
+    final_text = f"{header}{schedule_text}{weather_text}{tasks_text}{food_text}{countdown_text}\n\n━━━━━━━━━━━━━━━━━━"
 
     # 4. Keyboard for Mensa Menu
     keyboard = InlineKeyboardMarkup([
@@ -7164,9 +7184,15 @@ async def handle_change_semester(update: Update, context: ContextTypes.DEFAULT_T
     await _show_semester_picker(query, callback_prefix, prompt)
 
 
+TASK_SNOOZE_OPTIONS = [("15m", "⏰ +15 min"), ("1h", "⏰ +1 hour"), ("1d", "⏰ Tomorrow")]
+
+
 async def check_task_reminders(bot):
     """Send any reminder-tasks whose due time has passed, then drop them (one-shot).
-    Plain to-dos (no due_time) are left untouched until the user marks them done."""
+    Plain to-dos (no due_time) are left untouched until the user marks them done.
+    The fired task is kept in task_reminder_cache (keyed by its own id, which
+    is unique) so the reminder message's "✔️ Done" / snooze buttons can still
+    act on it after it's already been removed from tasks_cache.json."""
     tasks = load_tasks()
     now = datetime.now(TZ_BERLIN)
     remaining = []
@@ -7177,8 +7203,13 @@ async def check_task_reminders(bot):
         if due:
             due_dt = datetime.fromisoformat(due)
             if due_dt <= now:
+                task_reminder_cache[task["id"]] = task
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✔️ Done", callback_data=f"task_reminder_done|{task['id']}")],
+                    [InlineKeyboardButton(label, callback_data=f"task_reminder_snooze|{task['id']}|{code}") for code, label in TASK_SNOOZE_OPTIONS],
+                ])
                 try:
-                    await bot.send_message(chat_id=task["user_id"], text=f"⏰ <b>Reminder:</b> {task['text']}", parse_mode="HTML")
+                    await bot.send_message(chat_id=task["user_id"], text=f"⏰ <b>Reminder:</b> {task['text']}", parse_mode="HTML", reply_markup=keyboard)
                 except Exception as e:
                     logging.error(f"Failed to send task reminder {task['id']}: {e}")
                 changed = True
@@ -7187,6 +7218,47 @@ async def check_task_reminders(bot):
 
     if changed:
         save_tasks(remaining)
+
+
+def _snooze_offset(code: str) -> timedelta:
+    return {"15m": timedelta(minutes=15), "1h": timedelta(hours=1), "1d": timedelta(days=1)}[code]
+
+
+async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle task_reminder_done|<id> and task_reminder_snooze|<id>|<code>
+    — the buttons on a fired reminder (see check_task_reminders /
+    task_reminder_cache). Snoozing re-saves the task with a new due_time;
+    "Done" just acknowledges, since the task is already gone from the list."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    parts = query.data.split("|")
+    action, task_id = parts[0], parts[1]
+    task = task_reminder_cache.pop(task_id, None)
+    if not task:
+        await query.answer("This reminder has expired.", show_alert=True)
+        return
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if action == "task_reminder_done":
+        await query.message.reply_text(f"✔️ Done: {task['text']}")
+        return
+
+    code = parts[2]
+    new_due = datetime.now(TZ_BERLIN) + _snooze_offset(code)
+    task["due_time"] = new_due.isoformat()
+    tasks = load_tasks()
+    tasks.append(task)
+    save_tasks(tasks)
+    await query.message.reply_text(f"⏰ Snoozed — reminding you again at {new_due.strftime('%d.%m.%Y %H:%M')}: {task['text']}")
 
 
 # ── Voice-to-task (free-tier speech-to-text, no API key needed) ────────────────
@@ -8132,6 +8204,37 @@ async def extract_exam_reminder_task(transcript: str) -> dict:
         "offset_value": offset_value,
         "offset_unit": offset_unit,
     }
+
+
+async def _next_upcoming_exam(session):
+    """Return (title, exam_datetime) for the soonest still-upcoming exam
+    among the student's own registered exams (get_registered_exam_schedule
+    — deliberately not the full curriculum's exam dates, since a countdown
+    should reflect what the student is actually sitting), or (None, None)
+    if there isn't one / the fetch failed. Used for the morning summary's
+    "⏳ N days until <exam>" countdown line."""
+    try:
+        registered = await get_registered_exam_schedule(session)
+    except Exception as e:
+        logging.warning(f"_next_upcoming_exam: fetch failed: {e}")
+        return None, None
+
+    now = datetime.now()
+    upcoming = []
+    for e in registered:
+        if not e.get("date"):
+            continue
+        if e.get("start_datetime"):
+            dt = datetime.fromisoformat(e["start_datetime"])
+        else:
+            dt = datetime.fromisoformat(e["date"]).replace(hour=9, minute=0)
+        if dt >= now:
+            upcoming.append((e["title"], dt))
+
+    if not upcoming:
+        return None, None
+    upcoming.sort(key=lambda x: x[1])
+    return upcoming[0]
 
 
 async def _find_exam_datetime(session, query_text: Optional[str]):
@@ -9187,6 +9290,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_task_course_pick, pattern="^(task_course\\|.*|task_course_skip)$"))
         app.add_handler(CallbackQueryHandler(handle_task_suggestion_add, pattern=r"^tasksug_add\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_announcement_to_task, pattern=r"^ann_to_task\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_task_reminder_action, pattern=r"^(task_reminder_done|task_reminder_snooze)\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_view, pattern="^course_view\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_browse_courses, pattern="^browse_courses$"))
         app.add_handler(CallbackQueryHandler(handle_course_noop, pattern="^course_noop$"))
