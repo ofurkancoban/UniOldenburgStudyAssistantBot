@@ -3454,6 +3454,15 @@ async def check_new_messages(bot, chat_id, silent: bool = False):
 
 # ── forum checking ─────────────────────────────────────────────────────────────
 
+def _truncate_with_ellipsis(text: str, limit: int) -> str:
+    """Cut `text` to at most `limit` characters, appending "…" only when it
+    actually got cut — plain slicing with no marker looks indistinguishable
+    from a parsing bug (text just stopping mid-sentence)."""
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "…"
+
+
 async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
     """Parallel forum checking for new posts browser-less"""
     global global_session, courses_map
@@ -3542,7 +3551,7 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
                             p_author_id = post.get("relationships", {}).get("author", {}).get("data", {}).get("id")
                             p_author = get_author_name(p_author_id)
                             p_html = post.get("attributes", {}).get("content-html", "")
-                            p_body = BeautifulSoup(p_html, "html.parser").get_text(separator=' ', strip=True)[:400] if p_html else "No content"
+                            p_body = _truncate_with_ellipsis(BeautifulSoup(p_html, "html.parser").get_text(separator=' ', strip=True), 400) if p_html else "No content"
                             p_date = friendly_date(post.get("attributes", {}).get("mkdate", ""))
                             history_bodies.append(f"👤 <b>{html.escape(p_author)}</b> <i>({p_date})</i>:\n{html.escape(p_body)}")
                             
@@ -3559,7 +3568,7 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
                             final_body = f"💬 <b>Conversation History:</b>\n\n" + "\n\n".join(history_bodies)
                         else:
                             content_html = last_post.get("attributes", {}).get("content-html", "")
-                            body = BeautifulSoup(content_html, "html.parser").get_text(separator=' ', strip=True)[:500] if content_html else "No content"
+                            body = _truncate_with_ellipsis(BeautifulSoup(content_html, "html.parser").get_text(separator=' ', strip=True), 3000) if content_html else "No content"
                             final_body = f"📩 <b>Last message:</b>\n{html.escape(body)}"
                         
                         course_posts.append({
@@ -3607,7 +3616,7 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
                     "━━━━━━━━━━━━━━━━━"
                 )
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
-                await broadcast(bot, text, parse_mode="HTML", reply_markup=markup)
+                await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup)
 
         # Always save cache to bootstrap the "Last 5" feature
         tmp_path = CACHE_PATH + ".tmp"
