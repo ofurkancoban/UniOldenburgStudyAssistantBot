@@ -269,24 +269,40 @@ app.post('/send', async (req, res) => {
 
         // Use hardcoded WA_GROUP_ID from .env if available to completely bypass getChats()
         const hardcodedGroupId = process.env.WA_GROUP_ID;
-        
+
         if (hardcodedGroupId) {
-            await client.sendMessage(hardcodedGroupId, text);
+            const sent = await client.sendMessage(hardcodedGroupId, text);
+            if (!sent) {
+                // sendMessage() resolves to undefined (no exception) when the internal
+                // chat lookup fails - e.g. a stale WA_GROUP_ID, or the WhatsApp Web
+                // chat store not synced yet. Without this check the message silently
+                // never sends while the caller is told it succeeded.
+                console.log(`sendMessage returned no message for WA_GROUP_ID: ${hardcodedGroupId} - chat lookup likely failed`);
+                return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (stale group ID, or chat not synced yet). Try /request_qr to refresh the connection, or re-check WA_GROUP_ID.' });
+            }
             console.log(`Message sent directly to WA_GROUP_ID: ${hardcodedGroupId}`);
             return res.json({ success: true, message: 'Message sent via Hardcoded ID' });
         }
 
         // If the python bot sent an ID instead of a name (ends with @g.us or @c.us), use it directly
         if (groupName.endsWith('@g.us') || groupName.endsWith('@c.us')) {
-            await client.sendMessage(groupName, text);
+            const sent = await client.sendMessage(groupName, text);
+            if (!sent) {
+                console.log(`sendMessage returned no message for ID: ${groupName} - chat lookup likely failed`);
+                return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (stale group ID, or chat not synced yet). Try /request_qr to refresh the connection.' });
+            }
             console.log(`Message sent directly to ID: ${groupName}`);
             return res.json({ success: true, message: 'Message sent via direct ID' });
         }
-        
+
         // Otherwise try searching by name
         const group = await findGroupByName(groupName);
         if (group) {
-            await client.sendMessage(group.id._serialized, text);
+            const sent = await client.sendMessage(group.id._serialized, text);
+            if (!sent) {
+                console.log(`sendMessage returned no message for group "${groupName}" - chat lookup likely failed`);
+                return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (chat not synced yet). Try /request_qr to refresh the connection.' });
+            }
             console.log(`Message sent to group "${groupName}"`);
             res.json({ success: true, message: 'Message sent' });
         } else {
