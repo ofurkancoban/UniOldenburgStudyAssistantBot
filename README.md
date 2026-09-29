@@ -83,6 +83,7 @@ A lightweight to-do list that lives inside the bot:
 *   Manage everything from **"📋 My Tasks"**: mark done, delete, or cancel a pending reminder.
 *   Reminders fire automatically once due — no forced-reply prompts, so the bot's keyboard never disappears mid-flow.
 *   Combines with **🔔 Upcoming** (under the Calendar message) for one chronologically-sorted view of task reminders, exam dates, and registration deadlines together.
+*   **📝 AI-suggested tasks from announcements/forum posts**: when a new Stud.IP announcement or forum post mentions an actual deadline (a submission date, an exam date, "by Friday", etc — a free OpenRouter LLM reads each new post to check, ignoring anything without a real date), its notification gets an extra **"📝 Add as task: ..."** button that saves it straight to your task list with the course and due date/time already filled in — no typing needed. Silently skipped if the LLM call fails or nothing dated is mentioned, same fail-open behavior as the other AI features.
 
 ### 🎙️ Voice Commands (AI Intent Routing)
 Every voice note is transcribed first (via the free Google Web Speech API, no API key needed — **Turkish and English are both tried automatically**, `langdetect` picks whichever transcript actually matches its language) and shown back to you for a quick **✅ Yes / ✏️ Try again** confirmation before anything happens.

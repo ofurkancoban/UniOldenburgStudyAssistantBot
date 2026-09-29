@@ -75,6 +75,7 @@ global_announcement_watcher = None
 # navigation & cache
 link_cache = {}  # short_id -> { url, cid, name?, action?, user_id?, current_url?, ts }
 exam_action_cache = {}  # short_id -> { unit_id, action_type ("anmelden"|"abmelden"), title, ts }
+task_suggestion_cache = {}  # short_id -> { text, due_time (ISO or None), course }
 nav_stack = {}  # user_id -> [url1, url2, ...]
 nav_names = {}  # user_id -> [name1, name2, ...]  (for breadcrumb)
 user_courses = {}  # user_id -> cid
@@ -2668,7 +2669,17 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
                     f"{ann['body']}\n"
                     "━━━━━━━━━━━━━━━━━"
                 )
-                markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+                buttons = [[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]]
+                try:
+                    suggestion = await extract_task_suggestion(ann['course'], ann['subject'], ann['body'])
+                except Exception as e:
+                    logging.warning(f"Task suggestion extraction failed for announcement: {e}")
+                    suggestion = None
+                if suggestion:
+                    sid = _short_id()
+                    task_suggestion_cache[sid] = {**suggestion, "course": ann['course']}
+                    buttons.append([InlineKeyboardButton(f"📝 Add as task: {suggestion['text'][:40]}", callback_data=f"tasksug_add|{sid}")])
+                markup = InlineKeyboardMarkup(buttons)
                 await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup)
         elif not silent:
             await bot.send_message(chat_id=chat_id, text="☑️ No new announcements found.", disable_notification=True)
@@ -3563,20 +3574,22 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
                         main_author_id = last_post.get("relationships", {}).get("author", {}).get("data", {}).get("id")
                         author = get_author_name(main_author_id)
                         time_str = friendly_date(last_post.get("attributes", {}).get("mkdate", datetime.now().isoformat()))
-                        
+                        last_content_html = last_post.get("attributes", {}).get("content-html", "")
+                        last_message_plain = BeautifulSoup(last_content_html, "html.parser").get_text(separator=' ', strip=True) if last_content_html else ""
+
                         if len(history_bodies) > 1:
                             final_body = f"💬 <b>Conversation History:</b>\n\n" + "\n\n".join(history_bodies)
                         else:
-                            content_html = last_post.get("attributes", {}).get("content-html", "")
-                            body = _truncate_with_ellipsis(BeautifulSoup(content_html, "html.parser").get_text(separator=' ', strip=True), 3000) if content_html else "No content"
+                            body = _truncate_with_ellipsis(last_message_plain, 3000) if last_message_plain else "No content"
                             final_body = f"📩 <b>Last message:</b>\n{html.escape(body)}"
-                        
+
                         course_posts.append({
                             "course": course_name,
                             "thread": title,
                             "author": author,
                             "date": time_str,
                             "body": final_body,
+                            "last_message_plain": last_message_plain,
                             "key": f"{cid}:{title}:{disc_id}",
                             "is_new": is_new_ind,
                             "timestamp": time_str
@@ -3615,7 +3628,18 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
                     f"{p['body']}\n"
                     "━━━━━━━━━━━━━━━━━"
                 )
-                markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+                buttons = [[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]]
+                if p.get("last_message_plain"):
+                    try:
+                        suggestion = await extract_task_suggestion(p.get('course', ''), p.get('thread'), p['last_message_plain'])
+                    except Exception as e:
+                        logging.warning(f"Task suggestion extraction failed for forum post: {e}")
+                        suggestion = None
+                    if suggestion:
+                        sid = _short_id()
+                        task_suggestion_cache[sid] = {**suggestion, "course": p.get('course')}
+                        buttons.append([InlineKeyboardButton(f"📝 Add as task: {suggestion['text'][:40]}", callback_data=f"tasksug_add|{sid}")])
+                markup = InlineKeyboardMarkup(buttons)
                 await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup)
 
         # Always save cache to bootstrap the "Last 5" feature
@@ -6441,6 +6465,52 @@ async def handle_task_course_pick(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(f"✅ Task added: {task['text']}{course_line}")
 
 
+async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle tasksug_add|<sid> — save the task the "📝 Add as task?" button
+    on a new announcement/forum notification suggested (see
+    extract_task_suggestion / task_suggestion_cache). The course is already
+    known from the source announcement/post, so this saves directly with no
+    course-picker step, unlike the ➕ Add Task wizard."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    sid = query.data.split("|", 1)[1]
+    info = task_suggestion_cache.pop(sid, None)
+    if not info:
+        await query.answer("This suggestion has expired.", show_alert=True)
+        return
+
+    task = {
+        "id": str(uuid.uuid4())[:8],
+        "user_id": user_id,
+        "text": info["text"],
+        "due_time": info.get("due_time"),
+        "course": info.get("course"),
+        "created_at": datetime.now(TZ_BERLIN).isoformat(),
+        "notified": False,
+    }
+    tasks = load_tasks()
+    tasks.append(task)
+    save_tasks(tasks)
+
+    course_line = f" [{task['course']}]" if task["course"] else ""
+    if task["due_time"]:
+        due_dt = datetime.fromisoformat(task["due_time"])
+        confirmation = f"✅ Reminder set: {due_dt.strftime('%d.%m.%Y %H:%M')} — {task['text']}{course_line}"
+    else:
+        confirmation = f"✅ Task added: {task['text']}{course_line}"
+
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.message.reply_text(confirmation)
+
+
 async def send_course_picker(message, context: ContextTypes.DEFAULT_TYPE):
     """List the student's currently-enrolled Stud.IP courses so they can pick one
     for the combined tasks+exam-info view."""
@@ -7851,6 +7921,40 @@ async def extract_food_preferences(transcript: str) -> dict:
     return {"avoid_codes": codes, "avoid_keywords": keywords}
 
 
+TASK_SUGGESTION_SYSTEM_PROMPT = """You read one announcement or forum post from a university course and decide whether it mentions a concrete task or deadline the student should be reminded about — a submission deadline, an exam/quiz date, something they need to bring/do/upload by a specific day. Ignore anything with no actionable date (general course info, a topic being "covered later in the semester", opinions, small talk, a reply that doesn't add a new date).
+
+Respond with strict JSON only, no other text: {"has_task": true/false, "task_text": "<short actionable summary in English, e.g. 'Submit problem set 3' or 'Upload presentation slides'>" or null, "due_date": "<YYYY-MM-DD>" or null, "due_time": "<HH:MM 24h>" or null}.
+
+If has_task is false, every other field must be null. If a date is mentioned but no specific time, leave due_time null. Resolve relative dates ("by Friday", "next Monday", "in two weeks") against today's date, which you're given in the prompt."""
+
+
+async def extract_task_suggestion(course_name: str, thread_title: Optional[str], body_text: str) -> Optional[dict]:
+    """Ask the LLM whether an announcement/forum post body mentions an
+    actionable deadline/task, for the "📝 Add as task?" suggestion button
+    on new announcement/forum notifications. Returns {"text", "due_time"}
+    (due_time is an ISO string or None) on a detected task, or None if no
+    task was found or the call/parse failed — callers should just skip
+    the suggestion button in that case, never treat it as an error."""
+    today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
+    user_text = f"Today is {today_str}.\nCourse: {course_name}\n" + (f"Thread: {thread_title}\n" if thread_title else "") + f"\n{body_text}"
+    raw = await _call_openrouter(TASK_SUGGESTION_SYSTEM_PROMPT, user_text)
+    parsed = _extract_json_object(raw)
+    if not parsed or not parsed.get("has_task") or not parsed.get("task_text"):
+        return None
+
+    due_time = None
+    due_date = parsed.get("due_date")
+    if due_date:
+        try:
+            time_part = parsed.get("due_time") or "09:00"
+            due_dt = datetime.strptime(f"{due_date} {time_part}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ_BERLIN)
+            due_time = due_dt.isoformat()
+        except ValueError:
+            due_time = None
+
+    return {"text": str(parsed["task_text"])[:200], "due_time": due_time}
+
+
 EXAM_REMINDER_TASK_SYSTEM_PROMPT = """You extract the details of an exam reminder request (spoken in Turkish or English) for a university assistant bot. The user wants a task/reminder created some amount of time before a named exam.
 
 Extract:
@@ -8941,6 +9045,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_voice_reject, pattern="^voice_reject$"))
         app.add_handler(CallbackQueryHandler(handle_voice_clarify, pattern="^voice_clarify\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_task_course_pick, pattern="^(task_course\\|.*|task_course_skip)$"))
+        app.add_handler(CallbackQueryHandler(handle_task_suggestion_add, pattern=r"^tasksug_add\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_view, pattern="^course_view\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_browse_courses, pattern="^browse_courses$"))
         app.add_handler(CallbackQueryHandler(handle_course_noop, pattern="^course_noop$"))
