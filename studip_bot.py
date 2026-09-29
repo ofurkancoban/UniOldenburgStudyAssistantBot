@@ -4334,9 +4334,29 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
 
+        groups = groups[:10]
+
+        # Resolve real names directly from WhatsApp (getChatById, see
+        # /group_name) for any entry the discovered-groups log doesn't
+        # have one for yet, so the picker always shows names to tap
+        # rather than falling back to a raw ID.
+        missing = [g for g in groups if not g.get("name")]
+        if missing:
+            async def _resolve(g):
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get("http://localhost:3838/group_name", params={"groupId": g["groupId"]}, timeout=3) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                if data.get("name"):
+                                    g["name"] = data["name"]
+                except Exception:
+                    pass
+            await asyncio.gather(*(_resolve(g) for g in missing))
+
         current_id = os.getenv("WA_GROUP_ID", "")
         kb = []
-        for g in groups[:10]:
+        for g in groups:
             label = g.get("name") or g["groupId"]
             if g["groupId"] == current_id:
                 label = f"✅ {label} (active)"
