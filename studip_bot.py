@@ -4258,7 +4258,6 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         keyboard = [
             [InlineKeyboardButton("📲 Request WA QR", callback_data="request_wa_qr")],
             [InlineKeyboardButton("🔄 Force New WA QR", callback_data="force_wa_qr")],
-            [InlineKeyboardButton("✏️ Change WA Group", callback_data="change_wa_group")],
             [InlineKeyboardButton("🔍 Detect WA Groups", callback_data="detect_wa_groups")],
         ]
         await query.message.reply_text("📱 WhatsApp menu:", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -4316,10 +4315,6 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logging.error(f"Failed to force new WA QR: {e}")
             await query.message.reply_text("❌ WhatsApp service unreachable. Make sure it's running.")
-
-    elif query.data == "change_wa_group":
-        context.user_data["pending_step"] = "wa_group_name"
-        await query.message.reply_text("Please type the new WhatsApp group name:", reply_markup=get_main_keyboard())
 
     elif query.data == "detect_wa_groups":
         import aiohttp
@@ -4496,12 +4491,20 @@ async def _send_text_to_whatsapp(text: str) -> tuple[bool, str]:
     factored out so the "EXAM REGISTRATION OPEN"-style notifications (which
     have no single Telegram message to re-read text from, since their WA
     button opens its own confirm step) can send their own composed text
-    through the same path."""
-    group_name = os.getenv("WHATSAPP_GROUP_NAME", "StudIP Alerts")
+    through the same path.
+
+    The target group is always WA_GROUP_ID — the exact group ID captured
+    from a real message via "🔍 Detect WA Groups" (see set_wa_group_handler),
+    never a manually-typed group name (fragile: names can collide or drift
+    from what WhatsApp actually has stored, which was silently sending
+    nothing in exactly the group-not-found case)."""
+    group_id = os.getenv("WA_GROUP_ID", "").strip()
+    if not group_id:
+        return False, "No WhatsApp group is set yet. Use /status → \"📱 WhatsApp\" → \"🔍 Detect WA Groups\" and pick one first."
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            payload = {"text": text, "groupName": group_name}
+            payload = {"text": text, "groupName": group_id}
             async with session.post("http://localhost:3838/send", json=payload, timeout=10) as resp:
                 if resp.status == 200:
                     return True, "Sent to WhatsApp successfully!"
@@ -4988,16 +4991,6 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if step in ("task_text", "task_time"):
         return await _handle_task_wizard_reply(update, context, step, text)
-
-    if step == "wa_group_name":
-        new_group = text
-        import dotenv
-        env_path = ".env"
-        dotenv.set_key(env_path, "WHATSAPP_GROUP_NAME", new_group)
-        os.environ["WHATSAPP_GROUP_NAME"] = new_group
-        context.user_data.pop("pending_step", None)
-        await update.effective_message.reply_text(f"✅ WhatsApp group successfully updated: {new_group}", reply_markup=get_main_keyboard())
-        return True
 
     if step == "ical_link":
         new_link = text
@@ -8701,10 +8694,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     global_paused = "✅ Yes" if global_watcher_paused else "❌ No"
     active_check = "✅ Yes" if check_in_progress else "❌ No"
-    wa_group_name = os.getenv("WHATSAPP_GROUP_NAME", "StudIP Alerts")
-    
-    # Check WA Connection Status
+    wa_group_id = os.getenv("WA_GROUP_ID", "").strip()
+
+    # Check WA Connection Status, and resolve the active group's display
+    # name from the microservice's discovered-groups log (the group is
+    # always set by exact ID via "🔍 Detect WA Groups" now — this is just
+    # a friendlier label for it here).
     wa_status = "🔴 Offline / Not Connected"
+    wa_group_label = "⚠️ Not set — use 📱 WhatsApp → 🔍 Detect WA Groups" if not wa_group_id else wa_group_id
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
@@ -8712,6 +8709,14 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if resp.status == 200:
                     data = await resp.json()
                     wa_status = "🟢 Connected" if data.get("isAuthenticated") else "🟡 Waiting for QR Scan"
+            if wa_group_id:
+                async with session.get("http://localhost:3838/discovered_groups", timeout=2) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for g in data.get("groups", []):
+                            if g.get("groupId") == wa_group_id and g.get("name"):
+                                wa_group_label = g["name"]
+                                break
     except Exception:
         pass
 
@@ -8722,7 +8727,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔑 Logged in: {logged_in}\n"
         f"👀 Unified Watcher: {watcher_status}\n"
         f"🔁 Global Scans: {global_scan_count}\n"
-        f"📱 WA Group: {wa_group_name}\n"
+        f"📱 WA Group: {wa_group_label}\n"
         f"💬 WA Status: {wa_status}"
     )
 
@@ -8874,7 +8879,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(show_last_announcements, pattern="^show_last_announcements$"))
         app.add_handler(CallbackQueryHandler(show_last_files, pattern="^show_last_files$"))
         app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
-        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|force_wa_qr|change_wa_group|detect_wa_groups|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu)$"))
+        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|force_wa_qr|detect_wa_groups|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu)$"))
         app.add_handler(CallbackQueryHandler(handle_exam_buttons, pattern="^(exam_menu|exam_noop|exam_cancel|exam_ask\\|.*|exam_do\\|.*)$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_wa_ask, pattern="^examopen_wa_ask\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_wa_confirm, pattern="^examopen_wa_confirm\\|.*$"))

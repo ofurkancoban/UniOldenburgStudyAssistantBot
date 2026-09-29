@@ -166,7 +166,7 @@ TOTP_SECRET=YOUR_KEY            # Optional: If 2FA/App Authenticator is enabled
 STUDIP_ICAL_URL=https://elearning.uni-oldenburg.de/dispatch.php/ical/index/...
 
 # --- WhatsApp Integration ---
-WHATSAPP_GROUP_NAME="StudIP Alerts"
+# WA_GROUP_ID is set from within the bot (see below), not typed here.
 PORT=3838  # Port for the WhatsApp Microservice
 
 # --- Voice Command Intent Routing (optional) ---
@@ -206,7 +206,7 @@ OPENROUTER_MODEL=cohere/north-mini-code:free  # any OpenRouter model id; default
 
 1. **Auto-Start**: When you launch the bot (`python studip_bot.py`), it automatically starts the WhatsApp microservice in the background.
 2. **First Time Login (QR)**: The bot will generate a WhatsApp Web QR code and send it to you via Telegram as an image. Scan it with your phone's WhatsApp (Linked Devices).
-3. **Change Target Group**: Use the `/status` menu and click **"✏️ Change WA Group"** to dynamically change the group where messages are forwarded.
+3. **Pick the Target Group**: Use the `/status` menu → **"📱 WhatsApp"** → **"🔍 Detect WA Groups"**. Send or receive any message in the target group first (so the service logs its exact ID), then tap it in the list to set it active — the group is always set by the exact ID captured this way, not a typed name, since name-based lookup is fragile (collisions, drift) and could silently fail to find the right group.
 4. **Session Persistence**: Your session is saved securely. If you need a new QR code (e.g., you logged out), simply tap **"📲 Request WA QR"** in the `/status` menu.
 
 > [!TIP]
