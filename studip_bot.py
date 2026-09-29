@@ -3239,9 +3239,19 @@ async def send_morning_summary(bot, user_ids):
         [InlineKeyboardButton("🍴 Today's Menu", callback_data="menu_nav|2/|new")]
     ])
 
+    # Pinning isn't automatic in Telegram - a pinned message stays pinned
+    # forever until explicitly unpinned, so keeping only "today's" summary
+    # pinned means unpinning yesterday's (tracked per-chat in general_cache,
+    # since pin state is per-chat) before pinning the new one. Best-effort:
+    # a pin/unpin failure (e.g. missing chat permission) never blocks the
+    # summary itself from going out.
+    pin_cache = load_general_cache()
+    pinned = pin_cache.get("pinned_morning_summary", {})
+    pin_cache_dirty = False
+
     for uid in user_ids:
         try:
-            await bot.send_message(
+            sent_msg = await bot.send_message(
                 chat_id=uid,
                 text=final_text,
                 parse_mode="HTML",
@@ -3249,6 +3259,24 @@ async def send_morning_summary(bot, user_ids):
             )
         except Exception as e:
             logging.error(f"Failed to send summary to {uid}: {e}")
+            continue
+
+        prev_msg_id = pinned.get(str(uid))
+        if prev_msg_id:
+            try:
+                await bot.unpin_chat_message(chat_id=uid, message_id=prev_msg_id)
+            except Exception as e:
+                logging.warning(f"Failed to unpin previous morning summary for {uid}: {e}")
+        try:
+            await bot.pin_chat_message(chat_id=uid, message_id=sent_msg.message_id, disable_notification=True)
+            pinned[str(uid)] = sent_msg.message_id
+            pin_cache_dirty = True
+        except Exception as e:
+            logging.warning(f"Failed to pin morning summary for {uid}: {e}")
+
+    if pin_cache_dirty:
+        pin_cache["pinned_morning_summary"] = pinned
+        save_general_cache(pin_cache)
 
     # 4b. Photo of the lunch pick, when one can be matched on the
     # Studierendenwerk's public Speiseplan site — same as the standalone
