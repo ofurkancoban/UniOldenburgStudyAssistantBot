@@ -9080,7 +9080,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # first (asks WhatsApp directly by ID via getChatById, so it works even
     # right after a service restart), falling back to the discovered-groups
     # log (names seen via message_create) if that's unreachable.
-    wa_status = "🔴 Offline / Not Connected"
+    wa_status = "🔴 Disconnected (service unreachable)"
     wa_group_label = "⚠️ Not set — use 📱 WhatsApp → 🔍 Detect WA Groups" if not wa_group_id else wa_group_id
     try:
         import aiohttp
@@ -9088,7 +9088,16 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             async with session.get("http://localhost:3838/status", timeout=2) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    wa_status = "🟢 Connected" if data.get("isAuthenticated") else "🟡 Waiting for QR Scan"
+                    if data.get("isAuthenticated"):
+                        wa_status = "🟢 Connected"
+                    elif data.get("hasEverConnected") or data.get("isReconnecting"):
+                        # Was connected before (or is mid-reconnect) - a real
+                        # session drop, not first-time setup. See the
+                        # proactive 🔴/🟢 Telegram alerts in server.js for
+                        # when this actually changed.
+                        wa_status = "🔴 Disconnected (session dropped, reconnecting...)"
+                    else:
+                        wa_status = "🟡 Waiting for first QR scan"
             if wa_group_id:
                 resolved = False
                 try:

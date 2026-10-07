@@ -95,6 +95,7 @@ async function sendTextToTelegram(text, replyMarkup) {
 let lastQrCode = null;
 let isAuthenticated = false;
 let isReconnecting = false;
+let hasEverConnected = false; // true once 'ready' has fired at least once this process - never reset, so /status can tell "waiting for the first-ever QR" apart from "was connected, session dropped"
 const announcedGroupIds = new Set();
 const discoveredGroups = new Map(); // groupId -> { name, lastSeen }
 
@@ -118,6 +119,7 @@ client.on('ready', () => {
     console.log('WhatsApp Client is ready!');
     isAuthenticated = true;
     isReconnecting = false;
+    hasEverConnected = true;
     lastQrCode = null;
     if (disconnectAlertPending) {
         disconnectAlertPending = false;
@@ -207,9 +209,12 @@ client.on('auth_failure', msg => {
 
 client.initialize();
 
-// API endpoint to check authentication status
+// API endpoint to check authentication status. isAuthenticated alone can't
+// tell "never set up yet, waiting for the first QR" apart from "was
+// connected, the session just dropped" - isReconnecting/hasEverConnected
+// let a caller (see /status in studip_bot.py) show that distinction.
 app.get('/status', (req, res) => {
-    res.json({ isAuthenticated });
+    res.json({ isAuthenticated, isReconnecting, hasEverConnected });
 });
 
 // API endpoint to set WA_GROUP_ID at runtime (persisted to .env by the Telegram bot)
