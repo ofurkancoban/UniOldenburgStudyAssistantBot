@@ -51,8 +51,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Dedicated text-to-speech models (a separate OpenRouter API surface from
 # chat/completions — see synthesize_speech). deepgram/flux-tts:free requires
 # an explicit "voice"; fish-audio/s2.1-pro-free:free doesn't need one.
-OPENROUTER_TTS_MODEL = os.getenv("OPENROUTER_TTS_MODEL", "deepgram/flux-tts:free")
-OPENROUTER_TTS_VOICE = os.getenv("OPENROUTER_TTS_VOICE", "flux-elise-en")
+OPENROUTER_TTS_MODEL = os.getenv("OPENROUTER_TTS_MODEL", "fish-audio/s2.1-pro-free:free")
+OPENROUTER_TTS_VOICE = os.getenv("OPENROUTER_TTS_VOICE", "")  # fish-audio/s2.1-pro-free:free has no selectable voice param - OpenRouter's previous free TTS model (deepgram/flux-tts:free) was discontinued and this replaced it; passing a "voice" value this model doesn't support (e.g. the old "flux-elise-en") causes a 400
 OPENROUTER_TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
 # University of Oldenburg's coordinates, for the daily-plan weather snapshot
 # (see get_weather_snapshot) — configurable in case the bot is ever reused
@@ -7528,12 +7528,18 @@ async def synthesize_speech(text: str) -> Optional[tuple]:
     gracefully (e.g. fall back to sending the plain text)."""
     if not OPENROUTER_API_KEY:
         return None
+    payload = {"model": OPENROUTER_TTS_MODEL, "input": text}
+    if OPENROUTER_TTS_VOICE:
+        # Only some TTS models take a "voice" selector - sending one a model
+        # doesn't support (e.g. the previous model's voice name against a
+        # different model) gets a 400 back instead of just being ignored.
+        payload["voice"] = OPENROUTER_TTS_VOICE
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 OPENROUTER_TTS_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
-                json={"model": OPENROUTER_TTS_MODEL, "input": text, "voice": OPENROUTER_TTS_VOICE},
+                json=payload,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 if resp.status != 200:
