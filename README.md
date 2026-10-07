@@ -191,6 +191,7 @@ OPENROUTER_MODEL=cohere/north-mini-code:free  # any OpenRouter model id; default
 | `/menu` | The main hub. Access Courses, Files, and Calendar. |
 | `/check` | Manual sync of all watchers (Files, News, Posts). |
 | `/status` | View system health, uptime, last sync timestamps, and access **Course Enrollment (Fast Enroll / Enroll Course / Sign Out), Default Semester, Exam Registration, Transcript, and WhatsApp settings**. |
+| `/healthcheck` | On-demand, full check of every subsystem the bot depends on — Stud.IP login, WhatsApp connection, Open-Meteo (weather), and a real live OpenRouter (AI) call — plus the currently-running git commit, so "is everything actually working" is one command instead of SSHing into the server. The same checks also run automatically every 30 minutes in the background (minus the live OpenRouter call, to not spend API quota that often) and **proactively message you** the moment something breaks (🔴) or recovers (🟢) — no need to go looking for it. |
 
 ### ⌨️ Persistent Keyboard
 

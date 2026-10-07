@@ -857,6 +857,45 @@ async def unified_watcher_controller(app):
                 general_cache["last_exam_date_check"] = now.isoformat()
                 save_general_cache(general_cache)
 
+            # Subsystem health check (Stud.IP/WhatsApp/weather, plus just
+            # confirming the OpenRouter key is set - a live OpenRouter call
+            # is reserved for the on-demand /healthcheck command, to avoid
+            # spending API quota every cycle). Throttled to every 30
+            # minutes; only alerts on an actual state change (something
+            # broke, or recovered), not on every check, same philosophy as
+            # the WA disconnect alerts.
+            HEALTH_CHECK_INTERVAL_SECONDS = 30 * 60
+            general_cache = load_general_cache()
+            last_health_check_iso = general_cache.get("last_health_check")
+            due_for_health_check = True
+            if last_health_check_iso:
+                try:
+                    last_health_check = datetime.fromisoformat(last_health_check_iso)
+                    due_for_health_check = (now - last_health_check).total_seconds() >= HEALTH_CHECK_INTERVAL_SECONDS
+                except ValueError:
+                    pass
+            if due_for_health_check:
+                try:
+                    results = await run_health_checks(live_openrouter=False)
+                    prev_state = general_cache.get("health_state", {})
+                    new_state = {}
+                    for key, (ok, detail) in results.items():
+                        new_state[key] = ok
+                        # Assume healthy if never checked before, so the very
+                        # first run after deploying this feature can't fire a
+                        # false "broke" alert for a check that's simply never
+                        # run yet (e.g. OPENROUTER_API_KEY genuinely unset).
+                        was_ok = prev_state.get(key, True)
+                        if was_ok and not ok:
+                            await broadcast(app.bot, f"🔴 <b>Health check failed:</b> {HEALTH_CHECK_LABELS[key]}\n{html.escape(detail)}", parse_mode="HTML")
+                        elif not was_ok and ok:
+                            await broadcast(app.bot, f"🟢 <b>Recovered:</b> {HEALTH_CHECK_LABELS[key]} is back up.", parse_mode="HTML")
+                    general_cache["health_state"] = new_state
+                except Exception as e:
+                    logging.error(f"❌ Health check failed: {e}")
+                general_cache["last_health_check"] = now.isoformat()
+                save_general_cache(general_cache)
+
             # 1️⃣ MESSAGE CHECK
             try:
                 logging.info("📨 Checking messages...")
@@ -9066,6 +9105,127 @@ async def _restart_process():
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+HEALTH_CHECK_LABELS = {
+    "studip": "🎓 Stud.IP",
+    "whatsapp": "📱 WhatsApp",
+    "weather": "🌤️ Weather (Open-Meteo)",
+    "openrouter": "🤖 OpenRouter (AI features)",
+}
+
+
+async def check_studip_health() -> tuple[bool, str]:
+    """(ok, detail) — logs in (or confirms the cached session still works)
+    and fetches the course list as a cheap end-to-end check that Stud.IP
+    access actually works, not just that credentials are configured."""
+    try:
+        session = await login_studip()
+        courses = await list_courses()
+        if courses:
+            return True, "OK"
+        return False, "Logged in, but no courses returned"
+    except Exception as e:
+        return False, str(e)[:150]
+
+
+async def check_whatsapp_health() -> tuple[bool, str]:
+    """(ok, detail) — asks the local WhatsApp microservice for its own
+    connection state (same /status endpoint the 📱 WhatsApp status line
+    in /status uses)."""
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get("http://localhost:3838/status", timeout=5) as resp:
+                if resp.status != 200:
+                    return False, f"Service returned HTTP {resp.status}"
+                data = await resp.json()
+                if data.get("isAuthenticated"):
+                    return True, "OK"
+                if data.get("isReconnecting"):
+                    return False, "Reconnecting"
+                return False, "Not authenticated (needs a QR scan)"
+    except Exception as e:
+        return False, f"Service unreachable: {str(e)[:120]}"
+
+
+async def check_weather_health() -> tuple[bool, str]:
+    """(ok, detail) — free/keyless, so just confirms Open-Meteo itself is
+    reachable right now, same endpoint get_weather_snapshot calls."""
+    try:
+        import aiohttp
+        lat = os.getenv("WEATHER_LATITUDE", "53.1435")
+        lon = os.getenv("WEATHER_LONGITUDE", "8.2146")
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=5) as resp:
+                if resp.status == 200:
+                    return True, "OK"
+                return False, f"HTTP {resp.status}"
+    except Exception as e:
+        return False, str(e)[:150]
+
+
+async def check_openrouter_health(live: bool = False) -> tuple[bool, str]:
+    """(ok, detail). `live=False` (used by the automatic periodic check,
+    to avoid spending API quota every cycle) only confirms the API key is
+    configured; `live=True` (used by the on-demand /healthcheck command)
+    makes one real, minimal completion call."""
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return False, "OPENROUTER_API_KEY not set"
+    if not live:
+        return True, "Key configured"
+    try:
+        result = await _call_openrouter("Reply with exactly one word: OK", "ping", temperature=0)
+        if result and "OK" in result.upper():
+            return True, "OK"
+        return False, f"Unexpected response: {result!r}"
+    except Exception as e:
+        return False, str(e)[:150]
+
+
+async def run_health_checks(live_openrouter: bool = False) -> dict:
+    """Run every subsystem check and return {key: (ok, detail)} for
+    "studip", "whatsapp", "weather", "openrouter" (see HEALTH_CHECK_LABELS
+    for display names). Each check is independently best-effort — one
+    failing never blocks or skews the others."""
+    studip = await check_studip_health()
+    whatsapp = await check_whatsapp_health()
+    weather = await check_weather_health()
+    openrouter = await check_openrouter_health(live=live_openrouter)
+    return {"studip": studip, "whatsapp": whatsapp, "weather": weather, "openrouter": openrouter}
+
+
+async def healthcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /healthcheck — an on-demand, full (live OpenRouter call
+    included) check of every subsystem the bot depends on, plus the
+    currently-running git commit, so "is everything actually working
+    right now" is a single command instead of SSHing into the server."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        return
+
+    msg = await update.message.reply_text("🩺 Running health check...")
+    results = await run_health_checks(live_openrouter=True)
+
+    lines = ["🩺 <b>Health Check</b>", "━━━━━━━━━━━━━━━━━"]
+    for key, (ok, detail) in results.items():
+        icon = "✅" if ok else "❌"
+        lines.append(f"{icon} {HEALTH_CHECK_LABELS[key]}: {html.escape(detail)}")
+    lines.append("━━━━━━━━━━━━━━━━━")
+
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL,
+        ).decode().strip()
+        lines.append(f"📦 Running commit: <code>{commit}</code>")
+    except Exception:
+        pass
+
+    await msg.edit_text("\n".join(lines), parse_mode="HTML")
+
+
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed bot status"""
     global watcher_controller_running, global_watcher_paused, check_in_progress
@@ -9277,6 +9437,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(fastenroll_cancel_callback, pattern="^fastenroll_cancel\\|.*$"))
         app.add_handler(CommandHandler("watch", watch))
         app.add_handler(CommandHandler("status", status_command))
+        app.add_handler(CommandHandler("healthcheck", healthcheck_command))
         app.add_handler(CommandHandler("menu", menu_command))
         app.add_handler(CommandHandler("restart", restart_command))
         
