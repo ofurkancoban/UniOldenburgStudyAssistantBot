@@ -315,6 +315,24 @@ client.on('message_create', async msg => {
     }
 });
 
+// client.sendMessage() resolves to undefined (no exception) when something
+// inside whatsapp-web.js's injected send path returns nothing. This is
+// intermittent even against a confirmed-valid, confirmed-synced chat (the
+// raw chat lookup behind /group_name succeeds every time this happens;
+// it's sendMessage's own internal message-composition step that's flaky)
+// and - critically - there's no reliable way to tell from here whether
+// the message actually went out and only the confirmation failed, or it
+// never sent at all. Given that ambiguity, this deliberately does NOT
+// auto-retry the send itself (a message that did go out would then be
+// sent a second time, duplicating it in a shared WhatsApp group - a much
+// worse outcome than one bounced request). It only kicks off a background
+// reconnect so the *next* attempt has better odds; this request still
+// reports failure and leaves resending to the caller tapping again.
+function noteSendFailureAndReconnect(chatId) {
+    console.log(`sendMessage returned no message for ${chatId} - triggering a background reconnect for next time`);
+    reconnectClient(`sendMessage returned no message for ${chatId}`);
+}
+
 // API endpoint to send a message
 app.post('/send', async (req, res) => {
     if (!isAuthenticated) {
@@ -335,12 +353,8 @@ app.post('/send', async (req, res) => {
         if (hardcodedGroupId) {
             const sent = await client.sendMessage(hardcodedGroupId, text);
             if (!sent) {
-                // sendMessage() resolves to undefined (no exception) when the internal
-                // chat lookup fails - e.g. a stale WA_GROUP_ID, or the WhatsApp Web
-                // chat store not synced yet. Without this check the message silently
-                // never sends while the caller is told it succeeded.
-                console.log(`sendMessage returned no message for WA_GROUP_ID: ${hardcodedGroupId} - chat lookup likely failed`);
-                return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (stale group ID, or chat not synced yet). Try /request_qr to refresh the connection, or re-check WA_GROUP_ID.' });
+                noteSendFailureAndReconnect(hardcodedGroupId);
+                return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (it may or may not have actually gone out - check the group before resending). Reconnecting in the background; try again in about 30 seconds.' });
             }
             console.log(`Message sent directly to WA_GROUP_ID: ${hardcodedGroupId}`);
             return res.json({ success: true, message: 'Message sent via Hardcoded ID' });
@@ -350,8 +364,8 @@ app.post('/send', async (req, res) => {
         if (groupName.endsWith('@g.us') || groupName.endsWith('@c.us')) {
             const sent = await client.sendMessage(groupName, text);
             if (!sent) {
-                console.log(`sendMessage returned no message for ID: ${groupName} - chat lookup likely failed`);
-                return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (stale group ID, or chat not synced yet). Try /request_qr to refresh the connection.' });
+                noteSendFailureAndReconnect(groupName);
+                return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (it may or may not have actually gone out - check the group before resending). Reconnecting in the background; try again in about 30 seconds.' });
             }
             console.log(`Message sent directly to ID: ${groupName}`);
             return res.json({ success: true, message: 'Message sent via direct ID' });
@@ -362,8 +376,8 @@ app.post('/send', async (req, res) => {
         if (group) {
             const sent = await client.sendMessage(group.id._serialized, text);
             if (!sent) {
-                console.log(`sendMessage returned no message for group "${groupName}" - chat lookup likely failed`);
-                return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (chat not synced yet). Try /request_qr to refresh the connection.' });
+                noteSendFailureAndReconnect(group.id._serialized);
+                return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (it may or may not have actually gone out - check the group before resending). Reconnecting in the background; try again in about 30 seconds.' });
             }
             console.log(`Message sent to group "${groupName}"`);
             res.json({ success: true, message: 'Message sent' });
