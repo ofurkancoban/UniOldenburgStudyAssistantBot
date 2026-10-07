@@ -797,6 +797,14 @@ async def unified_watcher_controller(app):
                     try:
                         logging.info("🌞 Sending morning summary...")
                         await send_morning_summary(app.bot, ALLOWED_USER_IDS)
+                        # Re-load rather than reusing the `cache` loaded above -
+                        # send_morning_summary does its own separate
+                        # load/save of general_cache.json (to track which
+                        # message is currently pinned), and saving the stale
+                        # pre-call `cache` here would silently overwrite that
+                        # with a copy that never has it, breaking the
+                        # unpin-before-pin logic every single day.
+                        cache = load_general_cache()
                         cache["last_morning_summary"] = today_str
                         save_general_cache(cache)
                     except Exception as e:
