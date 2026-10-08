@@ -29,8 +29,7 @@ weather_location.json
 
 # WhatsApp Microservice
 whatsapp_service/node_modules/
-whatsapp_service/.wwebjs_auth/
-whatsapp_service/.wwebjs_cache/
+whatsapp_service/baileys_auth/
 whatsapp_service/qr.png
 
 # IDE & OS
