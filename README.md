@@ -208,10 +208,12 @@ OPENROUTER_MODEL=cohere/north-mini-code:free  # any OpenRouter model id; default
 
 ## 📱 WhatsApp Integration Setup
 
+The microservice (`whatsapp_service/`) talks to WhatsApp via **[Baileys](https://github.com/WhiskeySockets/Baileys)** — a direct implementation of WhatsApp's multi-device protocol over a WebSocket, not a browser. No Chromium/Puppeteer involved, ~50MB lighter at idle, and no "headless browser internals changed and broke everything" class of bug.
+
 1. **Auto-Start**: When you launch the bot (`python studip_bot.py`), it automatically starts the WhatsApp microservice in the background.
-2. **First Time Login (QR)**: The bot will generate a WhatsApp Web QR code and send it to you via Telegram as an image. Scan it with your phone's WhatsApp (Linked Devices).
+2. **First Time Login (QR)**: The bot will generate a WhatsApp QR code and send it to you via Telegram as an image. Scan it with your phone's WhatsApp (Linked Devices) — same scan-a-code flow as linking WhatsApp Web, just without an actual browser behind it.
 3. **Pick the Target Group**: Use the `/status` menu → **"📱 WhatsApp"** → **"🔍 Detect WA Groups"**. Send or receive any message in the target group first (so the service logs its exact ID), then tap it in the list to set it active — the group is always set by the exact ID captured this way, not a typed name, since name-based lookup is fragile (collisions, drift) and could silently fail to find the right group.
-4. **Session Persistence**: Your session is saved securely. If you need a new QR code (e.g., you logged out), simply tap **"📲 Request WA QR"** in the `/status` menu.
+4. **Session Persistence**: Your session is saved to `whatsapp_service/baileys_auth/` (a folder of credential files — gitignored, never commit it). If you need a new QR code (e.g., you logged out), simply tap **"📲 Request WA QR"** in the `/status` menu.
 
 > [!TIP]
 > Every **"📲 Forward to WA"** button requires a **Yes/No confirmation** tap before anything is sent, to prevent an accidental forward into a shared group. Grade notifications go a step further: the message with your actual grade never carries a forward button at all — only a separate, grade-free announcement does. Auto-generated "Enrolment in course" messages also skip the forward button, since they're never meant for a shared group.
@@ -234,9 +236,9 @@ graph TD
     C --> K[exam_reminder.py]
     K -->|Shared SSO session| L[StuMS / HISinOne Portal]
     L --> H
-    C -.->|Forward & Status| I[Node.js WhatsApp Microservice]
+    C -.->|Forward & Status| I[Node.js WhatsApp Microservice / Baileys]
     D -.->|Forward & Status| I
-    I --> J[WhatsApp Web]
+    I --> J[WhatsApp multi-device protocol over WebSocket]
     C -.->|Voice note| M[Google Web Speech STT]
     M -.->|Transcript| N[OpenRouter free LLM]
     N -.->|Classified intent| C
@@ -245,6 +247,8 @@ graph TD
 > **exam_reminder.py** shares the same authenticated session as `studip_bot.py` (Stud.IP's SSO trust extends to the StuMS/HISinOne exam portal) to track registrations, exam dates, and grades — no separate login required.
 >
 > Voice notes go through two free external calls before anything happens: Google's Web Speech API for transcription, then an OpenRouter `:free` model for intent classification — both optional, both fail gracefully back to plain-text behavior if unavailable.
+>
+> **WhatsApp Microservice** (`whatsapp_service/`) runs on [Baileys](https://github.com/WhiskeySockets/Baileys), not a browser — it speaks WhatsApp's multi-device protocol directly over a WebSocket (no Puppeteer/Chromium). Session credentials persist to `whatsapp_service/baileys_auth/`.
 
 ---
 
