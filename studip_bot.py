@@ -8368,7 +8368,13 @@ async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Option
             vton_img=handle_file(person_path),
             garm_img=handle_file(garm_path),
             category=category,
-            n_samples=1, n_steps=20, image_scale=2.0, seed=42,
+            # 40 steps noticeably sharpens small garment logos/text over the
+            # default 20 (confirmed by live comparison). The seed is pinned
+            # (not randomized) — a different seed was observed hallucinating
+            # an extra object (a bag) onto the shoulder on one test run, so
+            # a fixed seed is the safer choice even though it means every
+            # generation for a given photo+garment pair looks the same.
+            n_samples=1, n_steps=40, image_scale=2.0, seed=42,
             api_name="/process_dc",
         )
 
