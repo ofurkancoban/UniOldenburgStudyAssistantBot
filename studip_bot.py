@@ -1810,7 +1810,7 @@ async def build_food_recommendation() -> Optional[dict]:
 OUTFIT_RECOMMENDATION_SYSTEM_PROMPT = """You are picking a coherent, weather-appropriate outfit for a student from their own wardrobe, using only the candidate items listed (each with an id, type, subtype, color, and warmth level). Follow this layering logic based on today's forecast high temperature and whether rain is expected:
 - Below 5°C ("very cold"): full layering — a top (prefer subtype=sweater, else shirt/t-shirt) + a light_jacket AND a coat together if both are available (worn as mid layer + outer shell) + pants.
 - 5-12°C ("cold"): a top + exactly ONE outerwear item (a coat if available, else a light_jacket) + pants.
-- 12-18°C ("mild"): a top + pants; add a light_jacket only if rain is expected.
+- 12-18°C ("mild"): a top + pants; add a light_jacket if rain is expected OR if the morning low is below 8°C (the high alone can be misleading on a day that starts cold).
 - 18-24°C ("warm"): a top (prefer subtype=t-shirt) + pants or shorts, preferring shorts (subtype=shorts) when available; add a light_jacket only if rain is expected.
 - 24°C and above ("hot"): a top (prefer subtype=t-shirt) + shorts, preferring shorts over pants even if rain is expected — just add a light_jacket too if one's available on a rainy hot day.
 Never pick two tops or two bottoms. Also always include exactly one "shoes" item and one headwear "accessory" item (a cap/beanie/hat, not socks or other accessories) if any such items are present in the candidate list — these can't be shown in the outfit image, but still name them in your reasoning. Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie and the coat since it'll be cold and dry, plus the beanie and trainers.'>"}. Use only ids from the given list."""
@@ -1843,6 +1843,8 @@ def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict]) -> list[d
     fallback)."""
     band = _temperature_band(weather.get("temp_max") if weather else None)
     is_wet = bool(weather.get("is_wet")) if weather else False
+    temp_min = weather.get("temp_min") if weather else None
+    cold_morning = temp_min is not None and temp_min < 8
 
     tops = [it for it in items if it.get("type") == "top"]
     bottoms = [it for it in items if it.get("type") == "bottom"]
@@ -1882,7 +1884,11 @@ def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict]) -> list[d
         outer = coat or light_jacket or (outerwear[0] if outerwear else None)
         if outer:
             chosen.append(outer)
-    elif band == "mild" and is_wet:
+    elif band == "mild" and (is_wet or cold_morning):
+        # A dry mild afternoon can still start from a genuinely cold
+        # morning (e.g. 6°C low, 12°C high) - temp_max alone would miss
+        # that, so a cold morning low also triggers a light layer even
+        # when it won't rain.
         outer = light_jacket or coat or (outerwear[0] if outerwear else None)
         if outer:
             chosen.append(outer)
