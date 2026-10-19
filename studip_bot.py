@@ -590,6 +590,7 @@ def add_wardrobe_item(user_id, file_id: str, tags: dict) -> dict:
         "id": f"w_{uuid.uuid4().hex[:10]}",
         "file_id": file_id,
         "type": tags.get("type", "other"),
+        "subtype": tags.get("subtype"),
         "color": tags.get("color", ""),
         "warmth": tags.get("warmth", "medium"),
         "label": tags.get("label", "clothing item"),
@@ -1798,44 +1799,101 @@ async def build_food_recommendation() -> Optional[dict]:
     return {"dish": chosen["name"], "category": chosen["category"], "reasoning": reasoning}
 
 
-OUTFIT_RECOMMENDATION_SYSTEM_PROMPT = """You are picking a coherent, weather-appropriate outfit for a student from their own wardrobe, using only the candidate items listed (each with an id, type, color, and warmth level). Pick at least one "top" and one "bottom" (or a single "outerwear"/one-piece item that already covers both), adding an "outerwear" item only if the weather is cold or wet. Match overall warmth to the given temperature range — don't pick "light" warmth items for a cold day or "warm" items for a mild/warm one. Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie since it'll be cold and dry.'>"}. Use only ids from the given list."""
+OUTFIT_RECOMMENDATION_SYSTEM_PROMPT = """You are picking a coherent, weather-appropriate outfit for a student from their own wardrobe, using only the candidate items listed (each with an id, type, subtype, color, and warmth level). Follow this layering logic based on today's forecast high temperature and whether rain is expected:
+- Below 5°C ("very cold"): full layering — a top (prefer subtype=sweater, else shirt/t-shirt) + a light_jacket AND a coat together if both are available (worn as mid layer + outer shell) + pants.
+- 5-12°C ("cold"): a top + exactly ONE outerwear item (a coat if available, else a light_jacket) + pants.
+- 12-18°C ("mild"): a top + pants; add a light_jacket only if rain is expected.
+- 18-24°C ("warm"): a top (prefer subtype=t-shirt) + pants or shorts, preferring shorts (subtype=shorts) when available; add a light_jacket only if rain is expected.
+- 24°C and above ("hot"): a top (prefer subtype=t-shirt) + shorts, preferring shorts over pants even if rain is expected — just add a light_jacket too if one's available on a rainy hot day.
+Never pick two tops or two bottoms. Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie and the coat since it'll be cold and dry.'>"}. Use only ids from the given list."""
+
+
+def _temperature_band(temp_max: Optional[float]) -> str:
+    """Map a forecast high to one of the 5 bands the outfit logic (both
+    the LLM prompt above and this heuristic fallback) reasons in terms
+    of — kept as one function so the two stay in sync if the thresholds
+    ever change."""
+    if temp_max is None:
+        return "mild"
+    if temp_max < 5:
+        return "very_cold"
+    if temp_max < 12:
+        return "cold"
+    if temp_max < 18:
+        return "mild"
+    if temp_max < 24:
+        return "warm"
+    return "hot"
 
 
 def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict]) -> list[dict]:
     """Fallback used when the LLM call fails or returns unparsable JSON —
-    picks by warmth-vs-temperature instead of randomly, since an
-    incoherent random outfit is a worse failure mode than an incoherent
-    random meal pick (build_food_recommendation's equivalent fallback)."""
-    temp_max = weather.get("temp_max") if weather else None
-    if temp_max is not None and temp_max < 10:
-        target_warmth = "warm"
-    elif temp_max is not None and temp_max < 18:
-        target_warmth = "medium"
+    deterministic temperature-band + layering logic (mirrors
+    OUTFIT_RECOMMENDATION_SYSTEM_PROMPT) instead of a plain warmth match,
+    since an incoherent random outfit is a worse failure mode than an
+    incoherent random meal pick (build_food_recommendation's equivalent
+    fallback)."""
+    band = _temperature_band(weather.get("temp_max") if weather else None)
+    is_wet = bool(weather.get("is_wet")) if weather else False
+
+    tops = [it for it in items if it.get("type") == "top"]
+    bottoms = [it for it in items if it.get("type") == "bottom"]
+    outerwear = [it for it in items if it.get("type") == "outerwear"]
+
+    def _by_subtype(pool, subtype):
+        return next((it for it in pool if it.get("subtype") == subtype), None)
+
+    chosen = []
+
+    if band == "very_cold":
+        top = _by_subtype(tops, "sweater") or _by_subtype(tops, "shirt") or _by_subtype(tops, "t-shirt") or (tops[0] if tops else None)
+    elif band == "hot" or band == "warm":
+        top = _by_subtype(tops, "t-shirt") or (tops[0] if tops else None)
     else:
-        target_warmth = "light"
+        top = _by_subtype(tops, "shirt") or _by_subtype(tops, "sweater") or _by_subtype(tops, "t-shirt") or (tops[0] if tops else None)
+    if top:
+        chosen.append(top)
 
-    def _best_of(item_type):
-        candidates = [it for it in items if it.get("type") == item_type]
-        if not candidates:
-            return None
-        exact = [it for it in candidates if it.get("warmth") == target_warmth]
-        return (exact or candidates)[0]
+    if band in ("warm", "hot"):
+        bottom = _by_subtype(bottoms, "shorts") or _by_subtype(bottoms, "pants") or (bottoms[0] if bottoms else None)
+    else:
+        bottom = _by_subtype(bottoms, "pants") or (bottoms[0] if bottoms else None)
+    if bottom:
+        chosen.append(bottom)
 
-    chosen = [it for it in (_best_of("top"), _best_of("bottom")) if it]
-    if target_warmth != "light":
-        outerwear = _best_of("outerwear")
-        if outerwear:
-            chosen.append(outerwear)
+    light_jacket = _by_subtype(outerwear, "light_jacket")
+    coat = _by_subtype(outerwear, "coat")
+    if band == "very_cold":
+        # Full layering - both pieces together if the wardrobe has them.
+        for piece in (light_jacket, coat):
+            if piece:
+                chosen.append(piece)
+        if not light_jacket and not coat and outerwear:
+            chosen.append(outerwear[0])
+    elif band == "cold":
+        outer = coat or light_jacket or (outerwear[0] if outerwear else None)
+        if outer:
+            chosen.append(outer)
+    elif band == "mild" and is_wet:
+        outer = light_jacket or coat or (outerwear[0] if outerwear else None)
+        if outer:
+            chosen.append(outer)
+    elif band in ("warm", "hot") and is_wet:
+        outer = light_jacket or (outerwear[0] if outerwear else None)
+        if outer:
+            chosen.append(outer)
+
     return chosen or items[:2]
 
 
 async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict]) -> Optional[dict]:
-    """Ask the LLM to pick a coherent outfit from the user's cataloged
-    wardrobe items, considering the morning's weather snapshot (see
-    get_weather_snapshot) — structural twin of build_food_recommendation,
-    just over wardrobe metadata instead of menu items. Pure text reasoning
-    over already-tagged items, so this reuses the bot's existing free-tier
-    OpenRouter text call, not the Cloudflare/HF image providers.
+    """Ask the LLM to pick a coherent, temperature-banded outfit from the
+    user's cataloged wardrobe items, considering the morning's weather
+    snapshot (see get_weather_snapshot) — structural twin of
+    build_food_recommendation, just over wardrobe metadata instead of menu
+    items. Pure text reasoning over already-tagged items, so this reuses
+    the bot's existing free-tier OpenRouter text call, not the
+    Cloudflare/HF image providers.
 
     Returns {"chosen_items": [...item dicts...], "description": "<human
     readable, e.g. 'navy hoodie + black jeans'>"}, or None if there are no
@@ -1843,12 +1901,13 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict]) 
     if not items:
         return None
 
-    lines = [f"- id={it['id']}: {it['label']} (type={it['type']}, color={it['color']}, warmth={it['warmth']})" for it in items]
+    band = _temperature_band(weather.get("temp_max") if weather else None)
+    lines = [f"- id={it['id']}: {it['label']} (type={it['type']}, subtype={it.get('subtype') or 'n/a'}, color={it['color']}, warmth={it['warmth']})" for it in items]
     if weather:
         is_wet = weather.get("is_wet")
-        weather_line = f"Weather: {weather.get('description', 'unknown')}, {weather.get('temp_min')}-{weather.get('temp_max')}°C, {'rain expected' if is_wet else 'dry'}."
+        weather_line = f"Weather: {weather.get('description', 'unknown')}, {weather.get('temp_min')}-{weather.get('temp_max')}°C ({band}), {'rain expected' if is_wet else 'dry'}."
     else:
-        weather_line = "Weather: no data available today — pick something reasonably versatile."
+        weather_line = "Weather: no data available today — pick something reasonably versatile (mild band)."
 
     raw = await _call_openrouter(
         OUTFIT_RECOMMENDATION_SYSTEM_PROMPT,
@@ -2342,7 +2401,7 @@ def _wardrobe_list_view(user_id) -> tuple:
 
     text = "👔 <b>My Wardrobe</b>\n"
     text += f"{len(items)} item(s) cataloged.\n" if items else "Nothing added yet.\n"
-    keyboard = [[InlineKeyboardButton(f"🗑 {it['label']} ({it['type']})", callback_data=f"wardrobe_remove|{it['id']}")] for it in items]
+    keyboard = [[InlineKeyboardButton(f"🗑 {it['label']} ({it['type']}/{it.get('subtype') or '-'})", callback_data=f"wardrobe_remove|{it['id']}")] for it in items]
     keyboard.append([InlineKeyboardButton("📸 Add Clothing Item", callback_data="wardrobe_add_item")])
     if items and entry.get("reference_photo_file_id"):
         keyboard.append([InlineKeyboardButton("👔 Suggest Outfit Now", callback_data="wardrobe_suggest_now")])
@@ -8177,7 +8236,7 @@ async def _download_telegram_file(bot, file_id: str) -> Optional[bytes]:
             pass
 
 
-TAG_WARDROBE_ITEM_PROMPT = """You're looking at a photo of a single clothing item. Respond with strict JSON only, no other text: {"type": "top|bottom|outerwear|shoes|accessory", "color": "<main color, 1-2 words>", "warmth": "light|medium|warm", "label": "<short description, e.g. 'navy blue hoodie'>"}."""
+TAG_WARDROBE_ITEM_PROMPT = """You're looking at a photo of a single clothing item. Respond with strict JSON only, no other text: {"type": "top|bottom|outerwear|shoes|accessory", "subtype": "<for type=top: t-shirt|shirt|sweater; for type=bottom: pants|shorts; for type=outerwear: light_jacket|coat; otherwise null>", "color": "<main color, 1-2 words>", "warmth": "light|medium|warm", "label": "<short description, e.g. 'navy blue hoodie'>"}."""
 
 
 async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
@@ -9210,7 +9269,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             return  # pending_step stays set so a retry just works
         item = add_wardrobe_item(user_id, file_id, tags)
         context.user_data.pop("pending_step", None)
-        await status_msg.edit_text(f"👔 Added: {item['label']} ({item['type']}, {item['warmth']} warmth)", reply_markup=get_main_keyboard())
+        subtype_note = f"/{item['subtype']}" if item.get("subtype") else ""
+        await status_msg.edit_text(f"👔 Added: {item['label']} ({item['type']}{subtype_note}, {item['warmth']} warmth)", reply_markup=get_main_keyboard())
         return
 
     if step == "wardrobe_set_reference":
