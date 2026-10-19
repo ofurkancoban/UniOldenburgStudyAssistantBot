@@ -642,6 +642,69 @@ def set_wardrobe_feature_enabled(enabled: bool) -> None:
     save_general_cache(cache)
 
 
+WARDROBE_OUTFIT_HISTORY_DAYS = 7  # how far back record_worn_items prunes to
+WARDROBE_RECENT_WORN_DAYS = 2  # how far back get_recently_worn_item_ids looks when deprioritizing repeats
+
+
+def get_cached_outfit_today(user_id) -> Optional[dict]:
+    """Return today's already-generated outfit result for this user, if
+    "Suggest Outfit Now" or the morning summary already produced one
+    earlier today — {"description", "photo_file_id" (None if the image
+    step failed and only text went out)} — so a second trigger the same
+    day resends it instantly instead of burning another round of (quota-
+    limited, free-tier) image-generation calls. None if nothing cached
+    yet today."""
+    cache = load_general_cache().get("outfit_today_cache", {}).get(str(user_id))
+    if cache and cache.get("date") == datetime.now(TZ_BERLIN).date().isoformat():
+        return cache
+    return None
+
+
+def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[str]) -> None:
+    cache = load_general_cache()
+    all_cached = cache.setdefault("outfit_today_cache", {})
+    all_cached[str(user_id)] = {
+        "date": datetime.now(TZ_BERLIN).date().isoformat(),
+        "description": description,
+        "photo_file_id": photo_file_id,
+    }
+    save_general_cache(cache)
+
+
+def get_recently_worn_item_ids(user_id) -> set:
+    """Item ids chosen in the last WARDROBE_RECENT_WORN_DAYS days, used to
+    deprioritize (not hard-exclude — the wardrobe may simply have only one
+    t-shirt) repeating the exact same outfit back-to-back."""
+    history = load_general_cache().get("outfit_history", {}).get(str(user_id), {})
+    cutoff = datetime.now(TZ_BERLIN).date() - timedelta(days=WARDROBE_RECENT_WORN_DAYS)
+    recent_ids = set()
+    for date_str, item_ids in history.items():
+        try:
+            if datetime.fromisoformat(date_str).date() >= cutoff:
+                recent_ids.update(item_ids)
+        except ValueError:
+            continue
+    return recent_ids
+
+
+def record_worn_items(user_id, item_ids: list) -> None:
+    """Record today's chosen item ids and prune entries older than
+    WARDROBE_OUTFIT_HISTORY_DAYS so this cache doesn't grow forever."""
+    cache = load_general_cache()
+    history = cache.setdefault("outfit_history", {})
+    user_history = history.setdefault(str(user_id), {})
+    today_str = datetime.now(TZ_BERLIN).date().isoformat()
+    user_history[today_str] = item_ids
+    cutoff = datetime.now(TZ_BERLIN).date() - timedelta(days=WARDROBE_OUTFIT_HISTORY_DAYS)
+    for date_str in list(user_history.keys()):
+        try:
+            if datetime.fromisoformat(date_str).date() < cutoff:
+                del user_history[date_str]
+        except ValueError:
+            del user_history[date_str]
+    save_general_cache(cache)
+
+
 WEATHER_LOCATION_CACHE_PATH = "weather_location.json"
 WEATHER_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 
@@ -1813,7 +1876,7 @@ OUTFIT_RECOMMENDATION_SYSTEM_PROMPT = """You are picking a coherent, weather-app
 - 12-18°C ("mild"): a top + pants; add a light_jacket if rain is expected OR if the morning low is below 8°C (the high alone can be misleading on a day that starts cold).
 - 18-24°C ("warm"): a top (prefer subtype=t-shirt) + pants or shorts, preferring shorts (subtype=shorts) when available; add a light_jacket only if rain is expected.
 - 24°C and above ("hot"): a top (prefer subtype=t-shirt) + shorts, preferring shorts over pants even if rain is expected — just add a light_jacket too if one's available on a rainy hot day.
-Never pick two tops or two bottoms. Also always include exactly one "shoes" item and one headwear "accessory" item (a cap/beanie/hat, not socks or other accessories) if any such items are present in the candidate list — these can't be shown in the outfit image, but still name them in your reasoning. Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie and the coat since it'll be cold and dry, plus the beanie and trainers.'>"}. Use only ids from the given list."""
+Never pick two tops or two bottoms. Also always include exactly one "shoes" item and one headwear "accessory" item (a cap/beanie/hat, not socks or other accessories) if any such items are present in the candidate list — these can't be shown in the outfit image, but still name them in your reasoning. Some items are tagged "[worn in the last couple days, prefer an alternative if one fits]" — pick a different item of that same type when a suitable alternative exists in the list, but don't force an unsuitable combination just to avoid a repeat. Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie and the coat since it'll be cold and dry, plus the beanie and trainers.'>"}. Use only ids from the given list."""
 
 
 def _temperature_band(temp_max: Optional[float]) -> str:
@@ -1834,7 +1897,18 @@ def _temperature_band(temp_max: Optional[float]) -> str:
     return "hot"
 
 
-def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict]) -> list[dict]:
+def _prefer_unworn(pool: list[dict], recent_ids: set) -> list[dict]:
+    """Stable-partition a candidate pool so recently-worn items (see
+    get_recently_worn_item_ids) sort after everything else — the
+    "first match" selection below then naturally avoids repeats when a
+    genuine alternative exists, but still falls back to a recently-worn
+    item rather than nothing when it's the only option in that subtype."""
+    if not recent_ids:
+        return pool
+    return [it for it in pool if it["id"] not in recent_ids] + [it for it in pool if it["id"] in recent_ids]
+
+
+def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict], recent_ids: Optional[set] = None) -> list[dict]:
     """Fallback used when the LLM call fails or returns unparsable JSON —
     deterministic temperature-band + layering logic (mirrors
     OUTFIT_RECOMMENDATION_SYSTEM_PROMPT) instead of a plain warmth match,
@@ -1845,10 +1919,11 @@ def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict]) -> list[d
     is_wet = bool(weather.get("is_wet")) if weather else False
     temp_min = weather.get("temp_min") if weather else None
     cold_morning = temp_min is not None and temp_min < 8
+    recent_ids = recent_ids or set()
 
-    tops = [it for it in items if it.get("type") == "top"]
-    bottoms = [it for it in items if it.get("type") == "bottom"]
-    outerwear = [it for it in items if it.get("type") == "outerwear"]
+    tops = _prefer_unworn([it for it in items if it.get("type") == "top"], recent_ids)
+    bottoms = _prefer_unworn([it for it in items if it.get("type") == "bottom"], recent_ids)
+    outerwear = _prefer_unworn([it for it in items if it.get("type") == "outerwear"], recent_ids)
 
     def _by_subtype(pool, subtype):
         return next((it for it in pool if it.get("subtype") == subtype), None)
@@ -1929,7 +2004,7 @@ def _add_mandatory_shoes_and_headwear(items: list[dict], chosen: list[dict]) -> 
     return chosen
 
 
-async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict]) -> Optional[dict]:
+async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], recent_ids: Optional[set] = None) -> Optional[dict]:
     """Ask the LLM to pick a coherent, temperature-banded outfit from the
     user's cataloged wardrobe items, considering the morning's weather
     snapshot (see get_weather_snapshot) — structural twin of
@@ -1938,6 +2013,11 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict]) 
     the bot's existing free-tier OpenRouter text call, not the
     Cloudflare/HF image providers.
 
+    `recent_ids` (see get_recently_worn_item_ids) nudges away from
+    repeating the exact same outfit two days running — soft preference,
+    not a hard exclusion, since a small wardrobe may have only one real
+    option for a given slot.
+
     Returns {"chosen_items": [...item dicts...], "description": "<human
     readable, e.g. 'navy hoodie + black jeans'>"}, or None if there are no
     items to choose from at all."""
@@ -1945,7 +2025,12 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict]) 
         return None
 
     band = _temperature_band(weather.get("temp_max") if weather else None)
-    lines = [f"- id={it['id']}: {it['label']} (type={it['type']}, subtype={it.get('subtype') or 'n/a'}, color={it['color']}, warmth={it['warmth']})" for it in items]
+    recent_ids = recent_ids or set()
+    lines = [
+        f"- id={it['id']}: {it['label']} (type={it['type']}, subtype={it.get('subtype') or 'n/a'}, color={it['color']}, warmth={it['warmth']})"
+        + (" [worn in the last couple days, prefer an alternative if one fits]" if it["id"] in recent_ids else "")
+        for it in items
+    ]
     if weather:
         is_wet = weather.get("is_wet")
         weather_line = f"Weather: {weather.get('description', 'unknown')}, {weather.get('temp_min')}-{weather.get('temp_max')}°C ({band}), {'rain expected' if is_wet else 'dry'}."
@@ -1964,7 +2049,7 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict]) 
         chosen_items = [by_id[i] for i in parsed["item_ids"] if i in by_id]
 
     if not chosen_items:
-        chosen_items = _heuristic_outfit_pick(items, weather)
+        chosen_items = _heuristic_outfit_pick(items, weather, recent_ids)
     if not chosen_items:
         return None
     pre_ids = {it["id"] for it in chosen_items}
@@ -2554,12 +2639,26 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
         await query.message.reply_text("🖼️ Set your reference photo first — tap 🖼️ Set Reference Photo in /status.")
         return
 
+    # Reuse today's already-generated pick if this is a second trigger the
+    # same day (e.g. morning summary already ran) — resending a cached
+    # photo_file_id is instant and free, unlike burning another round of
+    # quota-limited image-generation calls for the same day's outfit.
+    cached = get_cached_outfit_today(user_id)
+    if cached:
+        caption = f"👔 <b>Today's outfit:</b> {cached['description']}"
+        if cached.get("photo_file_id"):
+            await query.message.reply_photo(photo=cached["photo_file_id"], caption=caption, parse_mode="HTML")
+        else:
+            await query.message.reply_text(caption, parse_mode="HTML")
+        return
+
     await _show_typing(query)
     status_msg = await query.message.reply_text("👔 Picking an outfit for you...", disable_notification=True)
     stop_evt, anim_task = _start_loading_animation(status_msg, "Picking an outfit for you...")
     try:
         weather = await get_weather_snapshot(datetime.now(TZ_BERLIN).date())
-        outfit = await pick_outfit_from_wardrobe(items, weather)
+        recent_ids = get_recently_worn_item_ids(user_id)
+        outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids)
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
 
@@ -2570,10 +2669,15 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
     caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
     reference_bytes = await _download_telegram_file(context.bot, ref_file_id)
     image_bytes = await generate_outfit_tryon_image(context.bot, reference_bytes, outfit["chosen_items"]) if reference_bytes else None
+    photo_file_id = None
     if image_bytes:
-        await query.message.reply_photo(photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
+        sent = await query.message.reply_photo(photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
+        photo_file_id = sent.photo[-1].file_id if sent.photo else None
     else:
         await query.message.reply_text(caption, parse_mode="HTML")
+
+    record_worn_items(user_id, [it["id"] for it in outfit["chosen_items"]])
+    save_cached_outfit_today(user_id, outfit["description"], photo_file_id)
 
 
 async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3894,24 +3998,41 @@ async def send_morning_summary(bot, user_ids):
     if get_wardrobe_feature_enabled():
         for uid in user_ids:
             try:
+                # A manual "Suggest Outfit Now" tap may have already run
+                # today (e.g. before this morning's run fired) - reuse
+                # that result instead of generating a second one.
+                cached = get_cached_outfit_today(uid)
+                if cached:
+                    caption = f"👔 <b>Today's outfit:</b> {cached['description']}"
+                    if cached.get("photo_file_id"):
+                        await bot.send_photo(chat_id=uid, photo=cached["photo_file_id"], caption=caption, parse_mode="HTML")
+                    else:
+                        await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
+                    continue
+
                 wardrobe_entry = get_wardrobe_entry(uid)
                 items = wardrobe_entry.get("items", [])
                 ref_file_id = wardrobe_entry.get("reference_photo_file_id")
                 if not items or not ref_file_id:
                     continue
-                outfit = await pick_outfit_from_wardrobe(items, weather)
+                recent_ids = get_recently_worn_item_ids(uid)
+                outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids)
                 if not outfit:
                     continue
                 caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
                 reference_bytes = await _download_telegram_file(bot, ref_file_id)
                 image_bytes = await generate_outfit_tryon_image(bot, reference_bytes, outfit["chosen_items"]) if reference_bytes else None
+                photo_file_id = None
                 if image_bytes:
-                    await bot.send_photo(chat_id=uid, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
+                    sent = await bot.send_photo(chat_id=uid, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
+                    photo_file_id = sent.photo[-1].file_id if sent.photo else None
                 else:
                     # Both free image providers failed/unavailable - still
                     # deliver the text-only pick rather than nothing, since
                     # the weather-aware reasoning is useful on its own.
                     await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
+                record_worn_items(uid, [it["id"] for it in outfit["chosen_items"]])
+                save_cached_outfit_today(uid, outfit["description"], photo_file_id)
             except Exception as e:
                 logging.warning(f"Outfit suggestion failed for {uid}: {e}")
 
