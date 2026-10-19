@@ -66,6 +66,7 @@ CLOUDFLARE_VISION_MODEL = os.getenv("CLOUDFLARE_VISION_MODEL", "@cf/mistralai/mi
 CLOUDFLARE_IMAGE_MODEL = os.getenv("CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-2-dev")
 CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
 HF_SPACE_VTON = os.getenv("HF_SPACE_VTON", "levihsu/OOTDiffusion")
+HF_SPACE_ACCESSORIES = os.getenv("HF_SPACE_ACCESSORIES", "black-forest-labs/FLUX.1-Kontext-Dev")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 # University of Oldenburg's coordinates, for the daily-plan weather snapshot
 # (see get_weather_snapshot) — configurable in case the bot is ever reused
@@ -8460,6 +8461,73 @@ async def generate_outfit_tryon_flux(reference_bytes: bytes, item_images: list[b
         return None
 
 
+def _describe_item_for_prompt(item: dict) -> str:
+    color = (item.get("color") or "").strip()
+    label = item.get("label") or "item"
+    return f"{color} {label}".strip()
+
+
+async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: Optional[dict], headwear_item: Optional[dict]) -> Optional[bytes]:
+    """Add shoes/headwear via black-forest-labs/FLUX.1-Kontext-Dev — a
+    general instruction-based image editor (not garment-category-locked
+    like OOTDiffusion/IDM-VTON), so it can place accessories neither of
+    those support. Described in TEXT only (color + label), not from the
+    actual wardrobe photo, since Kontext takes one image + one instruction,
+    not a reference garment image — so exact styling/logos won't match
+    perfectly, just the general look.
+
+    Both accessories are requested in a SINGLE combined call rather than
+    two sequential ones — confirmed via live comparison that chaining
+    separate hat-then-shoes calls compounds visible distortion (warped
+    face/proportions) across each successive edit, while one combined
+    instruction stays clean. Returns None if there's nothing to add or
+    the call fails — caller keeps the un-accessorized image rather than
+    nothing."""
+    if not shoes_item and not headwear_item:
+        return None
+    try:
+        from gradio_client import Client, handle_file
+    except ImportError:
+        logging.warning("generate_outfit_tryon_accessories: gradio_client not installed")
+        return None
+
+    parts = []
+    if headwear_item:
+        parts.append(f"a small fitted {_describe_item_for_prompt(headwear_item)} on top of his head, not covering his face or eyes")
+    if shoes_item:
+        parts.append(f"{_describe_item_for_prompt(shoes_item)} on his feet, replacing his current shoes")
+    instruction = "Add " + " and ".join(parts) + ". Keep his face, body proportions, pose, clothing and background exactly unchanged."
+
+    ref_path = os.path.join(tempfile.gettempdir(), f"kontext_{uuid.uuid4().hex}.jpg")
+    try:
+        with open(ref_path, "wb") as f:
+            f.write(reference_bytes)
+
+        def _call():
+            client = Client(HF_SPACE_ACCESSORIES, token=HF_TOKEN or None)
+            return client.predict(
+                input_image=handle_file(ref_path),
+                prompt=instruction,
+                seed=7, randomize_seed=False, guidance_scale=2.5, steps=20,
+                api_name="/infer",
+            )
+
+        result = await asyncio.to_thread(_call)
+        output_path = result[0] if isinstance(result, (list, tuple)) else result
+        if output_path and os.path.exists(output_path):
+            with open(output_path, "rb") as f:
+                return f.read()
+        return None
+    except Exception as e:
+        logging.warning(f"generate_outfit_tryon_accessories failed: {e}")
+        return None
+    finally:
+        try:
+            os.remove(ref_path)
+        except OSError:
+            pass
+
+
 async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items: list[dict]) -> Optional[bytes]:
     """Dress the reference photo in the chosen outfit — picks one
     representative upper-body garment (the outermost layer if the outfit
@@ -8468,11 +8536,13 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
     and one bottom, downloads their bytes, and tries the free, purpose-
     built OOTDiffusion Space first (chained upper+lower, see
     generate_outfit_tryon_ootd), falling back to Cloudflare's general
-    FLUX.2 editing model if that Space is unavailable. Shoes/headwear
-    items in chosen_items are intentionally not visualized — no free
-    try-on model supports footwear/headwear, they're text-only (see
-    _add_mandatory_shoes_and_headwear). Returns None if nothing could be
-    generated — caller must degrade to a text-only outfit message."""
+    FLUX.2 editing model if that Space is unavailable. If the outfit also
+    includes shoes/a cap-or-beanie (see _add_mandatory_shoes_and_headwear),
+    one more pass via generate_outfit_tryon_accessories adds them — text-
+    described, not photo-matched, and best-effort: a failure there just
+    means the base outfit image goes out without them. Returns None only
+    if the base top/bottom dressing itself produced nothing — caller must
+    degrade to a text-only outfit message in that case."""
     upper_item = next((it for it in reversed(chosen_items) if it.get("type") == "outerwear"), None) \
         or next((it for it in chosen_items if it.get("type") == "top"), None)
     lower_item = next((it for it in chosen_items if it.get("type") == "bottom"), None)
@@ -8481,9 +8551,21 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
     lower_bytes = await _fetch_wardrobe_item_bytes(bot, lower_item) if lower_item else None
 
     image_bytes = await generate_outfit_tryon_ootd(reference_bytes, upper_bytes, lower_bytes)
-    if image_bytes:
-        return image_bytes
-    return await generate_outfit_tryon_flux(reference_bytes, [b for b in (upper_bytes, lower_bytes) if b])
+    if not image_bytes:
+        image_bytes = await generate_outfit_tryon_flux(reference_bytes, [b for b in (upper_bytes, lower_bytes) if b])
+    if not image_bytes:
+        return None
+
+    shoes_item = next((it for it in chosen_items if it.get("type") == "shoes"), None)
+    headwear_item = next(
+        (it for it in chosen_items if it.get("type") == "accessory" and any(kw in it.get("label", "").lower() for kw in _HEADWEAR_KEYWORDS)),
+        None,
+    )
+    if shoes_item or headwear_item:
+        accessorized = await generate_outfit_tryon_accessories(image_bytes, shoes_item, headwear_item)
+        if accessorized:
+            return accessorized
+    return image_bytes
 
 
 WEATHER_CODE_DESCRIPTIONS = {

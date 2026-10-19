@@ -63,7 +63,7 @@ A beautiful, emoji-rich menu with:
 Catalog your clothes once, get a weather-aware outfit picked for you every morning — with an AI-generated image of yourself wearing it:
 - **📸 "Add Clothing Item"** (`/status` → **"👔 My Wardrobe"**): send a photo of one piece of clothing and it's auto-tagged (type, color, warmth) by a free vision model and saved permanently — no need to resend it each day. Delete items or **"🗑 Clear all"** any time from the same screen.
 - **🖼️ "Set Reference Photo"**: one fixed full-body photo of yourself, reused every morning for the try-on image. Resend it any time via `/status` to update it.
-- **Automatic, in the Morning Summary**: toggle **"👔 Daily Outfit Suggestion"** on in `/status` and every morning, alongside the weather/lunch pick, a free OpenRouter LLM picks a coherent outfit from your wardrobe weighing the day's temperature and rain chance, then an image of your reference photo wearing it is generated and sent — tries a free, purpose-built virtual try-on model (Hugging Face's `IDM-VTON` Space) first, falling back to Cloudflare Workers AI's `FLUX.2` image editing model if that's unavailable, and to a text-only outfit description if both fail. Skipped quietly (no nag message) until you've added at least one item and a reference photo. Entirely free-tier: no OpenRouter image-generation cost involved.
+- **Automatic, in the Morning Summary**: toggle **"👔 Daily Outfit Suggestion"** on in `/status` and every morning, alongside the weather/lunch pick, a free OpenRouter LLM picks a coherent, temperature-banded outfit from your wardrobe (full layering below 5°C, shorts preferred above 18°C, etc.), always including a shoes item and a cap/beanie if your wardrobe has one. An image of your reference photo wearing the top+bottom is generated via a free, purpose-built virtual try-on model (Hugging Face's `OOTDiffusion` Space, chaining upper- and lower-body passes), with shoes/headwear added in one more pass via a general image-editing model (`FLUX.1-Kontext-Dev`) — those two are text-described rather than photo-matched, since no free try-on model supports footwear/headwear directly. Falls back to Cloudflare Workers AI's `FLUX.2` if the HF Spaces are unavailable, and to a text-only outfit description if nothing could be generated. Skipped quietly (no nag message) until you've added at least one item and a reference photo. Quality depends heavily on the reference photo being a real, plain-background, front-facing, full-body shot. Entirely free-tier: no OpenRouter image-generation cost involved, though a free Hugging Face account token is effectively required (anonymous usage hits a low shared-GPU quota fast).
 - **👔 "Suggest Outfit Now"**: the same pick + try-on image on demand, any time — tap it from **"👔 My Wardrobe"** (shown once you have at least one item and a reference photo) without waiting for tomorrow's morning summary, and independent of whether the automatic toggle is on.
 
 ### 🎓 Exam & Grade Intelligence (StuMS/HISinOne)
@@ -188,10 +188,11 @@ OPENROUTER_MODEL=cohere/north-mini-code:free  # any OpenRouter model id; default
 # --- 👔 AI Wardrobe (optional, free-tier only) ---
 CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id_here        # dashboard.cloudflare.com, 10,000 free Neurons/day
 CLOUDFLARE_API_TOKEN=your_cloudflare_workers_ai_token_here    # My Profile -> API Tokens -> Custom Token -> Workers AI permission
-# CLOUDFLARE_VISION_MODEL=@cf/mistral-small-3.1-24b-instruct  # used to auto-tag uploaded clothing photos
+# CLOUDFLARE_VISION_MODEL=@cf/mistralai/mistral-small-3.1-24b-instruct  # used to auto-tag uploaded clothing photos
 # CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-2-dev     # fallback try-on image if the HF Space below is unavailable
-# HF_SPACE_VTON=yisol/IDM-VTON   # primary try-on model, free public Space — no token required
-# HF_TOKEN=                      # optional, only raises the Space's rate limit
+# HF_SPACE_VTON=levihsu/OOTDiffusion              # primary try-on model (supports upper+lower body)
+# HF_SPACE_ACCESSORIES=black-forest-labs/FLUX.1-Kontext-Dev  # adds shoes/headwear via general image editing
+HF_TOKEN=your_free_huggingface_read_token_here    # huggingface.co/settings/tokens — effectively required, anonymous ZeroGPU quota is too low
 ```
 
 > [!IMPORTANT]
