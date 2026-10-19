@@ -62,7 +62,7 @@ OPENROUTER_TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
 # ZeroGPU Spaces), see tag_wardrobe_item/generate_outfit_tryon_image.
 CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
 CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
-CLOUDFLARE_VISION_MODEL = os.getenv("CLOUDFLARE_VISION_MODEL", "@cf/mistral-small-3.1-24b-instruct")
+CLOUDFLARE_VISION_MODEL = os.getenv("CLOUDFLARE_VISION_MODEL", "@cf/mistralai/mistral-small-3.1-24b-instruct")
 CLOUDFLARE_IMAGE_MODEL = os.getenv("CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-2-dev")
 CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
 HF_SPACE_VTON = os.getenv("HF_SPACE_VTON", "yisol/IDM-VTON")
@@ -8188,7 +8188,7 @@ async def generate_outfit_tryon_hf(reference_bytes: bytes, item_bytes: bytes) ->
             f.write(item_bytes)
 
         def _call():
-            client = Client(HF_SPACE_VTON, hf_token=HF_TOKEN or None)
+            client = Client(HF_SPACE_VTON, token=HF_TOKEN or None)
             return client.predict(
                 dict={"background": handle_file(ref_path), "layers": [], "composite": None},
                 garm_img=handle_file(item_path),
@@ -8226,28 +8226,34 @@ async def generate_outfit_tryon_flux(reference_bytes: bytes, item_images: list[b
     if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
         return None
     import base64
-    images_b64 = [base64.b64encode(reference_bytes).decode("ascii")] + [
-        base64.b64encode(b).decode("ascii") for b in item_images[:3]
-    ]
     url = CLOUDFLARE_AI_URL.format(account_id=CLOUDFLARE_ACCOUNT_ID, model=CLOUDFLARE_IMAGE_MODEL)
     try:
+        # FLUX.2 [dev] requires multipart/form-data even with no file inputs
+        # (confirmed against a live call — a plain JSON body is rejected
+        # with "required properties at '/' are 'multipart'"), with each
+        # reference image in its own field: image, image2, image3, image4
+        # (up to 4 references total, confirmed working with 2). The
+        # response is JSON with a base64 "image" field, not raw bytes.
+        form = aiohttp.FormData()
+        form.add_field(
+            "prompt",
+            "Dress the person shown in the first reference image with the clothing items shown in the following reference images. Keep the person's face, body, pose, and background realistic and unchanged.",
+        )
+        form.add_field("image", reference_bytes, filename="reference.jpg", content_type="image/jpeg")
+        for i, item_bytes in enumerate(item_images[:3], start=2):
+            form.add_field(f"image{i}", item_bytes, filename=f"item{i}.jpg", content_type="image/jpeg")
+
         async with aiohttp.ClientSession() as session:
             async with session.post(
                 url,
                 headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
-                data={
-                    "prompt": "Dress the person shown in the first reference image with the clothing items shown in the following reference images. Keep the person's face, body, pose, and background realistic and unchanged.",
-                    "reference_images": json.dumps(images_b64),
-                },
+                data=form,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     logging.warning(f"Cloudflare FLUX.2 call failed: HTTP {resp.status}: {body[:200]}")
                     return None
-                content_type = resp.headers.get("Content-Type", "")
-                if "image" in content_type:
-                    return await resp.read()
                 data = await resp.json()
                 image_b64 = data.get("result", {}).get("image")
                 return base64.b64decode(image_b64) if image_b64 else None
