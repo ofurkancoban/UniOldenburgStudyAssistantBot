@@ -65,7 +65,7 @@ CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
 CLOUDFLARE_VISION_MODEL = os.getenv("CLOUDFLARE_VISION_MODEL", "@cf/mistralai/mistral-small-3.1-24b-instruct")
 CLOUDFLARE_IMAGE_MODEL = os.getenv("CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-2-dev")
 CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
-HF_SPACE_VTON = os.getenv("HF_SPACE_VTON", "yisol/IDM-VTON")
+HF_SPACE_VTON = os.getenv("HF_SPACE_VTON", "levihsu/OOTDiffusion")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 # University of Oldenburg's coordinates, for the daily-plan weather snapshot
 # (see get_weather_snapshot) — configurable in case the bot is ever reused
@@ -1812,7 +1812,7 @@ OUTFIT_RECOMMENDATION_SYSTEM_PROMPT = """You are picking a coherent, weather-app
 - 12-18°C ("mild"): a top + pants; add a light_jacket only if rain is expected.
 - 18-24°C ("warm"): a top (prefer subtype=t-shirt) + pants or shorts, preferring shorts (subtype=shorts) when available; add a light_jacket only if rain is expected.
 - 24°C and above ("hot"): a top (prefer subtype=t-shirt) + shorts, preferring shorts over pants even if rain is expected — just add a light_jacket too if one's available on a rainy hot day.
-Never pick two tops or two bottoms. Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie and the coat since it'll be cold and dry.'>"}. Use only ids from the given list."""
+Never pick two tops or two bottoms. Also always include exactly one "shoes" item and one headwear "accessory" item (a cap/beanie/hat, not socks or other accessories) if any such items are present in the candidate list — these can't be shown in the outfit image, but still name them in your reasoning. Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie and the coat since it'll be cold and dry, plus the beanie and trainers.'>"}. Use only ids from the given list."""
 
 
 def _temperature_band(temp_max: Optional[float]) -> str:
@@ -1893,6 +1893,35 @@ def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict]) -> list[d
     return chosen or items[:2]
 
 
+_HEADWEAR_KEYWORDS = ("cap", "beanie", "hat")
+
+
+def _add_mandatory_shoes_and_headwear(items: list[dict], chosen: list[dict]) -> list[dict]:
+    """Shoes and a cap/beanie/hat can't be visually rendered (no free
+    try-on model supports footwear/headwear), but the user wants them
+    named in the outfit text whenever the wardrobe has one — applied
+    after BOTH the LLM pick and the heuristic fallback, so it's
+    guaranteed regardless of whether the LLM actually complied with the
+    "always include" instruction in OUTFIT_RECOMMENDATION_SYSTEM_PROMPT."""
+    chosen_ids = {it["id"] for it in chosen}
+    if not any(it.get("type") == "shoes" for it in chosen):
+        shoes = next((it for it in items if it.get("type") == "shoes"), None)
+        if shoes and shoes["id"] not in chosen_ids:
+            chosen.append(shoes)
+    has_headwear = any(
+        it.get("type") == "accessory" and any(kw in it.get("label", "").lower() for kw in _HEADWEAR_KEYWORDS)
+        for it in chosen
+    )
+    if not has_headwear:
+        headwear = next(
+            (it for it in items if it.get("type") == "accessory" and any(kw in it.get("label", "").lower() for kw in _HEADWEAR_KEYWORDS)),
+            None,
+        )
+        if headwear and headwear["id"] not in chosen_ids:
+            chosen.append(headwear)
+    return chosen
+
+
 async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict]) -> Optional[dict]:
     """Ask the LLM to pick a coherent, temperature-banded outfit from the
     user's cataloged wardrobe items, considering the morning's weather
@@ -1931,9 +1960,17 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict]) 
         chosen_items = _heuristic_outfit_pick(items, weather)
     if not chosen_items:
         return None
+    pre_ids = {it["id"] for it in chosen_items}
+    chosen_items = _add_mandatory_shoes_and_headwear(items, chosen_items)
+    forced_extras = [it["label"] for it in chosen_items if it["id"] not in pre_ids]
 
     reasoning = ((parsed or {}).get("reasoning") or "").strip()
     description = reasoning or " + ".join(it["label"] for it in chosen_items)
+    if forced_extras:
+        # The LLM/heuristic reasoning may not mention the mandatory
+        # shoes/headwear add-ons (see _add_mandatory_shoes_and_headwear) -
+        # make sure they're always named in what the user sees.
+        description += " + " + " + ".join(forced_extras)
     return {"chosen_items": chosen_items, "description": description}
 
 
@@ -2525,12 +2562,7 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
 
     caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
     reference_bytes = await _download_telegram_file(context.bot, ref_file_id)
-    item_bytes = []
-    for it in outfit["chosen_items"]:
-        b = await _fetch_wardrobe_item_bytes(context.bot, it)
-        if b:
-            item_bytes.append(b)
-    image_bytes = await generate_outfit_tryon_image(reference_bytes, item_bytes) if reference_bytes and item_bytes else None
+    image_bytes = await generate_outfit_tryon_image(context.bot, reference_bytes, outfit["chosen_items"]) if reference_bytes else None
     if image_bytes:
         await query.message.reply_photo(photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
     else:
@@ -3865,12 +3897,7 @@ async def send_morning_summary(bot, user_ids):
                     continue
                 caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
                 reference_bytes = await _download_telegram_file(bot, ref_file_id)
-                item_bytes = []
-                for it in outfit["chosen_items"]:
-                    b = await _fetch_wardrobe_item_bytes(bot, it)
-                    if b:
-                        item_bytes.append(b)
-                image_bytes = await generate_outfit_tryon_image(reference_bytes, item_bytes) if reference_bytes and item_bytes else None
+                image_bytes = await generate_outfit_tryon_image(bot, reference_bytes, outfit["chosen_items"]) if reference_bytes else None
                 if image_bytes:
                     await bot.send_photo(chat_id=uid, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
                 else:
@@ -8305,51 +8332,77 @@ async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
         return None
 
 
-async def generate_outfit_tryon_hf(reference_bytes: bytes, item_bytes: bytes) -> Optional[bytes]:
-    """Try the user wearing one garment via the yisol/IDM-VTON Hugging Face
-    Space — a dedicated virtual-try-on model, free on HF's shared ZeroGPU
-    pool. Only one garment per call (IDM-VTON's own API shape); the caller
-    picks the primary/top chosen item for the image and mentions any extra
-    pieces only in the message caption. Returns image bytes, or None on any
-    failure/timeout (the Space is a shared community demo with no uptime
-    guarantee, so callers must fall back rather than treat this as fatal)."""
+async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Optional[bytes], lower_bytes: Optional[bytes]) -> Optional[bytes]:
+    """Dress the reference photo via levihsu/OOTDiffusion's dress-code
+    endpoint (process_dc) — unlike yisol/IDM-VTON, this exposes a
+    category selector (Upper-body/Lower-body/Dress), so it can be
+    CHAINED: apply the upper garment first, then feed that result back in
+    as the new person photo for the lower garment, actually dressing both
+    halves instead of leaving the lower body untouched. Each step is
+    independently best-effort (a failed upper-body step still lets the
+    lower-body step run against the original reference). Returns None if
+    neither step produced an image, or if there's nothing to apply.
+    Quality depends heavily on the reference photo being a plain-
+    background, front-facing, full-body shot — not guaranteed otherwise,
+    this is a free shared-GPU community demo, not a production API."""
     try:
         from gradio_client import Client, handle_file
     except ImportError:
-        logging.warning("generate_outfit_tryon_hf: gradio_client not installed")
+        logging.warning("generate_outfit_tryon_ootd: gradio_client not installed")
         return None
-    ref_path = os.path.join(tempfile.gettempdir(), f"vton_ref_{uuid.uuid4().hex}.jpg")
-    item_path = os.path.join(tempfile.gettempdir(), f"vton_item_{uuid.uuid4().hex}.jpg")
+    if not upper_bytes and not lower_bytes:
+        return None
+
+    tmp_paths = []
+
+    def _write_tmp(data: bytes) -> str:
+        path = os.path.join(tempfile.gettempdir(), f"ootd_{uuid.uuid4().hex}.jpg")
+        with open(path, "wb") as f:
+            f.write(data)
+        tmp_paths.append(path)
+        return path
+
+    def _call(person_path, garm_path, category):
+        client = Client(HF_SPACE_VTON, token=HF_TOKEN or None)
+        return client.predict(
+            vton_img=handle_file(person_path),
+            garm_img=handle_file(garm_path),
+            category=category,
+            n_samples=1, n_steps=20, image_scale=2.0, seed=42,
+            api_name="/process_dc",
+        )
+
+    person_path = _write_tmp(reference_bytes)
+    applied_any = False
     try:
-        with open(ref_path, "wb") as f:
-            f.write(reference_bytes)
-        with open(item_path, "wb") as f:
-            f.write(item_bytes)
+        if upper_bytes:
+            garm_path = _write_tmp(upper_bytes)
+            try:
+                result = await asyncio.to_thread(_call, person_path, garm_path, "Upper-body")
+                output_path = result[0]["image"] if result else None
+                if output_path and os.path.exists(output_path):
+                    person_path = output_path
+                    applied_any = True
+            except Exception as e:
+                logging.warning(f"OOTDiffusion upper-body step failed: {e}")
 
-        def _call():
-            client = Client(HF_SPACE_VTON, token=HF_TOKEN or None)
-            return client.predict(
-                dict={"background": handle_file(ref_path), "layers": [], "composite": None},
-                garm_img=handle_file(item_path),
-                garment_des="clothing item",
-                is_checked=True,
-                is_checked_crop=False,
-                denoise_steps=20,
-                seed=42,
-                api_name="/tryon",
-            )
+        if lower_bytes:
+            garm_path = _write_tmp(lower_bytes)
+            try:
+                result = await asyncio.to_thread(_call, person_path, garm_path, "Lower-body")
+                output_path = result[0]["image"] if result else None
+                if output_path and os.path.exists(output_path):
+                    person_path = output_path
+                    applied_any = True
+            except Exception as e:
+                logging.warning(f"OOTDiffusion lower-body step failed: {e}")
 
-        result = await asyncio.to_thread(_call)
-        output_path = result[0] if isinstance(result, (list, tuple)) else result
-        if output_path and os.path.exists(output_path):
-            with open(output_path, "rb") as f:
-                return f.read()
-        return None
-    except Exception as e:
-        logging.warning(f"generate_outfit_tryon_hf failed: {e}")
-        return None
+        if not applied_any:
+            return None
+        with open(person_path, "rb") as f:
+            return f.read()
     finally:
-        for p in (ref_path, item_path):
+        for p in tmp_paths:
             try:
                 os.remove(p)
             except OSError:
@@ -8401,16 +8454,30 @@ async def generate_outfit_tryon_flux(reference_bytes: bytes, item_images: list[b
         return None
 
 
-async def generate_outfit_tryon_image(reference_bytes: bytes, item_images: list[bytes]) -> Optional[bytes]:
-    """Try the free, purpose-built IDM-VTON Space first, then the general
-    Cloudflare FLUX.2 editing model as a fallback. Returns None if both
-    fail — caller must degrade to a text-only outfit message rather than
-    skip the whole morning-summary section."""
-    if item_images:
-        image_bytes = await generate_outfit_tryon_hf(reference_bytes, item_images[0])
-        if image_bytes:
-            return image_bytes
-    return await generate_outfit_tryon_flux(reference_bytes, item_images)
+async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items: list[dict]) -> Optional[bytes]:
+    """Dress the reference photo in the chosen outfit — picks one
+    representative upper-body garment (the outermost layer if the outfit
+    has layering, e.g. a coat over a t-shirt, since OOTDiffusion replaces
+    the whole upper-body region per call rather than stacking garments)
+    and one bottom, downloads their bytes, and tries the free, purpose-
+    built OOTDiffusion Space first (chained upper+lower, see
+    generate_outfit_tryon_ootd), falling back to Cloudflare's general
+    FLUX.2 editing model if that Space is unavailable. Shoes/headwear
+    items in chosen_items are intentionally not visualized — no free
+    try-on model supports footwear/headwear, they're text-only (see
+    _add_mandatory_shoes_and_headwear). Returns None if nothing could be
+    generated — caller must degrade to a text-only outfit message."""
+    upper_item = next((it for it in reversed(chosen_items) if it.get("type") == "outerwear"), None) \
+        or next((it for it in chosen_items if it.get("type") == "top"), None)
+    lower_item = next((it for it in chosen_items if it.get("type") == "bottom"), None)
+
+    upper_bytes = await _fetch_wardrobe_item_bytes(bot, upper_item) if upper_item else None
+    lower_bytes = await _fetch_wardrobe_item_bytes(bot, lower_item) if lower_item else None
+
+    image_bytes = await generate_outfit_tryon_ootd(reference_bytes, upper_bytes, lower_bytes)
+    if image_bytes:
+        return image_bytes
+    return await generate_outfit_tryon_flux(reference_bytes, [b for b in (upper_bytes, lower_bytes) if b])
 
 
 WEATHER_CODE_DESCRIPTIONS = {
