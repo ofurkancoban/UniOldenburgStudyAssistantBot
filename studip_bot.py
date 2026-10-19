@@ -583,12 +583,19 @@ def get_wardrobe_entry(user_id) -> dict:
     return load_wardrobe().get(str(user_id), {"items": [], "reference_photo_file_id": None})
 
 
-def add_wardrobe_item(user_id, file_id: str, tags: dict) -> dict:
+def add_wardrobe_item(user_id, tags: dict, file_id: Optional[str] = None, image_url: Optional[str] = None) -> dict:
+    """Catalog one wardrobe item, backed by either a Telegram file_id (the
+    normal photo-upload flow, see handle_photo_message) or a direct
+    image_url (used for bulk-importing items from an external source,
+    e.g. an order history page) — exactly one of the two should be set.
+    See _fetch_wardrobe_item_bytes for how either is resolved back to
+    bytes when the item is actually needed for tagging/try-on."""
     wardrobe = load_wardrobe()
     entry = wardrobe.setdefault(str(user_id), {"items": [], "reference_photo_file_id": None})
     item = {
         "id": f"w_{uuid.uuid4().hex[:10]}",
         "file_id": file_id,
+        "image_url": image_url,
         "type": tags.get("type", "other"),
         "subtype": tags.get("subtype"),
         "color": tags.get("color", ""),
@@ -2520,7 +2527,7 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
     reference_bytes = await _download_telegram_file(context.bot, ref_file_id)
     item_bytes = [
         b for b in (
-            await _download_telegram_file(context.bot, it["file_id"]) for it in outfit["chosen_items"]
+            await _fetch_wardrobe_item_bytes(context.bot, it) for it in outfit["chosen_items"]
         ) if b
     ]
     image_bytes = await generate_outfit_tryon_image(reference_bytes, item_bytes) if reference_bytes and item_bytes else None
@@ -3860,7 +3867,7 @@ async def send_morning_summary(bot, user_ids):
                 reference_bytes = await _download_telegram_file(bot, ref_file_id)
                 item_bytes = [
                     b for b in (
-                        await _download_telegram_file(bot, it["file_id"]) for it in outfit["chosen_items"]
+                        await _fetch_wardrobe_item_bytes(bot, it) for it in outfit["chosen_items"]
                     ) if b
                 ]
                 image_bytes = await generate_outfit_tryon_image(reference_bytes, item_bytes) if reference_bytes and item_bytes else None
@@ -8236,6 +8243,26 @@ async def _download_telegram_file(bot, file_id: str) -> Optional[bytes]:
             pass
 
 
+async def _fetch_wardrobe_item_bytes(bot, item: dict) -> Optional[bytes]:
+    """Resolve a wardrobe item (or the reference-photo dict shape) back to
+    image bytes, regardless of whether it's backed by a Telegram file_id
+    (the normal upload flow) or a direct image_url (bulk-imported items).
+    Returns None on any failure so callers degrade gracefully."""
+    if item.get("file_id"):
+        return await _download_telegram_file(bot, item["file_id"])
+    image_url = item.get("image_url")
+    if image_url:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status == 200:
+                        return await resp.read()
+                    logging.warning(f"_fetch_wardrobe_item_bytes: HTTP {resp.status} for {image_url}")
+        except Exception as e:
+            logging.warning(f"_fetch_wardrobe_item_bytes failed for {image_url}: {e}")
+    return None
+
+
 TAG_WARDROBE_ITEM_PROMPT = """You're looking at a photo of a single clothing item. Respond with strict JSON only, no other text: {"type": "top|bottom|outerwear|shoes|accessory", "subtype": "<for type=top: t-shirt|shirt|sweater; for type=bottom: pants|shorts; for type=outerwear: light_jacket|coat; otherwise null>", "color": "<main color, 1-2 words>", "warmth": "light|medium|warm", "label": "<short description, e.g. 'navy blue hoodie'>"}."""
 
 
@@ -9267,7 +9294,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if not tags:
             await status_msg.edit_text("⚠️ Couldn't recognize that item — try a clearer photo of just this one piece of clothing, or /status to cancel.")
             return  # pending_step stays set so a retry just works
-        item = add_wardrobe_item(user_id, file_id, tags)
+        item = add_wardrobe_item(user_id, tags, file_id=file_id)
         context.user_data.pop("pending_step", None)
         subtype_note = f"/{item['subtype']}" if item.get("subtype") else ""
         await status_msg.edit_text(f"👔 Added: {item['label']} ({item['type']}{subtype_note}, {item['warmth']} warmth)", reply_markup=get_main_keyboard())
