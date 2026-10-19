@@ -2344,6 +2344,8 @@ def _wardrobe_list_view(user_id) -> tuple:
     text += f"{len(items)} item(s) cataloged.\n" if items else "Nothing added yet.\n"
     keyboard = [[InlineKeyboardButton(f"🗑 {it['label']} ({it['type']})", callback_data=f"wardrobe_remove|{it['id']}")] for it in items]
     keyboard.append([InlineKeyboardButton("📸 Add Clothing Item", callback_data="wardrobe_add_item")])
+    if items and entry.get("reference_photo_file_id"):
+        keyboard.append([InlineKeyboardButton("👔 Suggest Outfit Now", callback_data="wardrobe_suggest_now")])
     if len(items) > 1:
         keyboard.append([InlineKeyboardButton("🗑 Clear all", callback_data="wardrobe_clear_ask")])
     return text, InlineKeyboardMarkup(keyboard)
@@ -2416,6 +2418,57 @@ async def handle_wardrobe_clear_cancel(update: Update, context: ContextTypes.DEF
     user_id = query.from_user.id
     text, keyboard = _wardrobe_list_view(user_id)
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle wardrobe_suggest_now callback ("👔 Suggest Outfit Now") — the
+    on-demand twin of the morning summary's automatic section (see 4c in
+    send_morning_summary), using the same pick_outfit_from_wardrobe/
+    generate_outfit_tryon_image pipeline. Unlike the morning summary, which
+    skips silently when the wardrobe/reference photo aren't set up yet,
+    this is an explicit request — tell the user why nothing happened."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    entry = get_wardrobe_entry(user_id)
+    items = entry.get("items", [])
+    ref_file_id = entry.get("reference_photo_file_id")
+    if not items:
+        await query.message.reply_text("👔 Add at least one clothing item first — tap 📸 Add Clothing Item.")
+        return
+    if not ref_file_id:
+        await query.message.reply_text("🖼️ Set your reference photo first — tap 🖼️ Set Reference Photo in /status.")
+        return
+
+    await _show_typing(query)
+    status_msg = await query.message.reply_text("👔 Picking an outfit for you...", disable_notification=True)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Picking an outfit for you...")
+    try:
+        weather = await get_weather_snapshot(datetime.now(TZ_BERLIN).date())
+        outfit = await pick_outfit_from_wardrobe(items, weather)
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
+
+    if not outfit:
+        await query.message.reply_text("❌ Couldn't put together an outfit right now — try again in a bit.")
+        return
+
+    caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
+    reference_bytes = await _download_telegram_file(context.bot, ref_file_id)
+    item_bytes = [
+        b for b in (
+            await _download_telegram_file(context.bot, it["file_id"]) for it in outfit["chosen_items"]
+        ) if b
+    ]
+    image_bytes = await generate_outfit_tryon_image(reference_bytes, item_bytes) if reference_bytes and item_bytes else None
+    if image_bytes:
+        await query.message.reply_photo(photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
+    else:
+        await query.message.reply_text(caption, parse_mode="HTML")
 
 
 async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10240,6 +10293,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_toggle_wardrobe_feature, pattern="^toggle_wardrobe_feature$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_menu, pattern="^wardrobe_menu$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_add_item, pattern="^wardrobe_add_item$"))
+        app.add_handler(CallbackQueryHandler(handle_wardrobe_suggest_now, pattern="^wardrobe_suggest_now$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_set_reference, pattern="^wardrobe_set_reference$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_remove, pattern="^wardrobe_remove\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_clear_ask, pattern="^wardrobe_clear_ask$"))
