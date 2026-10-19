@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import io
 
 try:
     from dotenv import load_dotenv
@@ -54,6 +55,18 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_TTS_MODEL = os.getenv("OPENROUTER_TTS_MODEL", "fish-audio/s2.1-pro-free:free")
 OPENROUTER_TTS_VOICE = os.getenv("OPENROUTER_TTS_VOICE", "")  # fish-audio/s2.1-pro-free:free has no selectable voice param - OpenRouter's previous free TTS model (deepgram/flux-tts:free) was discontinued and this replaced it; passing a "voice" value this model doesn't support (e.g. the old "flux-elise-en") causes a 400
 OPENROUTER_TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
+# Free-tier providers for the "👔 My Wardrobe" daily outfit feature — kept
+# separate from OpenRouter since neither vision tagging nor image generation
+# runs on OpenRouter's free text models; both of these have a genuinely free
+# tier instead (Cloudflare Workers AI's daily Neuron allowance, HF's shared
+# ZeroGPU Spaces), see tag_wardrobe_item/generate_outfit_tryon_image.
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID")
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN")
+CLOUDFLARE_VISION_MODEL = os.getenv("CLOUDFLARE_VISION_MODEL", "@cf/mistral-small-3.1-24b-instruct")
+CLOUDFLARE_IMAGE_MODEL = os.getenv("CLOUDFLARE_IMAGE_MODEL", "@cf/black-forest-labs/flux-2-dev")
+CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
+HF_SPACE_VTON = os.getenv("HF_SPACE_VTON", "yisol/IDM-VTON")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 # University of Oldenburg's coordinates, for the daily-plan weather snapshot
 # (see get_weather_snapshot) — configurable in case the bot is ever reused
 # for a different campus.
@@ -536,6 +549,88 @@ def save_user_name(user_id, name: str) -> None:
         os.replace(tmp, USER_NAMES_CACHE_PATH)
     except Exception as e:
         logging.error(f"Could not save user name: {e}")
+
+
+WARDROBE_CACHE_PATH = "wardrobe.json"
+
+
+def load_wardrobe() -> dict:
+    """Return {"<user_id>": {"items": [...], "reference_photo_file_id": ...}}
+    for the "👔 My Wardrobe" feature. Stores Telegram file_ids, not local image
+    copies — they're free to re-resolve via bot.get_file() whenever an item or
+    the reference photo needs to be downloaded transiently for a tagging/
+    try-on API call, so this cache never needs its own media directory."""
+    if os.path.exists(WARDROBE_CACHE_PATH):
+        try:
+            with open(WARDROBE_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load wardrobe: {e}")
+    return {}
+
+
+def save_wardrobe(data: dict) -> None:
+    try:
+        tmp = WARDROBE_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, WARDROBE_CACHE_PATH)
+    except Exception as e:
+        logging.error(f"Could not save wardrobe: {e}")
+
+
+def get_wardrobe_entry(user_id) -> dict:
+    return load_wardrobe().get(str(user_id), {"items": [], "reference_photo_file_id": None})
+
+
+def add_wardrobe_item(user_id, file_id: str, tags: dict) -> dict:
+    wardrobe = load_wardrobe()
+    entry = wardrobe.setdefault(str(user_id), {"items": [], "reference_photo_file_id": None})
+    item = {
+        "id": f"w_{uuid.uuid4().hex[:10]}",
+        "file_id": file_id,
+        "type": tags.get("type", "other"),
+        "color": tags.get("color", ""),
+        "warmth": tags.get("warmth", "medium"),
+        "label": tags.get("label", "clothing item"),
+        "added_at": datetime.now().isoformat(),
+    }
+    entry["items"].append(item)
+    save_wardrobe(wardrobe)
+    return item
+
+
+def remove_wardrobe_item(user_id, item_id: str) -> None:
+    wardrobe = load_wardrobe()
+    entry = wardrobe.get(str(user_id))
+    if entry:
+        entry["items"] = [it for it in entry["items"] if it["id"] != item_id]
+        save_wardrobe(wardrobe)
+
+
+def clear_wardrobe_items(user_id) -> None:
+    wardrobe = load_wardrobe()
+    entry = wardrobe.get(str(user_id))
+    if entry:
+        entry["items"] = []
+        save_wardrobe(wardrobe)
+
+
+def set_wardrobe_reference_photo(user_id, file_id: str) -> None:
+    wardrobe = load_wardrobe()
+    entry = wardrobe.setdefault(str(user_id), {"items": [], "reference_photo_file_id": None})
+    entry["reference_photo_file_id"] = file_id
+    save_wardrobe(wardrobe)
+
+
+def get_wardrobe_feature_enabled() -> bool:
+    return bool(load_general_cache().get("wardrobe_feature_enabled"))
+
+
+def set_wardrobe_feature_enabled(enabled: bool) -> None:
+    cache = load_general_cache()
+    cache["wardrobe_feature_enabled"] = enabled
+    save_general_cache(cache)
 
 
 WEATHER_LOCATION_CACHE_PATH = "weather_location.json"
@@ -1703,6 +1798,79 @@ async def build_food_recommendation() -> Optional[dict]:
     return {"dish": chosen["name"], "category": chosen["category"], "reasoning": reasoning}
 
 
+OUTFIT_RECOMMENDATION_SYSTEM_PROMPT = """You are picking a coherent, weather-appropriate outfit for a student from their own wardrobe, using only the candidate items listed (each with an id, type, color, and warmth level). Pick at least one "top" and one "bottom" (or a single "outerwear"/one-piece item that already covers both), adding an "outerwear" item only if the weather is cold or wet. Match overall warmth to the given temperature range — don't pick "light" warmth items for a cold day or "warm" items for a mild/warm one. Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie since it'll be cold and dry.'>"}. Use only ids from the given list."""
+
+
+def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict]) -> list[dict]:
+    """Fallback used when the LLM call fails or returns unparsable JSON —
+    picks by warmth-vs-temperature instead of randomly, since an
+    incoherent random outfit is a worse failure mode than an incoherent
+    random meal pick (build_food_recommendation's equivalent fallback)."""
+    temp_max = weather.get("temp_max") if weather else None
+    if temp_max is not None and temp_max < 10:
+        target_warmth = "warm"
+    elif temp_max is not None and temp_max < 18:
+        target_warmth = "medium"
+    else:
+        target_warmth = "light"
+
+    def _best_of(item_type):
+        candidates = [it for it in items if it.get("type") == item_type]
+        if not candidates:
+            return None
+        exact = [it for it in candidates if it.get("warmth") == target_warmth]
+        return (exact or candidates)[0]
+
+    chosen = [it for it in (_best_of("top"), _best_of("bottom")) if it]
+    if target_warmth != "light":
+        outerwear = _best_of("outerwear")
+        if outerwear:
+            chosen.append(outerwear)
+    return chosen or items[:2]
+
+
+async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict]) -> Optional[dict]:
+    """Ask the LLM to pick a coherent outfit from the user's cataloged
+    wardrobe items, considering the morning's weather snapshot (see
+    get_weather_snapshot) — structural twin of build_food_recommendation,
+    just over wardrobe metadata instead of menu items. Pure text reasoning
+    over already-tagged items, so this reuses the bot's existing free-tier
+    OpenRouter text call, not the Cloudflare/HF image providers.
+
+    Returns {"chosen_items": [...item dicts...], "description": "<human
+    readable, e.g. 'navy hoodie + black jeans'>"}, or None if there are no
+    items to choose from at all."""
+    if not items:
+        return None
+
+    lines = [f"- id={it['id']}: {it['label']} (type={it['type']}, color={it['color']}, warmth={it['warmth']})" for it in items]
+    if weather:
+        is_wet = weather.get("is_wet")
+        weather_line = f"Weather: {weather.get('description', 'unknown')}, {weather.get('temp_min')}-{weather.get('temp_max')}°C, {'rain expected' if is_wet else 'dry'}."
+    else:
+        weather_line = "Weather: no data available today — pick something reasonably versatile."
+
+    raw = await _call_openrouter(
+        OUTFIT_RECOMMENDATION_SYSTEM_PROMPT,
+        f"{weather_line}\n\nWardrobe:\n" + "\n".join(lines),
+        temperature=0.9,
+    )
+    parsed = _extract_json_object(raw)
+    chosen_items = []
+    if parsed and parsed.get("item_ids"):
+        by_id = {it["id"]: it for it in items}
+        chosen_items = [by_id[i] for i in parsed["item_ids"] if i in by_id]
+
+    if not chosen_items:
+        chosen_items = _heuristic_outfit_pick(items, weather)
+    if not chosen_items:
+        return None
+
+    reasoning = ((parsed or {}).get("reasoning") or "").strip()
+    description = reasoning or " + ".join(it["label"] for it in chosen_items)
+    return {"chosen_items": chosen_items, "description": description}
+
+
 async def _deliver_food_recommendation(sender, result: dict):
     """Send a build_food_recommendation() result the way it's meant to be
     read: the Counter/Culinarium location + dish name as its own short text
@@ -2162,6 +2330,103 @@ async def handle_foodpref_clear_cancel(update: Update, context: ContextTypes.DEF
     await query.answer("Cancelled")
     text, keyboard = _food_preferences_management_view()
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+def _wardrobe_list_view(user_id) -> tuple:
+    """Build the (text, reply_markup) pair for the "👔 My Wardrobe" screen —
+    direct template match to _food_preferences_management_view: one delete
+    button per cataloged item, an "Add" button, and Clear All when there's
+    more than one item."""
+    entry = get_wardrobe_entry(user_id)
+    items = entry.get("items", [])
+
+    text = "👔 <b>My Wardrobe</b>\n"
+    text += f"{len(items)} item(s) cataloged.\n" if items else "Nothing added yet.\n"
+    keyboard = [[InlineKeyboardButton(f"🗑 {it['label']} ({it['type']})", callback_data=f"wardrobe_remove|{it['id']}")] for it in items]
+    keyboard.append([InlineKeyboardButton("📸 Add Clothing Item", callback_data="wardrobe_add_item")])
+    if len(items) > 1:
+        keyboard.append([InlineKeyboardButton("🗑 Clear all", callback_data="wardrobe_clear_ask")])
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+async def handle_wardrobe_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+    text, keyboard = _wardrobe_list_view(user_id)
+    await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_wardrobe_add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+    context.user_data["pending_step"] = "wardrobe_add_item"
+    await query.message.reply_text("📸 Send a photo of one clothing item.")
+
+
+async def handle_wardrobe_set_reference(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+    context.user_data["pending_step"] = "wardrobe_set_reference"
+    await query.message.reply_text("🖼️ Send one clear full-body photo of yourself — I'll reuse it every morning.")
+
+
+async def handle_wardrobe_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+    item_id = query.data.split("|", 1)[1]
+    remove_wardrobe_item(user_id, item_id)
+    text, keyboard = _wardrobe_list_view(user_id)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_wardrobe_clear_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, clear all", callback_data="wardrobe_clear_confirm"),
+        InlineKeyboardButton("❌ Cancel", callback_data="wardrobe_clear_cancel"),
+    ]])
+    await query.edit_message_text("🗑 Clear your whole wardrobe? Your reference photo is kept.", reply_markup=keyboard)
+
+
+async def handle_wardrobe_clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Cleared")
+    user_id = query.from_user.id
+    clear_wardrobe_items(user_id)
+    text, keyboard = _wardrobe_list_view(user_id)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_wardrobe_clear_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Cancelled")
+    user_id = query.from_user.id
+    text, keyboard = _wardrobe_list_view(user_id)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stateless flip toggle, same template as handle_toggle_watch_prev_sem."""
+    query = update.callback_query
+    await query.answer()
+    new_state = not get_wardrobe_feature_enabled()
+    set_wardrobe_feature_enabled(new_state)
+    await query.edit_message_text(
+        f"👔 Daily Outfit Suggestion is now {'✅ On' if new_state else '🔲 Off'}.\nRun /status to see the full menu again."
+    )
 
 
 async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3461,6 +3726,41 @@ async def send_morning_summary(bot, user_ids):
                     await bot.send_photo(chat_id=uid, photo=photo_url)
                 except Exception as e:
                     logging.error(f"Failed to send lunch photo to {uid}: {e}")
+
+    # 4c. Daily outfit suggestion with virtual try-on image — opt-in (toggle
+    # in /status), skipped entirely (not just "no image") if the wardrobe is
+    # empty or no reference photo is set, since there's nothing useful to
+    # say yet. Every sub-step is best-effort; any failure here just means
+    # this one extra message doesn't go out — never raises into the rest
+    # of the summary, which has already been delivered above.
+    if get_wardrobe_feature_enabled():
+        for uid in user_ids:
+            try:
+                wardrobe_entry = get_wardrobe_entry(uid)
+                items = wardrobe_entry.get("items", [])
+                ref_file_id = wardrobe_entry.get("reference_photo_file_id")
+                if not items or not ref_file_id:
+                    continue
+                outfit = await pick_outfit_from_wardrobe(items, weather)
+                if not outfit:
+                    continue
+                caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
+                reference_bytes = await _download_telegram_file(bot, ref_file_id)
+                item_bytes = [
+                    b for b in (
+                        await _download_telegram_file(bot, it["file_id"]) for it in outfit["chosen_items"]
+                    ) if b
+                ]
+                image_bytes = await generate_outfit_tryon_image(reference_bytes, item_bytes) if reference_bytes and item_bytes else None
+                if image_bytes:
+                    await bot.send_photo(chat_id=uid, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
+                else:
+                    # Both free image providers failed/unavailable - still
+                    # deliver the text-only pick rather than nothing, since
+                    # the weather-aware reasoning is useful on its own.
+                    await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
+            except Exception as e:
+                logging.warning(f"Outfit suggestion failed for {uid}: {e}")
 
     # 5. Automatic AI-narrated voice message — no "🔊 Listen" tap needed, and
     # freshly improvised every morning rather than a fixed template (see
@@ -5244,6 +5544,12 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         return False
 
     text = text_override if text_override is not None else (update.message.text or "").strip()
+
+    if step in ("wardrobe_add_item", "wardrobe_set_reference"):
+        # These two steps only consume a photo (handle_photo_message) — a
+        # text reply here means the user typed instead of sending one.
+        await update.effective_message.reply_text("📸 I'm waiting for a photo, not text — send one, or /status to cancel.")
+        return True
 
     if step in ("fastenroll_date", "fastenroll_time", "fastenroll_link"):
         return await _handle_fastenroll_wizard_reply(update, context, step, text)
@@ -7797,6 +8103,171 @@ async def _pcm_to_ogg_voice(pcm_bytes: bytes, sample_rate: int) -> Optional[str]
             pass
 
 
+async def _download_telegram_file(bot, file_id: str) -> Optional[bytes]:
+    """Download a Telegram-hosted file (photo) to a transient temp path, read
+    it into memory, then remove the temp file — same disposable-temp-file
+    convention as _pcm_to_ogg_voice's PCM intermediate. Returns None on any
+    failure (expired file_id, network error) so callers degrade gracefully."""
+    path = os.path.join(tempfile.gettempdir(), f"wardrobe_{uuid.uuid4().hex}.jpg")
+    try:
+        file = await bot.get_file(file_id)
+        await file.download_to_drive(path)
+        with open(path, "rb") as f:
+            return f.read()
+    except Exception as e:
+        logging.warning(f"_download_telegram_file failed: {e}")
+        return None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+TAG_WARDROBE_ITEM_PROMPT = """You're looking at a photo of a single clothing item. Respond with strict JSON only, no other text: {"type": "top|bottom|outerwear|shoes|accessory", "color": "<main color, 1-2 words>", "warmth": "light|medium|warm", "label": "<short description, e.g. 'navy blue hoodie'>"}."""
+
+
+async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
+    """Auto-tag a newly uploaded clothing-item photo via Cloudflare Workers
+    AI's free-tier vision model (text output, not image-generating, so it's
+    cheap against the account's daily Neuron allowance). Returns
+    {"type", "color", "warmth", "label"} or None on any failure (missing
+    config, non-2xx, unparsable JSON) — caller must not catalog a garbage
+    entry on None, and should let the user retry."""
+    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
+        return None
+    import base64
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    url = CLOUDFLARE_AI_URL.format(account_id=CLOUDFLARE_ACCOUNT_ID, model=CLOUDFLARE_VISION_MODEL)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"},
+                json={
+                    "messages": [
+                        {"role": "user", "content": [
+                            {"type": "text", "text": TAG_WARDROBE_ITEM_PROMPT},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                        ]},
+                    ],
+                },
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.warning(f"Cloudflare tagging call failed: HTTP {resp.status}: {body[:200]}")
+                    return None
+                data = await resp.json()
+                raw = data.get("result", {}).get("response")
+                return _extract_json_object(raw)
+    except Exception as e:
+        logging.warning(f"Cloudflare tagging call failed: {e}")
+        return None
+
+
+async def generate_outfit_tryon_hf(reference_bytes: bytes, item_bytes: bytes) -> Optional[bytes]:
+    """Try the user wearing one garment via the yisol/IDM-VTON Hugging Face
+    Space — a dedicated virtual-try-on model, free on HF's shared ZeroGPU
+    pool. Only one garment per call (IDM-VTON's own API shape); the caller
+    picks the primary/top chosen item for the image and mentions any extra
+    pieces only in the message caption. Returns image bytes, or None on any
+    failure/timeout (the Space is a shared community demo with no uptime
+    guarantee, so callers must fall back rather than treat this as fatal)."""
+    try:
+        from gradio_client import Client, handle_file
+    except ImportError:
+        logging.warning("generate_outfit_tryon_hf: gradio_client not installed")
+        return None
+    ref_path = os.path.join(tempfile.gettempdir(), f"vton_ref_{uuid.uuid4().hex}.jpg")
+    item_path = os.path.join(tempfile.gettempdir(), f"vton_item_{uuid.uuid4().hex}.jpg")
+    try:
+        with open(ref_path, "wb") as f:
+            f.write(reference_bytes)
+        with open(item_path, "wb") as f:
+            f.write(item_bytes)
+
+        def _call():
+            client = Client(HF_SPACE_VTON, hf_token=HF_TOKEN or None)
+            return client.predict(
+                dict={"background": handle_file(ref_path), "layers": [], "composite": None},
+                garm_img=handle_file(item_path),
+                garment_des="clothing item",
+                is_checked=True,
+                is_checked_crop=False,
+                denoise_steps=20,
+                seed=42,
+                api_name="/tryon",
+            )
+
+        result = await asyncio.to_thread(_call)
+        output_path = result[0] if isinstance(result, (list, tuple)) else result
+        if output_path and os.path.exists(output_path):
+            with open(output_path, "rb") as f:
+                return f.read()
+        return None
+    except Exception as e:
+        logging.warning(f"generate_outfit_tryon_hf failed: {e}")
+        return None
+    finally:
+        for p in (ref_path, item_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+async def generate_outfit_tryon_flux(reference_bytes: bytes, item_images: list[bytes]) -> Optional[bytes]:
+    """Fallback try-on image via Cloudflare Workers AI's FLUX.2 [dev] —
+    a general multi-reference image-editing model (not purpose-built for
+    try-on like IDM-VTON, used only when that Space is unavailable). Takes
+    the reference photo plus up to 3 item photos as reference images.
+    Returns image bytes, or None on any failure."""
+    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
+        return None
+    import base64
+    images_b64 = [base64.b64encode(reference_bytes).decode("ascii")] + [
+        base64.b64encode(b).decode("ascii") for b in item_images[:3]
+    ]
+    url = CLOUDFLARE_AI_URL.format(account_id=CLOUDFLARE_ACCOUNT_ID, model=CLOUDFLARE_IMAGE_MODEL)
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
+                data={
+                    "prompt": "Dress the person shown in the first reference image with the clothing items shown in the following reference images. Keep the person's face, body, pose, and background realistic and unchanged.",
+                    "reference_images": json.dumps(images_b64),
+                },
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logging.warning(f"Cloudflare FLUX.2 call failed: HTTP {resp.status}: {body[:200]}")
+                    return None
+                content_type = resp.headers.get("Content-Type", "")
+                if "image" in content_type:
+                    return await resp.read()
+                data = await resp.json()
+                image_b64 = data.get("result", {}).get("image")
+                return base64.b64decode(image_b64) if image_b64 else None
+    except Exception as e:
+        logging.warning(f"Cloudflare FLUX.2 call failed: {e}")
+        return None
+
+
+async def generate_outfit_tryon_image(reference_bytes: bytes, item_images: list[bytes]) -> Optional[bytes]:
+    """Try the free, purpose-built IDM-VTON Space first, then the general
+    Cloudflare FLUX.2 editing model as a fallback. Returns None if both
+    fail — caller must degrade to a text-only outfit message rather than
+    skip the whole morning-summary section."""
+    if item_images:
+        image_bytes = await generate_outfit_tryon_hf(reference_bytes, item_images[0])
+        if image_bytes:
+            return image_bytes
+    return await generate_outfit_tryon_flux(reference_bytes, item_images)
+
+
 WEATHER_CODE_DESCRIPTIONS = {
     0: ("clear sky", "☀️"), 1: ("mostly clear", "🌤️"), 2: ("partly cloudy", "⛅"), 3: ("overcast", "☁️"),
     45: ("foggy", "🌫️"), 48: ("foggy with frost", "🌫️"),
@@ -8657,6 +9128,39 @@ def _best_title_match(query: Optional[str], candidates: list, min_score: float =
             best_payload = payload
 
     return best_payload if best_score >= min_score else None
+
+
+async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route an incoming photo by whatever pending_step is waiting (same
+    context.user_data field the text/voice wizards use, just a new reader
+    of it — there's no generic photo-wizard router like handle_pending_step,
+    since only the wardrobe feature expects photos today)."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        return
+
+    step = context.user_data.get("pending_step")
+    file_id = update.message.photo[-1].file_id
+
+    if step == "wardrobe_add_item":
+        status_msg = await update.message.reply_text("📸 Tagging...", disable_notification=True)
+        image_bytes = await _download_telegram_file(context.bot, file_id)
+        tags = await tag_wardrobe_item(image_bytes) if image_bytes else None
+        if not tags:
+            await status_msg.edit_text("⚠️ Couldn't recognize that item — try a clearer photo of just this one piece of clothing, or /status to cancel.")
+            return  # pending_step stays set so a retry just works
+        item = add_wardrobe_item(user_id, file_id, tags)
+        context.user_data.pop("pending_step", None)
+        await status_msg.edit_text(f"👔 Added: {item['label']} ({item['type']}, {item['warmth']} warmth)", reply_markup=get_main_keyboard())
+        return
+
+    if step == "wardrobe_set_reference":
+        set_wardrobe_reference_photo(user_id, file_id)
+        context.user_data.pop("pending_step", None)
+        await update.message.reply_text("🖼️ Reference photo updated — I'll reuse it every morning.", reply_markup=get_main_keyboard())
+        return
+
+    await update.message.reply_text("📸 Got a photo — if you want to add it to your wardrobe, go to /status → 👔 My Wardrobe → 📸 Add Clothing Item first.")
 
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -9558,11 +10062,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     weather_location_label = f"{weather_location['name']}, {weather_location['country']}" if weather_location else "Uni Oldenburg (default)"
     text += f"\n📍 Weather Location: {weather_location_label}"
 
+    wardrobe_enabled = get_wardrobe_feature_enabled()
+    text += f"\n👔 Daily Outfit Suggestion: {'✅ On' if wardrobe_enabled else '🔲 Off'}"
+
     keyboard = [
         [InlineKeyboardButton("👤 Set Your Name", callback_data="set_user_name")],
         [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
         [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
         [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="toggle_watch_prev_sem")],
+        [InlineKeyboardButton(f"{'✅' if wardrobe_enabled else '🔲'} Daily Outfit Suggestion", callback_data="toggle_wardrobe_feature")],
+        [InlineKeyboardButton("👔 My Wardrobe", callback_data="wardrobe_menu")],
+        [InlineKeyboardButton("🖼️ Set Reference Photo", callback_data="wardrobe_set_reference")],
         [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
         [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
         [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
@@ -9721,10 +10231,19 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_ask, pattern="^foodpref_clear_ask$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_confirm, pattern="^foodpref_clear_confirm$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_cancel, pattern="^foodpref_clear_cancel$"))
+        app.add_handler(CallbackQueryHandler(handle_toggle_wardrobe_feature, pattern="^toggle_wardrobe_feature$"))
+        app.add_handler(CallbackQueryHandler(handle_wardrobe_menu, pattern="^wardrobe_menu$"))
+        app.add_handler(CallbackQueryHandler(handle_wardrobe_add_item, pattern="^wardrobe_add_item$"))
+        app.add_handler(CallbackQueryHandler(handle_wardrobe_set_reference, pattern="^wardrobe_set_reference$"))
+        app.add_handler(CallbackQueryHandler(handle_wardrobe_remove, pattern="^wardrobe_remove\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_wardrobe_clear_ask, pattern="^wardrobe_clear_ask$"))
+        app.add_handler(CallbackQueryHandler(handle_wardrobe_clear_confirm, pattern="^wardrobe_clear_confirm$"))
+        app.add_handler(CallbackQueryHandler(handle_wardrobe_clear_cancel, pattern="^wardrobe_clear_cancel$"))
         app.add_handler(CallbackQueryHandler(handle_selection))
 
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))
         app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+        app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
 
         # Explicitly initialize and start the application
         await app.initialize()

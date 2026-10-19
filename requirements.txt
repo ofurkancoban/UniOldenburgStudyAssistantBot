@@ -15,4 +15,5 @@ recurring-ical-events
 SpeechRecognition
 pydub
 langdetect
+gradio_client
 # Verified

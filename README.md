@@ -59,6 +59,12 @@ A beautiful, emoji-rich menu with:
 - **🍽️ "What should I eat?"**: tap the button on the menu, or ask out loud — a free OpenRouter LLM judges and picks **one** recommended dish from today's Counter/Culinarium options (not the full menu list — this is a single pick, not a browse), weighing meat/chicken/turkey/fish priority, price, and likely nutritional value together, not just a random or fixed pick. Comes as a quick text line naming which Counter (1-4) or Culinarium section it's at plus the dish name, a **photo of the dish** when one can be matched on the Studierendenwerk's public Speiseplan site, then the actual pick and reasoning as a real **spoken voice note** (same free TTS pipeline as 🔊 Listen; falls back to text if that's ever unavailable). Always excludes pork, alcohol, wine, and gelatine on top of whatever's in your **🚫 Food Preferences**, and never a weather-based suggestion — purely about the food itself.
 - **📸 "Show Dish Photos"**: photos are opt-in, not automatic — the full text menu is always just the text menu. Tap **"📸 Show Dish Photos"** (above ⚙️ Food Preferences, on any day view including ⬅️/➡️ navigation) to get a photo for every dish on *that* day that could be matched on the Studierendenwerk's public Speiseplan site, each as its own message captioned with the dish's name, Counter/Culinarium location, description, allergens, and price. Best-effort: a fetch/match failure for a dish just means no photo for it, never a hard error.
 
+### 👔 AI Wardrobe & Daily Outfit Suggestion
+Catalog your clothes once, get a weather-aware outfit picked for you every morning — with an AI-generated image of yourself wearing it:
+- **📸 "Add Clothing Item"** (`/status` → **"👔 My Wardrobe"**): send a photo of one piece of clothing and it's auto-tagged (type, color, warmth) by a free vision model and saved permanently — no need to resend it each day. Delete items or **"🗑 Clear all"** any time from the same screen.
+- **🖼️ "Set Reference Photo"**: one fixed full-body photo of yourself, reused every morning for the try-on image. Resend it any time via `/status` to update it.
+- **Automatic, in the Morning Summary**: toggle **"👔 Daily Outfit Suggestion"** on in `/status` and every morning, alongside the weather/lunch pick, a free OpenRouter LLM picks a coherent outfit from your wardrobe weighing the day's temperature and rain chance, then an image of your reference photo wearing it is generated and sent — tries a free, purpose-built virtual try-on model (Hugging Face's `IDM-VTON` Space) first, falling back to Cloudflare Workers AI's `FLUX.2` image editing model if that's unavailable, and to a text-only outfit description if both fail. Skipped quietly (no nag message) until you've added at least one item and a reference photo. Entirely free-tier: no OpenRouter image-generation cost involved.
+
 ### 🎓 Exam & Grade Intelligence (StuMS/HISinOne)
 The bot goes beyond Stud.IP and reverse-engineers the university's separate **StuMS/HISinOne** exam portal to close the entire loop — *register → remind → sit the exam → get the result*:
 *   **📖 Registration Watcher**: Detects the moment an exam's registration window opens, and warns you **7 / 3 / 1 days** before it closes.
@@ -177,6 +183,14 @@ PORT=3838  # Port for the WhatsApp Microservice
 # --- Voice Command Intent Routing (optional) ---
 OPENROUTER_API_KEY=your_openrouter_key_here   # https://openrouter.ai/keys — omit to disable, tasks-only voice input still works
 OPENROUTER_MODEL=cohere/north-mini-code:free  # any OpenRouter model id; defaults to this free one
+
+# --- 👔 AI Wardrobe (optional, free-tier only) ---
+CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id_here        # dashboard.cloudflare.com, 10,000 free Neurons/day
+CLOUDFLARE_API_TOKEN=your_cloudflare_workers_ai_token_here    # My Profile -> API Tokens -> Custom Token -> Workers AI permission
+# CLOUDFLARE_VISION_MODEL=@cf/mistral-small-3.1-24b-instruct  # used to auto-tag uploaded clothing photos
+# CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-2-dev     # fallback try-on image if the HF Space below is unavailable
+# HF_SPACE_VTON=yisol/IDM-VTON   # primary try-on model, free public Space — no token required
+# HF_TOKEN=                      # optional, only raises the Space's rate limit
 ```
 
 > [!IMPORTANT]
