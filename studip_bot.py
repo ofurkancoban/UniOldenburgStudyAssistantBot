@@ -457,6 +457,21 @@ def clear_default_semester() -> None:
         logging.error(f"Could not clear default semester: {e}")
 
 
+def get_scan_previous_semester_enabled() -> bool:
+    """Whether "📚 Enroll Course" should also include the semester right
+    before the one being browsed (a module can still show open enrolment
+    for a prior term's course instance, e.g. a retake slot) — off by
+    default, toggled via a button on the open-courses view itself (see
+    handle_toggle_prev_sem_scan)."""
+    return bool(load_general_cache().get("scan_previous_semester"))
+
+
+def set_scan_previous_semester_enabled(enabled: bool) -> None:
+    cache = load_general_cache()
+    cache["scan_previous_semester"] = enabled
+    save_general_cache(cache)
+
+
 USER_NAMES_CACHE_PATH = "user_names.json"
 
 
@@ -6786,18 +6801,29 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
     """List a given semester's currently open-for-enrolment courses within the
     student's own degree programme. Shared by handle_course_semester_pick
     (explicit picker) and handle_browse_courses (when a default semester is
-    set, skipping the picker)."""
+    set, skipping the picker).
+
+    If "include previous semester" is toggled on (get_scan_previous_semester_enabled,
+    see handle_toggle_prev_sem_scan), the semester right before this one is
+    scanned too and merged in — a module can still have an open retake slot
+    on a prior term's course instance. Off by default, since most of the
+    time it's just doubling the fetch time for nothing."""
     # Explicitly clear the keyboard here: editing text alone leaves whatever
     # buttons were on the previous message (e.g. the prior semester's "Enroll"
     # rows) live and tappable during this network wait, which let an
     # impatient tap land on stale "Enroll" buttons and silently enroll in the
     # wrong course from the old list.
-    status_msg = await _reply_or_edit(sender, "📚 Checking which courses are open for enrolment... this may take a moment.", reply_markup=InlineKeyboardMarkup([]))
+    scan_prev = get_scan_previous_semester_enabled()
+    loading_text = "📚 Checking which courses are open for enrolment" + (" (this and the previous semester)" if scan_prev else "") + "... this may take a moment."
+    status_msg = await _reply_or_edit(sender, loading_text, reply_markup=InlineKeyboardMarkup([]))
     await _show_typing(sender)
-    stop_evt, anim_task = _start_loading_animation(status_msg, "Checking which courses are open for enrolment... this may take a moment.")
+    stop_evt, anim_task = _start_loading_animation(status_msg, loading_text)
 
     try:
         session = await login_studip()
+        semester_options = await get_semester_options(session)
+        current_label = next((label for sid, label in semester_options if sid == semester_id), None)
+
         open_courses = await get_open_courses(session, semester_id=semester_id)
         # get_open_courses() only reads each component's own "unrestricted
         # access" badge on the module listing page — it doesn't know which of
@@ -6805,6 +6831,32 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
         # here against the student's own course list before displaying.
         enrolled_cids = {cid for _, cid in await list_courses(semester_id=semester_id)}
         open_courses = [c for c in open_courses if c["sem_id"] not in enrolled_cids]
+
+        prev_label = None
+        if scan_prev:
+            # get_semester_options() is newest-first, so the semester right
+            # before this one (chronologically) is the NEXT entry in the list.
+            idx = next((i for i, (sid, _) in enumerate(semester_options) if sid == semester_id), None)
+            if idx is not None and idx + 1 < len(semester_options):
+                prev_id, prev_label = semester_options[idx + 1]
+                try:
+                    prev_open = await get_open_courses(session, semester_id=prev_id)
+                    prev_enrolled = {cid for _, cid in await list_courses(semester_id=prev_id)}
+                    prev_open = [c for c in prev_open if c["sem_id"] not in prev_enrolled]
+                    # Tag each item with its source semester's label, and only
+                    # once there are two terms in play, so the grouping below
+                    # can tell same-named modules from different semesters
+                    # apart without cluttering the common single-semester case.
+                    for c in open_courses:
+                        c["_sem_label"] = current_label
+                    for c in prev_open:
+                        c["_sem_label"] = prev_label
+                    open_courses = open_courses + prev_open
+                except Exception as e:
+                    # Best-effort - the current semester's results above are
+                    # still shown even if the previous-semester scan fails.
+                    logging.warning(f"_render_open_courses_for_semester: previous-semester scan failed: {e}")
+                    prev_label = None
     except Exception as e:
         # Stop the animation before this edits the same status_msg with the
         # error — otherwise a late animation tick can race with (or land
@@ -6816,22 +6868,27 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
 
-    change_semester_row = [InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|enroll")]
+    change_semester_row = InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|enroll")
+    toggle_label = f"{'✅' if scan_prev else '🔲'} Include Previous Semester"
+    toggle_row = InlineKeyboardButton(toggle_label, callback_data=f"toggle_prev_sem_scan|{semester_id}")
 
     if not open_courses:
         await _reply_or_edit(
             sender,
-            "ℹ️ No courses in your degree programme are currently open for enrolment in that semester.",
-            reply_markup=InlineKeyboardMarkup([change_semester_row]),
+            "ℹ️ No courses in your degree programme are currently open for enrolment in that semester" + (" (or the previous one)" if scan_prev and prev_label else "") + ".",
+            reply_markup=InlineKeyboardMarkup([[toggle_row], [change_semester_row]]),
         )
         return
 
-    # Group by module (a module can require both a Lecture and a separate
-    # Seminar/Exercise, each its own enrolment) so the two aren't just two
-    # unrelated-looking rows in a flat list.
+    # Group by (semester label, module) rather than just module — when the
+    # previous semester is merged in, a module can share a name across both
+    # terms, and these need to stay visually/functionally separate (distinct
+    # headers) even though the course details underneath differ. _sem_label
+    # is only set on items at all when two semesters were actually merged
+    # (see above), so this is a no-op grouping-by-module-alone otherwise.
     grouped = {}
     for c in open_courses:
-        grouped.setdefault(c["module"], []).append(c)
+        grouped.setdefault((c.get("_sem_label"), c["module"]), []).append(c)
 
     # Circles first, then squares once a semester has more modules than
     # circle colors — same color on a module's header and every one of its
@@ -6840,24 +6897,31 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
                       "🟥", "🟧", "🟨", "🟩", "🟦", "🟪", "⬛", "⬜", "🟫"]
 
     keyboard = []
-    for i, (module_label, courses) in enumerate(grouped.items()):
+    for i, ((sem_label, module_label), courses) in enumerate(grouped.items()):
         color = color_palette[i % len(color_palette)]
         # "Module:" distinguishes this header row (a non-tappable group label,
         # callback_data="course_noop") from the actual Lecture/Seminar/Exercise
         # buttons below it, which otherwise looked identical apart from lacking
-        # a type prefix.
-        keyboard.append([InlineKeyboardButton(f"{color} Module: {module_label[:48]}", callback_data="course_noop")])
+        # a type prefix. The semester tag only shows when more than one term
+        # is in play, to avoid clutter in the common single-semester case.
+        header = f"{color} Module: {module_label[:48]}"
+        if sem_label:
+            header = f"{color} [{sem_label}] {module_label[:40]}"
+        keyboard.append([InlineKeyboardButton(header, callback_data="course_noop")])
         for c in courses:
             keyboard.append([InlineKeyboardButton(
                 f"{color} {c['type']}: {c['course'][:45]}",
                 callback_data=f"course_enroll_ask|{c['sem_id']}",
             )])
 
-    keyboard.append([change_semester_row[0]])
+    keyboard.append([toggle_row])
+    keyboard.append([change_semester_row])
 
+    count_text = f"📚 {len(open_courses)} course component(s) open for enrolment, grouped by module"
+    count_text += f" (current + {prev_label} semester)." if prev_label else "."
     await _reply_or_edit(
         sender,
-        f"📚 {len(open_courses)} course component(s) open for enrolment, grouped by module.\n"
+        f"{count_text}\n"
         "A module can require both a Lecture and a separate Seminar/Exercise — each is enrolled in individually. Tap one to enroll:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -6874,6 +6938,23 @@ async def handle_course_semester_pick(update: Update, context: ContextTypes.DEFA
         return
 
     semester_id = query.data.split("|", 1)[1]
+    await _render_open_courses_for_semester(query, semester_id)
+
+
+async def handle_toggle_prev_sem_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle toggle_prev_sem_scan|<semester_id> — flip the "include the
+    previous semester too" setting (see get_scan_previous_semester_enabled)
+    and re-render the same semester's open-courses view with the new
+    setting applied."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    semester_id = query.data.split("|", 1)[1]
+    set_scan_previous_semester_enabled(not get_scan_previous_semester_enabled())
     await _render_open_courses_for_semester(query, semester_id)
 
 
@@ -9481,6 +9562,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_browse_courses, pattern="^browse_courses$"))
         app.add_handler(CallbackQueryHandler(handle_course_noop, pattern="^course_noop$"))
         app.add_handler(CallbackQueryHandler(handle_course_semester_pick, pattern="^course_sem\\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_toggle_prev_sem_scan, pattern=r"^toggle_prev_sem_scan\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_enroll_ask, pattern="^course_enroll_ask\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_enroll_confirm, pattern="^course_enroll_confirm\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_enroll_cancel, pattern="^course_enroll_cancel$"))

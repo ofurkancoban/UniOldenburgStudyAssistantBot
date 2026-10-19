@@ -25,6 +25,8 @@ tasks_cache.json
 food_preferences.json
 user_names.json
 weather_location.json
+general_cache.json
+default_semester.json
 .bot_instance.lock
 
 # WhatsApp Microservice
