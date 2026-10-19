@@ -239,6 +239,22 @@ def _parse_registration_status(html_text: str) -> list[dict]:
     return list(seen.values())
 
 
+def _format_time_range_24h(time_range_text: str) -> Optional[str]:
+    """Convert a scraped "4:00 PM - 6:00 PM" time range into 24h "16:00 -
+    18:00". Returns None if it doesn't parse (caller falls back to the
+    original text), so a format the page unexpectedly changes to never
+    breaks the notification, just loses the 24h conversion for that one."""
+    m = re.match(r"^(\d{1,2}:\d{2}\s*[AP]M)\s*-\s*(\d{1,2}:\d{2}\s*[AP]M)$", time_range_text.strip())
+    if not m:
+        return None
+    try:
+        start = datetime.strptime(m.group(1), "%I:%M %p").strftime("%H:%M")
+        end = datetime.strptime(m.group(2), "%I:%M %p").strftime("%H:%M")
+        return f"{start} - {end}"
+    except ValueError:
+        return None
+
+
 def _parse_examination_periods(body_text: str) -> list[dict]:
     """Parse the detail page's flattened text into one entry per offered exam sitting.
 
@@ -289,14 +305,29 @@ def _parse_examination_periods(body_text: str) -> list[dict]:
         exam_date_display = None
         exam_date = None
         if exam_date_text:
-            parts = [p for p in (exam_weekday, exam_date_text) if p]
-            exam_date_display = ", ".join(parts)
-            if exam_time_range:
-                exam_date_display += f", {exam_time_range}"
             try:
-                exam_date = datetime.strptime(exam_date_text, "%b %d, %Y").date().isoformat()
+                exam_date_obj = datetime.strptime(exam_date_text, "%b %d, %Y").date()
             except ValueError:
-                pass
+                exam_date_obj = None
+
+            if exam_date_obj:
+                # Day/month/year + 24h, not the page's scraped "Nov 27,
+                # 2026" / "4:00 PM" — matches the rest of the bot's date
+                # formatting conventions.
+                exam_date = exam_date_obj.isoformat()
+                exam_date_display = exam_date_obj.strftime("%a, %d.%m.%Y")
+                time_range_24h = _format_time_range_24h(exam_time_range) if exam_time_range else None
+                if time_range_24h:
+                    exam_date_display += f", {time_range_24h}"
+                elif exam_time_range:
+                    exam_date_display += f", {exam_time_range}"
+            else:
+                # Couldn't parse the date at all - fall back to the raw
+                # scraped text rather than showing nothing.
+                parts = [p for p in (exam_weekday, exam_date_text) if p]
+                exam_date_display = ", ".join(parts)
+                if exam_time_range:
+                    exam_date_display += f", {exam_time_range}"
 
         # Positionally, "Examiner" and "Room" follow right after the
         # Enrollment/Disenrollment lines in the page's table layout.
@@ -328,6 +359,15 @@ def _parse_examination_periods(body_text: str) -> list[dict]:
             except ValueError:
                 pass
 
+        if start_dt and end_dt:
+            # Day/month/year + 24h, built from the already-parsed datetimes
+            # rather than re-displaying the page's raw "10/19/26 12:00 AM
+            # until 11/20/26 11:59 PM" sentence.
+            verb = "feasible" if is_open else "was feasible"
+            window_display = f"Enrollment {verb} from {start_dt.strftime('%d.%m.%Y %H:%M')} until {end_dt.strftime('%d.%m.%Y %H:%M')}"
+        else:
+            window_display = enroll_line
+
         periods.append({
             "is_open": is_open,
             "exam_date_text": exam_date_text,
@@ -338,6 +378,7 @@ def _parse_examination_periods(body_text: str) -> list[dict]:
             "start_date": start_dt.isoformat() if start_dt else None,
             "end_date": end_dt.isoformat() if end_dt else None,
             "raw": enroll_line,
+            "window_display": window_display,
         })
 
     return periods
@@ -831,6 +872,13 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
             "action_type": "anmelden",
             "title": exam["title"],
             "code": code,
+            # Carried along so "📲 Forward to WA" (handle_examopen_wa_confirm,
+            # studip_bot.py) can rebuild the same detailed text the Telegram
+            # notification itself shows, instead of just the course title.
+            "exam_date_display": exam.get("exam_date_display"),
+            "window_display": exam.get("window_display") or exam.get("raw"),
+            "group_label": exam.get("group_label"),
+            "room": exam.get("room"),
         }
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Register", callback_data=f"exam_ask|{sid}")],
@@ -846,7 +894,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
                 f"{exam_date_line}"
                 f"{class_line}"
                 f"{room_line}"
-                f"🗓 <b>Window:</b> {exam['raw']}\n"
+                f"🗓 <b>Window:</b> {exam.get('window_display') or exam['raw']}\n"
                 "━━━━━━━━━━━━━━━━━"
             )
             try:

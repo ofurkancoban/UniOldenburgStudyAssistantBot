@@ -4788,7 +4788,24 @@ async def handle_examopen_wa_confirm(update: Update, context: ContextTypes.DEFAU
     if not info:
         await query.edit_message_text("⚠️ This notification has expired.")
         return
-    text = f"📢 <b>EXAM REGISTRATION OPEN</b>\n{info['title']}"
+    # Mirrors the Telegram notification's own format (see exam_reminder.py's
+    # check_exam_reminders) instead of just the course title - the WA
+    # forward used to carry noticeably less information than what the
+    # student actually saw in Telegram.
+    class_line = f"👥 <b>Class:</b> {info['group_label']}\n" if info.get("group_label") else ""
+    room_line = f"📍 <b>Room:</b> {info['room']}\n" if info.get("room") else ""
+    exam_date_line = f"📅 <b>Exam Date:</b> {info['exam_date_display']}\n" if info.get("exam_date_display") else ""
+    window_line = f"🗓 <b>Window:</b> {info['window_display']}\n" if info.get("window_display") else ""
+    text = (
+        "🆕 <b>EXAM REGISTRATION OPEN</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"📘 <b>Course:</b> {info['title']}\n"
+        f"{exam_date_line}"
+        f"{class_line}"
+        f"{room_line}"
+        f"{window_line}"
+        "━━━━━━━━━━━━━━━━━"
+    )
     success, message = await _send_text_to_whatsapp(text)
     await query.edit_message_text(f"✅ {message}" if success else f"❌ {message}")
 
