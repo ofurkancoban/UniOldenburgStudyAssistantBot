@@ -2525,11 +2525,11 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
 
     caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
     reference_bytes = await _download_telegram_file(context.bot, ref_file_id)
-    item_bytes = [
-        b for b in (
-            await _fetch_wardrobe_item_bytes(context.bot, it) for it in outfit["chosen_items"]
-        ) if b
-    ]
+    item_bytes = []
+    for it in outfit["chosen_items"]:
+        b = await _fetch_wardrobe_item_bytes(context.bot, it)
+        if b:
+            item_bytes.append(b)
     image_bytes = await generate_outfit_tryon_image(reference_bytes, item_bytes) if reference_bytes and item_bytes else None
     if image_bytes:
         await query.message.reply_photo(photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
@@ -3865,11 +3865,11 @@ async def send_morning_summary(bot, user_ids):
                     continue
                 caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
                 reference_bytes = await _download_telegram_file(bot, ref_file_id)
-                item_bytes = [
-                    b for b in (
-                        await _fetch_wardrobe_item_bytes(bot, it) for it in outfit["chosen_items"]
-                    ) if b
-                ]
+                item_bytes = []
+                for it in outfit["chosen_items"]:
+                    b = await _fetch_wardrobe_item_bytes(bot, it)
+                    if b:
+                        item_bytes.append(b)
                 image_bytes = await generate_outfit_tryon_image(reference_bytes, item_bytes) if reference_bytes and item_bytes else None
                 if image_bytes:
                     await bot.send_photo(chat_id=uid, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
