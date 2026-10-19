@@ -47,7 +47,8 @@ The bot runs a state-of-the-art background loop that tracks:
 *   **📁 File Manager**: Detects new uploads. Download files **directly** with one click.
 *   **💬 Forum Discussions**: Stay in the loop with new posts and full conversation history.
 *   **📨 Direct Messages**: Never miss an important message from lecturers or peers.
-*   **🟢 WhatsApp Integration**: Forward any announcement or message directly to a target WhatsApp group with the tap of a button. The bot runs a local Node.js microservice to handle secure WhatsApp Web sessions.
+*   **🟢 WhatsApp Integration**: Forward any announcement or message directly to a target WhatsApp group with the tap of a button. The bot runs a local Node.js microservice to handle secure WhatsApp sessions.
+*   **👀 Watch Previous Semester Too**: `/status` has a toggle (off by default) that extends Announcements, File Manager, and Forum Discussions above to also watch the semester right before your current one, not just your active courses (Direct Messages aren't course-scoped, so this doesn't change those). Useful if a retake course or a module you're still following doesn't show up in the new term. Flip it anytime from `/status`; takes effect on the next check cycle, no restart needed.
 
 ### 🍽️ Enhanced Mensa Menu
 A beautiful, emoji-rich menu with:

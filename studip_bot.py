@@ -472,6 +472,23 @@ def set_scan_previous_semester_enabled(enabled: bool) -> None:
     save_general_cache(cache)
 
 
+def get_watch_previous_semester_enabled() -> bool:
+    """Whether the background watchers (announcements, forum posts, new
+    files) should also monitor the previous semester's courses, not just
+    the current one — off by default, toggled via /status (see
+    handle_toggle_watch_prev_sem). Distinct from
+    get_scan_previous_semester_enabled, which only affects the "➕ Enroll
+    Course" browsing list, not what's being actively watched for new
+    activity."""
+    return bool(load_general_cache().get("watch_previous_semester"))
+
+
+def set_watch_previous_semester_enabled(enabled: bool) -> None:
+    cache = load_general_cache()
+    cache["watch_previous_semester"] = enabled
+    save_general_cache(cache)
+
+
 USER_NAMES_CACHE_PATH = "user_names.json"
 
 
@@ -1128,6 +1145,77 @@ async def list_courses(semester_id: str = None):
     return []
 
 
+async def _switch_semester_filter(session, semester_id: str) -> None:
+    """Explicitly switch Stud.IP's own session-level "my_courses" semester
+    filter — the exact same request list_courses(semester_id=...) makes as
+    a side effect. Used to restore the filter back to a known semester
+    after a temporary switch to fetch a *different* semester's data (e.g.
+    the previous one, for the previous-semester enrolment/watch features),
+    since leaving the shared, long-lived session pinned to the wrong
+    semester would otherwise silently corrupt any later no-arg
+    list_courses() call elsewhere that assumes it reflects "current"."""
+    try:
+        async with await session.get(
+            "https://elearning.uni-oldenburg.de/dispatch.php/my_courses/set_semester",
+            params={"sem_select": semester_id},
+        ) as r:
+            await r.text()
+    except Exception as e:
+        logging.warning(f"_switch_semester_filter: failed to switch to {semester_id}: {e}")
+
+
+_courses_map_built_with_prev = None  # tracks whether the shared courses_map currently reflects get_watch_previous_semester_enabled() == True/False, so it's rebuilt only when that's actually changed
+
+
+async def _ensure_watched_courses_map(session) -> None:
+    """(Re)builds the shared `courses_map` global — used by all three
+    background watchers (announcements, new files, forum posts) to decide
+    which courses to check — to include the previous semester's courses
+    too when that's enabled (see get_watch_previous_semester_enabled /
+    /status's toggle). Only rebuilds when the map is empty or the toggle's
+    state has changed since the last build, not on every watcher cycle.
+
+    Deliberately resolves "current semester" explicitly (default_semester,
+    falling back to the newest entry in get_semester_options) rather than
+    relying on a no-arg list_courses() call reflecting "current" — that
+    depends on whatever semester some unrelated browsing interaction
+    (Files/Enroll/Sign Out's own semester pickers) last left the shared
+    session's filter pointed at, which isn't reliable here."""
+    global courses_map, _courses_map_built_with_prev
+    want_prev = get_watch_previous_semester_enabled()
+    if courses_map and _courses_map_built_with_prev == want_prev:
+        return
+
+    anchor_id = None
+    semester_options = []
+    try:
+        default = load_default_semester()
+        semester_options = await get_semester_options(session)
+        anchor_id = default.get("id") or (semester_options[0][0] if semester_options else None)
+    except Exception as e:
+        logging.warning(f"_ensure_watched_courses_map: failed to resolve current semester: {e}")
+
+    courses_list = await list_courses(semester_id=anchor_id) if anchor_id else await list_courses()
+    merged = {cid: name for name, cid in courses_list}
+
+    if want_prev and anchor_id and semester_options:
+        idx = next((i for i, (sid, _) in enumerate(semester_options) if sid == anchor_id), None)
+        if idx is not None and idx + 1 < len(semester_options):
+            prev_id, prev_label = semester_options[idx + 1]
+            try:
+                prev_courses = await list_courses(semester_id=prev_id)
+                for name, cid in prev_courses:
+                    merged.setdefault(cid, name)
+                logging.info(f"👀 Also watching {len(prev_courses)} course(s) from {prev_label}")
+            except Exception as e:
+                logging.warning(f"_ensure_watched_courses_map: previous-semester fetch failed: {e}")
+            finally:
+                # Leave the shared session's semester filter back on the
+                # current/anchor semester, not stuck on the previous one.
+                await _switch_semester_filter(session, anchor_id)
+
+    courses_map = merged
+    _courses_map_built_with_prev = want_prev
 
 
 # ── menu functions ─────────────────────────────────────────────────
@@ -2642,11 +2730,8 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
                 cache = {"seen": [], "history": []}
         seen = set(cache.get("seen", []))
 
-        if not courses_map:
-            courses_list = await list_courses()
-            courses = courses_list
-        else:
-            courses = [(name, cid) for cid, name in courses_map.items()]
+        await _ensure_watched_courses_map(session)
+        courses = [(name, cid) for cid, name in courses_map.items()]
 
         all_found = []
         semaphore = asyncio.Semaphore(3)
@@ -3013,10 +3098,8 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False):
         updated = False
         all_collected = []
 
-        if not courses_map:
-            courses = await list_courses()
-        else:
-            courses = [(name, cid) for cid, name in courses_map.items()]
+        await _ensure_watched_courses_map(session)
+        courses = [(name, cid) for cid, name in courses_map.items()]
 
         if not courses:
             return
@@ -3607,11 +3690,7 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
                 logging.warning("⚠️ Failed to load forum cache, using empty.")
 
         # ── Ensure courses are loaded ───────────────────────────────────────
-        if not courses_map:
-            # Try to load courses if empty
-            courses_list = await list_courses()
-            courses_map = {cid: name for name, cid in courses_list}
-
+        await _ensure_watched_courses_map(session)
         courses = [(name, cid) for cid, name in courses_map.items()]
         new_posts_found = []
 
@@ -4314,7 +4393,7 @@ async def _run_check_now(update, context):
 
         # ✅ Load courses ONCE if needed
         if not courses_map:
-            await list_courses()
+            await _ensure_watched_courses_map(global_session)
 
         results = []
 
@@ -6857,6 +6936,12 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
                     # still shown even if the previous-semester scan fails.
                     logging.warning(f"_render_open_courses_for_semester: previous-semester scan failed: {e}")
                     prev_label = None
+                finally:
+                    # The fetches above leave Stud.IP's shared session filter
+                    # pinned to the previous semester - restore it to the one
+                    # actually being browsed so it doesn't silently corrupt
+                    # some unrelated later no-arg list_courses() call.
+                    await _switch_semester_filter(session, semester_id)
     except Exception as e:
         # Stop the animation before this edits the same status_msg with the
         # error — otherwise a late animation tick can race with (or land
@@ -7288,6 +7373,31 @@ async def handle_default_semester_clear(update: Update, context: ContextTypes.DE
 
     clear_default_semester()
     await query.edit_message_text("✅ Default semester cleared. Files, Browse Courses, and Sign Out will ask each time again.")
+
+
+async def handle_toggle_watch_prev_sem(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle toggle_watch_prev_sem callback (from /status) — flip whether
+    the background watchers (announcements, new files, forum posts) also
+    monitor the previous semester's courses, not just the current one
+    (see get_watch_previous_semester_enabled). Forces courses_map to be
+    rebuilt on the next watcher cycle so the change takes effect without
+    needing a bot restart."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    global courses_map
+    new_state = not get_watch_previous_semester_enabled()
+    set_watch_previous_semester_enabled(new_state)
+    courses_map = {}  # force _ensure_watched_courses_map to rebuild on the next watcher cycle
+
+    if new_state:
+        await query.edit_message_text("✅ Now also watching the previous semester's courses for new announcements, files, and forum posts — takes effect on the next check cycle.")
+    else:
+        await query.edit_message_text("🔲 Back to only watching the current semester's courses — takes effect on the next check cycle.")
 
 
 CHANGE_SEM_CONFIG = {
@@ -9420,6 +9530,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     default_semester_label = default_semester.get("label") or "Not set (always asks)"
     text += f"\n\n📆 Default Semester: {default_semester_label}"
 
+    watch_prev = get_watch_previous_semester_enabled()
+    text += f"\n👀 Watch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
+
     user_id_for_name = update.effective_user.id if update.effective_user else None
     display_name = get_user_name(user_id_for_name) if user_id_for_name else None
     text += f"\n👤 Your Name: {display_name or 'Not set'}"
@@ -9432,6 +9545,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👤 Set Your Name", callback_data="set_user_name")],
         [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
         [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
+        [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="toggle_watch_prev_sem")],
         [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
         [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
         [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
@@ -9575,6 +9689,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_set_weather_location, pattern="^set_weather_location$"))
         app.add_handler(CallbackQueryHandler(handle_default_semester_pick, pattern="^default_sem\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_default_semester_clear, pattern="^default_sem_clear$"))
+        app.add_handler(CallbackQueryHandler(handle_toggle_watch_prev_sem, pattern="^toggle_watch_prev_sem$"))
         app.add_handler(CallbackQueryHandler(handle_change_semester, pattern="^change_sem\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_deenroll_ask, pattern="^course_deenroll_ask\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_deenroll_confirm, pattern="^course_deenroll_confirm\\|.*$"))
