@@ -63,7 +63,7 @@ A beautiful, emoji-rich menu with:
 Catalog your clothes once, get a weather-aware outfit picked for you every morning — with an AI-generated image of yourself wearing it:
 - **📸 "Add Clothing Item"** (`/status` → **"👔 My Wardrobe"**): send a photo of one piece of clothing and it's auto-tagged (type, color, warmth) by a free vision model and saved permanently — no need to resend it each day. Delete items or **"🗑 Clear all"** any time from the same screen.
 - **🖼️ "Set Reference Photo"**: one fixed full-body photo of yourself, reused every morning for the try-on image. Resend it any time via `/status` to update it.
-- **Automatic, in the Morning Summary**: toggle **"👔 Daily Outfit Suggestion"** on in `/status` and every morning, alongside the weather/lunch pick, a free OpenRouter LLM picks a coherent, temperature-banded outfit from your wardrobe (full layering below 5°C, shorts preferred above 18°C, etc.), always including a shoes item and a cap/beanie if your wardrobe has one. An image of your reference photo wearing the top+bottom is generated via a free, purpose-built virtual try-on model (Hugging Face's `OOTDiffusion` Space, chaining upper- and lower-body passes), with shoes/headwear added in one more pass via a general image-editing model (`FLUX.1-Kontext-Dev`) — those two are text-described rather than photo-matched, since no free try-on model supports footwear/headwear directly. Falls back to Cloudflare Workers AI's `FLUX.2` if the HF Spaces are unavailable, and to a text-only outfit description if nothing could be generated. Skipped quietly (no nag message) until you've added at least one item and a reference photo. Quality depends heavily on the reference photo being a real, plain-background, front-facing, full-body shot. Entirely free-tier: no OpenRouter image-generation cost involved, though a free Hugging Face account token is effectively required (anonymous usage hits a low shared-GPU quota fast).
+- **Automatic, in the Morning Summary**: toggle **"👔 Daily Outfit Suggestion"** on in `/status` and every morning, alongside the weather/lunch pick, a free OpenRouter LLM picks a coherent, temperature-banded outfit from your wardrobe (full layering below 5°C, shorts preferred above 18°C, a light jacket on a cold morning even if the afternoon warms up, etc.), always including a shoes item and a cap/beanie if your wardrobe has one. An image of your reference photo wearing the top+bottom is generated via FASHN's try-on model (fal.ai, paid, ~$0.075/image, chaining upper- and lower-body passes) when `FAL_KEY` is set — picked after a live quality comparison showed it preserves the actual garment (cut, logo sharpness) noticeably better than the free options — falling back to Hugging Face's free `OOTDiffusion` Space, then Cloudflare Workers AI's `FLUX.2`. Shoes/headwear are added in one more pass via a general image-editing model (`FLUX.1-Kontext-Dev`) — text-described rather than photo-matched, since no try-on model tested supports footwear/headwear from an actual reference photo. Falls back to a text-only outfit description if nothing could be generated. Skipped quietly (no nag message) until you've added at least one item and a reference photo. Quality depends heavily on the reference photo being a real, plain-background, front-facing, full-body shot. Today's pick is cached and resent (free) if triggered again the same day, and recently-worn items are soft-avoided for variety the next day.
 - **👔 "Suggest Outfit Now"**: the same pick + try-on image on demand, any time — tap it from **"👔 My Wardrobe"** (shown once you have at least one item and a reference photo) without waiting for tomorrow's morning summary, and independent of whether the automatic toggle is on.
 
 ### 🎓 Exam & Grade Intelligence (StuMS/HISinOne)
@@ -185,14 +185,19 @@ PORT=3838  # Port for the WhatsApp Microservice
 OPENROUTER_API_KEY=your_openrouter_key_here   # https://openrouter.ai/keys — omit to disable, tasks-only voice input still works
 OPENROUTER_MODEL=cohere/north-mini-code:free  # any OpenRouter model id; defaults to this free one
 
-# --- 👔 AI Wardrobe (optional, free-tier only) ---
+# --- 👔 AI Wardrobe ---
+# fal.ai (paid, ~$0.075/image) — primary try-on provider when set; a live
+# comparison against the free Spaces below showed it preserves the actual
+# garment (cut, logo sharpness) noticeably better. fal.ai/dashboard/keys
+FAL_KEY=your_fal_ai_key_here
+# FAL_TRYON_MODEL=fal-ai/fashn/tryon/v1.6
 CLOUDFLARE_ACCOUNT_ID=your_cloudflare_account_id_here        # dashboard.cloudflare.com, 10,000 free Neurons/day
 CLOUDFLARE_API_TOKEN=your_cloudflare_workers_ai_token_here    # My Profile -> API Tokens -> Custom Token -> Workers AI permission
 # CLOUDFLARE_VISION_MODEL=@cf/mistralai/mistral-small-3.1-24b-instruct  # used to auto-tag uploaded clothing photos
-# CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-2-dev     # fallback try-on image if the HF Space below is unavailable
-# HF_SPACE_VTON=levihsu/OOTDiffusion              # primary try-on model (supports upper+lower body)
+# CLOUDFLARE_IMAGE_MODEL=@cf/black-forest-labs/flux-2-dev     # last-resort fallback try-on image
+# HF_SPACE_VTON=levihsu/OOTDiffusion              # free fallback try-on model if FAL_KEY is unset/fails (supports upper+lower body)
 # HF_SPACE_ACCESSORIES=black-forest-labs/FLUX.1-Kontext-Dev  # adds shoes/headwear via general image editing
-HF_TOKEN=your_free_huggingface_read_token_here    # huggingface.co/settings/tokens — effectively required, anonymous ZeroGPU quota is too low
+HF_TOKEN=your_free_huggingface_read_token_here    # huggingface.co/settings/tokens — effectively required for the free fallback, anonymous ZeroGPU quota is too low
 ```
 
 > [!IMPORTANT]

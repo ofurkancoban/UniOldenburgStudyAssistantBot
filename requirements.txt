@@ -16,4 +16,5 @@ SpeechRecognition
 pydub
 langdetect
 gradio_client
+fal-client
 # Verified

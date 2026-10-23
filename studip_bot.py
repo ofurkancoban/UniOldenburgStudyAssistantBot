@@ -68,6 +68,13 @@ CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/
 HF_SPACE_VTON = os.getenv("HF_SPACE_VTON", "levihsu/OOTDiffusion")
 HF_SPACE_ACCESSORIES = os.getenv("HF_SPACE_ACCESSORIES", "black-forest-labs/FLUX.1-Kontext-Dev")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
+# fal.ai (paid, ~$0.075/image) — primary try-on provider when configured,
+# since a live side-by-side comparison showed it preserves the actual
+# garment (cut, logo sharpness) noticeably better than the free HF Spaces
+# below. Those remain as a free fallback when FAL_KEY isn't set or a call
+# fails. See generate_outfit_tryon_image for the fallback order.
+FAL_KEY = os.getenv("FAL_KEY", "")
+FAL_TRYON_MODEL = os.getenv("FAL_TRYON_MODEL", "fal-ai/fashn/tryon/v1.6")
 # University of Oldenburg's coordinates, for the daily-plan weather snapshot
 # (see get_weather_snapshot) — configurable in case the bot is ever reused
 # for a different campus.
@@ -8460,6 +8467,70 @@ async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
         return None
 
 
+async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optional[bytes], lower_bytes: Optional[bytes]) -> Optional[bytes]:
+    """Dress the reference photo via FASHN's try-on model (fal.ai-hosted,
+    paid, ~$0.075/image) — the primary provider when FAL_KEY is set, since
+    a live comparison against the free Spaces below showed it preserves
+    the actual garment (cut/taper, logo sharpness) noticeably better.
+    Chained the same way as generate_outfit_tryon_ootd: apply the upper
+    garment, then feed that result back in as the new model photo for the
+    lower garment. Each step is independently best-effort. Returns None
+    if FAL_KEY isn't configured, there's nothing to apply, or both steps
+    failed — caller falls back to the free OOTDiffusion path."""
+    if not FAL_KEY or (not upper_bytes and not lower_bytes):
+        return None
+    try:
+        import fal_client
+    except ImportError:
+        logging.warning("generate_outfit_tryon_fashn: fal_client not installed")
+        return None
+
+    async def _apply_garment(person_bytes: bytes, garment_bytes: bytes) -> Optional[bytes]:
+        person_path = os.path.join(tempfile.gettempdir(), f"fashn_person_{uuid.uuid4().hex}.jpg")
+        garment_path = os.path.join(tempfile.gettempdir(), f"fashn_garment_{uuid.uuid4().hex}.jpg")
+        try:
+            with open(person_path, "wb") as f:
+                f.write(person_bytes)
+            with open(garment_path, "wb") as f:
+                f.write(garment_bytes)
+            person_url = await fal_client.upload_file_async(person_path)
+            garment_url = await fal_client.upload_file_async(garment_path)
+            result = await fal_client.subscribe_async(
+                FAL_TRYON_MODEL,
+                arguments={"model_image": person_url, "garment_image": garment_url},
+            )
+            image_url = result["images"][0]["url"]
+            async with aiohttp.ClientSession() as session:
+                async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status == 200:
+                        return await resp.read()
+            return None
+        except Exception as e:
+            logging.warning(f"FASHN try-on step failed: {e}")
+            return None
+        finally:
+            for p in (person_path, garment_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    current = reference_bytes
+    applied_any = False
+    if upper_bytes:
+        result = await _apply_garment(current, upper_bytes)
+        if result:
+            current = result
+            applied_any = True
+    if lower_bytes:
+        result = await _apply_garment(current, lower_bytes)
+        if result:
+            current = result
+            applied_any = True
+
+    return current if applied_any else None
+
+
 async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Optional[bytes], lower_bytes: Optional[bytes]) -> Optional[bytes]:
     """Dress the reference photo via levihsu/OOTDiffusion's dress-code
     endpoint (process_dc) — unlike yisol/IDM-VTON, this exposes a
@@ -8658,12 +8729,14 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
 async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items: list[dict]) -> Optional[bytes]:
     """Dress the reference photo in the chosen outfit — picks one
     representative upper-body garment (the outermost layer if the outfit
-    has layering, e.g. a coat over a t-shirt, since OOTDiffusion replaces
-    the whole upper-body region per call rather than stacking garments)
-    and one bottom, downloads their bytes, and tries the free, purpose-
-    built OOTDiffusion Space first (chained upper+lower, see
-    generate_outfit_tryon_ootd), falling back to Cloudflare's general
-    FLUX.2 editing model if that Space is unavailable. If the outfit also
+    has layering, e.g. a coat over a t-shirt, since none of these models
+    stack multiple garments visually in one region) and one bottom,
+    downloads their bytes, and tries FASHN (paid, via fal.ai) first if
+    FAL_KEY is configured — confirmed via live comparison to preserve the
+    actual garment better than the free options — falling back to the
+    free OOTDiffusion Space (chained upper+lower, see
+    generate_outfit_tryon_ootd), then to Cloudflare's general FLUX.2
+    editing model if neither is available. If the outfit also
     includes shoes/a cap-or-beanie (see _add_mandatory_shoes_and_headwear),
     one more pass via generate_outfit_tryon_accessories adds them — text-
     described, not photo-matched, and best-effort: a failure there just
@@ -8677,7 +8750,9 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
     upper_bytes = await _fetch_wardrobe_item_bytes(bot, upper_item) if upper_item else None
     lower_bytes = await _fetch_wardrobe_item_bytes(bot, lower_item) if lower_item else None
 
-    image_bytes = await generate_outfit_tryon_ootd(reference_bytes, upper_bytes, lower_bytes)
+    image_bytes = await generate_outfit_tryon_fashn(reference_bytes, upper_bytes, lower_bytes)
+    if not image_bytes:
+        image_bytes = await generate_outfit_tryon_ootd(reference_bytes, upper_bytes, lower_bytes)
     if not image_bytes:
         image_bytes = await generate_outfit_tryon_flux(reference_bytes, [b for b in (upper_bytes, lower_bytes) if b])
     if not image_bytes:
