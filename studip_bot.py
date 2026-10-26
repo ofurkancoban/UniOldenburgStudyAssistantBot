@@ -5996,6 +5996,17 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         sender = query
     else:
         text = (message.text or "").strip()
+        # Study buttons have their own status messages, so they skip the
+        # generic loading message below. Matched exactly, before the loose
+        # keyword checks ("Study Plan" etc. must not fall through to them).
+        study_buttons = {
+            "📘 Study Plan": study_plan_command,
+            "📊 Progress": progress_command,
+            "🎯 Courses": track_courses_command,
+        }
+        if text in study_buttons:
+            await study_buttons[text](update, context)
+            return
         # Check all buttons
         if "🍽️" in text or "menu" in text.lower():
             data = ["menu"]
@@ -6878,7 +6889,8 @@ def get_main_keyboard():
     return ReplyKeyboardMarkup(
         [
             ["⬇️ Files", "🔁 Check", "ℹ️ Status"],
-            ["🍽️ Menu", "✅ Tasks", "📅 Calendar"]
+            ["🍽️ Menu", "✅ Tasks", "📅 Calendar"],
+            ["📘 Study Plan", "📊 Progress", "🎯 Courses"]
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -6903,7 +6915,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔁 Check - Manual check\n"
         "ℹ️ Status - Bot status\n"
         "🍽️ Menu - Today's meals\n"
-        "📅 Calendar - Today's schedule\n",
+        "📅 Calendar - Today's schedule\n"
+        "📘 Study Plan - Next week's study sessions\n"
+        "📊 Progress - Study progress, courses you're behind on\n"
+        "🎯 Courses - Choose which courses to track\n",
         reply_markup=get_main_keyboard()
     )
 
