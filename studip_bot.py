@@ -9738,8 +9738,8 @@ STUDY_SESSION_BLOCK_MINUTES = 90  # one lecture unit per block; longer windows a
 STUDY_SESSION_MIN_BLOCK_MINUTES = 60  # a window's leftover shorter than this isn't worth a separate unit
 STUDY_PLAN_MAX_BLOCKS_PER_DAY = 3
 STUDY_PLAN_EXAM_WINDOW_DAYS = 21
-STUDY_DAY_START_HOUR = 9
-STUDY_DAY_END_HOUR = 19
+STUDY_DAY_START_HOUR = 10
+STUDY_DAY_END_HOUR = 21
 
 
 def _file_size_mb(size_str) -> float:
