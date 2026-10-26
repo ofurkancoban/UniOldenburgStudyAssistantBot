@@ -10023,8 +10023,9 @@ async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None) -> 
     to every user_id. Returns the rendered message text. status_msg, if
     given, is edited through the stages (used by the manual /studyplan
     command's progress display)."""
-    if status_msg:
-        await status_msg.edit_text("📘 Building your weekly study plan...\n\n📚 Scanning course files...")
+    # status_msg (from study_plan_command) already reads "Scanning course
+    # files..."; editing it to the same text makes Telegram raise "Message
+    # is not modified", so the first stage needs no edit.
     inputs = await gather_weekly_study_inputs(session)
 
     if not inputs["gaps"]:
@@ -10271,7 +10272,12 @@ async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAU
             # show the overview as a new message instead of overwriting it.
             await query.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
         else:
-            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            try:
+                await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+            except Exception as e:
+                # 🔄 Refresh with nothing changed: Telegram rejects an identical edit.
+                if "not modified" not in str(e).lower():
+                    raise
         return
 
     parts = data.split("|")
