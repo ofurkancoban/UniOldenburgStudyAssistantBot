@@ -6066,8 +6066,9 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ── Calendar helpers ──────────────────────────────────────────────────────────
 
-async def get_calendar_events(session, week_start) -> list:
-    """Fetch calendar events from the user's personal Stud.IP iCal export URL."""
+async def get_calendar_events(session, week_start, days: int = 7) -> list:
+    """Fetch calendar events from the user's personal Stud.IP iCal export URL,
+    for `days` days starting at week_start (a week by default)."""
     ical_url = os.getenv("STUDIP_ICAL_URL")
     
     if not ical_url:
@@ -6094,7 +6095,7 @@ async def get_calendar_events(session, week_start) -> list:
         cal = icalendar.Calendar.from_ical(raw_text)
         
         # Get events for the requested week
-        end_date = week_start + timedelta(days=7)
+        end_date = week_start + timedelta(days=days)
         # Use recurring_ical_events to expand RRULEs automatically and filter by date boundary
         week_events = recurring_ical_events.of(cal).between(week_start, end_date)
         
@@ -9136,12 +9137,13 @@ async def build_ai_weekly_plan_narration(events: list, week_start, week_end, nam
 # infrastructure is enough for "what, when, how urgent" without the cost
 # or maintenance of full-text semantic search.
 
-STUDY_PLAN_SUPPORTED_EXTENSIONS = (".pdf", ".pptx")
+STUDY_PLAN_SUPPORTED_EXTENSIONS = (".pdf", ".pptx", ".html")
 
 
 def extract_text_from_file(filename: str, content: bytes) -> Optional[str]:
     """Extract plain text from a downloaded lecture file, for topic
-    summarization. Any extension other than PDF/PPTX returns None
+    summarization (HTML covers reveal.js/Quarto slide decks). Any extension
+    other than PDF/PPTX/HTML returns None
     immediately with no log noise - that's the routine case for a typical
     course's file mix (videos, images, zips, docx), not an error. Each
     branch is independently try/except-wrapped since corrupt, scanned, or
@@ -9177,6 +9179,16 @@ def extract_text_from_file(filename: str, content: bytes) -> Optional[str]:
         except Exception as e:
             logging.warning(f"extract_text_from_file: PPTX parse failed for {filename}: {e}")
             return None
+    elif ext == ".html":
+        try:
+            soup = BeautifulSoup(content.decode("utf-8", errors="ignore"), "html.parser")
+            for tag in soup(["script", "style"]):
+                tag.decompose()
+            text = soup.get_text("\n", strip=True)
+            return text or None
+        except Exception as e:
+            logging.warning(f"extract_text_from_file: HTML parse failed for {filename}: {e}")
+            return None
     return None
 
 
@@ -9203,47 +9215,71 @@ async def summarize_lecture_file(filename: str, extracted_text: str) -> Optional
 
 
 async def collect_course_topics(session) -> dict:
-    """Scan every ENROLLED course's files, summarize any new/changed file
-    into a one-line topic label, cache the result, and return
-    {cid: [topic, ...]} read back from the now-current cache - so courses
-    with no new files this run still contribute topics learned in prior
-    runs, not just this run's fresh subset. The new/changed diff (size
-    first, then a >24h timestamp-change tolerance) mirrors
-    check_new_files_parallel's own logic against files_cache.json, just
-    inverted in purpose: there it flags changes to notify about, here it
-    flags changes to decide what needs re-summarizing."""
+    """Scan every ENROLLED course's files (top level plus one folder level
+    down, since many courses keep each week's slides in a dated folder
+    like "20261013"), summarize any new/changed lecture file into a
+    one-line topic label, cache the result, and return
+    {cid: {rel_path: entry}} read back from the now-current cache - so
+    courses with no new files this run still contribute topics learned in
+    prior runs. rel_path is "folder/name" for files inside a folder and
+    just "name" at the top level. The new/changed diff (size first, then a
+    >24h timestamp-change tolerance) mirrors check_new_files_parallel's
+    own logic against files_cache.json. Files that classify as admin or
+    exercise material (README, syllabus, quizzes) are never downloaded,
+    since the planner doesn't schedule them. When the student picked
+    which courses to track, only those are scanned."""
     await _ensure_watched_courses_map(session)
-    courses = [(name, cid) for cid, name in courses_map.items()]
+    tracked = load_study_progress().get("tracked")
+    courses = [(name, cid) for cid, name in courses_map.items() if tracked is None or cid in tracked]
     if not courses:
         return {}
 
     cache = load_study_plan_cache()
     semaphore = asyncio.Semaphore(3)
 
+    async def list_course_files(cid) -> list:
+        """[(folder_name or None, file_item)], skipping folders that only
+        hold side material (books, literature, code, problem sets)."""
+        out = []
+        for item in await list_files(cid):
+            if item.get("type") == "file":
+                out.append((None, item))
+            elif item.get("type") == "folder" and item.get("url") and not _SKIPPED_FOLDER_RE.match(item.get("name", "")):
+                try:
+                    sub = await list_files(cid, item["url"])
+                except Exception as e:
+                    logging.warning(f"collect_course_topics: list_files failed for folder {item.get('name')}: {e}")
+                    continue
+                out.extend((item["name"], f) for f in sub if f.get("type") == "file")
+        return out
+
     async def process_course(course_name, cid):
         async with semaphore:
             try:
-                files = await list_files(cid)
+                files = await list_course_files(cid)
             except Exception as e:
                 logging.warning(f"collect_course_topics: list_files failed for {cid}: {e}")
                 return
 
             course_cache = cache.setdefault(cid, {})
-            for f in files:
-                if f.get("type") != "file":
-                    continue
+            for folder, f in files:
                 name = f.get("name")
                 url = f.get("url")
                 if not name or not url:
                     continue
                 if os.path.splitext(name)[1].lower() not in STUDY_PLAN_SUPPORTED_EXTENSIONS:
                     continue
+                if classify_lecture_file(name, folder)[0] in ("admin", "exercise"):
+                    continue
+                if _file_size_mb(f.get("size")) > STUDY_PLAN_MAX_FILE_MB:
+                    continue
+                key = f"{folder}/{name}" if folder else name
 
                 dt = _parse_file_date_v2(f.get("modified"), f.get("modified_iso"))
                 modified_ts = None if dt == datetime.min else int(dt.timestamp())
                 cur_size = str(f.get("size", "-")).strip()
 
-                old = course_cache.get(name)
+                old = course_cache.get(key)
                 needs_processing = True
                 if old is not None:
                     old_size = str(old.get("size", "-")).strip()
@@ -9260,7 +9296,7 @@ async def collect_course_topics(session) -> dict:
                             continue
                         content = await resp.read()
                 except Exception as e:
-                    logging.warning(f"collect_course_topics: download failed for {name}: {e}")
+                    logging.warning(f"collect_course_topics: download failed for {key}: {e}")
                     continue
 
                 text = extract_text_from_file(name, content)
@@ -9269,52 +9305,376 @@ async def collect_course_topics(session) -> dict:
                 summary = await summarize_lecture_file(name, text)
                 if not summary:
                     continue
-                course_cache[name] = {"summary": summary, "size": cur_size, "modified_ts": modified_ts}
+                course_cache[key] = {"summary": summary, "size": cur_size, "modified_ts": modified_ts, "folder": folder}
 
     await asyncio.gather(*(process_course(name, cid) for name, cid in courses))
     save_study_plan_cache(cache)
 
     enrolled_cids = {cid for _, cid in courses}
-    return {cid: [v["summary"] for v in files.values()] for cid, files in cache.items() if cid in enrolled_cids}
+    return {cid: files for cid, files in cache.items() if cid in enrolled_cids}
+
+
+# A lecture's position in the course is read from its folder/filename
+# ("20261013/Top_OLS.pdf", "AM_L3_Nash.pdf", "Lecture_04.pptx",
+# "03_Intro.pdf") rather than from its upload timestamp - instructors
+# routinely re-upload last year's whole deck at once, so timestamps say
+# nothing about the order the material is taught in.
+_LECTURE_NUMBER_RE = re.compile(
+    r"(?:^|[^a-z])(?:l|lec|lecture|vl|vorlesung|week|woche|kapitel|chapter|ch|session|sitzung|unit|topic|part|teil)[\s_.-]*0*(\d{1,2})(?!\d)",
+    re.IGNORECASE,
+)
+_LEADING_NUMBER_RE = re.compile(r"^0*(\d{1,2})(?!\d)[\s_.-]")
+_DATED_FOLDER_RE = re.compile(r"^(20\d{2})[-_.]?(\d{2})[-_.]?(\d{2})(?:\D|$)")
+_EXAM_FILE_RE = re.compile(r"klausur|exam|prüfung|pruefung|mock|past.?paper|sample.?question|answers|(?:^|[^a-z])q-?a(?:[^a-z]|$)|(?:^|[^a-z])test(?:[^a-z]|$)", re.IGNORECASE)
+_EXERCISE_FILE_RE = re.compile(r"übung|uebung|exercise|tutorial|tutorium|(?:^|[^a-z])(?:sheet|blatt|solutions?|lösung|loesung)(?:[^a-z]|$)|assignment|problem.?set|quiz", re.IGNORECASE)
+_ADMIN_FILE_RE = re.compile(r"syllabus|readme|(?:^|[^a-z])info(?:[^a-z]|$)|organi[sz]ation|orga\b|literatur|reading.?list|handbook|modul", re.IGNORECASE)
+_SKIPPED_FOLDER_RE = re.compile(r"^(books?|literat\w*|readings?|r ?markdown|syllabus|src|code|data|labs?|ps|ep|solutions?|videos?|pyblp)$", re.IGNORECASE)
+
+STUDY_PLAN_MAX_FILE_MB = 20  # whole textbooks dropped into a course folder aren't lecture material and are slow to fetch
+STUDY_SESSION_BLOCK_MINUTES = 90  # one lecture unit per block; longer windows are split into several blocks
+STUDY_SESSION_MIN_BLOCK_MINUTES = 60  # a window's leftover shorter than this isn't worth a separate unit
+STUDY_PLAN_MAX_BLOCKS_PER_DAY = 3
+STUDY_PLAN_EXAM_WINDOW_DAYS = 21
+STUDY_DAY_START_HOUR = 9
+STUDY_DAY_END_HOUR = 19
+
+
+def _file_size_mb(size_str) -> float:
+    m = re.match(r"([\d.,]+)\s*([KMG]?B)", str(size_str or ""), re.IGNORECASE)
+    if not m:
+        return 0.0
+    value = float(m.group(1).replace(",", "."))
+    return value * {"B": 1 / 1024 / 1024, "KB": 1 / 1024, "MB": 1, "GB": 1024}[m.group(2).upper()]
+
+
+def _folder_date(folder: Optional[str]):
+    m = _DATED_FOLDER_RE.match(folder or "")
+    if not m:
+        return None
+    try:
+        return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3))).date()
+    except ValueError:
+        return None
+
+
+def classify_lecture_file(filename: str, folder: Optional[str] = None) -> tuple:
+    """Return (kind, lecture_number) for a course file, where kind is one of
+    "exam" (past papers, used for exam prep), "exercise", "lecture",
+    "admin" (syllabus/README sheets, never scheduled) or "other"."""
+    stem = os.path.splitext(filename)[0]
+    if _EXAM_FILE_RE.search(stem) or _EXAM_FILE_RE.search(folder or ""):
+        return "exam", None
+    if _EXERCISE_FILE_RE.search(stem):
+        return "exercise", None
+    m = _LECTURE_NUMBER_RE.search(stem) or _LEADING_NUMBER_RE.search(stem)
+    if m:
+        return "lecture", int(m.group(1))
+    if _ADMIN_FILE_RE.search(stem):
+        return "admin", None
+    return "other", None
+
+
+def build_course_units(files: dict) -> dict:
+    """Turn one course's topic cache ({rel_path: {"summary", "folder", ...}})
+    into {"lectures": [...], "exam_practice": [...], "dated": bool},
+    lectures in teaching order. A unit is what one study session covers:
+    - dated folders ("20261013"): one unit per folder = that day's lecture,
+      with every content file's topic in it; "dated" is then True and the
+      unit's date says exactly when it was taught.
+    - otherwise one unit per lecture file, ordered by its number.
+    Unnumbered non-admin material only counts as lectures when the course
+    has no numbered lecture files at all (otherwise it's usually a side
+    reading that would shift every lecture's position by one)."""
+    files_list = []
+    for key, entry in files.items():
+        name = key.rsplit("/", 1)[-1]
+        folder = entry.get("folder")
+        kind, number = classify_lecture_file(name, folder)
+        files_list.append({
+            "file": key,
+            "topic": entry.get("summary") or name,
+            "kind": kind,
+            "number": number,
+            "folder": folder,
+            "date": _folder_date(folder),
+            "modified_ts": entry.get("modified_ts") or 0,
+        })
+    exam_practice = sorted((u for u in files_list if u["kind"] == "exam"), key=lambda u: u["file"])
+    content = [u for u in files_list if u["kind"] in ("lecture", "other")]
+
+    dated = [u for u in content if u["date"] is not None]
+    if dated:
+        by_folder: dict = {}
+        for u in sorted(dated, key=lambda u: (u["number"] if u["number"] is not None else 999, u["file"])):
+            by_folder.setdefault(u["folder"], []).append(u)
+        lectures = [
+            {"file": folder, "topic": "; ".join(u["topic"] for u in group), "kind": "lecture", "number": None, "date": group[0]["date"]}
+            for folder, group in sorted(by_folder.items(), key=lambda kv: (kv[1][0]["date"], kv[0]))
+        ]
+        return {"lectures": lectures, "exam_practice": exam_practice, "dated": True}
+
+    lectures = [u for u in content if u["kind"] == "lecture"] or content
+    lectures.sort(key=lambda u: (u["number"] if u["number"] is not None else 999, u["modified_ts"], u["file"]))
+    return {"lectures": lectures, "exam_practice": exam_practice, "dated": False}
+
+
+def _unit_label(unit: dict) -> str:
+    if unit.get("date") is not None:
+        prefix = f"{unit['date']:%d.%m}: "
+    elif unit.get("number") is not None:
+        prefix = f"L{unit['number']}: "
+    else:
+        prefix = ""
+    return f"{prefix}{unit['topic']}"
+
+
+STUDY_PROGRESS_PATH = "study_progress.json"
+
+
+def load_study_progress() -> dict:
+    """{"studied": {cid: [unit_key, ...]}, "last_plan": [session, ...],
+    "held": {cid: n}, "held_date": "YYYY-MM-DD", "tracked": [cid, ...]}.
+    A unit_key is the lecture file's name, or "session-N" for a held
+    lecture with no slides. "tracked" is absent while course selection is
+    automatic (see compute_course_progress)."""
+    if os.path.exists(STUDY_PROGRESS_PATH):
+        try:
+            with open(STUDY_PROGRESS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load study progress: {e}")
+    return {}
+
+
+def save_study_progress(data: dict) -> None:
+    try:
+        tmp = STUDY_PROGRESS_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, STUDY_PROGRESS_PATH)
+    except Exception as e:
+        logging.error(f"Failed to save study progress: {e}")
+
+
+def _semester_lecture_start(today):
+    """First day of the current semester's lecture period (approximate:
+    WS from 1 Oct, SS from 1 Apr) - only used as the lower bound for
+    counting lectures that already took place."""
+    if today.month >= 10:
+        return datetime(today.year, 10, 1).date()
+    if today.month >= 4:
+        return datetime(today.year, 4, 1).date()
+    return datetime(today.year - 1, 10, 1).date()
+
+
+async def count_lectures_held(session, course_candidates: list) -> dict:
+    """{cid: number of lecture sessions already held this semester}, from
+    the iCal feed. Only "Vorlesung"/"Lecture"/"Seminar" entries count
+    (exercises repeat the lecture's material), and cancelled ones
+    ("fällt aus") are skipped. This is what "covered in class" means for
+    the behind-schedule check: the first N lecture units of a course."""
+    today = datetime.now(TZ_BERLIN).date()
+    start = _semester_lecture_start(today)
+    events = await get_calendar_events(session, start, days=(today - start).days + 1)
+    now = datetime.now(TZ_BERLIN)
+    held: dict = {}
+    for ev in events:
+        title = ev.get("title", "")
+        lower = title.lower()
+        if ev["end_dt"] > now:
+            continue
+        if not lower.startswith(("vorlesung", "lecture", "seminar")):
+            continue
+        if "fällt aus" in lower or "cancelled" in lower or "canceled" in lower:
+            continue
+        cid = _best_title_match(clean_course_title(title), course_candidates, min_score=0.6)
+        if cid:
+            held[cid] = held.get(cid, 0) + 1
+    return held
+
+
+async def _get_lectures_held(session, progress: dict, refresh: bool = False) -> dict:
+    """Held-lecture counts, recomputed at most once a day unless refresh
+    is set (the progress menu's buttons would otherwise refetch the whole
+    semester's iCal on every tap)."""
+    today_iso = datetime.now(TZ_BERLIN).date().isoformat()
+    if not refresh and progress.get("held_date") == today_iso and "held" in progress:
+        return progress["held"]
+    course_candidates = [(name, cid) for cid, name in courses_map.items()]
+    held = await count_lectures_held(session, course_candidates)
+    progress["held"] = held
+    progress["held_date"] = today_iso
+    save_study_progress(progress)
+    return held
+
+
+def compute_course_progress(course_files: dict, held: dict, studied: dict, names: dict, tracked: Optional[list] = None) -> list:
+    """One row per tracked course: which lecture units count as covered in
+    class, which of those are still unstudied (the backlog), and what
+    comes next. Sorted with the biggest backlog first. tracked is the
+    student's own course selection; when None (automatic), every course
+    that has had lectures this semester or already has logged progress
+    is included."""
+    today = datetime.now(TZ_BERLIN).date()
+    rows = []
+    for cid, name in names.items():
+        units = build_course_units(course_files.get(cid, {}))
+        lectures = units["lectures"]
+        n_held = held.get(cid, 0)
+        done = set(studied.get(cid, []))
+        if tracked is not None:
+            if cid not in tracked:
+                continue
+        elif n_held == 0 and not done:
+            continue
+
+        if units["dated"]:
+            # Dated folders say exactly which material was taught when, so
+            # no need to estimate from the held-lecture count.
+            covered = [u for u in lectures if u["date"] <= today]
+        else:
+            covered = list(lectures[:n_held])
+            for k in range(len(lectures) + 1, n_held + 1):
+                covered.append({"file": f"session-{k}", "topic": f"Lecture {k} notes (no slides on Stud.IP yet)", "kind": "lecture", "number": k})
+        upcoming = [u for u in lectures if u not in covered and u["file"] not in done]
+        backlog = [u for u in covered if u["file"] not in done]
+        rows.append({
+            "cid": cid,
+            "name": name,
+            "held": n_held,
+            "total_lectures": len(lectures),
+            "covered": covered,
+            "studied_covered": len(covered) - len(backlog),
+            "backlog": backlog,
+            "upcoming": upcoming,
+            "exam_practice": [u for u in units["exam_practice"] if u["file"] not in done],
+            "lectures": lectures,
+        })
+    rows.sort(key=lambda r: (-len(r["backlog"]), r["name"]))
+    return rows
+
+
+def _split_gaps_into_blocks(gaps: list) -> list:
+    blocks = []
+    per_day: dict = {}
+    for g in gaps:
+        t = g["start_dt"]
+        while (g["end_dt"] - t).total_seconds() / 60 >= STUDY_SESSION_MIN_BLOCK_MINUTES:
+            if per_day.get(g["date_key"], 0) >= STUDY_PLAN_MAX_BLOCKS_PER_DAY:
+                break
+            end = min(t + timedelta(minutes=STUDY_SESSION_BLOCK_MINUTES), g["end_dt"])
+            blocks.append((t, end))
+            per_day[g["date_key"]] = per_day.get(g["date_key"], 0) + 1
+            t = end
+    return blocks
+
+
+def schedule_study_sessions(gaps: list, rows: list, exams: list) -> list:
+    """Fill next week's free blocks with concrete lecture units, in each
+    course's teaching order: first the backlog (held in class but not yet
+    studied), plus past exam papers for courses with an exam within
+    STUDY_PLAN_EXAM_WINDOW_DAYS, and only once a course is caught up, a
+    preview of its next lecture. Courses are interleaved by priority
+    (backlog size + exam proximity) instead of one course eating every
+    slot, and the same course is not scheduled twice in a row when
+    another one still has something due."""
+    exam_days: dict = {}
+    for e in exams:
+        cid = e.get("matched_cid")
+        if cid and (cid not in exam_days or e["days_until"] < exam_days[cid]):
+            exam_days[cid] = e["days_until"]
+
+    queues: dict = {}
+    score: dict = {}
+    for row in rows:
+        cid = row["cid"]
+        q = [(0, "catch-up", u) for u in row["backlog"]]
+        if cid in exam_days:
+            q += [(0, "exam prep", u) for u in row["exam_practice"]]
+        q += [(1, "prepare next lecture", u) for u in row["upcoming"][:1]]
+        if not q:
+            continue
+        queues[cid] = q
+        score[cid] = 2 * len(row["backlog"])
+        if cid in exam_days:
+            score[cid] += STUDY_PLAN_EXAM_WINDOW_DAYS + 1 - exam_days[cid]
+
+    names = {r["cid"]: r["name"] for r in rows}
+    sessions = []
+    last_cid = None
+    for start, end in _split_gaps_into_blocks(gaps):
+        candidates = [c for c in queues if queues[c]]
+        if not candidates:
+            break
+        candidates.sort(key=lambda c: (queues[c][0][0], c == last_cid, -score[c]))
+        cid = candidates[0]
+        _, reason, unit = queues[cid].pop(0)
+        sessions.append({
+            "day": f"{start:%A}",
+            "date": start.date().isoformat(),
+            "start": f"{start:%H:%M}",
+            "end": f"{end:%H:%M}",
+            "cid": cid,
+            "course": names.get(cid, cid),
+            "unit": unit["file"],
+            "label": _unit_label(unit),
+            "reason": reason,
+        })
+        score[cid] -= 1.5
+        last_cid = cid
+    return sessions
+
+
+def find_free_study_windows(events: list, week_start) -> list:
+    """Free windows of at least STUDY_GAP_MIN_MINUTES within each weekday's
+    STUDY_DAY_START_HOUR-STUDY_DAY_END_HOUR study day, in the same dict
+    shape as find_weekly_study_gaps. Unlike that function (which is shared
+    with the voice narration and only looks between two classes), this
+    also counts the morning before the first class, the afternoon after
+    the last one and fully free days. Cancelled classes ("fällt aus") are
+    treated as free time. Weekends are deliberately excluded."""
+    from datetime import time as _dtime
+    windows = []
+    for i in range(5):
+        day = week_start + timedelta(days=i)
+        day_start = datetime.combine(day, _dtime(STUDY_DAY_START_HOUR, 0), tzinfo=TZ_BERLIN)
+        day_end = datetime.combine(day, _dtime(STUDY_DAY_END_HOUR, 0), tzinfo=TZ_BERLIN)
+        busy = sorted(
+            (ev for ev in events if ev["date_key"] == day and "fällt aus" not in ev.get("title", "").lower()),
+            key=lambda ev: ev["start_dt"],
+        )
+        cursor, after = day_start, ("no classes that day" if not busy else "start of day")
+        for ev in busy + [None]:
+            if ev is None:
+                end, before = day_end, ("no classes that day" if not busy else "end of day")
+            else:
+                end, before = min(ev["start_dt"], day_end), clean_course_title(ev.get("title", "")) or "your next class"
+            minutes = (end - cursor).total_seconds() / 60
+            if minutes >= STUDY_GAP_MIN_MINUTES:
+                windows.append({
+                    "date_key": day,
+                    "start_dt": cursor,
+                    "end_dt": end,
+                    "duration_minutes": int(minutes),
+                    "after": after,
+                    "before": before,
+                })
+            if ev is not None and ev["end_dt"] > cursor:
+                cursor = max(cursor, ev["end_dt"])
+                after = clean_course_title(ev.get("title", "")) or "your previous class"
+    return windows
 
 
 async def gather_weekly_study_inputs(session) -> dict:
-    """Collect this run's three inputs: next week's free calendar gaps,
-    the student's own upcoming registered exams (closest first, next 3
-    weeks — the same get_registered_exam_schedule source _upcoming_exams
-    uses, not the full-curriculum list), and per-course cached topic
-    labels."""
+    """Collect this run's inputs: next week's free study windows, the
+    student's own upcoming registered exams (closest first, next 3 weeks;
+    the same get_registered_exam_schedule source _upcoming_exams uses, not
+    the full-curriculum list), and per-course progress rows (ordered
+    lecture units vs. lectures already held vs. units already studied)."""
     today = datetime.now(TZ_BERLIN).date()
     next_monday = today + timedelta(days=7 - today.weekday())
     events = await get_calendar_events(session, next_monday)
-    gaps = find_weekly_study_gaps(events)
-
-    # find_weekly_study_gaps only flags windows BETWEEN two classes on the
-    # same day - a day with zero classes (e.g. a free Monday/Friday) never
-    # even enters its grouping, so it was silently invisible here. Add one
-    # representative study slot (10:00-13:00, within the same 90-360min
-    # bounds as a real gap) for every day in the week that has no events at
-    # all, without touching find_weekly_study_gaps itself (shared with the
-    # weekly voice narration feature).
-    # Weekdays only (Monday-Friday) - weekends are deliberately excluded
-    # both here and from find_weekly_study_gaps's own output below, per
-    # explicit request not to suggest study sessions on weekends.
-    from datetime import time as _dtime
-    days_with_events = {ev["date_key"] for ev in events}
-    for i in range(5):
-        day = next_monday + timedelta(days=i)
-        if day in days_with_events:
-            continue
-        gaps.append({
-            "date_key": day,
-            "start_dt": datetime.combine(day, _dtime(10, 0), tzinfo=TZ_BERLIN),
-            "end_dt": datetime.combine(day, _dtime(13, 0), tzinfo=TZ_BERLIN),
-            "duration_minutes": 180,
-            "after": "no classes that day",
-            "before": "no classes that day",
-        })
-    gaps = [g for g in gaps if g["start_dt"].weekday() < 5]
-    gaps.sort(key=lambda g: g["start_dt"])
+    gaps = find_free_study_windows(events, next_monday)
 
     try:
         raw_exams = await get_registered_exam_schedule(session)
@@ -9322,6 +9682,7 @@ async def gather_weekly_study_inputs(session) -> dict:
         logging.warning(f"gather_weekly_study_inputs: get_registered_exam_schedule failed: {e}")
         raw_exams = []
 
+    course_files = await collect_course_topics(session)
     course_candidates = [(name, cid) for cid, name in courses_map.items()]
     exams = []
     for exam in raw_exams:
@@ -9333,123 +9694,357 @@ async def gather_weekly_study_inputs(session) -> dict:
         except ValueError:
             continue
         days_until = (exam_date - today).days
-        if not (0 <= days_until <= 21):
+        if not (0 <= days_until <= STUDY_PLAN_EXAM_WINDOW_DAYS):
             continue
         matched_cid = _best_title_match(exam["title"], course_candidates, min_score=0.6)
         exams.append({**exam, "days_until": days_until, "matched_cid": matched_cid})
     exams.sort(key=lambda e: e["days_until"])
 
-    course_topics = await collect_course_topics(session)
-    return {"gaps": gaps, "exams": exams, "course_topics": course_topics}
+    progress = load_study_progress()
+    held = await _get_lectures_held(session, progress, refresh=True)
+    rows = compute_course_progress(course_files, held, progress.get("studied", {}), dict(courses_map), progress.get("tracked"))
+    return {"gaps": gaps, "exams": exams, "rows": rows}
 
 
-WEEKLY_STUDY_PLAN_SYSTEM_PROMPT = """You are building a concrete weekly study plan for a university student. You are given: (1) a list of free time slots next week (gaps between their classes), (2) the student's own upcoming exams with days remaining, (3) known lecture topics per course. Assign specific study sessions into the given slots - you do not need to use every slot. Prioritize courses whose exam is soonest. Reference the actual topic labels given; never invent a generic "study for X" session when real topics are listed for that course - if a course truly has no listed topics, you may still assign it a slot (e.g. because its exam is close) but must say so honestly (e.g. "general review - no topic data yet") rather than fabricate a topic. Respond with strict JSON only, no other text: {"sessions": [{"day": "Monday", "start": "14:00", "end": "15:30", "course": "<course name>", "topic": "<specific topic or honest general-review note>"}]}. Use only the day names and time slots given."""
+def _progress_bar(done: int, total: int, width: int = 10) -> str:
+    if total <= 0:
+        return "░" * width
+    filled = round(width * done / total)
+    return "▓" * filled + "░" * (width - filled)
 
 
-async def build_weekly_study_plan(gaps: list, exams: list, course_topics: dict, courses_map_snapshot: dict) -> Optional[list]:
-    """Ask the LLM to assign concrete study sessions into next week's free
-    slots, weighing exam proximity and known lecture topics — structural
-    analog to pick_outfit_from_wardrobe (strict-JSON decision, Python
-    renders the final text) rather than build_ai_weekly_plan_narration's
-    free-prose style, since this output is an addressable schedule, not
-    something meant to be read aloud."""
-    if not gaps:
-        return None
-
-    lines = ["Free time slots next week:"]
-    for g in gaps:
-        context = "no classes that day, fully free" if g["after"] == g["before"] == "no classes that day" else f"between {g['after']} and {g['before']}"
-        lines.append(
-            f"- {g['start_dt']:%A} {g['start_dt']:%H:%M}-{g['end_dt']:%H:%M} "
-            f"({g['duration_minutes']}min), {context}"
-        )
-
-    if exams:
-        lines.append("\nUpcoming exams (your own registered sittings):")
-        for e in exams:
-            course_name = courses_map_snapshot.get(e.get("matched_cid"), "")
-            course_note = f" — course: {course_name}" if course_name else ""
-            lines.append(f"- {e['title']}: in {e['days_until']} day(s) ({e.get('date')}){course_note}")
-
-    if course_topics:
-        lines.append("\nKnown lecture topics per course:")
-        for cid, topics in course_topics.items():
-            if not topics:
-                continue
-            course_name = courses_map_snapshot.get(cid, cid)
-            lines.append(f"- {course_name}: {', '.join(topics[:8])}")
-
-    raw = await _call_openrouter(WEEKLY_STUDY_PLAN_SYSTEM_PROMPT, "\n".join(lines), temperature=0.75)
-    parsed = _extract_json_object(raw)
-    sessions = parsed.get("sessions") if parsed else None
-    return sessions if sessions else None
+def render_behind_lines(rows: list) -> list:
+    behind = [r for r in rows if r["backlog"]]
+    if not behind:
+        return ["✅ <b>You're caught up</b> with every lecture held so far."]
+    lines = ["⚠️ <b>Behind on:</b>"]
+    for r in behind:
+        n = len(r["backlog"])
+        lines.append(f"• {html.escape(r['name'])}: {n} lecture{'s' if n != 1 else ''} not studied yet")
+    return lines
 
 
-def render_weekly_study_plan_message(sessions: Optional[list], gaps: list, exams: list) -> str:
-    """Build the final HTML Telegram message from either the LLM's
-    structured sessions (preferred), or — when composition failed or
-    there were no topics to work with — a plain listing of the free slots
-    with no topic detail, so the feature degrades gracefully instead of
-    sending nothing."""
+def render_weekly_study_plan_message(sessions: list, gaps: list, exams: list, rows: list) -> str:
+    """Final HTML Telegram message: the behind-schedule summary, then the
+    concrete sessions grouped by day (or, when there is nothing to
+    schedule, a plain listing of the free slots), then upcoming exams."""
+    lines = ["📘 <b>Your Study Plan for Next Week</b>", "━━━━━━━━━━━━━━━━━━"]
+    lines += render_behind_lines(rows)
+    lines.append("━━━━━━━━━━━━━━━━━━")
+
     if sessions:
-        by_day: dict = {}
-        for s in sessions:
-            by_day.setdefault(s.get("day", "?"), []).append(s)
-        lines = ["📘 <b>Your Study Plan for Next Week</b>", "━━━━━━━━━━━━━━━━━━"]
-        for day, day_sessions in by_day.items():
-            lines.append(f"<b>{day}</b>")
-            for s in day_sessions:
-                lines.append(f"🕑 {s.get('start', '?')}–{s.get('end', '?')} — <b>{s.get('course', '')}</b>")
-                if s.get("topic"):
-                    lines.append(f"   {s['topic']}")
-            lines.append("")
+        current_day = None
+        for i, s in enumerate(sessions, 1):
+            if s["day"] != current_day:
+                if current_day is not None:
+                    lines.append("")
+                current_day = s["day"]
+                lines.append(f"<b>{s['day']}</b>")
+            lines.append(f"{i}. 🕑 {s['start']}–{s['end']} · <b>{html.escape(s['course'])}</b>")
+            lines.append(f"   📖 {html.escape(s['label'])} <i>({s['reason']})</i>")
         lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append("Tap a session's button once you've studied it, so progress stays accurate. /progress shows the full overview.")
     else:
-        lines = [
-            "📘 <b>Your Free Study Windows Next Week</b>",
-            "(couldn't generate topic-specific suggestions this time)",
-            "━━━━━━━━━━━━━━━━━━",
-        ]
+        lines.append("(no lecture material to schedule yet, here are your free windows)")
         for g in gaps:
-            context = "fully free day" if g["after"] == g["before"] == "no classes that day" else f"between {g['after']} and {g['before']}"
+            context = "fully free day" if g["after"] == g["before"] == "no classes that day" else f"between {html.escape(g['after'])} and {html.escape(g['before'])}"
             lines.append(f"{g['start_dt']:%A} {g['start_dt']:%H:%M}–{g['end_dt']:%H:%M} ({context})")
         lines.append("━━━━━━━━━━━━━━━━━━")
 
-    if exams:
-        for e in exams[:3]:
-            lines.append(f"⏳ Exam in {e['days_until']} day(s): {e['title']} ({e.get('date')})")
+    for e in exams[:3]:
+        lines.append(f"⏳ Exam in {e['days_until']} day(s): {html.escape(e['title'])} ({e.get('date')})")
 
     return "\n".join(lines)
 
 
+def build_study_plan_keyboard(plan: list, studied: dict) -> InlineKeyboardMarkup:
+    keyboard = []
+    for i, s in enumerate(plan):
+        done = s["unit"] in set(studied.get(s["cid"], []))
+        mark = "✅" if done else "⬜"
+        label = f"{mark} {i + 1}. {s['day'][:3]} {s['start']} {s['course']}"
+        keyboard.append([InlineKeyboardButton(label[:60], callback_data=f"sp_plan|{i}")])
+    keyboard.append([InlineKeyboardButton("📊 Progress", callback_data="sp_progress")])
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None) -> str:
-    """End-to-end weekly study plan: gather inputs, compose (or degrade),
-    render, send to every user_id. Returns the rendered message text.
-    status_msg, if given, is edited through the stages (used by the
-    manual /studyplan command's progress display)."""
+    """End-to-end weekly study plan: gather inputs, schedule, render, send
+    to every user_id. Returns the rendered message text. status_msg, if
+    given, is edited through the stages (used by the manual /studyplan
+    command's progress display)."""
     if status_msg:
         await status_msg.edit_text("📘 Building your weekly study plan...\n\n📚 Scanning course files...")
     inputs = await gather_weekly_study_inputs(session)
 
     if not inputs["gaps"]:
-        text = "📘 No free study gaps found in next week's schedule — fully booked! No study plan to suggest this week."
+        text = "\n".join(
+            ["📘 No free study gaps found in next week's schedule, fully booked! No study plan to suggest this week.", ""]
+            + render_behind_lines(inputs["rows"])
+        )
         for uid in user_ids:
             try:
-                await bot.send_message(chat_id=uid, text=text)
+                await bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
             except Exception as e:
                 logging.warning(f"run_weekly_study_plan_job: failed to send to {uid}: {e}")
         return text
 
     if status_msg:
-        await status_msg.edit_text("📘 Building your weekly study plan...\n\n🧠 Composing plan...")
-    sessions = await build_weekly_study_plan(inputs["gaps"], inputs["exams"], inputs["course_topics"], dict(courses_map))
-    text = render_weekly_study_plan_message(sessions, inputs["gaps"], inputs["exams"])
+        await status_msg.edit_text("📘 Building your weekly study plan...\n\n🧠 Scheduling sessions...")
+    sessions = schedule_study_sessions(inputs["gaps"], inputs["rows"], inputs["exams"])
+    progress = load_study_progress()
+    progress["last_plan"] = sessions
+    save_study_progress(progress)
+
+    text = render_weekly_study_plan_message(sessions, inputs["gaps"], inputs["exams"], inputs["rows"])
+    reply_markup = build_study_plan_keyboard(sessions, progress.get("studied", {})) if sessions else None
     for uid in user_ids:
         try:
-            await bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
+            await bot.send_message(chat_id=uid, text=text, parse_mode="HTML", reply_markup=reply_markup)
         except Exception as e:
             logging.warning(f"run_weekly_study_plan_job: failed to send to {uid}: {e}")
     return text
+
+
+def _toggle_studied(progress: dict, cid: str, unit_key: str) -> bool:
+    """Flip one unit's studied state; returns the new state."""
+    studied = progress.setdefault("studied", {}).setdefault(cid, [])
+    if unit_key in studied:
+        studied.remove(unit_key)
+        return False
+    studied.append(unit_key)
+    return True
+
+
+async def handle_study_plan_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A session button on the weekly plan message: mark/unmark that
+    session's lecture unit as studied and refresh the checkmarks."""
+    query = update.callback_query
+    progress = load_study_progress()
+    plan = progress.get("last_plan", [])
+    try:
+        idx = int(query.data.split("|", 1)[1])
+        s = plan[idx]
+    except (ValueError, IndexError):
+        await query.answer("This plan is outdated, run /studyplan again.", show_alert=True)
+        return
+    now_done = _toggle_studied(progress, s["cid"], s["unit"])
+    save_study_progress(progress)
+    await query.answer("Marked as studied ✅" if now_done else "Marked as not studied")
+    try:
+        await query.edit_message_reply_markup(reply_markup=build_study_plan_keyboard(plan, progress["studied"]))
+    except Exception as e:
+        logging.debug(f"handle_study_plan_toggle: keyboard refresh skipped: {e}")
+
+
+async def _load_progress_rows(refresh: bool = False) -> tuple:
+    """(rows, progress) from cached topic labels only - no file scan, so
+    the progress menu stays fast. Lecture units appear here once a
+    /studyplan run (or the weekly job) has summarized them."""
+    if not global_session or not await global_session.is_logged_in():
+        await login_studip()
+    await _ensure_watched_courses_map(global_session)
+    progress = load_study_progress()
+    held = await _get_lectures_held(global_session, progress, refresh=refresh)
+    enrolled = set(courses_map)
+    course_files = {cid: files for cid, files in load_study_plan_cache().items() if cid in enrolled}
+    rows = compute_course_progress(course_files, held, progress.get("studied", {}), dict(courses_map), progress.get("tracked"))
+    return rows, progress
+
+
+def render_progress_overview(rows: list) -> tuple:
+    lines = ["📊 <b>Study Progress</b>", "<i>studied / lectures held so far</i>", "━━━━━━━━━━━━━━━━━━"]
+    if not rows:
+        lines.append("No tracked courses with lectures yet. Use 🎯 Tracked Courses to pick the courses to follow.")
+    for r in rows:
+        covered = len(r["covered"])
+        if r["backlog"]:
+            status = f"⚠️ {len(r['backlog'])} behind"
+        elif covered:
+            status = "✅ on track"
+        else:
+            status = "no lectures held yet"
+        lines.append(f"<b>{html.escape(r['name'])}</b>")
+        lines.append(f"{_progress_bar(r['studied_covered'], covered)} {r['studied_covered']}/{covered} · {status}")
+        if r["backlog"]:
+            lines.append(f"   next up: {html.escape(_unit_label(r['backlog'][0]))}")
+        elif r["upcoming"]:
+            lines.append(f"   next lecture: {html.escape(_unit_label(r['upcoming'][0]))}")
+        lines.append("")
+    keyboard = [[InlineKeyboardButton(f"{'⚠️' if r['backlog'] else '📚'} {r['name']}"[:60], callback_data=f"sp_course|{r['cid']}")] for r in rows]
+    keyboard.append([InlineKeyboardButton("🎯 Tracked Courses", callback_data="sp_track_menu")])
+    keyboard.append([InlineKeyboardButton("🔄 Refresh", callback_data="sp_progress_refresh")])
+    return "\n".join(lines).rstrip(), InlineKeyboardMarkup(keyboard)
+
+
+def _auto_tracked_cids(progress: dict) -> list:
+    """What automatic mode tracks: courses with lectures held this
+    semester or with progress already logged."""
+    held = progress.get("held", {})
+    studied = progress.get("studied", {})
+    return [cid for cid in courses_map if held.get(cid, 0) > 0 or studied.get(cid)]
+
+
+def render_track_menu(progress: dict) -> tuple:
+    tracked = progress.get("tracked")
+    selected = set(tracked if tracked is not None else _auto_tracked_cids(progress))
+    held = progress.get("held", {})
+    mode = "manual selection" if tracked is not None else "automatic (courses with lectures held this semester)"
+    lines = [
+        "🎯 <b>Tracked Courses</b>",
+        "Only the selected courses appear in /progress and the weekly study plan.",
+        f"Mode: <i>{mode}</i>",
+        "━━━━━━━━━━━━━━━━━━",
+        "Tap a course to add or remove it.",
+    ]
+    keyboard = []
+    for cid, name in sorted(courses_map.items(), key=lambda kv: (kv[0] not in selected, kv[1].lower())):
+        mark = "✅" if cid in selected else "⬜"
+        n = held.get(cid, 0)
+        suffix = f" · {n} held" if n else ""
+        keyboard.append([InlineKeyboardButton(f"{mark} {name}"[:55] + suffix, callback_data=f"sp_track|{cid}")])
+    if tracked is not None:
+        keyboard.append([InlineKeyboardButton("🔄 Back to automatic selection", callback_data="sp_track_auto")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back to progress", callback_data="sp_progress")])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+async def _load_track_menu_progress() -> dict:
+    if not global_session or not await global_session.is_logged_in():
+        await login_studip()
+    await _ensure_watched_courses_map(global_session)
+    progress = load_study_progress()
+    await _get_lectures_held(global_session, progress)
+    return progress
+
+
+async def track_courses_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        return
+    status_msg = await update.message.reply_text("🎯 Loading your courses...", disable_notification=True)
+    try:
+        text, markup = render_track_menu(await _load_track_menu_progress())
+        await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception as e:
+        logging.exception("track_courses_command failed")
+        await status_msg.edit_text(f"❌ Could not load courses: {e}")
+
+
+async def handle_study_track_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """sp_track_menu / sp_track_auto / sp_track|cid. The first toggle in
+    automatic mode starts the manual selection from what automatic mode
+    currently shows, so tapping one course doesn't wipe all the others."""
+    query = update.callback_query
+    await query.answer()
+    progress = await _load_track_menu_progress()
+    data = query.data
+    if data == "sp_track_auto":
+        progress.pop("tracked", None)
+        save_study_progress(progress)
+    elif data.startswith("sp_track|"):
+        cid = data.split("|", 1)[1]
+        tracked = progress.get("tracked")
+        if tracked is None:
+            tracked = _auto_tracked_cids(progress)
+        if cid in tracked:
+            tracked.remove(cid)
+        else:
+            tracked.append(cid)
+        progress["tracked"] = tracked
+        save_study_progress(progress)
+    text, markup = render_track_menu(progress)
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+def _course_view_units(row: dict) -> list:
+    """Units shown (and toggleable by index) in one course's progress
+    view: everything held so far, then the not-yet-held lectures."""
+    return row["covered"] + [u for u in row["lectures"] if u not in row["covered"]]
+
+
+def render_course_progress(row: dict, studied: dict) -> tuple:
+    done = set(studied.get(row["cid"], []))
+    units = _course_view_units(row)
+    lines = [
+        f"📚 <b>{html.escape(row['name'])}</b>",
+        f"{row['held']} lecture(s) held · {row['studied_covered']}/{len(row['covered'])} of those studied",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+    keyboard = []
+    for i, u in enumerate(units):
+        held = i < len(row["covered"])
+        if u["file"] in done:
+            mark = "✅"
+        elif held:
+            mark = "⚠️"
+        else:
+            mark = "⬜"
+        lines.append(f"{mark} {html.escape(_unit_label(u))}")
+        if i < 40:
+            keyboard.append([InlineKeyboardButton(f"{mark} {_unit_label(u)}"[:60], callback_data=f"sp_unit|{row['cid']}|{i}")])
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    lines.append("✅ studied · ⚠️ held in class, not studied · ⬜ not held yet")
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="sp_progress")])
+    return "\n".join(lines), InlineKeyboardMarkup(keyboard)
+
+
+async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        return
+    status_msg = await update.message.reply_text("📊 Loading study progress...", disable_notification=True)
+    try:
+        rows, _ = await _load_progress_rows()
+        text, markup = render_progress_overview(rows)
+        await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception as e:
+        logging.exception("progress_command failed")
+        await status_msg.edit_text(f"❌ Could not load progress: {e}")
+
+
+async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """sp_progress / sp_progress_refresh / sp_course|cid / sp_unit|cid|i."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    rows, progress = await _load_progress_rows(refresh=(data == "sp_progress_refresh"))
+
+    if data in ("sp_progress", "sp_progress_refresh"):
+        text, markup = render_progress_overview(rows)
+        if query.message.reply_markup and any(b.callback_data and b.callback_data.startswith("sp_plan|") for row in query.message.reply_markup.inline_keyboard for b in row):
+            # Opened from the weekly plan message: keep the plan intact and
+            # show the overview as a new message instead of overwriting it.
+            await query.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+        else:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    parts = data.split("|")
+    row = next((r for r in rows if r["cid"] == parts[1]), None)
+    if row is None:
+        await query.edit_message_text("Course not found anymore, run /progress again.")
+        return
+
+    if parts[0] == "sp_unit":
+        units = _course_view_units(row)
+        try:
+            unit = units[int(parts[2])]
+        except (ValueError, IndexError):
+            return
+        _toggle_studied(progress, row["cid"], unit["file"])
+        save_study_progress(progress)
+        rows = compute_course_progress(
+            {row["cid"]: load_study_plan_cache().get(row["cid"], {})},
+            progress.get("held", {}),
+            progress.get("studied", {}),
+            {row["cid"]: row["name"]},
+            progress.get("tracked"),
+        )
+        row = rows[0] if rows else row
+
+    text, markup = render_course_progress(row, progress.get("studied", {}))
+    await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
 study_plan_in_progress: set = set()
@@ -9478,7 +10073,7 @@ async def study_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await status_msg.edit_text("🔄 Session expired, re-logging...")
             await login_studip()
         await run_weekly_study_plan_job(context.bot, [user_id], global_session, status_msg=status_msg)
-        await status_msg.edit_text("✅ Study plan ready — see below 👇")
+        await status_msg.edit_text("✅ Study plan ready, see below 👇")
     except Exception as e:
         await update.message.reply_text(f"❌ Fatal error: {e}")
         logging.exception("study_plan_command failed")
@@ -11112,6 +11707,8 @@ async def main():
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("check", check_command))
         app.add_handler(CommandHandler("studyplan", study_plan_command))
+        app.add_handler(CommandHandler("progress", progress_command))
+        app.add_handler(CommandHandler("trackcourses", track_courses_command))
         app.add_handler(CommandHandler("fastenroll", fastenroll_command))
         app.add_handler(CommandHandler("fastenroll_list", fastenroll_list_command))
         app.add_handler(CommandHandler("fastenroll_cancel", fastenroll_cancel_command))
@@ -11186,6 +11783,9 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_cancel, pattern="^foodpref_clear_cancel$"))
         app.add_handler(CallbackQueryHandler(handle_toggle_wardrobe_feature, pattern="^toggle_wardrobe_feature$"))
         app.add_handler(CallbackQueryHandler(handle_toggle_weekly_study_plan, pattern="^toggle_weekly_study_plan$"))
+        app.add_handler(CallbackQueryHandler(handle_study_plan_toggle, pattern=r"^sp_plan\|\d+$"))
+        app.add_handler(CallbackQueryHandler(handle_study_progress_menu, pattern=r"^(sp_progress|sp_progress_refresh|sp_course\|.*|sp_unit\|.*)$"))
+        app.add_handler(CallbackQueryHandler(handle_study_track_menu, pattern=r"^(sp_track_menu|sp_track_auto|sp_track\|.*)$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_menu, pattern="^wardrobe_menu$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_add_item, pattern="^wardrobe_add_item$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_suggest_now, pattern="^wardrobe_suggest_now$"))
