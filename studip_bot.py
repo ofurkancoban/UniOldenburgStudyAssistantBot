@@ -49,6 +49,10 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ALLOWED_USER_IDS_ENV = os.getenv("ALLOWED_USER_IDS", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "cohere/north-mini-code:free")
+# Outfit picks need strict rule-following over a long item list without a
+# slow thinking phase; in a live comparison this model got the layering
+# right every time in 2-3 s, where the default model broke the rules.
+OUTFIT_OPENROUTER_MODEL = os.getenv("OUTFIT_OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 # Dedicated text-to-speech models (a separate OpenRouter API surface from
 # chat/completions — see synthesize_speech). deepgram/flux-tts:free requires
@@ -710,15 +714,26 @@ def get_cached_outfit_today(user_id) -> Optional[dict]:
     return None
 
 
-def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[str]) -> None:
+def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[str], color_tip: str = "") -> None:
     cache = load_general_cache()
     all_cached = cache.setdefault("outfit_today_cache", {})
     all_cached[str(user_id)] = {
         "date": datetime.now(TZ_BERLIN).date().isoformat(),
         "description": description,
+        "color_tip": color_tip,
         "photo_file_id": photo_file_id,
     }
     save_general_cache(cache)
+
+
+def outfit_caption(outfit: dict) -> str:
+    """HTML caption for an outfit pick (fresh or cached): the description,
+    then the color-harmony note when there is one. Item labels can hold a
+    bare "&" ("Jack & Jones"), so both parts are escaped."""
+    caption = f"👔 <b>Today's outfit:</b> {html.escape(outfit['description'])}"
+    if outfit.get("color_tip"):
+        caption += f"\n🎨 {html.escape(outfit['color_tip'])}"
+    return caption
 
 
 def get_recently_worn_item_ids(user_id) -> set:
@@ -1955,7 +1970,14 @@ OUTFIT_RECOMMENDATION_SYSTEM_PROMPT = """You are picking a coherent, weather-app
 - 12-18°C ("mild"): a top + pants; add a light_jacket if rain is expected OR if the morning low is below 8°C (the high alone can be misleading on a day that starts cold).
 - 18-24°C ("warm"): a top (prefer subtype=t-shirt) + pants or shorts, preferring shorts (subtype=shorts) when available; add a light_jacket only if rain is expected.
 - 24°C and above ("hot"): a top (prefer subtype=t-shirt) + shorts, preferring shorts over pants even if rain is expected — just add a light_jacket too if one's available on a rainy hot day.
-Never pick two tops or two bottoms. Also always include exactly one "shoes" item and one headwear "accessory" item (a cap/beanie/hat, not socks or other accessories) if any such items are present in the candidate list — these can't be shown in the outfit image, but still name them in your reasoning. Some items are tagged "[worn in the last couple days, prefer an alternative if one fits]" — pick a different item of that same type when a suitable alternative exists in the list, but don't force an unsuitable combination just to avoid a repeat. Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie and the coat since it'll be cold and dry, plus the beanie and trainers.'>"}. Use only ids from the given list."""
+Never pick two tops or two bottoms. Also always include exactly one "shoes" item and one headwear "accessory" item (a cap/beanie/hat, not socks or other accessories) if any such items are present in the candidate list — these can't be shown in the outfit image, but still name them in your reasoning. Some items are tagged "[worn in the last couple days, prefer an alternative if one fits]" — pick a different item of that same type when a suitable alternative exists in the list, but don't force an unsuitable combination just to avoid a repeat.
+Among the weather-appropriate options, pick the combination whose colors work best together:
+- Neutrals (black, white, grey, navy, denim blue, beige, camel, brown, olive/khaki) go with almost anything; build on them.
+- At most one statement piece per outfit (a bold color like bordeaux or bright green, or a loud pattern); keep the rest neutral. Never combine two loud patterns.
+- Earth tones (olive, dark green, brown, camel, bordeaux, rust) look good together; a tonal outfit (shades of one color, e.g. dark green trousers + green tee) is fine too.
+- Don't clash warm and cool brights (e.g. bordeaux with bright blue), and avoid near-matches that look like a mistake (e.g. a black top under a slightly different black jacket).
+- Repeat a color: shoes or headwear that echo a color from the top/outerwear tie the outfit together.
+Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie and the coat since it'll be cold and dry, plus the beanie and trainers.'>", "color_tip": "<one short sentence on the colors: why they work together (e.g. 'The olive jacket and olive trainers frame the neutral black tee and light denim.'), or a concrete swap from the list that would match better if the weather forced a weaker combination>"}. Use only ids from the given list."""
 
 
 def _temperature_band(temp_max: Optional[float]) -> str:
@@ -2055,6 +2077,11 @@ def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict], recent_id
 
 
 _HEADWEAR_KEYWORDS = ("cap", "beanie", "hat")
+# The pick prompt lists the whole wardrobe; with a thinking phase on, a free
+# model can spend minutes on it (7k+ reasoning tokens for ~30 items), so the
+# pick runs with reasoning off and a timeout above the default 15 s (most
+# answers take 2-3 s, the odd slow one close to a minute).
+OUTFIT_AI_TIMEOUT_SECONDS = 60
 
 
 def _add_mandatory_shoes_and_headwear(items: list[dict], chosen: list[dict]) -> list[dict]:
@@ -2116,11 +2143,17 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
     else:
         weather_line = "Weather: no data available today — pick something reasonably versatile (mild band)."
 
-    raw = await _call_openrouter(
-        OUTFIT_RECOMMENDATION_SYSTEM_PROMPT,
-        f"{weather_line}\n\nWardrobe:\n" + "\n".join(lines),
-        temperature=0.9,
-    )
+    user_text = f"{weather_line}\n\nWardrobe:\n" + "\n".join(lines)
+    raw = None
+    # Free models get rate-limited upstream now and then; the default model
+    # is the backup.
+    for model in dict.fromkeys((OUTFIT_OPENROUTER_MODEL, OPENROUTER_MODEL)):
+        raw = await _call_openrouter(
+            OUTFIT_RECOMMENDATION_SYSTEM_PROMPT, user_text,
+            temperature=0.9, timeout=OUTFIT_AI_TIMEOUT_SECONDS, reasoning=False, model=model,
+        )
+        if raw:
+            break
     parsed = _extract_json_object(raw)
     chosen_items = []
     if parsed and parsed.get("item_ids"):
@@ -2137,12 +2170,14 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
 
     reasoning = ((parsed or {}).get("reasoning") or "").strip()
     description = reasoning or " + ".join(it["label"] for it in chosen_items)
-    if forced_extras:
+    if reasoning and forced_extras:
         # The LLM/heuristic reasoning may not mention the mandatory
         # shoes/headwear add-ons (see _add_mandatory_shoes_and_headwear) -
         # make sure they're always named in what the user sees.
         description += " + " + " + ".join(forced_extras)
-    return {"chosen_items": chosen_items, "description": description}
+    # Only the LLM pick reasons about colors; the heuristic fallback has no tip.
+    color_tip = (parsed.get("color_tip") or "").strip() if parsed and parsed.get("item_ids") else ""
+    return {"chosen_items": chosen_items, "description": description, "color_tip": color_tip}
 
 
 async def _deliver_food_recommendation(sender, result: dict):
@@ -2724,7 +2759,7 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
     # quota-limited image-generation calls for the same day's outfit.
     cached = get_cached_outfit_today(user_id)
     if cached:
-        caption = f"👔 <b>Today's outfit:</b> {cached['description']}"
+        caption = outfit_caption(cached)
         if cached.get("photo_file_id"):
             await query.message.reply_photo(photo=cached["photo_file_id"], caption=caption, parse_mode="HTML")
         else:
@@ -2745,7 +2780,7 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
         await query.message.reply_text("❌ Couldn't put together an outfit right now — try again in a bit.")
         return
 
-    caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
+    caption = outfit_caption(outfit)
     reference_bytes = await _download_telegram_file(context.bot, ref_file_id)
     image_bytes = await generate_outfit_tryon_image(context.bot, reference_bytes, outfit["chosen_items"]) if reference_bytes else None
     photo_file_id = None
@@ -2756,7 +2791,7 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
         await query.message.reply_text(caption, parse_mode="HTML")
 
     record_worn_items(user_id, [it["id"] for it in outfit["chosen_items"]])
-    save_cached_outfit_today(user_id, outfit["description"], photo_file_id)
+    save_cached_outfit_today(user_id, outfit["description"], photo_file_id, outfit.get("color_tip", ""))
 
 
 async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4258,7 +4293,7 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
                 # two different outfits for the same day.
                 cached = get_cached_outfit_today(uid)
                 if cached:
-                    caption = f"👔 <b>Today's outfit:</b> {cached['description']}"
+                    caption = outfit_caption(cached)
                     if cached.get("photo_file_id"):
                         await bot.send_photo(chat_id=uid, photo=cached["photo_file_id"], caption=caption, parse_mode="HTML")
                     else:
@@ -4268,7 +4303,7 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
                 if not entry:
                     continue
                 outfit = entry["outfit"]
-                caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
+                caption = outfit_caption(outfit)
                 photo_file_id = None
                 if entry["image_bytes"]:
                     sent = await bot.send_photo(chat_id=uid, photo=io.BytesIO(entry["image_bytes"]), caption=caption, parse_mode="HTML")
@@ -4279,7 +4314,7 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
                     # the weather-aware reasoning is useful on its own.
                     await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
                 record_worn_items(uid, [it["id"] for it in outfit["chosen_items"]])
-                save_cached_outfit_today(uid, outfit["description"], photo_file_id)
+                save_cached_outfit_today(uid, outfit["description"], photo_file_id, outfit.get("color_tip", ""))
             except Exception as e:
                 logging.warning(f"Outfit suggestion failed for {uid}: {e}")
 
@@ -8645,14 +8680,14 @@ _ai_patience: contextvars.ContextVar = contextvars.ContextVar("_ai_patience", de
 AI_RETRY_PAUSE_SECONDS = 5
 
 
-async def _call_openrouter(system_prompt: str, user_text: str, temperature: float = 0, timeout: Optional[float] = None) -> Optional[str]:
+async def _call_openrouter(system_prompt: str, user_text: str, temperature: float = 0, timeout: Optional[float] = None, reasoning: bool = True, model: Optional[str] = None) -> Optional[str]:
     """_call_openrouter_once, retried and with a longer timeout while
     _ai_patience is set. An explicit timeout always wins."""
     patience = _ai_patience.get()
     timeout = timeout or (patience[0] if patience else 15)
     attempts = patience[1] if patience else 1
     for attempt in range(attempts):
-        result = await _call_openrouter_once(system_prompt, user_text, temperature, timeout)
+        result = await _call_openrouter_once(system_prompt, user_text, temperature, timeout, reasoning, model)
         if result is not None:
             return result
         if attempt + 1 < attempts:
@@ -8661,7 +8696,7 @@ async def _call_openrouter(system_prompt: str, user_text: str, temperature: floa
     return None
 
 
-async def _call_openrouter_once(system_prompt: str, user_text: str, temperature: float = 0, timeout: float = 15) -> Optional[str]:
+async def _call_openrouter_once(system_prompt: str, user_text: str, temperature: float = 0, timeout: float = 15, reasoning: bool = True, model: Optional[str] = None) -> Optional[str]:
     """POST one chat completion to OpenRouter's free tier and return the raw
     assistant text, or None on any failure (missing key, network error,
     timeout, non-2xx response). Callers must treat None as "couldn't
@@ -8675,7 +8710,10 @@ async def _call_openrouter_once(system_prompt: str, user_text: str, temperature:
     to produce the same greedy completion.
 
     `timeout` (seconds) can be raised for slower structured-extraction
-    calls (see extract_exam_events)."""
+    calls (see extract_exam_events). `reasoning=False` turns off the
+    model's thinking phase for prompts where it adds minutes but little
+    quality (see pick_outfit_from_wardrobe). `model` overrides
+    OPENROUTER_MODEL for one call."""
     if not OPENROUTER_API_KEY:
         return None
     try:
@@ -8684,12 +8722,13 @@ async def _call_openrouter_once(system_prompt: str, user_text: str, temperature:
                 OPENROUTER_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
                 json={
-                    "model": OPENROUTER_MODEL,
+                    "model": model or OPENROUTER_MODEL,
                     "temperature": temperature,
                     "messages": [
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_text},
                     ],
+                    **({} if reasoning else {"reasoning": {"enabled": False}}),
                 },
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
@@ -8906,9 +8945,13 @@ async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -
             "clothing items shown in the other images:\n"
             f"{garment_lines}\n"
             "Reproduce each garment faithfully (color, cut, fit, length, logos, prints). Layer outerwear "
-            "over tops, put the shoes on the feet and any cap or beanie on the head. The person always "
-            "wears plain white crew socks with the shoes (visible at the ankle wherever the trousers "
-            "allow, regardless of the other items). Keep the person's "
+            "over tops, put the shoes on the feet and any cap or beanie on the head. Keep each pair of "
+            "trousers at its real length and leg width as shown in its image: full-length trousers and "
+            "jeans fall all the way to the shoes with a natural break, and straight, relaxed or wide legs "
+            "stay straight, relaxed or wide. Never crop, roll up or taper a hem unless the garment itself "
+            "is cropped. The person always wears plain white crew socks with the shoes; they only show "
+            "where the trousers naturally leave the ankle bare, so never shorten trousers to reveal "
+            "them. Keep the person's "
             "face, identity, hair, skin tone, body shape and pose exactly as in Image 1, and keep the "
             "original background and lighting. Show the full body from head to feet. Photorealistic "
             "photo, no text."
