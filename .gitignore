@@ -17,6 +17,7 @@ announcement_cache.json
 files_cache.json
 study_plan_cache.json
 study_progress.json
+exam_file_cache.json
 messages_cache.json
 forum_cache.json
 link_cache.json
