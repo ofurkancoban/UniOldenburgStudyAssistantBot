@@ -34,7 +34,7 @@ from telegram.constants import ChatAction
 from asyncio import CancelledError
 from studip_session import StudIPSession
 from fast_enroll import run_fast_enroll, load_pending, list_pending_jobs, save_pending_job, clear_pending_job, get_semester_options, get_open_courses, enroll_now, decline_course, get_course_type_map
-from exam_reminder import check_exam_reminders, check_exam_date_reminders, check_grade_reminders, get_open_exam_registrations, get_registered_exams, get_registered_exam_schedule, get_all_exam_dates, filter_exams_by_module_codes, submit_exam_action, get_grades, compute_transcript_summary, load_exam_cache, save_exam_cache
+from exam_reminder import check_exam_reminders, check_exam_date_reminders, check_grade_reminders, get_open_exam_registrations, get_registered_exams, get_registered_exam_schedule, get_all_exam_dates, filter_exams_by_module_codes, base_module_code, submit_exam_action, get_grades, compute_transcript_summary, load_exam_cache, save_exam_cache
 
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -6723,7 +6723,14 @@ async def get_my_module_codes(session, courses) -> set:
     systems reference the same underlying module code, so this is the reliable
     way to link a Stud.IP course to its StuMS exam(s).
     """
-    codes = set()
+    by_course = await get_course_module_codes(session, [cid for _, cid in courses])
+    return set().union(*by_course.values()) if by_course else set()
+
+
+async def get_course_module_codes(session, cids: list) -> dict:
+    """{cid: {module_code, ...}}, the per-course form of get_my_module_codes
+    (needed to tie a StuMS sitting back to one specific Stud.IP course)."""
+    result: dict = {}
     semaphore = asyncio.Semaphore(3)
 
     async def fetch_one(cid):
@@ -6733,13 +6740,12 @@ async def get_my_module_codes(session, courses) -> set:
                 async with await session.get(url) as r:
                     html_text = await r.text()
             except Exception as e:
-                logging.warning(f"get_my_module_codes: failed to fetch course {cid}: {e}")
+                logging.warning(f"get_course_module_codes: failed to fetch course {cid}: {e}")
                 return
-        for m in MODULE_CODE_RE.finditer(html_text):
-            codes.add(m.group(1).lower())
+        result[cid] = {m.group(1).lower() for m in MODULE_CODE_RE.finditer(html_text)}
 
-    await asyncio.gather(*(fetch_one(cid) for _, cid in courses))
-    return codes
+    await asyncio.gather(*(fetch_one(cid) for cid in cids))
+    return result
 
 
 async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6781,8 +6787,17 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
     ])
 
     # Dates instructors announced in course files (see
-    # scan_course_files_for_exams), from the daily scan's cache.
-    file_events = [e for e in get_file_exam_events() if not e["date"] or e["date"] >= today.isoformat()]
+    # scan_course_files_for_exams), from the daily scan's cache. StuMS
+    # dates override them, and those are already listed above.
+    try:
+        await _ensure_watched_courses_map(session)
+        await refresh_stums_exam_sittings(session, all_exams=exams)
+    except Exception as e:
+        logging.warning(f"handle_exam_dates_list: StuMS override refresh failed: {e}")
+    file_events = [
+        e for e in get_file_exam_events()
+        if e.get("source") != "StuMS" and (not e["date"] or e["date"] >= today.isoformat())
+    ]
     file_lines = render_file_exam_events(file_events, "📄 <b>From Course Files</b>") if file_events else []
 
     if not upcoming:
@@ -10484,13 +10499,19 @@ async def extract_exam_events(course_name: str, filename: str, passages: str) ->
     (retry next scan), [] means the file genuinely has no exam info."""
     semester = load_default_semester().get("label") or "current semester"
     today = datetime.now(TZ_BERLIN).date()
-    raw = await _call_openrouter(
-        EXAM_EXTRACTION_SYSTEM_PROMPT,
-        f"Course: {course_name}\nSemester: {semester}\nToday: {today.isoformat()}\nFile: {filename}\n\nPassages:\n{passages}",
-        temperature=0,
-        timeout=60,
-    )
-    parsed = _extract_json_object(raw)
+    # The free model sometimes needs well over a minute; a few attempts
+    # here beat waiting for tomorrow's scan to retry.
+    parsed = None
+    for _ in range(3):
+        raw = await _call_openrouter(
+            EXAM_EXTRACTION_SYSTEM_PROMPT,
+            f"Course: {course_name}\nSemester: {semester}\nToday: {today.isoformat()}\nFile: {filename}\n\nPassages:\n{passages}",
+            temperature=0,
+            timeout=90,
+        )
+        parsed = _extract_json_object(raw)
+        if parsed is not None:
+            break
     if parsed is None or not isinstance(parsed.get("events"), list):
         return None
     return _normalize_exam_events(parsed["events"], filename)
@@ -10522,6 +10543,28 @@ def get_file_exam_events() -> list:
                     continue
                 seen.add(key)
                 out.append({**e, "cid": cid, "course": names.get(cid, cid)})
+    # StuMS is authoritative: for a course with StuMS sittings, those
+    # replace whatever exam/retake/midterm dates the course files gave
+    # (see refresh_stums_exam_sittings). Presentations and submissions
+    # aren't in StuMS, so the files stay the source for those.
+    stums = cache.get("stums_sittings", {})
+    overridden_kinds = ("exam", "retake", "midterm")
+    for cid, sittings in stums.items():
+        if not sittings or (names and cid not in names) or (tracked is not None and cid not in tracked):
+            continue
+        file_dates = {e["kind"]: e["date"] for e in out if e["cid"] == cid and e["kind"] in overridden_kinds and e["date"]}
+        out = [e for e in out if not (e["cid"] == cid and e["kind"] in overridden_kinds)]
+        for i, s in enumerate(sorted(sittings, key=lambda s: s["date"])):
+            kind = "exam" if i == 0 else "retake"
+            file_date = file_dates.get(kind)
+            out.append({
+                "kind": kind, "date": s["date"], "start": s.get("start"), "end": s.get("end"),
+                "format": None, "location": s.get("room"), "note": None, "quote": "",
+                "year_corrected": False, "source": "StuMS",
+                "file_date": file_date if file_date and file_date != s["date"] else None,
+                "cid": cid, "course": names.get(cid, cid),
+            })
+
     # A course with an upcoming dated event of some kind doesn't also need
     # its "date not announced" entry of the same kind. Past dates don't
     # count: reused slides often still carry last year's deadline.
@@ -10530,6 +10573,48 @@ def get_file_exam_events() -> list:
     out = [e for e in out if e["date"] or (e["cid"], e["kind"]) not in dated_kinds]
     out.sort(key=lambda e: (e["date"] or "9999", e["course"]))
     return out
+
+
+async def refresh_stums_exam_sittings(session, all_exams: Optional[list] = None) -> None:
+    """Store each tracked course's StuMS exam sittings (matched via module
+    codes, cached since they practically never change) in the exam file
+    cache, where get_file_exam_events uses them to override dates found
+    in course files. all_exams can be passed in by a caller that already
+    fetched get_all_exam_dates."""
+    cache = load_exam_file_cache()
+    codes = cache.get("module_codes", {})
+    cids = list(courses_map)
+    missing = [cid for cid in cids if cid not in codes]
+    if missing:
+        fetched = await get_course_module_codes(session, missing)
+        codes.update({cid: sorted(c) for cid, c in fetched.items()})
+    if all_exams is None:
+        all_exams = await get_all_exam_dates(session)
+
+    sittings: dict = {}
+    for cid in cids:
+        course_codes = set(codes.get(cid, []))
+        if not course_codes:
+            continue
+        seen = {}
+        for e in all_exams:
+            if base_module_code(e.get("code", "")) not in course_codes or not e.get("exam_date"):
+                continue
+            date_iso = str(e["exam_date"])[:10]
+            times = re.findall(r"\b(\d{1,2}:\d{2})", e.get("exam_date_display") or "")
+            seen.setdefault(date_iso, {
+                "date": date_iso,
+                "start": times[0] if times else None,
+                "end": times[1] if len(times) > 1 else None,
+                "room": e.get("room"),
+            })
+        if seen:
+            sittings[cid] = list(seen.values())
+
+    cache = load_exam_file_cache()
+    cache["module_codes"] = codes
+    cache["stums_sittings"] = sittings
+    save_exam_file_cache(cache)
 
 
 async def scan_course_files_for_exams(session) -> list:
@@ -10597,6 +10682,10 @@ async def scan_course_files_for_exams(session) -> list:
 
     await asyncio.gather(*(process_course(name, cid) for name, cid in courses))
     save_exam_file_cache(cache)
+    try:
+        await refresh_stums_exam_sittings(session)
+    except Exception as e:
+        logging.warning(f"scan_course_files_for_exams: StuMS sittings unavailable, keeping the previous ones: {e}")
 
     today = datetime.now(TZ_BERLIN).date().isoformat()
     notified = cache.get("notified", {})
@@ -10632,6 +10721,10 @@ def _format_exam_event_line(e: dict) -> str:
         when = "date not announced yet"
     extras = [x for x in (e.get("format"), e.get("location")) if x]
     line = f"{label}: {when}" + (f" ({html.escape(', '.join(extras))})" if extras else "")
+    if e.get("source") == "StuMS":
+        line += " ✅ StuMS"
+    if e.get("file_date"):
+        line += f"\n   ℹ️ course file said {datetime.fromisoformat(e['file_date']).date():%d.%m.%Y}, StuMS date used"
     if e.get("previous_date"):
         line += f"\n   ⚠️ changed from {datetime.fromisoformat(e['previous_date']).date():%d.%m.%Y}"
     if e.get("year_corrected"):
@@ -10658,7 +10751,7 @@ def render_file_exam_events(events: list, header: str) -> list:
 async def notify_new_file_exam_events(bot, new_events: list) -> None:
     if not new_events:
         return
-    lines = render_file_exam_events(new_events, "📄 <b>Exam dates found in course files</b>")
+    lines = render_file_exam_events(new_events, "📄 <b>New exam dates</b> <i>(course files / StuMS)</i>")
     lines.append("They're now in 📚 My Exam Dates, the weekly study plan and the exam reminders.")
     await broadcast(bot, "\n".join(lines), disable_notification=False)
 
@@ -10689,7 +10782,7 @@ async def check_file_exam_reminders(bot, registered: list) -> None:
             continue
         when_line = "🔴 <b>TODAY!</b>" if days_left == 0 else f"⏳ <b>{days_left} day(s) left</b>"
         text = "\n".join([
-            "📚 <b>UPCOMING EXAM</b> <i>(from course files)</i>",
+            "📚 <b>UPCOMING EXAM</b>" + ("" if e.get("source") == "StuMS" else " <i>(from course files)</i>"),
             "━━━━━━━━━━━━━━━━━",
             f"📘 <b>{html.escape(e['course'])}</b>",
             _format_exam_event_line(e),
