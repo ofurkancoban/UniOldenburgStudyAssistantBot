@@ -568,7 +568,7 @@ def get_primary_user_name() -> Optional[str]:
     """Return whichever name is set across ALLOWED_USER_IDS. Currently every
     allowed user_id is the same person on a different device, so one shared
     name personalizes the daily-plan narration for all of them rather than
-    generating a separate one per recipient — see send_morning_summary and
+    generating a separate one per recipient — see prepare_morning_summary and
     send_daily_plan_voice, both of which fall back to this when no specific
     user_id is available."""
     names = load_user_names()
@@ -1037,26 +1037,12 @@ async def unified_watcher_controller(app):
             # 0️⃣ CALENDAR REMINDERS & MORNING SUMMARY
             now = datetime.now(TZ_BERLIN)
             
-            # Check for morning summary (Daily at 07:00)
-            if now.hour >= 7:
-                cache = load_general_cache()
-                today_str = now.strftime("%Y-%m-%d")
-                if cache.get("last_morning_summary") != today_str:
-                    try:
-                        logging.info("🌞 Sending morning summary...")
-                        await send_morning_summary(app.bot, ALLOWED_USER_IDS)
-                        # Re-load rather than reusing the `cache` loaded above -
-                        # send_morning_summary does its own separate
-                        # load/save of general_cache.json (to track which
-                        # message is currently pinned), and saving the stale
-                        # pre-call `cache` here would silently overwrite that
-                        # with a copy that never has it, breaking the
-                        # unpin-before-pin logic every single day.
-                        cache = load_general_cache()
-                        cache["last_morning_summary"] = today_str
-                        save_general_cache(cache)
-                    except Exception as e:
-                        logging.error(f"❌ Morning summary failed: {e}")
+            # Morning summary: prepared ahead of time (AI lunch pick, outfit
+            # image, voice), then sent all at once at MORNING_SUMMARY_HOUR.
+            try:
+                await run_morning_summary_schedule(app.bot, ALLOWED_USER_IDS, now)
+            except Exception as e:
+                logging.error(f"❌ Morning summary failed: {e}")
 
             # Weekly content-aware study plan (Sunday evening, opt-in toggle).
             # Dedup key is a per-ISO-week string (not a daily date), and is
@@ -2710,7 +2696,7 @@ async def handle_wardrobe_clear_cancel(update: Update, context: ContextTypes.DEF
 async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle wardrobe_suggest_now callback ("👔 Suggest Outfit Now") — the
     on-demand twin of the morning summary's automatic section (see 4c in
-    send_morning_summary), using the same pick_outfit_from_wardrobe/
+    prepare_morning_summary), using the same pick_outfit_from_wardrobe/
     generate_outfit_tryon_image pipeline. Unlike the morning summary, which
     skips silently when the wardrobe/reference photo aren't set up yet,
     this is an explicit request — tell the user why nothing happened."""
@@ -4004,16 +3990,31 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False):
         logging.error(f"check_new_files_parallel fatal: {e}")
 
 
-async def send_morning_summary(bot, user_ids):
-    """Fetch today's schedule and send to users with a button for the menu."""
+MORNING_SUMMARY_HOUR = 7
+MORNING_PREPARE_LEAD_MINUTES = 30  # AI parts (lunch pick, outfit image, voice) are generated this long before delivery
+
+# Today's prepared summary ({"date": "YYYY-MM-DD", "data": <prepare_morning_summary result>})
+# and the task that delivers it at MORNING_SUMMARY_HOUR. In memory only: if
+# the bot restarts in between, the watcher just prepares it again.
+_prepared_morning: dict = {}
+_morning_delivery_task: Optional[asyncio.Task] = None
+
+
+async def prepare_morning_summary(bot, user_ids) -> Optional[dict]:
+    """Build everything the morning summary sends, without sending anything:
+    the text (schedule, weather, tasks, AI lunch pick, exam countdown), the
+    lunch photo URL, each user's outfit (AI pick + try-on image) and the
+    AI-narrated voice message (already synthesized to an OGG file). The
+    slow AI parts run here, ahead of time, so deliver_morning_summary can
+    send everything at once at the scheduled time."""
     global global_session
     session = global_session
     if not session:
-        return
+        return None
 
     now = datetime.now(TZ_BERLIN)
     today_date = now.date()
-    
+
     # 1. Get Schedule
     try:
         week_start = today_date - timedelta(days=today_date.weekday())
@@ -4088,8 +4089,9 @@ async def send_morning_summary(bot, user_ids):
 
     # 2d. Countdown to every still-upcoming registered exam, not just the
     # nearest one — lives inside this same pinned message (see the
-    # pin/unpin block below) so it updates once a day along with
-    # everything else, rather than needing its own separate edit schedule.
+    # pin/unpin block in deliver_morning_summary) so it updates once a day
+    # along with everything else, rather than needing its own separate
+    # edit schedule.
     countdown_text = ""
     try:
         exams = await _upcoming_exams(session)
@@ -4111,13 +4113,76 @@ async def send_morning_summary(bot, user_ids):
     # 3. Final Message
     header = (
         "☀️ <b>GOOD MORNING!</b> ☀️\n"
-        f"🗓️ <b>Today:</b> {now:%d %B %Y, %A}\n"
+        f"🗓️ <b>Today:</b> {today_date:%d %B %Y, %A}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
     )
 
     final_text = f"{header}{schedule_text}{weather_text}{tasks_text}{food_text}{countdown_text}\n\n━━━━━━━━━━━━━━━━━━"
 
-    # 4. Keyboard for Mensa Menu
+    # 4. Photo of the lunch pick, when one can be matched on the
+    # Studierendenwerk's public Speiseplan site — same as the standalone
+    # "What should I eat?" delivery.
+    photo_url = None
+    if food and food.get("dish"):
+        try:
+            photo_url = await fetch_dish_photo_url(food["dish"])
+        except Exception as e:
+            logging.warning(f"Summary food photo fetch error: {e}")
+
+    # 5. Daily outfit suggestion with virtual try-on image — opt-in (toggle
+    # in /status), skipped entirely (not just "no image") if the wardrobe is
+    # empty or no reference photo is set, since there's nothing useful to
+    # say yet. Every sub-step is best-effort; a failure just means this one
+    # extra message doesn't go out.
+    outfits: dict = {}
+    if get_wardrobe_feature_enabled():
+        for uid in user_ids:
+            try:
+                # A manual "Suggest Outfit Now" tap may have already run
+                # today - deliver_morning_summary resends that one instead.
+                if get_cached_outfit_today(uid):
+                    continue
+                wardrobe_entry = get_wardrobe_entry(uid)
+                items = wardrobe_entry.get("items", [])
+                ref_file_id = wardrobe_entry.get("reference_photo_file_id")
+                if not items or not ref_file_id:
+                    continue
+                recent_ids = get_recently_worn_item_ids(uid)
+                outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids)
+                if not outfit:
+                    continue
+                reference_bytes = await _download_telegram_file(bot, ref_file_id)
+                image_bytes = await generate_outfit_tryon_image(bot, reference_bytes, outfit["chosen_items"]) if reference_bytes else None
+                outfits[uid] = {"outfit": outfit, "image_bytes": image_bytes}
+            except Exception as e:
+                logging.warning(f"Outfit suggestion failed for {uid}: {e}")
+
+    # 6. Automatic AI-narrated voice message — freshly improvised every
+    # morning rather than a fixed template (see
+    # build_ai_daily_plan_narration), synthesized and converted now so
+    # delivery is just an upload. A TTS/ffmpeg hiccup just skips it.
+    voice_path = None
+    try:
+        narration = await build_ai_daily_plan_narration(today_events, today_date, name=get_primary_user_name(), today_tasks=today_tasks, weather=weather, food=food) or build_daily_plan_speech_text(today_events, today_date)
+        result = await synthesize_speech(narration)
+        if result:
+            voice_path = await _pcm_to_ogg_voice(*result)
+        if not voice_path:
+            logging.warning("prepare_morning_summary: voice message unavailable (TTS or ffmpeg failed)")
+    except Exception as e:
+        logging.error(f"Morning voice summary failed: {e}")
+
+    return {
+        "text": final_text,
+        "photo_url": photo_url,
+        "outfits": outfits,
+        "voice_path": voice_path,
+    }
+
+
+async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
+    """Send a prepare_morning_summary result: text (pinned), lunch photo,
+    outfit, voice message, back to back."""
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🍴 Today's Menu", callback_data="menu_nav|2/|new")]
     ])
@@ -4136,7 +4201,7 @@ async def send_morning_summary(bot, user_ids):
         try:
             sent_msg = await bot.send_message(
                 chat_id=uid,
-                text=final_text,
+                text=prepared["text"],
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
@@ -4161,34 +4226,19 @@ async def send_morning_summary(bot, user_ids):
         pin_cache["pinned_morning_summary"] = pinned
         save_general_cache(pin_cache)
 
-    # 4b. Photo of the lunch pick, when one can be matched on the
-    # Studierendenwerk's public Speiseplan site — same as the standalone
-    # "What should I eat?" delivery.
-    if food and food.get("dish"):
-        try:
-            photo_url = await fetch_dish_photo_url(food["dish"])
-        except Exception as e:
-            logging.warning(f"Summary food photo fetch error: {e}")
-            photo_url = None
-        if photo_url:
-            for uid in user_ids:
-                try:
-                    await bot.send_photo(chat_id=uid, photo=photo_url)
-                except Exception as e:
-                    logging.error(f"Failed to send lunch photo to {uid}: {e}")
+    if prepared.get("photo_url"):
+        for uid in user_ids:
+            try:
+                await bot.send_photo(chat_id=uid, photo=prepared["photo_url"])
+            except Exception as e:
+                logging.error(f"Failed to send lunch photo to {uid}: {e}")
 
-    # 4c. Daily outfit suggestion with virtual try-on image — opt-in (toggle
-    # in /status), skipped entirely (not just "no image") if the wardrobe is
-    # empty or no reference photo is set, since there's nothing useful to
-    # say yet. Every sub-step is best-effort; any failure here just means
-    # this one extra message doesn't go out — never raises into the rest
-    # of the summary, which has already been delivered above.
     if get_wardrobe_feature_enabled():
         for uid in user_ids:
             try:
-                # A manual "Suggest Outfit Now" tap may have already run
-                # today (e.g. before this morning's run fired) - reuse
-                # that result instead of generating a second one.
+                # Checked again at delivery: a manual "Suggest Outfit Now"
+                # between preparation and now wins, so the user never gets
+                # two different outfits for the same day.
                 cached = get_cached_outfit_today(uid)
                 if cached:
                     caption = f"👔 <b>Today's outfit:</b> {cached['description']}"
@@ -4197,25 +4247,17 @@ async def send_morning_summary(bot, user_ids):
                     else:
                         await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
                     continue
-
-                wardrobe_entry = get_wardrobe_entry(uid)
-                items = wardrobe_entry.get("items", [])
-                ref_file_id = wardrobe_entry.get("reference_photo_file_id")
-                if not items or not ref_file_id:
+                entry = prepared["outfits"].get(uid)
+                if not entry:
                     continue
-                recent_ids = get_recently_worn_item_ids(uid)
-                outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids)
-                if not outfit:
-                    continue
+                outfit = entry["outfit"]
                 caption = f"👔 <b>Today's outfit:</b> {outfit['description']}"
-                reference_bytes = await _download_telegram_file(bot, ref_file_id)
-                image_bytes = await generate_outfit_tryon_image(bot, reference_bytes, outfit["chosen_items"]) if reference_bytes else None
                 photo_file_id = None
-                if image_bytes:
-                    sent = await bot.send_photo(chat_id=uid, photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
+                if entry["image_bytes"]:
+                    sent = await bot.send_photo(chat_id=uid, photo=io.BytesIO(entry["image_bytes"]), caption=caption, parse_mode="HTML")
                     photo_file_id = sent.photo[-1].file_id if sent.photo else None
                 else:
-                    # Both free image providers failed/unavailable - still
+                    # Every image provider failed/unavailable - still
                     # deliver the text-only pick rather than nothing, since
                     # the weather-aware reasoning is useful on its own.
                     await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
@@ -4224,16 +4266,80 @@ async def send_morning_summary(bot, user_ids):
             except Exception as e:
                 logging.warning(f"Outfit suggestion failed for {uid}: {e}")
 
-    # 5. Automatic AI-narrated voice message — no "🔊 Listen" tap needed, and
-    # freshly improvised every morning rather than a fixed template (see
-    # build_ai_daily_plan_narration). A TTS/ffmpeg hiccup here just skips
-    # the voice message; the text summary above has already gone out.
-    try:
-        narration = await build_ai_daily_plan_narration(today_events, today_date, name=get_primary_user_name(), today_tasks=today_tasks, weather=weather, food=food) or build_daily_plan_speech_text(today_events, today_date)
-        await _send_voice_to_users(bot, user_ids, narration)
-    except Exception as e:
-        logging.error(f"Morning voice summary failed: {e}")
+    voice_path = prepared.get("voice_path")
+    if voice_path:
+        try:
+            for uid in user_ids:
+                try:
+                    with open(voice_path, "rb") as f:
+                        await bot.send_voice(chat_id=uid, voice=f)
+                except Exception as e:
+                    logging.error(f"Morning voice: failed to send to {uid}: {e}")
+        finally:
+            try:
+                os.remove(voice_path)
+            except OSError:
+                pass
 
+
+def _mark_morning_summary_sent(today_str: str) -> None:
+    # Re-load rather than reusing a cache loaded earlier - deliver_morning_summary
+    # does its own separate load/save of general_cache.json (to track which
+    # message is currently pinned), and saving a stale copy would silently
+    # overwrite that, breaking the unpin-before-pin logic every day.
+    cache = load_general_cache()
+    cache["last_morning_summary"] = today_str
+    save_general_cache(cache)
+
+
+async def _deliver_morning_summary_at(bot, user_ids, prepared: dict, send_at: datetime, today_str: str) -> None:
+    """Background task: wait until send_at, then deliver."""
+    try:
+        delay = (send_at - datetime.now(TZ_BERLIN)).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        logging.info("🌞 Delivering prepared morning summary...")
+        await deliver_morning_summary(bot, user_ids, prepared)
+    except Exception as e:
+        logging.error(f"❌ Morning summary delivery failed: {e}")
+    finally:
+        # Marked even on failure, like the old inline send: a broken
+        # delivery shouldn't repeat on every watcher cycle all day.
+        _mark_morning_summary_sent(today_str)
+
+
+async def run_morning_summary_schedule(bot, user_ids, now: datetime) -> None:
+    """Called every watcher cycle. From MORNING_PREPARE_LEAD_MINUTES before
+    MORNING_SUMMARY_HOUR, prepares today's summary once, then hands it to a
+    task that sends it exactly at MORNING_SUMMARY_HOUR. If that time has
+    already passed (bot started late), prepares and sends right away."""
+    global _prepared_morning, _morning_delivery_task
+    today_str = now.strftime("%Y-%m-%d")
+    send_at = now.replace(hour=MORNING_SUMMARY_HOUR, minute=0, second=0, microsecond=0)
+    if now < send_at - timedelta(minutes=MORNING_PREPARE_LEAD_MINUTES):
+        return
+    if load_general_cache().get("last_morning_summary") == today_str:
+        return
+    if _morning_delivery_task and not _morning_delivery_task.done():
+        return  # prepared and waiting for send_at
+
+    if _prepared_morning.get("date") != today_str:
+        logging.info("🌞 Preparing morning summary...")
+        try:
+            data = await prepare_morning_summary(bot, user_ids)
+        except Exception as e:
+            logging.error(f"❌ Morning summary preparation failed: {e}")
+            data = None
+        if not data:
+            if datetime.now(TZ_BERLIN) >= send_at:
+                _mark_morning_summary_sent(today_str)  # same no-retry-all-day rule as before
+            return
+        _prepared_morning = {"date": today_str, "data": data}
+
+    _morning_delivery_task = asyncio.create_task(
+        _deliver_morning_summary_at(bot, user_ids, _prepared_morning["data"], send_at, today_str)
+    )
+    _prepared_morning = {}
 
 
 async def check_calendar_reminders(bot, chat_id, silent: bool = False):
@@ -6355,7 +6461,7 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
 def _week_tasks_for_range(week_start, week_end) -> list:
     """Return personal tasks due within [week_start, week_end] (inclusive),
     sorted by due time — regardless of which ALLOWED_USER_IDS entry created
-    them, same reasoning as send_morning_summary's today_tasks (they're the
+    them, same reasoning as prepare_morning_summary's today_tasks (they're the
     same person's other devices)."""
     try:
         tasks = [
