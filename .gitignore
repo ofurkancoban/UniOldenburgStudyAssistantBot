@@ -18,6 +18,7 @@ files_cache.json
 study_plan_cache.json
 study_progress.json
 exam_file_cache.json
+workload_cache.json
 messages_cache.json
 forum_cache.json
 link_cache.json

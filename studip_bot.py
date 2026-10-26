@@ -9777,17 +9777,254 @@ def classify_lecture_file(filename: str, folder: Optional[str] = None) -> tuple:
     return "other", None
 
 
-def build_course_units(files: dict) -> dict:
+# ── Workload estimation ──────────────────────────────────────────────────────
+# Every lecture unit becomes a list of tasks with a time estimate, so the
+# weekly plan can schedule by minutes instead of "one lecture per block":
+# slides by page count, videos by the README's stated recording time (or
+# their file size, calibrated on weeks where the README states it), and
+# quizzes, problem sets and empirical projects by their number of
+# questions/pages. Measurements are cached per file like the topic cache.
+
+WORKLOAD_CACHE_PATH = "workload_cache.json"
+SLIDE_MINUTES_PER_PAGE = 2
+MIN_SLIDE_TASK_MINUTES = 20
+VIDEO_STUDY_FACTOR = 1.25  # pausing, rewinding, taking notes
+DEFAULT_VIDEO_MB_PER_MINUTE = 5.0
+QUIZ_MINUTES_PER_QUESTION = 5
+MIN_QUIZ_MINUTES = 15
+PROBLEM_SET_MINUTES_PER_QUESTION = 15
+MIN_PROBLEM_SET_MINUTES = 30
+PROJECT_MINUTES_PER_PAGE = 60
+PROJECT_MINUTES_RANGE = (120, 360)
+PAST_PAPER_MINUTES = 90
+UNKNOWN_UNIT_MINUTES = 60  # a lecture with no measurable material (e.g. no slides uploaded)
+
+_VIDEO_EXTENSIONS = (".webm", ".mp4", ".m4v", ".mov", ".mkv")
+# Unlike the topic scan, problem-set and project folders matter here.
+_WORKLOAD_SKIPPED_FOLDER_RE = re.compile(r"^(books?|literat\w*|readings?|r ?markdown|syllabus|src|code|data|labs?|solutions?|videos?|pyblp|sample_questions|exam_preparation)$", re.IGNORECASE)
+_PROBLEM_SET_FOLDER_RE = re.compile(r"^(ps|problem.?sets?|exercises?|übung\w*|uebung\w*|homework|assignments?)$", re.IGNORECASE)
+_PROJECT_FOLDER_RE = re.compile(r"^(ep|projects?|projekt\w*)$", re.IGNORECASE)
+_PROBLEM_SET_NAME_RE = re.compile(r"^ps[_\s-]|problem.?set|(?:^|[^a-z])(?:sheet|blatt|homework|assignment)(?:[^a-z]|$)", re.IGNORECASE)
+_PROJECT_NAME_RE = re.compile(r"^ep[_\s-]|project|projekt", re.IGNORECASE)
+_QUESTION_LINE_RE = re.compile(r"(?im)^\s*(?:(?:question|exercise|problem|task|aufgabe)\s*\d+|\d{1,2}[.)]\s+\S)")
+_RECORDING_MINUTES_RE = re.compile(r"(?:recording|video|opencast|aufzeichnung)[^.]{0,120}?(\d{1,3})\s*(?:min\b|minutes|minuten)", re.IGNORECASE)
+_MENTIONED_FILE_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9_\-.]*\.(?:pdf|pptx|html))", re.IGNORECASE)  # READMEs list files as "--Top_X.pdf"
+
+
+def load_workload_cache() -> dict:
+    """{cid: {rel_path: {"kind", "size", "modified_ts", "pages",
+    "questions", "video_minutes", "mentions"}}}."""
+    if os.path.exists(WORKLOAD_CACHE_PATH):
+        try:
+            with open(WORKLOAD_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load workload cache: {e}")
+    return {}
+
+
+def save_workload_cache(data: dict) -> None:
+    try:
+        tmp = WORKLOAD_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, WORKLOAD_CACHE_PATH)
+    except Exception as e:
+        logging.error(f"Failed to save workload cache: {e}")
+
+
+def classify_workload_file(name: str, folder_path: Optional[str]) -> Optional[str]:
+    """"slides", "video", "readme", "quiz", "problem_set", "project",
+    "past_paper", or None for anything that isn't work to schedule
+    (data files, solutions, papers that sit next to a project brief)."""
+    stem, ext = os.path.splitext(name)
+    ext = ext.lower()
+    parts = folder_path.split("/") if folder_path else []
+    if ext in _VIDEO_EXTENSIONS:
+        return "video"
+    if stem.lower().startswith("readme"):
+        return "readme" if ext in (".pdf", ".html", ".txt", ".md") else None
+    if ext not in STUDY_PLAN_SUPPORTED_EXTENSIONS:
+        return None
+    if "quiz" in stem.lower():
+        return "quiz"
+    if any(_PROBLEM_SET_FOLDER_RE.match(p) for p in parts) or _PROBLEM_SET_NAME_RE.search(stem):
+        return "problem_set"
+    if any(_PROJECT_FOLDER_RE.match(p) for p in parts):
+        return "project" if _PROJECT_NAME_RE.search(stem) else None
+    if _PROJECT_NAME_RE.search(stem) and parts and _folder_date(parts[0]):
+        return "project"
+    kind, _ = classify_lecture_file(name, parts[-1] if parts else None)
+    if kind == "exam":
+        return "past_paper"
+    if kind in ("lecture", "other"):
+        return "slides"
+    return None
+
+
+def _measure_workload_file(kind: str, name: str, content: bytes) -> dict:
+    text = extract_text_from_file(name, content) or ""
+    if kind == "readme":
+        m = _RECORDING_MINUTES_RE.search(text)
+        return {
+            "video_minutes": int(m.group(1)) if m else None,
+            "mentions": sorted({x.lower() for x in _MENTIONED_FILE_RE.findall(text)}),
+        }
+    pages = None
+    ext = os.path.splitext(name)[1].lower()
+    try:
+        if ext == ".pdf":
+            import pypdf
+            pages = len(pypdf.PdfReader(io.BytesIO(content)).pages)
+        elif ext == ".pptx":
+            import pptx
+            pages = len(pptx.Presentation(io.BytesIO(content)).slides)
+        elif ext == ".html":
+            # reveal.js/Quarto decks: one <section> per slide
+            pages = content.count(b"<section") or (len(text) // 1500 + 1)
+    except Exception as e:
+        logging.warning(f"_measure_workload_file: page count failed for {name}: {e}")
+    return {"pages": pages, "questions": len(_QUESTION_LINE_RE.findall(text))}
+
+
+async def _list_course_files_deep(cid) -> list:
+    """Like _list_course_files, plus the problem-set/project subfolders
+    inside weekly dated folders ("20261013/PS/PS_BaseR.pdf")."""
+    out = []
+    for item in await list_files(cid):
+        if item.get("type") == "file":
+            out.append((None, item))
+            continue
+        if item.get("type") != "folder" or not item.get("url") or _WORKLOAD_SKIPPED_FOLDER_RE.match(item.get("name", "")):
+            continue
+        try:
+            sub = await list_files(cid, item["url"])
+        except Exception as e:
+            logging.warning(f"_list_course_files_deep: listing failed for {item.get('name')}: {e}")
+            continue
+        for s in sub:
+            if s.get("type") == "file":
+                out.append((item["name"], s))
+            elif (
+                s.get("type") == "folder" and s.get("url") and _folder_date(item["name"])
+                and (_PROBLEM_SET_FOLDER_RE.match(s.get("name", "")) or _PROJECT_FOLDER_RE.match(s.get("name", "")))
+            ):
+                try:
+                    out.extend((f"{item['name']}/{s['name']}", f) for f in await list_files(cid, s["url"]) if f.get("type") == "file")
+                except Exception as e:
+                    logging.warning(f"_list_course_files_deep: listing failed for {item['name']}/{s.get('name')}: {e}")
+    return out
+
+
+async def collect_course_workload(session, cids: list) -> dict:
+    """Measure every schedulable file of the given courses (downloads only
+    new/changed files; videos are never downloaded, only their size is
+    used) and return {cid: {rel_path: entry}} for them."""
+    cache = load_workload_cache()
+    semaphore = asyncio.Semaphore(3)
+
+    async def process_course(cid):
+        async with semaphore:
+            try:
+                files = await _list_course_files_deep(cid)
+            except Exception as e:
+                logging.warning(f"collect_course_workload: listing failed for {cid}: {e}")
+                return
+            old_entries = cache.get(cid, {})
+            entries = {}
+            for folder, f in files:
+                name, url = f.get("name"), f.get("url")
+                kind = classify_workload_file(name or "", folder)
+                if not kind or not url:
+                    continue
+                key = f"{folder}/{name}" if folder else name
+                cur_size = str(f.get("size", "-")).strip()
+                if kind == "video":
+                    entries[key] = {"kind": "video", "size": cur_size}
+                    continue
+                if _file_size_mb(cur_size) > STUDY_PLAN_MAX_FILE_MB:
+                    continue
+                dt = _parse_file_date_v2(f.get("modified"), f.get("modified_iso"))
+                modified_ts = None if dt == datetime.min else int(dt.timestamp())
+                old = old_entries.get(key)
+                if old is not None and old.get("kind") == kind and str(old.get("size", "-")).strip() == cur_size and not (
+                    old.get("modified_ts") and modified_ts and abs(modified_ts - old["modified_ts"]) > 86400
+                ):
+                    entries[key] = old
+                    continue
+                try:
+                    async with await global_session.get(url) as resp:
+                        if resp.status != 200:
+                            continue
+                        content = await resp.read()
+                except Exception as e:
+                    logging.warning(f"collect_course_workload: download failed for {key}: {e}")
+                    continue
+                entries[key] = {"kind": kind, "size": cur_size, "modified_ts": modified_ts, **_measure_workload_file(kind, name, content)}
+            cache[cid] = entries
+
+    await asyncio.gather(*(process_course(cid) for cid in cids))
+    save_workload_cache(cache)
+    return {cid: cache.get(cid, {}) for cid in cids}
+
+
+def _video_mb_per_minute(workload: dict) -> float:
+    """Calibrate the video size→duration estimate on weeks whose README
+    states the total recording time (Opencast .webm files carry no
+    duration header, so this is the only cheap source)."""
+    total_mb = total_min = 0.0
+    for entries in workload.values():
+        folders: dict = {}
+        for rel, e in entries.items():
+            folders.setdefault(rel.split("/")[0], []).append(e)
+        for group in folders.values():
+            minutes = next((e.get("video_minutes") for e in group if e.get("kind") == "readme" and e.get("video_minutes")), None)
+            mb = sum(_file_size_mb(e.get("size")) for e in group if e.get("kind") == "video")
+            if minutes and mb:
+                total_mb += mb
+                total_min += minutes
+    return total_mb / total_min if total_min else DEFAULT_VIDEO_MB_PER_MINUTE
+
+
+def _make_task(unit_key: str, kind: str, ref: str, title: str, minutes: float) -> dict:
+    return {"key": f"{unit_key}::{kind}::{ref}", "kind": kind, "title": title, "minutes": max(5, int(round(minutes)))}
+
+
+def _file_task(unit_key: str, rel: str, e: dict) -> Optional[dict]:
+    """The task for one measured file (slides/quiz/problem set/project/past paper)."""
+    stem = os.path.splitext(rel.rsplit("/", 1)[-1])[0]
+    kind, pages, questions = e.get("kind"), e.get("pages"), e.get("questions") or 0
+    if kind == "slides":
+        minutes = max(MIN_SLIDE_TASK_MINUTES, pages * SLIDE_MINUTES_PER_PAGE) if pages else UNKNOWN_UNIT_MINUTES
+        return _make_task(unit_key, kind, rel, f"Slides {stem}" + (f" ({pages} p.)" if pages else ""), minutes)
+    if kind == "quiz":
+        return _make_task(unit_key, kind, rel, f"Quiz {stem}", max(MIN_QUIZ_MINUTES, questions * QUIZ_MINUTES_PER_QUESTION))
+    if kind == "problem_set":
+        return _make_task(unit_key, kind, rel, f"Problem set {stem}" + (f" ({questions} q.)" if questions else ""), max(MIN_PROBLEM_SET_MINUTES, questions * PROBLEM_SET_MINUTES_PER_QUESTION))
+    if kind == "project":
+        lo, hi = PROJECT_MINUTES_RANGE
+        return _make_task(unit_key, kind, rel, f"Empirical project {stem}", min(hi, max(lo, (pages or 0) * PROJECT_MINUTES_PER_PAGE)))
+    if kind == "past_paper":
+        return _make_task(unit_key, kind, rel, f"Past exam {stem}", PAST_PAPER_MINUTES)
+    return None
+
+
+def build_course_units(files: dict, workload: Optional[dict] = None, video_mb_per_minute: float = DEFAULT_VIDEO_MB_PER_MINUTE) -> dict:
     """Turn one course's topic cache ({rel_path: {"summary", "folder", ...}})
-    into {"lectures": [...], "exam_practice": [...], "dated": bool},
-    lectures in teaching order. A unit is what one study session covers:
-    - dated folders ("20261013"): one unit per folder = that day's lecture,
-      with every content file's topic in it; "dated" is then True and the
-      unit's date says exactly when it was taught.
+    and workload cache ({rel_path: measured entry}) into
+    {"lectures": [...], "exam_practice": [...], "dated": bool}, lectures in
+    teaching order, each with "tasks" (see _file_task) that say what to do
+    and how long it takes. A unit is one lecture:
+    - dated folders ("20261013"): one unit per folder = that day's class,
+      with its slides, videos, quiz, problem set and project. When the
+      folder's README names the slide decks, only those count (the rest
+      are optional readings). "dated" is then True and the unit's date is
+      the class it belongs to.
     - otherwise one unit per lecture file, ordered by its number.
     Unnumbered non-admin material only counts as lectures when the course
     has no numbered lecture files at all (otherwise it's usually a side
     reading that would shift every lecture's position by one)."""
+    workload = workload or {}
     files_list = []
     for key, entry in files.items():
         name = key.rsplit("/", 1)[-1]
@@ -9803,21 +10040,49 @@ def build_course_units(files: dict) -> dict:
             "modified_ts": entry.get("modified_ts") or 0,
         })
     exam_practice = sorted((u for u in files_list if u["kind"] == "exam"), key=lambda u: u["file"])
+    for u in exam_practice:
+        u["tasks"] = [_make_task(u["file"], "past_paper", u["file"], f"Past exam {os.path.splitext(u['file'].rsplit('/', 1)[-1])[0]}", PAST_PAPER_MINUTES)]
     content = [u for u in files_list if u["kind"] in ("lecture", "other")]
 
-    dated = [u for u in content if u["date"] is not None]
-    if dated:
-        by_folder: dict = {}
-        for u in sorted(dated, key=lambda u: (u["number"] if u["number"] is not None else 999, u["file"])):
-            by_folder.setdefault(u["folder"], []).append(u)
-        lectures = [
-            {"file": folder, "topic": "; ".join(u["topic"] for u in group), "kind": "lecture", "number": None, "date": group[0]["date"]}
-            for folder, group in sorted(by_folder.items(), key=lambda kv: (kv[1][0]["date"], kv[0]))
-        ]
+    dated_folders = {u["folder"] for u in content if u["date"] is not None}
+    dated_folders |= {rel.split("/")[0] for rel in workload if "/" in rel and _folder_date(rel.split("/")[0])}
+    if dated_folders:
+        lectures = []
+        for folder in dated_folders:
+            topics = [u["topic"] for u in sorted(content, key=lambda u: (u["number"] if u["number"] is not None else 999, u["file"])) if u["folder"] == folder]
+            entries = {rel: e for rel, e in workload.items() if rel.split("/")[0] == folder}
+            readme = next((e for e in entries.values() if e.get("kind") == "readme"), None)
+            mentions = {m.lstrip("-_.").lower() for m in (readme.get("mentions") or [])} if readme else set()
+            tasks = []
+            for rel, e in sorted(entries.items()):
+                if e.get("kind") == "slides" and rel.count("/") == 1 and mentions and rel.rsplit("/", 1)[-1].lower() not in mentions:
+                    continue  # not one of the README's slide decks: optional reading
+                task = _file_task(folder, rel, e)
+                if task:
+                    tasks.append(task)
+            videos = [e for e in entries.values() if e.get("kind") == "video"]
+            if videos:
+                stated = readme.get("video_minutes") if readme else None
+                raw = stated or sum(_file_size_mb(e.get("size")) for e in videos) / video_mb_per_minute
+                approx = "" if stated else "est. "
+                tasks.append(_make_task(folder, "video", "all", f"Videos ({len(videos)} files, {approx}{int(raw)} min)", raw * VIDEO_STUDY_FACTOR))
+            # Watch/read first, then quiz, then exercises and projects.
+            order = {"slides": 0, "video": 1, "quiz": 2, "problem_set": 3, "project": 4}
+            tasks.sort(key=lambda t: order.get(t["kind"], 9))
+            if not tasks and topics:
+                tasks = [_make_task(folder, "study", "all", "Study the material", UNKNOWN_UNIT_MINUTES)]
+            if not tasks:
+                continue
+            topic = "; ".join(topics) or ", ".join(t["title"] for t in tasks)
+            lectures.append({"file": folder, "topic": topic, "kind": "lecture", "number": None, "date": _folder_date(folder), "tasks": tasks})
+        lectures.sort(key=lambda u: (u["date"], u["file"]))
         return {"lectures": lectures, "exam_practice": exam_practice, "dated": True}
 
     lectures = [u for u in content if u["kind"] == "lecture"] or content
     lectures.sort(key=lambda u: (u["number"] if u["number"] is not None else 999, u["modified_ts"], u["file"]))
+    for u in lectures:
+        task = _file_task(u["file"], u["file"], workload[u["file"]]) if u["file"] in workload else None
+        u["tasks"] = [task or _make_task(u["file"], "study", "all", "Study the slides", UNKNOWN_UNIT_MINUTES)]
     return {"lectures": lectures, "exam_practice": exam_practice, "dated": False}
 
 
@@ -9829,6 +10094,17 @@ def _unit_label(unit: dict) -> str:
     else:
         prefix = ""
     return f"{prefix}{unit['topic']}"
+
+
+def _apply_unit_progress(unit: dict, studied: set, task_minutes: dict) -> None:
+    """Annotate a unit's tasks with "remaining" minutes, and the unit with
+    "remaining" (sum) and "done". A unit marked studied by hand counts as
+    fully done regardless of task minutes."""
+    manual = unit["file"] in studied
+    for t in unit["tasks"]:
+        t["remaining"] = 0 if manual else max(0, t["minutes"] - task_minutes.get(t["key"], 0))
+    unit["remaining"] = sum(t["remaining"] for t in unit["tasks"])
+    unit["done"] = unit["remaining"] == 0
 
 
 STUDY_PROGRESS_PATH = "study_progress.json"
@@ -9911,49 +10187,63 @@ async def _get_lectures_held(session, progress: dict, refresh: bool = False) -> 
     return held
 
 
-def compute_course_progress(course_files: dict, held: dict, studied: dict, names: dict, tracked: Optional[list] = None) -> list:
+def compute_course_progress(course_files: dict, held: dict, progress: dict, names: dict, workload: Optional[dict] = None) -> list:
     """One row per tracked course: which lecture units count as covered in
-    class, which of those are still unstudied (the backlog), and what
-    comes next. Sorted with the biggest backlog first. tracked is the
-    student's own course selection; when None (automatic), every course
-    that has had lectures this semester or already has logged progress
-    is included."""
+    class, which of those still have work left (the backlog, with its
+    minutes), and what comes next. Sorted with the biggest backlog first.
+    The course selection is progress["tracked"]; when absent (automatic),
+    every course that has had lectures this semester or already has
+    logged progress is included. Studied state comes from
+    progress["studied"] (whole units marked by hand) and
+    progress["task_minutes"] (minutes credited from the weekly plan)."""
     today = datetime.now(TZ_BERLIN).date()
+    workload = workload or {}
+    video_rate = _video_mb_per_minute(workload)
+    tracked = progress.get("tracked")
     rows = []
     for cid, name in names.items():
-        units = build_course_units(course_files.get(cid, {}))
-        lectures = units["lectures"]
+        studied = set(progress.get("studied", {}).get(cid, []))
+        task_minutes = progress.get("task_minutes", {}).get(cid, {})
         n_held = held.get(cid, 0)
-        done = set(studied.get(cid, []))
         if tracked is not None:
             if cid not in tracked:
                 continue
-        elif n_held == 0 and not done:
+        elif n_held == 0 and not studied and not task_minutes:
             continue
 
+        units = build_course_units(course_files.get(cid, {}), workload.get(cid, {}), video_rate)
+        lectures = units["lectures"]
         if units["dated"]:
-            # Dated folders say exactly which material was taught when, so
-            # no need to estimate from the held-lecture count.
+            # Dated folders say exactly which material belongs to which
+            # class, so no need to estimate from the held-lecture count.
             covered = [u for u in lectures if u["date"] <= today]
         else:
             covered = list(lectures[:n_held])
             for k in range(len(lectures) + 1, n_held + 1):
-                covered.append({"file": f"session-{k}", "topic": f"Lecture {k} notes (no slides on Stud.IP yet)", "kind": "lecture", "number": k})
-        upcoming = [u for u in lectures if u not in covered and u["file"] not in done]
-        backlog = [u for u in covered if u["file"] not in done]
+                key = f"session-{k}"
+                covered.append({
+                    "file": key, "topic": f"Lecture {k} notes (no slides on Stud.IP yet)", "kind": "lecture", "number": k,
+                    "tasks": [_make_task(key, "study", "all", "Review your lecture notes", UNKNOWN_UNIT_MINUTES)],
+                })
+        for u in lectures + covered + units["exam_practice"]:
+            _apply_unit_progress(u, studied, task_minutes)
+        covered_ids = {id(u) for u in covered}
+        backlog = [u for u in covered if not u["done"]]
         rows.append({
             "cid": cid,
             "name": name,
             "held": n_held,
+            "dated": units["dated"],
             "total_lectures": len(lectures),
             "covered": covered,
             "studied_covered": len(covered) - len(backlog),
             "backlog": backlog,
-            "upcoming": upcoming,
-            "exam_practice": [u for u in units["exam_practice"] if u["file"] not in done],
+            "backlog_minutes": sum(u["remaining"] for u in backlog),
+            "upcoming": [u for u in lectures if id(u) not in covered_ids and not u["done"]],
+            "exam_practice": [u for u in units["exam_practice"] if not u["done"]],
             "lectures": lectures,
         })
-    rows.sort(key=lambda r: (-len(r["backlog"]), r["name"]))
+    rows.sort(key=lambda r: (-r["backlog_minutes"], r["name"]))
     return rows
 
 
@@ -9972,60 +10262,139 @@ def _split_gaps_into_blocks(gaps: list) -> list:
     return blocks
 
 
-def schedule_study_sessions(gaps: list, rows: list, exams: list) -> list:
-    """Fill next week's free blocks with concrete lecture units, in each
-    course's teaching order: first the backlog (held in class but not yet
-    studied), plus past exam papers for courses with an exam within
-    STUDY_PLAN_EXAM_WINDOW_DAYS, and only once a course is caught up, a
-    preview of its next lecture. Courses are interleaved by priority
-    (backlog size + exam proximity) instead of one course eating every
-    slot, and the same course is not scheduled twice in a row when
-    another one still has something due."""
+STUDY_PLAN_MIN_PIECE_MINUTES = 20  # don't start a task in the last few minutes of a block
+STUDY_PLAN_PREP_URGENT_DAYS = 2  # class prep becomes top priority this many days before the class
+
+
+def schedule_study_sessions(gaps: list, rows: list, exams: list, week_start) -> dict:
+    """Fill next week's free blocks with concrete tasks (minutes, not whole
+    lectures): a long task is split across blocks, short ones share one.
+    Work items, per course in teaching order:
+    - catch-up: unfinished tasks of lectures already held,
+    - exam prep: past papers for courses with an exam within
+      STUDY_PLAN_EXAM_WINDOW_DAYS,
+    - class prep (dated courses, which expect students to come prepared):
+      material of classes up to the Monday after the plan week, due
+      before that class; urgent from STUDY_PLAN_PREP_URGENT_DAYS before,
+    - preview: the next lecture of a caught-up undated course.
+    Each block takes the most urgent item first; within the same urgency
+    it stays with the course it started with (less context switching),
+    then prefers the course with the most work left / closest exam.
+    Returns {"sessions": [...], "stats": {...}} where stats has the needed
+    vs. scheduled minutes per course and class prep that didn't fit."""
     exam_days: dict = {}
     for e in exams:
         cid = e.get("matched_cid")
         if cid and (cid not in exam_days or e["days_until"] < exam_days[cid]):
             exam_days[cid] = e["days_until"]
 
-    queues: dict = {}
-    score: dict = {}
+    prep_until = week_start + timedelta(days=7)
+    items = []
     for row in rows:
         cid = row["cid"]
-        q = [(0, "catch-up", u) for u in row["backlog"]]
+        units = [("catch-up", None, u) for u in row["backlog"]]
         if cid in exam_days:
-            q += [(0, "exam prep", u) for u in row["exam_practice"]]
-        q += [(1, "prepare next lecture", u) for u in row["upcoming"][:1]]
-        if not q:
-            continue
-        queues[cid] = q
-        score[cid] = 2 * len(row["backlog"])
-        if cid in exam_days:
-            score[cid] += STUDY_PLAN_EXAM_WINDOW_DAYS + 1 - exam_days[cid]
+            units += [("exam prep", None, u) for u in row["exam_practice"]]
+        if row["dated"]:
+            for u in row["upcoming"]:
+                if u["date"] < week_start:
+                    units.append(("catch-up", None, u))  # its class happens before the plan week starts
+                elif u["date"] <= prep_until:
+                    units.append(("class prep", u["date"], u))
+        elif row["upcoming"] and not row["backlog"]:
+            units.append(("preview", None, row["upcoming"][0]))
+        for order, (reason, due, u) in enumerate(units):
+            for t in u["tasks"]:
+                if t["remaining"] > 0:
+                    items.append({
+                        "cid": cid, "course": row["name"], "unit": u["file"], "unit_label": _unit_label(u),
+                        "task_key": t["key"], "title": t["title"], "remaining": t["remaining"], "total": t["remaining"],
+                        "reason": reason, "due": due, "order": order,
+                    })
 
-    names = {r["cid"]: r["name"] for r in rows}
+    score = {r["cid"]: r["backlog_minutes"] / 60 + (STUDY_PLAN_EXAM_WINDOW_DAYS + 1 - exam_days[r["cid"]] if r["cid"] in exam_days else 0) for r in rows}
+    needed = {}
+    for it in items:
+        if it["reason"] != "preview":
+            needed[it["cid"]] = needed.get(it["cid"], 0) + it["remaining"]
+
+    def urgency(it, day):
+        if it["reason"] == "class prep":
+            slack = (it["due"] - day).days
+            if slack <= 0:
+                return 1  # too late to prepare before class: plain catch-up now
+            return 0 if slack <= STUDY_PLAN_PREP_URGENT_DAYS else 1
+        return 2 if it["reason"] == "preview" else 1
+
+    blocks = _split_gaps_into_blocks(gaps)
     sessions = []
-    last_cid = None
-    for start, end in _split_gaps_into_blocks(gaps):
-        candidates = [c for c in queues if queues[c]]
-        if not candidates:
-            break
-        candidates.sort(key=lambda c: (queues[c][0][0], c == last_cid, -score[c]))
-        cid = candidates[0]
-        _, reason, unit = queues[cid].pop(0)
-        sessions.append({
-            "day": f"{start:%A}",
-            "date": start.date().isoformat(),
-            "start": f"{start:%H:%M}",
-            "end": f"{end:%H:%M}",
-            "cid": cid,
-            "course": names.get(cid, cid),
-            "unit": unit["file"],
-            "label": _unit_label(unit),
-            "reason": reason,
-        })
-        score[cid] -= 1.5
-        last_cid = cid
-    return sessions
+    for start, end in blocks:
+        day = start.date()
+        left = int((end - start).total_seconds() / 60)
+        pieces, block_cid = [], None
+        while left >= STUDY_PLAN_MIN_PIECE_MINUTES:
+            pending = sorted(
+                (it for it in items if it["remaining"] > 0),
+                key=lambda it: (urgency(it, day), block_cid is not None and it["cid"] != block_cid, -score.get(it["cid"], 0), it["cid"], it["order"]),
+            )
+            chosen = None
+            for it in pending:
+                take = min(it["remaining"], left)
+                if 0 < it["remaining"] - take < STUDY_PLAN_MIN_PIECE_MINUTES:
+                    take = it["remaining"] - STUDY_PLAN_MIN_PIECE_MINUTES  # don't leave a crumb for later
+                if take >= it["remaining"] or take >= STUDY_PLAN_MIN_PIECE_MINUTES:
+                    chosen = (it, take)
+                    break
+            if not chosen:
+                break
+            it, take = chosen
+            pieces.append({
+                "cid": it["cid"], "course": it["course"], "unit": it["unit"], "unit_label": it["unit_label"],
+                "task_key": it["task_key"], "title": it["title"], "minutes": take, "reason": it["reason"],
+                "task_minutes": it["total"],
+            })
+            it["remaining"] -= take
+            left -= take
+            score[it["cid"]] = score.get(it["cid"], 0) - take / 60
+            block_cid = block_cid or it["cid"]
+        if pieces:
+            sessions.append({
+                "day": f"{start:%A}",
+                "date": day.isoformat(),
+                "start": f"{start:%H:%M}",
+                "end": f"{end:%H:%M}",
+                "pieces": pieces,
+            })
+
+    # "part 2/3" labels for tasks split across blocks (task keys are only
+    # unique per course: two courses can both have a "20261013" folder)
+    counts: dict = {}
+    for s in sessions:
+        for p in s["pieces"]:
+            k = (p["cid"], p["task_key"])
+            counts[k] = counts.get(k, 0) + 1
+    seen: dict = {}
+    for s in sessions:
+        for p in s["pieces"]:
+            k = (p["cid"], p["task_key"])
+            if counts[k] > 1:
+                seen[k] = seen.get(k, 0) + 1
+                p["part"] = f"{seen[k]}/{counts[k]}"
+
+    scheduled: dict = {}
+    for s in sessions:
+        for p in s["pieces"]:
+            if p["reason"] != "preview":
+                scheduled[p["cid"]] = scheduled.get(p["cid"], 0) + p["minutes"]
+    missed_prep = sorted({(it["course"], it["due"]) for it in items if it["reason"] == "class prep" and it["remaining"] > 0}, key=lambda x: x[1])
+    stats = {
+        "needed": needed,
+        "scheduled": scheduled,
+        "free_minutes": sum(int((e - s).total_seconds() / 60) for s, e in blocks),
+        "missed_prep": [(course, due.isoformat()) for course, due in missed_prep],
+        "names": {r["cid"]: r["name"] for r in rows},
+    }
+    return {"sessions": sessions, "stats": stats}
 
 
 def find_free_study_windows(events: list, week_start) -> list:
@@ -10115,8 +10484,12 @@ async def gather_weekly_study_inputs(session) -> dict:
 
     progress = load_study_progress()
     held = await _get_lectures_held(session, progress, refresh=True)
-    rows = compute_course_progress(course_files, held, progress.get("studied", {}), dict(courses_map), progress.get("tracked"))
-    return {"gaps": gaps, "exams": exams, "rows": rows}
+    tracked = progress.get("tracked")
+    if tracked is None:
+        tracked = _auto_tracked_cids(progress)
+    workload = await collect_course_workload(session, [cid for cid in tracked if cid in courses_map])
+    rows = compute_course_progress(course_files, held, progress, dict(courses_map), workload)
+    return {"gaps": gaps, "exams": exams, "rows": rows, "week_start": next_monday}
 
 
 def _progress_bar(done: int, total: int, width: int = 10) -> str:
@@ -10126,6 +10499,10 @@ def _progress_bar(done: int, total: int, width: int = 10) -> str:
     return "▓" * filled + "░" * (width - filled)
 
 
+def _hours(minutes: float) -> str:
+    return f"{minutes / 60:.1f} h"
+
+
 def render_behind_lines(rows: list) -> list:
     behind = [r for r in rows if r["backlog"]]
     if not behind:
@@ -10133,15 +10510,40 @@ def render_behind_lines(rows: list) -> list:
     lines = ["⚠️ <b>Behind on:</b>"]
     for r in behind:
         n = len(r["backlog"])
-        lines.append(f"• {html.escape(r['name'])}: {n} lecture{'s' if n != 1 else ''} not studied yet")
+        lines.append(f"• {html.escape(r['name'], quote=False)}: {n} lecture{'s' if n != 1 else ''}, ~{_hours(r['backlog_minutes'])} of work")
     return lines
 
 
-def render_weekly_study_plan_message(sessions: list, gaps: list, exams: list, rows: list) -> str:
-    """Final HTML Telegram message: the behind-schedule summary, then the
-    concrete sessions grouped by day (or, when there is nothing to
-    schedule, a plain listing of the free slots), then upcoming exams."""
+def _course_abbrev(name: str) -> str:
+    """"Econometrics of Policy Evaluation" -> "EPE", to keep plan lines short."""
+    words = [w for w in re.findall(r"[A-Za-zÄÖÜäöü]+", name) if w.lower() not in ("of", "and", "the", "for", "in", "und", "der", "die", "das")]
+    return "".join(w[0].upper() for w in words)[:5] or name[:5]
+
+
+def render_workload_lines(stats: dict) -> list:
+    """Needed vs. free time for the week, per course, plus what doesn't fit."""
+    needed_total = sum(stats["needed"].values())
+    lines = [f"📊 <b>Workload:</b> {_hours(needed_total)} needed · {_hours(stats['free_minutes'])} free study time"]
+    for cid, minutes in sorted(stats["needed"].items(), key=lambda kv: -kv[1]):
+        scheduled = stats["scheduled"].get(cid, 0)
+        short = minutes - scheduled
+        tail = f" (⚠️ {_hours(short)} doesn't fit)" if short >= 15 else ""
+        name = stats["names"].get(cid, cid)
+        lines.append(f"• {html.escape(name, quote=False)} ({_course_abbrev(name)}): {_hours(minutes)}{tail}")
+    for course, due in stats["missed_prep"]:
+        lines.append(f"⚠️ Not enough free time to fully prepare {html.escape(course, quote=False)} before class on {datetime.fromisoformat(due):%a %d.%m}")
+    return lines
+
+
+def render_weekly_study_plan_message(plan: dict, gaps: list, exams: list, rows: list) -> str:
+    """Final HTML Telegram message: workload vs. free time, the
+    behind-schedule summary, then the concrete sessions grouped by day
+    (or, when there is nothing to schedule, a plain listing of the free
+    slots), then upcoming exams."""
+    sessions = plan["sessions"]
     lines = ["📘 <b>Your Study Plan for Next Week</b>", "━━━━━━━━━━━━━━━━━━"]
+    lines += render_workload_lines(plan["stats"])
+    lines.append("")
     lines += render_behind_lines(rows)
     lines.append("━━━━━━━━━━━━━━━━━━")
 
@@ -10152,11 +10554,20 @@ def render_weekly_study_plan_message(sessions: list, gaps: list, exams: list, ro
                 if current_day is not None:
                     lines.append("")
                 current_day = s["day"]
-                lines.append(f"<b>{s['day']}</b>")
-            lines.append(f"{i}. 🕑 {s['start']}–{s['end']} · <b>{html.escape(s['course'])}</b>")
-            lines.append(f"   📖 {html.escape(s['label'])} <i>({s['reason']})</i>")
+                lines.append(f"<b>{s['day']} {datetime.fromisoformat(s['date']):%d.%m}</b>")
+            lines.append(f"{i}. 🕑 {s['start']}–{s['end']}")
+            last_unit = None
+            for p in s["pieces"]:
+                part = f" ({p['part']})" if p.get("part") else ""
+                if (p["cid"], p["unit"]) != last_unit:
+                    unit = p["unit_label"] if len(p["unit_label"]) <= 45 else p["unit_label"][:44] + "…"
+                    lines.append(f"   <b>{_course_abbrev(p['course'])}</b> {html.escape(unit, quote=False)} <i>({p['reason']})</i>")
+                    last_unit = (p["cid"], p["unit"])
+                total = p.get("task_minutes", p["minutes"])
+                amount = f"{p['minutes']} of {total} min" if p["minutes"] < total else f"{p['minutes']} min"
+                lines.append(f"     • {html.escape(p['title'], quote=False)}{part}: {amount}")
         lines.append("━━━━━━━━━━━━━━━━━━")
-        lines.append("Tap a session's button once you've studied it, so progress stays accurate. /progress shows the full overview.")
+        lines.append("Tap a session's button when you've done it: its minutes count towards your progress. /progress shows the full overview.")
     else:
         lines.append("(no lecture material to schedule yet, here are your free windows)")
         for g in gaps:
@@ -10170,15 +10581,30 @@ def render_weekly_study_plan_message(sessions: list, gaps: list, exams: list, ro
     return "\n".join(lines)
 
 
-def build_study_plan_keyboard(plan: list, studied: dict) -> InlineKeyboardMarkup:
+def build_study_plan_keyboard(plan: list, done_sessions: list) -> InlineKeyboardMarkup:
     keyboard = []
+    done = set(done_sessions)
     for i, s in enumerate(plan):
-        done = s["unit"] in set(studied.get(s["cid"], []))
-        mark = "✅" if done else "⬜"
-        label = f"{mark} {i + 1}. {s['day'][:3]} {s['start']} {s['course']}"
+        mark = "✅" if i in done else "⬜"
+        courses = list(dict.fromkeys(p["course"] for p in s["pieces"]))
+        course_label = courses[0] + (f" +{len(courses) - 1}" if len(courses) > 1 else "")
+        label = f"{mark} {i + 1}. {s['day'][:3]} {s['start']} {course_label}"
         keyboard.append([InlineKeyboardButton(label[:60], callback_data=f"sp_plan|{i}")])
     keyboard.append([InlineKeyboardButton("📊 Progress", callback_data="sp_progress")])
     return InlineKeyboardMarkup(keyboard)
+
+
+def _split_message(text: str, limit: int = 3800) -> list:
+    """Telegram caps messages at 4096 chars; split on line boundaries."""
+    chunks, chunk = [], ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > limit and chunk:
+            chunks.append(chunk.rstrip("\n"))
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        chunks.append(chunk.rstrip("\n"))
+    return chunks
 
 
 async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None) -> str:
@@ -10205,57 +10631,76 @@ async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None) -> 
 
     if status_msg:
         await status_msg.edit_text("📘 Building your weekly study plan...\n\n🧠 Scheduling sessions...")
-    sessions = schedule_study_sessions(inputs["gaps"], inputs["rows"], inputs["exams"])
+    plan = schedule_study_sessions(inputs["gaps"], inputs["rows"], inputs["exams"], inputs["week_start"])
     progress = load_study_progress()
-    progress["last_plan"] = sessions
+    progress["last_plan"] = plan["sessions"]
+    progress["last_plan_done"] = []
     save_study_progress(progress)
 
-    text = render_weekly_study_plan_message(sessions, inputs["gaps"], inputs["exams"], inputs["rows"])
-    reply_markup = build_study_plan_keyboard(sessions, progress.get("studied", {})) if sessions else None
+    text = render_weekly_study_plan_message(plan, inputs["gaps"], inputs["exams"], inputs["rows"])
+    reply_markup = build_study_plan_keyboard(plan["sessions"], []) if plan["sessions"] else None
+    chunks = _split_message(text)
     for uid in user_ids:
         try:
-            await bot.send_message(chat_id=uid, text=text, parse_mode="HTML", reply_markup=reply_markup)
+            for i, chunk in enumerate(chunks):
+                await bot.send_message(chat_id=uid, text=chunk, parse_mode="HTML", reply_markup=reply_markup if i == len(chunks) - 1 else None)
         except Exception as e:
             logging.warning(f"run_weekly_study_plan_job: failed to send to {uid}: {e}")
     return text
 
 
-def _toggle_studied(progress: dict, cid: str, unit_key: str) -> bool:
-    """Flip one unit's studied state; returns the new state."""
+def _toggle_studied(progress: dict, unit: dict, cid: str) -> bool:
+    """Flip one unit's studied state by hand; returns the new state.
+    Unmarking also clears minutes the weekly plan credited to its tasks,
+    so the unit really starts over."""
     studied = progress.setdefault("studied", {}).setdefault(cid, [])
-    if unit_key in studied:
-        studied.remove(unit_key)
+    if unit["done"]:
+        if unit["file"] in studied:
+            studied.remove(unit["file"])
+        task_minutes = progress.setdefault("task_minutes", {}).setdefault(cid, {})
+        for t in unit.get("tasks", []):
+            task_minutes.pop(t["key"], None)
         return False
-    studied.append(unit_key)
+    studied.append(unit["file"])
     return True
 
 
 async def handle_study_plan_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """A session button on the weekly plan message: mark/unmark that
-    session's lecture unit as studied and refresh the checkmarks."""
+    """A session button on the weekly plan message: credit (or take back)
+    that session's minutes to its tasks and refresh the checkmarks."""
     query = update.callback_query
     progress = load_study_progress()
     plan = progress.get("last_plan", [])
     try:
         idx = int(query.data.split("|", 1)[1])
         s = plan[idx]
-    except (ValueError, IndexError):
+        pieces = s["pieces"]
+    except (ValueError, IndexError, KeyError):
         await query.answer("This plan is outdated, run /studyplan again.", show_alert=True)
         return
-    now_done = _toggle_studied(progress, s["cid"], s["unit"])
+    done = progress.setdefault("last_plan_done", [])
+    now_done = idx not in done
+    sign = 1 if now_done else -1
+    for p in pieces:
+        task_minutes = progress.setdefault("task_minutes", {}).setdefault(p["cid"], {})
+        task_minutes[p["task_key"]] = max(0, task_minutes.get(p["task_key"], 0) + sign * p["minutes"])
+    if now_done:
+        done.append(idx)
+    else:
+        done.remove(idx)
     save_study_progress(progress)
-    await query.answer("Marked as studied ✅" if now_done else "Marked as not studied")
+    await query.answer("Session done ✅" if now_done else "Session unmarked")
     try:
-        await query.edit_message_reply_markup(reply_markup=build_study_plan_keyboard(plan, progress["studied"]))
+        await query.edit_message_reply_markup(reply_markup=build_study_plan_keyboard(plan, done))
     except Exception as e:
         logging.debug(f"handle_study_plan_toggle: keyboard refresh skipped: {e}")
 
 
 async def _load_progress_rows(refresh: bool = False) -> tuple:
     """(rows, progress). With refresh, the tracked courses' files are
-    rescanned first (only new/changed files are summarized, so this is
-    mostly listing requests) and held-lecture counts are recomputed;
-    without it, cached topic labels are used so per-lecture toggle
+    rescanned first (only new/changed files are summarized/measured, so
+    this is mostly listing requests) and held-lecture counts are
+    recomputed; without it, cached data is used so per-lecture toggle
     buttons stay instant."""
     if not global_session or not await global_session.is_logged_in():
         await login_studip()
@@ -10265,8 +10710,14 @@ async def _load_progress_rows(refresh: bool = False) -> tuple:
     progress = load_study_progress()
     held = await _get_lectures_held(global_session, progress, refresh=refresh)
     enrolled = set(courses_map)
+    tracked = progress.get("tracked")
+    if tracked is None:
+        tracked = _auto_tracked_cids(progress)
+    if refresh:
+        await collect_course_workload(global_session, [cid for cid in tracked if cid in enrolled])
     course_files = {cid: files for cid, files in load_study_plan_cache().items() if cid in enrolled}
-    rows = compute_course_progress(course_files, held, progress.get("studied", {}), dict(courses_map), progress.get("tracked"))
+    workload = {cid: entries for cid, entries in load_workload_cache().items() if cid in enrolled}
+    rows = compute_course_progress(course_files, held, progress, dict(courses_map), workload)
     return rows, progress
 
 
@@ -10277,7 +10728,7 @@ def render_progress_overview(rows: list) -> tuple:
     for r in rows:
         covered = len(r["covered"])
         if r["backlog"]:
-            status = f"⚠️ {len(r['backlog'])} behind"
+            status = f"⚠️ {len(r['backlog'])} behind, ~{_hours(r['backlog_minutes'])} left"
         elif covered:
             status = "✅ on track"
         else:
@@ -10285,9 +10736,9 @@ def render_progress_overview(rows: list) -> tuple:
         lines.append(f"<b>{html.escape(r['name'])}</b>")
         lines.append(f"{_progress_bar(r['studied_covered'], covered)} {r['studied_covered']}/{covered} · {status}")
         if r["backlog"]:
-            lines.append(f"   next up: {html.escape(_unit_label(r['backlog'][0]))}")
+            lines.append(f"   next up: {html.escape(_unit_label(r['backlog'][0]), quote=False)}")
         elif r["upcoming"]:
-            lines.append(f"   next lecture: {html.escape(_unit_label(r['upcoming'][0]))}")
+            lines.append(f"   next lecture: {html.escape(_unit_label(r['upcoming'][0]), quote=False)}")
         lines.append("")
     keyboard = [[InlineKeyboardButton(f"{'⚠️' if r['backlog'] else '📚'} {r['name']}"[:60], callback_data=f"sp_course|{r['cid']}")] for r in rows]
     keyboard.append([InlineKeyboardButton("🎯 Tracked Courses", callback_data="sp_track_menu")])
@@ -10378,31 +10829,34 @@ async def handle_study_track_menu(update: Update, context: ContextTypes.DEFAULT_
 def _course_view_units(row: dict) -> list:
     """Units shown (and toggleable by index) in one course's progress
     view: everything held so far, then the not-yet-held lectures."""
-    return row["covered"] + [u for u in row["lectures"] if u not in row["covered"]]
+    covered_ids = {id(u) for u in row["covered"]}
+    return row["covered"] + [u for u in row["lectures"] if id(u) not in covered_ids]
 
 
-def render_course_progress(row: dict, studied: dict) -> tuple:
-    done = set(studied.get(row["cid"], []))
+def render_course_progress(row: dict) -> tuple:
     units = _course_view_units(row)
     lines = [
         f"📚 <b>{html.escape(row['name'])}</b>",
-        f"{row['held']} lecture(s) held · {row['studied_covered']}/{len(row['covered'])} of those studied",
+        f"{row['held']} lecture(s) held · {row['studied_covered']}/{len(row['covered'])} of those studied"
+        + (f" · ~{_hours(row['backlog_minutes'])} of catch-up left" if row["backlog_minutes"] else ""),
         "━━━━━━━━━━━━━━━━━━",
     ]
     keyboard = []
     for i, u in enumerate(units):
         held = i < len(row["covered"])
-        if u["file"] in done:
+        if u["done"]:
             mark = "✅"
         elif held:
             mark = "⚠️"
         else:
             mark = "⬜"
-        lines.append(f"{mark} {html.escape(_unit_label(u))}")
+        total = sum(t["minutes"] for t in u["tasks"])
+        left = f" <i>({u['remaining']} of {total} min left)</i>" if 0 < u["remaining"] < total else (f" <i>(~{total} min)</i>" if not u["done"] else "")
+        lines.append(f"{mark} {html.escape(_unit_label(u), quote=False)}{left}")
         if i < 40:
             keyboard.append([InlineKeyboardButton(f"{mark} {_unit_label(u)}"[:60], callback_data=f"sp_unit|{row['cid']}|{i}")])
     lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append("✅ studied · ⚠️ held in class, not studied · ⬜ not held yet")
+    lines.append("✅ done · ⚠️ held in class, work left · ⬜ not held yet")
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="sp_progress")])
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
@@ -10455,18 +10909,18 @@ async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAU
             unit = units[int(parts[2])]
         except (ValueError, IndexError):
             return
-        _toggle_studied(progress, row["cid"], unit["file"])
+        _toggle_studied(progress, unit, row["cid"])
         save_study_progress(progress)
         rows = compute_course_progress(
             {row["cid"]: load_study_plan_cache().get(row["cid"], {})},
             progress.get("held", {}),
-            progress.get("studied", {}),
+            progress,
             {row["cid"]: row["name"]},
-            progress.get("tracked"),
+            {row["cid"]: load_workload_cache().get(row["cid"], {})},
         )
         row = rows[0] if rows else row
 
-    text, markup = render_course_progress(row, progress.get("studied", {}))
+    text, markup = render_course_progress(row)
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
