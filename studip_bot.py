@@ -2754,11 +2754,66 @@ async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.D
     )
 
 
+def _status_group_view(group: str) -> tuple:
+    """One /status submenu. The buttons reuse the existing callbacks, except
+    the on/off toggles, which go through status_group_toggle so the
+    submenu redraws in place instead of being replaced by a confirmation."""
+    if group == "profile":
+        title = "👤 <b>Profile</b>"
+        rows = [
+            [InlineKeyboardButton("👤 Set Your Name", callback_data="set_user_name")],
+            [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
+        ]
+    elif group == "semester":
+        watch_prev = get_watch_previous_semester_enabled()
+        title = f"📆 <b>Semester &amp; Calendar</b>\n\nWatch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
+        rows = [
+            [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
+            [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="status_group_toggle|semester|watch_prev")],
+            [InlineKeyboardButton("📅 Change iCal Link", callback_data="change_ical_link")],
+        ]
+    else:
+        study_plan = get_weekly_study_plan_enabled()
+        title = f"🎓 <b>Studies</b>\n\nWeekly Study Plan (Sunday evening): {'✅ On' if study_plan else '🔲 Off'}"
+        rows = [
+            [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
+            [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
+            [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
+            [InlineKeyboardButton(f"{'✅' if study_plan else '🔲'} Weekly Study Plan", callback_data="status_group_toggle|studies|study_plan")],
+        ]
+    return title, InlineKeyboardMarkup(rows)
+
+
+async def handle_status_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """status_group|<group> opens a /status submenu as a new message
+    (keeping /status itself intact); status_group_toggle|<group>|<feature>
+    flips a setting and redraws that submenu in place."""
+    global courses_map
+    query = update.callback_query
+    await query.answer()
+    if not is_user_allowed(query.from_user.id):
+        return
+    parts = query.data.split("|")
+    group = parts[1] if len(parts) > 1 else "profile"
+    if parts[0] == "status_group_toggle":
+        feature = parts[2] if len(parts) > 2 else ""
+        if feature == "watch_prev":
+            set_watch_previous_semester_enabled(not get_watch_previous_semester_enabled())
+            courses_map = {}  # same as handle_toggle_watch_prev_sem: rebuild on the next watcher cycle
+        elif feature == "study_plan":
+            set_weekly_study_plan_enabled(not get_weekly_study_plan_enabled())
+        text, keyboard = _status_group_view(group)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+    text, keyboard = _status_group_view(group)
+    await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
 def _outfit_menu_view() -> tuple:
     """/status's grouped outfit submenu: the daily suggestion toggle,
     the wardrobe list and the reference photo setup in one place."""
     enabled = get_wardrobe_feature_enabled()
-    text = f"👔 <b>Outfit & Wardrobe</b>\n\nDaily Outfit Suggestion: {'✅ On' if enabled else '🔲 Off'}"
+    text = f"👔 <b>Outfit &amp; Wardrobe</b>\n\nDaily Outfit Suggestion: {'✅ On' if enabled else '🔲 Off'}"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{'✅' if enabled else '🔲'} Daily Outfit Suggestion", callback_data="outfit_menu_toggle")],
         [InlineKeyboardButton("👔 My Wardrobe", callback_data="wardrobe_menu")],
@@ -11661,17 +11716,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n📘 Weekly Study Plan: {'✅ On' if study_plan_enabled else '🔲 Off'}"
 
     keyboard = [
-        [InlineKeyboardButton("👤 Set Your Name", callback_data="set_user_name")],
-        [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
-        [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
-        [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="toggle_watch_prev_sem")],
+        [InlineKeyboardButton("👤 Profile", callback_data="status_group|profile")],
+        [InlineKeyboardButton("📆 Semester & Calendar", callback_data="status_group|semester")],
+        [InlineKeyboardButton("🎓 Studies", callback_data="status_group|studies")],
         [InlineKeyboardButton("👔 Outfit & Wardrobe", callback_data="outfit_menu")],
-        [InlineKeyboardButton(f"{'✅' if study_plan_enabled else '🔲'} Weekly Study Plan", callback_data="toggle_weekly_study_plan")],
-        [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
-        [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
-        [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
         [InlineKeyboardButton("📱 WhatsApp", callback_data="wa_menu")],
-        [InlineKeyboardButton("📅 Change iCal Link", callback_data="change_ical_link")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -11831,6 +11880,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_toggle_wardrobe_feature, pattern="^toggle_wardrobe_feature$"))
         app.add_handler(CallbackQueryHandler(handle_toggle_weekly_study_plan, pattern="^toggle_weekly_study_plan$"))
         app.add_handler(CallbackQueryHandler(handle_outfit_menu, pattern="^(outfit_menu|outfit_menu_toggle)$"))
+        app.add_handler(CallbackQueryHandler(handle_status_group, pattern=r"^(status_group|status_group_toggle)\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_study_plan_toggle, pattern=r"^sp_plan\|\d+$"))
         app.add_handler(CallbackQueryHandler(handle_study_progress_menu, pattern=r"^(sp_progress|sp_progress_refresh|sp_course\|.*|sp_unit\|.*)$"))
         app.add_handler(CallbackQueryHandler(handle_study_track_menu, pattern=r"^(sp_track_menu|sp_track_auto|sp_track\|.*)$"))
