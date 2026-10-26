@@ -9838,12 +9838,16 @@ async def handle_study_plan_toggle(update: Update, context: ContextTypes.DEFAULT
 
 
 async def _load_progress_rows(refresh: bool = False) -> tuple:
-    """(rows, progress) from cached topic labels only - no file scan, so
-    the progress menu stays fast. Lecture units appear here once a
-    /studyplan run (or the weekly job) has summarized them."""
+    """(rows, progress). With refresh, the tracked courses' files are
+    rescanned first (only new/changed files are summarized, so this is
+    mostly listing requests) and held-lecture counts are recomputed;
+    without it, cached topic labels are used so per-lecture toggle
+    buttons stay instant."""
     if not global_session or not await global_session.is_logged_in():
         await login_studip()
     await _ensure_watched_courses_map(global_session)
+    if refresh:
+        await collect_course_topics(global_session)
     progress = load_study_progress()
     held = await _get_lectures_held(global_session, progress, refresh=refresh)
     enrolled = set(courses_map)
@@ -9993,9 +9997,9 @@ async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None or not is_user_allowed(user_id):
         return
-    status_msg = await update.message.reply_text("📊 Loading study progress...", disable_notification=True)
+    status_msg = await update.message.reply_text("📊 Loading study progress...\n\n📚 Scanning course files...", disable_notification=True)
     try:
-        rows, _ = await _load_progress_rows()
+        rows, _ = await _load_progress_rows(refresh=True)
         text, markup = render_progress_overview(rows)
         await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
     except Exception as e:
