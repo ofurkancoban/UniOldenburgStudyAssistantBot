@@ -68,12 +68,16 @@ CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/
 HF_SPACE_VTON = os.getenv("HF_SPACE_VTON", "levihsu/OOTDiffusion")
 HF_SPACE_ACCESSORIES = os.getenv("HF_SPACE_ACCESSORIES", "black-forest-labs/FLUX.1-Kontext-Dev")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
-# fal.ai (paid, ~$0.075/image) — primary try-on provider when configured,
-# since a live side-by-side comparison showed it preserves the actual
-# garment (cut, logo sharpness) noticeably better than the free HF Spaces
-# below. Those remain as a free fallback when FAL_KEY isn't set or a call
-# fails. See generate_outfit_tryon_image for the fallback order.
+# fal.ai (paid). Primary try-on is Google's Gemini image model "Nano Banana
+# 2" (~$0.06/image): one call dresses the reference photo in every garment
+# photo at once, shoes and headwear included, and a live side-by-side
+# comparison showed it matches the real items (cropped jeans, beanie shape
+# and logo) better than FASHN, at ~40% of the cost and a third of the time.
+# Set FAL_GEMINI_TRYON_MODEL to empty to skip it. FASHN (~$0.075/image,
+# chained upper + lower) and the free HF Spaces below remain as fallbacks.
+# See generate_outfit_tryon_image for the fallback order.
 FAL_KEY = os.getenv("FAL_KEY", "")
+FAL_GEMINI_TRYON_MODEL = os.getenv("FAL_GEMINI_TRYON_MODEL", "fal-ai/nano-banana-2/edit")
 FAL_TRYON_MODEL = os.getenv("FAL_TRYON_MODEL", "fal-ai/fashn/tryon/v1.6")
 # University of Oldenburg's coordinates, for the daily-plan weather snapshot
 # (see get_weather_snapshot) — configurable in case the bot is ever reused
@@ -8652,6 +8656,63 @@ async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
         return None
 
 
+async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -> Optional[bytes]:
+    """Dress the reference photo in every garment at once via a Gemini image
+    model on fal.ai (FAL_GEMINI_TRYON_MODEL). garments is [(item, bytes)]
+    in outer-to-inner order, shoes and headwear included; unlike the
+    dedicated try-on models, this one sees the actual shoe/hat photos, so
+    no separate text-described accessory pass is needed. Returns None if
+    unconfigured or the call failed, so the caller falls back to FASHN."""
+    if not FAL_KEY or not FAL_GEMINI_TRYON_MODEL or not garments:
+        return None
+    try:
+        import fal_client
+    except ImportError:
+        logging.warning("generate_outfit_tryon_gemini: fal_client not installed")
+        return None
+
+    paths = []
+    try:
+        urls = []
+        for data in [reference_bytes] + [g[1] for g in garments]:
+            path = os.path.join(tempfile.gettempdir(), f"gemini_tryon_{uuid.uuid4().hex}.jpg")
+            paths.append(path)
+            with open(path, "wb") as f:
+                f.write(data)
+            urls.append(await fal_client.upload_file_async(path))
+
+        garment_lines = "\n".join(f"- Image {i + 2}: {item.get('label', 'clothing item')} ({item.get('type', 'item')})" for i, (item, _) in enumerate(garments))
+        prompt = (
+            "Virtual try-on. Image 1 is a photo of a person. Dress this exact person in ALL of the "
+            "clothing items shown in the other images:\n"
+            f"{garment_lines}\n"
+            "Reproduce each garment faithfully (color, cut, fit, length, logos, prints). Layer outerwear "
+            "over tops, put the shoes on the feet and any cap or beanie on the head. Keep the person's "
+            "face, identity, hair, skin tone, body shape and pose exactly as in Image 1, and keep the "
+            "original background and lighting. Show the full body from head to feet. Photorealistic "
+            "photo, no text."
+        )
+        result = await fal_client.subscribe_async(
+            FAL_GEMINI_TRYON_MODEL,
+            arguments={"prompt": prompt, "image_urls": urls, "num_images": 1, "output_format": "png"},
+        )
+        image_url = result["images"][0]["url"]
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+        return None
+    except Exception as e:
+        logging.warning(f"Gemini try-on failed: {e}")
+        return None
+    finally:
+        for p in paths:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
 async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optional[bytes], lower_bytes: Optional[bytes]) -> Optional[bytes]:
     """Dress the reference photo via FASHN's try-on model (fal.ai-hosted,
     paid, ~$0.075/image) — the primary provider when FAL_KEY is set, since
@@ -8912,7 +8973,9 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
 
 
 async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items: list[dict]) -> Optional[bytes]:
-    """Dress the reference photo in the chosen outfit — picks one
+    """Dress the reference photo in the chosen outfit. First tries the
+    Gemini model with every visible item in one call (see
+    generate_outfit_tryon_gemini). If that fails, picks one
     representative upper-body garment (the outermost layer if the outfit
     has layering, e.g. a coat over a t-shirt, since none of these models
     stack multiple garments visually in one region) and one bottom,
@@ -8928,6 +8991,25 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
     means the base outfit image goes out without them. Returns None only
     if the base top/bottom dressing itself produced nothing — caller must
     degrade to a text-only outfit message in that case."""
+    shoes_item = next((it for it in chosen_items if it.get("type") == "shoes"), None)
+    headwear_item = next(
+        (it for it in chosen_items if it.get("type") == "accessory" and any(kw in it.get("label", "").lower() for kw in _HEADWEAR_KEYWORDS)),
+        None,
+    )
+
+    # Socks, watches etc. are left out: barely visible, and every extra
+    # reference image dilutes the model's attention on the main garments.
+    visible = [it for it in chosen_items if it.get("type") in ("outerwear", "top", "bottom")]
+    visible += [it for it in (shoes_item, headwear_item) if it]
+    garments = []
+    for it in visible:
+        data = await _fetch_wardrobe_item_bytes(bot, it)
+        if data:
+            garments.append((it, data))
+    image_bytes = await generate_outfit_tryon_gemini(reference_bytes, garments)
+    if image_bytes:
+        return image_bytes
+
     upper_item = next((it for it in reversed(chosen_items) if it.get("type") == "outerwear"), None) \
         or next((it for it in chosen_items if it.get("type") == "top"), None)
     lower_item = next((it for it in chosen_items if it.get("type") == "bottom"), None)
@@ -8943,11 +9025,6 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
     if not image_bytes:
         return None
 
-    shoes_item = next((it for it in chosen_items if it.get("type") == "shoes"), None)
-    headwear_item = next(
-        (it for it in chosen_items if it.get("type") == "accessory" and any(kw in it.get("label", "").lower() for kw in _HEADWEAR_KEYWORDS)),
-        None,
-    )
     if shoes_item or headwear_item:
         accessorized = await generate_outfit_tryon_accessories(image_bytes, shoes_item, headwear_item)
         if accessorized:
