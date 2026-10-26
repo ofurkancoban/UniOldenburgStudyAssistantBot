@@ -8687,7 +8687,9 @@ async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -
             "clothing items shown in the other images:\n"
             f"{garment_lines}\n"
             "Reproduce each garment faithfully (color, cut, fit, length, logos, prints). Layer outerwear "
-            "over tops, put the shoes on the feet and any cap or beanie on the head. Keep the person's "
+            "over tops, put the shoes on the feet and any cap or beanie on the head. The person always "
+            "wears plain white crew socks with the shoes (visible at the ankle wherever the trousers "
+            "allow, regardless of the other items). Keep the person's "
             "face, identity, hair, skin tone, body shape and pose exactly as in Image 1, and keep the "
             "original background and lighting. Show the full body from head to feet. Photorealistic "
             "photo, no text."
@@ -8939,7 +8941,8 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
     if headwear_item:
         parts.append(f"a small fitted {_describe_item_for_prompt(headwear_item)} on top of his head, not covering his face or eyes")
     if shoes_item:
-        parts.append(f"{_describe_item_for_prompt(shoes_item)} on his feet, replacing his current shoes")
+        # House rule: always plain white socks, same as generate_outfit_tryon_gemini.
+        parts.append(f"{_describe_item_for_prompt(shoes_item)} with plain white crew socks on his feet, replacing his current shoes")
     instruction = "Add " + " and ".join(parts) + ". Keep his face, body proportions, pose, clothing and background exactly unchanged."
 
     ref_path = os.path.join(tempfile.gettempdir(), f"kontext_{uuid.uuid4().hex}.jpg")
