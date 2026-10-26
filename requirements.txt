@@ -17,4 +17,6 @@ pydub
 langdetect
 gradio_client
 fal-client
+pypdf
+python-pptx
 # Verified

@@ -380,6 +380,34 @@ def save_files_cache(data):
         logging.error(f"Failed to save file cache: {e}")
 
 
+STUDY_PLAN_CACHE_PATH = "study_plan_cache.json"
+
+
+def load_study_plan_cache() -> dict:
+    """Per-course, per-file topic-label cache for the weekly study plan
+    feature — {cid: {filename: {"summary", "size", "modified_ts"}}}. Only
+    files that were successfully summarized ever get an entry, so a failed
+    summarization just means that file is retried cheaply next run rather
+    than cached as a placeholder (see collect_course_topics)."""
+    if os.path.exists(STUDY_PLAN_CACHE_PATH):
+        try:
+            with open(STUDY_PLAN_CACHE_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load study plan cache: {e}")
+    return {}
+
+
+def save_study_plan_cache(data: dict) -> None:
+    try:
+        tmp = STUDY_PLAN_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, STUDY_PLAN_CACHE_PATH)
+    except Exception as e:
+        logging.error(f"Failed to save study plan cache: {e}")
+
+
 def load_reminders_cache():
     if os.path.exists(REMINDERS_CACHE_PATH):
         try:
@@ -646,6 +674,16 @@ def get_wardrobe_feature_enabled() -> bool:
 def set_wardrobe_feature_enabled(enabled: bool) -> None:
     cache = load_general_cache()
     cache["wardrobe_feature_enabled"] = enabled
+    save_general_cache(cache)
+
+
+def get_weekly_study_plan_enabled() -> bool:
+    return bool(load_general_cache().get("weekly_study_plan_enabled"))
+
+
+def set_weekly_study_plan_enabled(enabled: bool) -> None:
+    cache = load_general_cache()
+    cache["weekly_study_plan_enabled"] = enabled
     save_general_cache(cache)
 
 
@@ -1015,6 +1053,24 @@ async def unified_watcher_controller(app):
                         save_general_cache(cache)
                     except Exception as e:
                         logging.error(f"❌ Morning summary failed: {e}")
+
+            # Weekly content-aware study plan (Sunday evening, opt-in toggle).
+            # Dedup key is a per-ISO-week string (not a daily date), and is
+            # written even if the job degrades/sends a fallback - otherwise a
+            # broken OpenRouter key would retry every single cycle for the
+            # rest of Sunday instead of just once.
+            if now.weekday() == 6 and now.hour >= 18 and get_weekly_study_plan_enabled():
+                cache = load_general_cache()
+                iso_week = now.strftime("%G-W%V")
+                if cache.get("last_weekly_study_plan") != iso_week:
+                    try:
+                        logging.info("📘 Generating weekly study plan...")
+                        await run_weekly_study_plan_job(app.bot, ALLOWED_USER_IDS, session)
+                    except Exception as e:
+                        logging.error(f"❌ Weekly study plan failed: {e}")
+                    cache = load_general_cache()
+                    cache["last_weekly_study_plan"] = iso_week
+                    save_general_cache(cache)
 
             # Regular calendar reminders
             try:
@@ -2695,6 +2751,17 @@ async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.D
     set_wardrobe_feature_enabled(new_state)
     await query.edit_message_text(
         f"👔 Daily Outfit Suggestion is now {'✅ On' if new_state else '🔲 Off'}.\nRun /status to see the full menu again."
+    )
+
+
+async def handle_toggle_weekly_study_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stateless flip toggle, same template as handle_toggle_wardrobe_feature."""
+    query = update.callback_query
+    await query.answer()
+    new_state = not get_weekly_study_plan_enabled()
+    set_weekly_study_plan_enabled(new_state)
+    await query.edit_message_text(
+        f"📘 Weekly Study Plan is now {'✅ On' if new_state else '🔲 Off'}.\nRun /status to see the full menu again."
     )
 
 
@@ -9058,6 +9125,338 @@ async def build_ai_weekly_plan_narration(events: list, week_start, week_end, nam
     return narration.strip() if narration else None
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+#  WEEKLY CONTENT-AWARE STUDY PLAN
+# ──────────────────────────────────────────────────────────────────────────────
+# Distinct from build_ai_weekly_plan_narration above (which narrates the
+# week's EXISTING schedule as a spoken briefing) - this plans NEW study
+# sessions into the free gaps, aware of what each course's lecture files
+# actually cover. Deliberately not a RAG/vector-search system: a lightweight
+# per-file topic-label cache plus the existing free-time/exam-date
+# infrastructure is enough for "what, when, how urgent" without the cost
+# or maintenance of full-text semantic search.
+
+STUDY_PLAN_SUPPORTED_EXTENSIONS = (".pdf", ".pptx")
+
+
+def extract_text_from_file(filename: str, content: bytes) -> Optional[str]:
+    """Extract plain text from a downloaded lecture file, for topic
+    summarization. Any extension other than PDF/PPTX returns None
+    immediately with no log noise - that's the routine case for a typical
+    course's file mix (videos, images, zips, docx), not an error. Each
+    branch is independently try/except-wrapped since corrupt, scanned, or
+    oddly-encoded files are common enough in real lecture archives that
+    this must fail open rather than blow up the whole run."""
+    ext = os.path.splitext(filename)[1].lower()
+    if ext == ".pdf":
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(content))
+            pages = []
+            for page in reader.pages:
+                try:
+                    text = page.extract_text()
+                    if text:
+                        pages.append(text)
+                except Exception:
+                    continue
+            return "\n".join(pages) if pages else None
+        except Exception as e:
+            logging.warning(f"extract_text_from_file: PDF parse failed for {filename}: {e}")
+            return None
+    elif ext == ".pptx":
+        try:
+            import pptx
+            prs = pptx.Presentation(io.BytesIO(content))
+            parts = []
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if getattr(shape, "has_text_frame", False) and shape.text_frame.text:
+                        parts.append(shape.text_frame.text)
+            return "\n".join(parts) if parts else None
+        except Exception as e:
+            logging.warning(f"extract_text_from_file: PPTX parse failed for {filename}: {e}")
+            return None
+    return None
+
+
+LECTURE_FILE_TOPIC_SYSTEM_PROMPT = """You're given raw extracted text from one university lecture file (slides or notes). Respond with a single short line (max ~12 words) naming the specific topic(s) covered - e.g. "Dijkstra's algorithm and shortest paths" or "Kant's categorical imperative, lecture 4" - not a generic description like "lecture slides" or "course material". No markdown, no quotes, just the one line."""
+
+
+async def summarize_lecture_file(filename: str, extracted_text: str) -> Optional[str]:
+    """Turn a lecture file's extracted text into a short topic label for
+    the weekly study plan's "known topics per course" prompt input.
+    Truncates to the first 6000 characters before calling the LLM -
+    lecture slides front-load the agenda/outline, so this cheaply captures
+    the topic without needing the whole deck; this is also the feature's
+    only defense against unbounded prompt size, since no token-budget
+    handling exists anywhere else in this codebase."""
+    text = (extracted_text or "")[:6000].strip()
+    if not text:
+        return None
+    raw = await _call_openrouter(
+        LECTURE_FILE_TOPIC_SYSTEM_PROMPT,
+        f"Filename: {filename}\n\nExtracted text:\n{text}",
+        temperature=0,
+    )
+    return raw.strip() if raw else None
+
+
+async def collect_course_topics(session) -> dict:
+    """Scan every ENROLLED course's files, summarize any new/changed file
+    into a one-line topic label, cache the result, and return
+    {cid: [topic, ...]} read back from the now-current cache - so courses
+    with no new files this run still contribute topics learned in prior
+    runs, not just this run's fresh subset. The new/changed diff (size
+    first, then a >24h timestamp-change tolerance) mirrors
+    check_new_files_parallel's own logic against files_cache.json, just
+    inverted in purpose: there it flags changes to notify about, here it
+    flags changes to decide what needs re-summarizing."""
+    await _ensure_watched_courses_map(session)
+    courses = [(name, cid) for cid, name in courses_map.items()]
+    if not courses:
+        return {}
+
+    cache = load_study_plan_cache()
+    semaphore = asyncio.Semaphore(3)
+
+    async def process_course(course_name, cid):
+        async with semaphore:
+            try:
+                files = await list_files(cid)
+            except Exception as e:
+                logging.warning(f"collect_course_topics: list_files failed for {cid}: {e}")
+                return
+
+            course_cache = cache.setdefault(cid, {})
+            for f in files:
+                if f.get("type") != "file":
+                    continue
+                name = f.get("name")
+                url = f.get("url")
+                if not name or not url:
+                    continue
+                if os.path.splitext(name)[1].lower() not in STUDY_PLAN_SUPPORTED_EXTENSIONS:
+                    continue
+
+                dt = _parse_file_date_v2(f.get("modified"), f.get("modified_iso"))
+                modified_ts = None if dt == datetime.min else int(dt.timestamp())
+                cur_size = str(f.get("size", "-")).strip()
+
+                old = course_cache.get(name)
+                needs_processing = True
+                if old is not None:
+                    old_size = str(old.get("size", "-")).strip()
+                    old_ts = old.get("modified_ts")
+                    size_changed = old_size != cur_size
+                    ts_changed = old_ts is not None and modified_ts is not None and abs(modified_ts - old_ts) > 86400
+                    needs_processing = size_changed or ts_changed
+                if not needs_processing:
+                    continue
+
+                try:
+                    async with await global_session.get(url) as resp:
+                        if resp.status != 200:
+                            continue
+                        content = await resp.read()
+                except Exception as e:
+                    logging.warning(f"collect_course_topics: download failed for {name}: {e}")
+                    continue
+
+                text = extract_text_from_file(name, content)
+                if not text:
+                    continue
+                summary = await summarize_lecture_file(name, text)
+                if not summary:
+                    continue
+                course_cache[name] = {"summary": summary, "size": cur_size, "modified_ts": modified_ts}
+
+    await asyncio.gather(*(process_course(name, cid) for name, cid in courses))
+    save_study_plan_cache(cache)
+
+    enrolled_cids = {cid for _, cid in courses}
+    return {cid: [v["summary"] for v in files.values()] for cid, files in cache.items() if cid in enrolled_cids}
+
+
+async def gather_weekly_study_inputs(session) -> dict:
+    """Collect this run's three inputs: next week's free calendar gaps,
+    the student's own upcoming registered exams (closest first, next 3
+    weeks — the same get_registered_exam_schedule source _upcoming_exams
+    uses, not the full-curriculum list), and per-course cached topic
+    labels."""
+    today = datetime.now(TZ_BERLIN).date()
+    next_monday = today + timedelta(days=7 - today.weekday())
+    events = await get_calendar_events(session, next_monday)
+    gaps = find_weekly_study_gaps(events)
+
+    try:
+        raw_exams = await get_registered_exam_schedule(session)
+    except Exception as e:
+        logging.warning(f"gather_weekly_study_inputs: get_registered_exam_schedule failed: {e}")
+        raw_exams = []
+
+    course_candidates = [(name, cid) for cid, name in courses_map.items()]
+    exams = []
+    for exam in raw_exams:
+        date_str = exam.get("date")
+        if not date_str:
+            continue
+        try:
+            exam_date = datetime.fromisoformat(date_str).date()
+        except ValueError:
+            continue
+        days_until = (exam_date - today).days
+        if not (0 <= days_until <= 21):
+            continue
+        matched_cid = _best_title_match(exam["title"], course_candidates, min_score=0.6)
+        exams.append({**exam, "days_until": days_until, "matched_cid": matched_cid})
+    exams.sort(key=lambda e: e["days_until"])
+
+    course_topics = await collect_course_topics(session)
+    return {"gaps": gaps, "exams": exams, "course_topics": course_topics}
+
+
+WEEKLY_STUDY_PLAN_SYSTEM_PROMPT = """You are building a concrete weekly study plan for a university student. You are given: (1) a list of free time slots next week (gaps between their classes), (2) the student's own upcoming exams with days remaining, (3) known lecture topics per course. Assign specific study sessions into the given slots - you do not need to use every slot. Prioritize courses whose exam is soonest. Reference the actual topic labels given; never invent a generic "study for X" session when real topics are listed for that course - if a course truly has no listed topics, you may still assign it a slot (e.g. because its exam is close) but must say so honestly (e.g. "general review - no topic data yet") rather than fabricate a topic. Respond with strict JSON only, no other text: {"sessions": [{"day": "Monday", "start": "14:00", "end": "15:30", "course": "<course name>", "topic": "<specific topic or honest general-review note>"}]}. Use only the day names and time slots given."""
+
+
+async def build_weekly_study_plan(gaps: list, exams: list, course_topics: dict, courses_map_snapshot: dict) -> Optional[list]:
+    """Ask the LLM to assign concrete study sessions into next week's free
+    slots, weighing exam proximity and known lecture topics — structural
+    analog to pick_outfit_from_wardrobe (strict-JSON decision, Python
+    renders the final text) rather than build_ai_weekly_plan_narration's
+    free-prose style, since this output is an addressable schedule, not
+    something meant to be read aloud."""
+    if not gaps:
+        return None
+
+    lines = ["Free time slots next week:"]
+    for g in gaps:
+        lines.append(
+            f"- {g['start_dt']:%A} {g['start_dt']:%H:%M}-{g['end_dt']:%H:%M} "
+            f"({g['duration_minutes']}min), between {g['after']} and {g['before']}"
+        )
+
+    if exams:
+        lines.append("\nUpcoming exams (your own registered sittings):")
+        for e in exams:
+            course_name = courses_map_snapshot.get(e.get("matched_cid"), "")
+            course_note = f" — course: {course_name}" if course_name else ""
+            lines.append(f"- {e['title']}: in {e['days_until']} day(s) ({e.get('date')}){course_note}")
+
+    if course_topics:
+        lines.append("\nKnown lecture topics per course:")
+        for cid, topics in course_topics.items():
+            if not topics:
+                continue
+            course_name = courses_map_snapshot.get(cid, cid)
+            lines.append(f"- {course_name}: {', '.join(topics[:8])}")
+
+    raw = await _call_openrouter(WEEKLY_STUDY_PLAN_SYSTEM_PROMPT, "\n".join(lines), temperature=0.75)
+    parsed = _extract_json_object(raw)
+    sessions = parsed.get("sessions") if parsed else None
+    return sessions if sessions else None
+
+
+def render_weekly_study_plan_message(sessions: Optional[list], gaps: list, exams: list) -> str:
+    """Build the final HTML Telegram message from either the LLM's
+    structured sessions (preferred), or — when composition failed or
+    there were no topics to work with — a plain listing of the free slots
+    with no topic detail, so the feature degrades gracefully instead of
+    sending nothing."""
+    if sessions:
+        by_day: dict = {}
+        for s in sessions:
+            by_day.setdefault(s.get("day", "?"), []).append(s)
+        lines = ["📘 <b>Your Study Plan for Next Week</b>", "━━━━━━━━━━━━━━━━━━"]
+        for day, day_sessions in by_day.items():
+            lines.append(f"<b>{day}</b>")
+            for s in day_sessions:
+                lines.append(f"🕑 {s.get('start', '?')}–{s.get('end', '?')} — <b>{s.get('course', '')}</b>")
+                if s.get("topic"):
+                    lines.append(f"   {s['topic']}")
+            lines.append("")
+        lines.append("━━━━━━━━━━━━━━━━━━")
+    else:
+        lines = [
+            "📘 <b>Your Free Study Windows Next Week</b>",
+            "(couldn't generate topic-specific suggestions this time)",
+            "━━━━━━━━━━━━━━━━━━",
+        ]
+        for g in gaps:
+            lines.append(f"{g['start_dt']:%A} {g['start_dt']:%H:%M}–{g['end_dt']:%H:%M} (between {g['after']} and {g['before']})")
+        lines.append("━━━━━━━━━━━━━━━━━━")
+
+    if exams:
+        for e in exams[:3]:
+            lines.append(f"⏳ Exam in {e['days_until']} day(s): {e['title']} ({e.get('date')})")
+
+    return "\n".join(lines)
+
+
+async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None) -> str:
+    """End-to-end weekly study plan: gather inputs, compose (or degrade),
+    render, send to every user_id. Returns the rendered message text.
+    status_msg, if given, is edited through the stages (used by the
+    manual /studyplan command's progress display)."""
+    if status_msg:
+        await status_msg.edit_text("📘 Building your weekly study plan...\n\n📚 Scanning course files...")
+    inputs = await gather_weekly_study_inputs(session)
+
+    if not inputs["gaps"]:
+        text = "📘 No free study gaps found in next week's schedule — fully booked! No study plan to suggest this week."
+        for uid in user_ids:
+            try:
+                await bot.send_message(chat_id=uid, text=text)
+            except Exception as e:
+                logging.warning(f"run_weekly_study_plan_job: failed to send to {uid}: {e}")
+        return text
+
+    if status_msg:
+        await status_msg.edit_text("📘 Building your weekly study plan...\n\n🧠 Composing plan...")
+    sessions = await build_weekly_study_plan(inputs["gaps"], inputs["exams"], inputs["course_topics"], dict(courses_map))
+    text = render_weekly_study_plan_message(sessions, inputs["gaps"], inputs["exams"])
+    for uid in user_ids:
+        try:
+            await bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
+        except Exception as e:
+            logging.warning(f"run_weekly_study_plan_job: failed to send to {uid}: {e}")
+    return text
+
+
+study_plan_in_progress: set = set()
+
+
+async def study_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual on-demand "/studyplan" trigger — same progress-message
+    pattern as _run_check_now: one status message edited through stages,
+    then the plan itself is delivered as its own message by
+    run_weekly_study_plan_job (shared with the automatic weekly trigger)."""
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        return
+    chat_id = update.effective_chat.id
+    if chat_id in study_plan_in_progress:
+        await update.message.reply_text("⚠️ A study plan is already being generated.")
+        return
+
+    study_plan_in_progress.add(chat_id)
+    try:
+        status_msg = await update.message.reply_text(
+            "📘 Building your weekly study plan...\n\n📚 Scanning course files...",
+            disable_notification=True,
+        )
+        if not global_session or not await global_session.is_logged_in():
+            await status_msg.edit_text("🔄 Session expired, re-logging...")
+            await login_studip()
+        await run_weekly_study_plan_job(context.bot, [user_id], global_session, status_msg=status_msg)
+        await status_msg.edit_text("✅ Study plan ready — see below 👇")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Fatal error: {e}")
+        logging.exception("study_plan_command failed")
+    finally:
+        study_plan_in_progress.discard(chat_id)
+
+
 async def _send_voice_to_users(bot, user_ids, text: str):
     """Synthesize `text` once via OpenRouter TTS and send the resulting
     voice message to every user_id, reusing the same converted file rather
@@ -10585,6 +10984,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wardrobe_enabled = get_wardrobe_feature_enabled()
     text += f"\n👔 Daily Outfit Suggestion: {'✅ On' if wardrobe_enabled else '🔲 Off'}"
 
+    study_plan_enabled = get_weekly_study_plan_enabled()
+    text += f"\n📘 Weekly Study Plan: {'✅ On' if study_plan_enabled else '🔲 Off'}"
+
     keyboard = [
         [InlineKeyboardButton("👤 Set Your Name", callback_data="set_user_name")],
         [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
@@ -10593,6 +10995,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton(f"{'✅' if wardrobe_enabled else '🔲'} Daily Outfit Suggestion", callback_data="toggle_wardrobe_feature")],
         [InlineKeyboardButton("👔 My Wardrobe", callback_data="wardrobe_menu")],
         [InlineKeyboardButton("🖼️ Set Reference Photo", callback_data="wardrobe_set_reference")],
+        [InlineKeyboardButton(f"{'✅' if study_plan_enabled else '🔲'} Weekly Study Plan", callback_data="toggle_weekly_study_plan")],
         [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
         [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
         [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
@@ -10679,6 +11082,7 @@ async def main():
         # Command & Callback handlers
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("check", check_command))
+        app.add_handler(CommandHandler("studyplan", study_plan_command))
         app.add_handler(CommandHandler("fastenroll", fastenroll_command))
         app.add_handler(CommandHandler("fastenroll_list", fastenroll_list_command))
         app.add_handler(CommandHandler("fastenroll_cancel", fastenroll_cancel_command))
@@ -10752,6 +11156,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_confirm, pattern="^foodpref_clear_confirm$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_cancel, pattern="^foodpref_clear_cancel$"))
         app.add_handler(CallbackQueryHandler(handle_toggle_wardrobe_feature, pattern="^toggle_wardrobe_feature$"))
+        app.add_handler(CallbackQueryHandler(handle_toggle_weekly_study_plan, pattern="^toggle_weekly_study_plan$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_menu, pattern="^wardrobe_menu$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_add_item, pattern="^wardrobe_add_item$"))
         app.add_handler(CallbackQueryHandler(handle_wardrobe_suggest_now, pattern="^wardrobe_suggest_now$"))

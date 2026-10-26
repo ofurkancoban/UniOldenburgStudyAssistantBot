@@ -15,6 +15,7 @@ yarn-error.log*
 # Bot Cache & Runtime
 announcement_cache.json
 files_cache.json
+study_plan_cache.json
 messages_cache.json
 forum_cache.json
 link_cache.json
