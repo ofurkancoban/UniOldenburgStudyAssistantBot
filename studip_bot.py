@@ -5308,6 +5308,22 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.message.reply_text(f"❌ Failed to {failed_verb} {title}: {result['message']}")
 
 
+def _html_to_whatsapp_text(text: str) -> str:
+    """Convert the Telegram-style HTML markup used in bot-composed WA
+    forwards (e.g. handle_examopen_wa_confirm's "EXAM REGISTRATION OPEN"
+    text) into WhatsApp's own plain-text markdown, since WhatsApp doesn't
+    render HTML at all — literal "<b>...</b>" was showing up verbatim in
+    forwarded messages instead of being bold. <b>/<strong> become
+    WhatsApp's *bold*, <i>/<em> become _italic_, and any other stray tag
+    (there shouldn't be any today, but this is the one chokepoint every
+    WA-forwarded message passes through) is stripped rather than leaked
+    through as-is."""
+    text = re.sub(r"<(b|strong)>(.*?)</\1>", r"*\2*", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<(i|em)>(.*?)</\1>", r"_\2_", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text)
+
+
 async def _send_text_to_whatsapp(text: str) -> tuple[bool, str]:
     """POST plain text to the local WhatsApp microservice's target group.
     Returns (success, message) — mirrors forward_to_whatsapp's own request,
@@ -5324,6 +5340,7 @@ async def _send_text_to_whatsapp(text: str) -> tuple[bool, str]:
     group_id = os.getenv("WA_GROUP_ID", "").strip()
     if not group_id:
         return False, "No WhatsApp group is set yet. Use /status → \"📱 WhatsApp\" → \"🔍 Detect WA Groups\" and pick one first."
+    text = _html_to_whatsapp_text(text)
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
