@@ -9289,6 +9289,33 @@ async def gather_weekly_study_inputs(session) -> dict:
     events = await get_calendar_events(session, next_monday)
     gaps = find_weekly_study_gaps(events)
 
+    # find_weekly_study_gaps only flags windows BETWEEN two classes on the
+    # same day - a day with zero classes (e.g. a free Monday/Friday) never
+    # even enters its grouping, so it was silently invisible here. Add one
+    # representative study slot (10:00-13:00, within the same 90-360min
+    # bounds as a real gap) for every day in the week that has no events at
+    # all, without touching find_weekly_study_gaps itself (shared with the
+    # weekly voice narration feature).
+    # Weekdays only (Monday-Friday) - weekends are deliberately excluded
+    # both here and from find_weekly_study_gaps's own output below, per
+    # explicit request not to suggest study sessions on weekends.
+    from datetime import time as _dtime
+    days_with_events = {ev["date_key"] for ev in events}
+    for i in range(5):
+        day = next_monday + timedelta(days=i)
+        if day in days_with_events:
+            continue
+        gaps.append({
+            "date_key": day,
+            "start_dt": datetime.combine(day, _dtime(10, 0), tzinfo=TZ_BERLIN),
+            "end_dt": datetime.combine(day, _dtime(13, 0), tzinfo=TZ_BERLIN),
+            "duration_minutes": 180,
+            "after": "no classes that day",
+            "before": "no classes that day",
+        })
+    gaps = [g for g in gaps if g["start_dt"].weekday() < 5]
+    gaps.sort(key=lambda g: g["start_dt"])
+
     try:
         raw_exams = await get_registered_exam_schedule(session)
     except Exception as e:
@@ -9331,9 +9358,10 @@ async def build_weekly_study_plan(gaps: list, exams: list, course_topics: dict, 
 
     lines = ["Free time slots next week:"]
     for g in gaps:
+        context = "no classes that day, fully free" if g["after"] == g["before"] == "no classes that day" else f"between {g['after']} and {g['before']}"
         lines.append(
             f"- {g['start_dt']:%A} {g['start_dt']:%H:%M}-{g['end_dt']:%H:%M} "
-            f"({g['duration_minutes']}min), between {g['after']} and {g['before']}"
+            f"({g['duration_minutes']}min), {context}"
         )
 
     if exams:
@@ -9383,7 +9411,8 @@ def render_weekly_study_plan_message(sessions: Optional[list], gaps: list, exams
             "━━━━━━━━━━━━━━━━━━",
         ]
         for g in gaps:
-            lines.append(f"{g['start_dt']:%A} {g['start_dt']:%H:%M}–{g['end_dt']:%H:%M} (between {g['after']} and {g['before']})")
+            context = "fully free day" if g["after"] == g["before"] == "no classes that day" else f"between {g['after']} and {g['before']}"
+            lines.append(f"{g['start_dt']:%A} {g['start_dt']:%H:%M}–{g['end_dt']:%H:%M} ({context})")
         lines.append("━━━━━━━━━━━━━━━━━━")
 
     if exams:
