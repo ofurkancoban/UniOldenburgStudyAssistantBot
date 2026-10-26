@@ -2754,6 +2754,36 @@ async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.D
     )
 
 
+def _outfit_menu_view() -> tuple:
+    """/status's grouped outfit submenu: the daily suggestion toggle,
+    the wardrobe list and the reference photo setup in one place."""
+    enabled = get_wardrobe_feature_enabled()
+    text = f"👔 <b>Outfit & Wardrobe</b>\n\nDaily Outfit Suggestion: {'✅ On' if enabled else '🔲 Off'}"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{'✅' if enabled else '🔲'} Daily Outfit Suggestion", callback_data="outfit_menu_toggle")],
+        [InlineKeyboardButton("👔 My Wardrobe", callback_data="wardrobe_menu")],
+        [InlineKeyboardButton("🖼️ Set Reference Photo", callback_data="wardrobe_set_reference")],
+    ])
+    return text, keyboard
+
+
+async def handle_outfit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """outfit_menu opens the submenu as a new message (keeping /status
+    intact, same as wardrobe_menu); outfit_menu_toggle flips the daily
+    suggestion and redraws the submenu in place."""
+    query = update.callback_query
+    await query.answer()
+    if not is_user_allowed(query.from_user.id):
+        return
+    if query.data == "outfit_menu_toggle":
+        set_wardrobe_feature_enabled(not get_wardrobe_feature_enabled())
+        text, keyboard = _outfit_menu_view()
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+    text, keyboard = _outfit_menu_view()
+    await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
 async def handle_toggle_weekly_study_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stateless flip toggle, same template as handle_toggle_wardrobe_feature."""
     query = update.callback_query
@@ -11635,9 +11665,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
         [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
         [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="toggle_watch_prev_sem")],
-        [InlineKeyboardButton(f"{'✅' if wardrobe_enabled else '🔲'} Daily Outfit Suggestion", callback_data="toggle_wardrobe_feature")],
-        [InlineKeyboardButton("👔 My Wardrobe", callback_data="wardrobe_menu")],
-        [InlineKeyboardButton("🖼️ Set Reference Photo", callback_data="wardrobe_set_reference")],
+        [InlineKeyboardButton("👔 Outfit & Wardrobe", callback_data="outfit_menu")],
         [InlineKeyboardButton(f"{'✅' if study_plan_enabled else '🔲'} Weekly Study Plan", callback_data="toggle_weekly_study_plan")],
         [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
         [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
@@ -11802,6 +11830,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_cancel, pattern="^foodpref_clear_cancel$"))
         app.add_handler(CallbackQueryHandler(handle_toggle_wardrobe_feature, pattern="^toggle_wardrobe_feature$"))
         app.add_handler(CallbackQueryHandler(handle_toggle_weekly_study_plan, pattern="^toggle_weekly_study_plan$"))
+        app.add_handler(CallbackQueryHandler(handle_outfit_menu, pattern="^(outfit_menu|outfit_menu_toggle)$"))
         app.add_handler(CallbackQueryHandler(handle_study_plan_toggle, pattern=r"^sp_plan\|\d+$"))
         app.add_handler(CallbackQueryHandler(handle_study_progress_menu, pattern=r"^(sp_progress|sp_progress_refresh|sp_course\|.*|sp_unit\|.*)$"))
         app.add_handler(CallbackQueryHandler(handle_study_track_menu, pattern=r"^(sp_track_menu|sp_track_auto|sp_track\|.*)$"))
