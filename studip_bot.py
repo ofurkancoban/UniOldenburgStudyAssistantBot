@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import logging
 import io
 
@@ -4000,7 +4001,23 @@ _prepared_morning: dict = {}
 _morning_delivery_task: Optional[asyncio.Task] = None
 
 
+MORNING_AI_TIMEOUT_SECONDS = 60
+MORNING_AI_ATTEMPTS = 3
+
+
 async def prepare_morning_summary(bot, user_ids) -> Optional[dict]:
+    """See _prepare_morning_summary. Nobody waits on this (it runs up to
+    MORNING_PREPARE_LEAD_MINUTES before delivery), so every AI call inside
+    gets a longer timeout and retries instead of falling back to a
+    template on the free model's first slow response."""
+    token = _ai_patience.set((MORNING_AI_TIMEOUT_SECONDS, MORNING_AI_ATTEMPTS))
+    try:
+        return await _prepare_morning_summary(bot, user_ids)
+    finally:
+        _ai_patience.reset(token)
+
+
+async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     """Build everything the morning summary sends, without sending anything:
     the text (schedule, weather, tasks, AI lunch pick, exam countdown), the
     lunch photo URL, each user's outfit (AI pick + try-on image) and the
@@ -8620,7 +8637,31 @@ If — and only if — you pick "unclear", also set "alternatives" to an array o
 Respond with strict JSON only, no other text: {"intent": "<intent>", "query": "<name or null>", "alternatives": ["<intent>", ...]}"""
 
 
-async def _call_openrouter(system_prompt: str, user_text: str, temperature: float = 0, timeout: float = 15) -> Optional[str]:
+# (timeout_seconds, attempts) for AI calls made where nobody is waiting on
+# the result, i.e. while the morning summary is prepared ahead of time
+# (see prepare_morning_summary). Unset everywhere else, so interactive
+# features keep their short single-attempt timeouts.
+_ai_patience: contextvars.ContextVar = contextvars.ContextVar("_ai_patience", default=None)
+AI_RETRY_PAUSE_SECONDS = 5
+
+
+async def _call_openrouter(system_prompt: str, user_text: str, temperature: float = 0, timeout: Optional[float] = None) -> Optional[str]:
+    """_call_openrouter_once, retried and with a longer timeout while
+    _ai_patience is set. An explicit timeout always wins."""
+    patience = _ai_patience.get()
+    timeout = timeout or (patience[0] if patience else 15)
+    attempts = patience[1] if patience else 1
+    for attempt in range(attempts):
+        result = await _call_openrouter_once(system_prompt, user_text, temperature, timeout)
+        if result is not None:
+            return result
+        if attempt + 1 < attempts:
+            logging.info(f"OpenRouter call: retrying ({attempt + 2}/{attempts})")
+            await asyncio.sleep(AI_RETRY_PAUSE_SECONDS)
+    return None
+
+
+async def _call_openrouter_once(system_prompt: str, user_text: str, temperature: float = 0, timeout: float = 15) -> Optional[str]:
     """POST one chat completion to OpenRouter's free tier and return the raw
     assistant text, or None on any failure (missing key, network error,
     timeout, non-2xx response). Callers must treat None as "couldn't
@@ -8663,6 +8704,22 @@ async def _call_openrouter(system_prompt: str, user_text: str, temperature: floa
 
 
 async def synthesize_speech(text: str) -> Optional[tuple]:
+    """_synthesize_speech_once, retried and with a longer timeout while
+    _ai_patience is set (see _call_openrouter)."""
+    patience = _ai_patience.get()
+    timeout = max(30, patience[0]) if patience else 30
+    attempts = patience[1] if patience else 1
+    for attempt in range(attempts):
+        result = await _synthesize_speech_once(text, timeout)
+        if result is not None:
+            return result
+        if attempt + 1 < attempts:
+            logging.info(f"TTS call: retrying ({attempt + 2}/{attempts})")
+            await asyncio.sleep(AI_RETRY_PAUSE_SECONDS)
+    return None
+
+
+async def _synthesize_speech_once(text: str, timeout: float = 30) -> Optional[tuple]:
     """Convert text to speech via OpenRouter's free-tier TTS endpoint
     (/api/v1/audio/speech — a separate API surface from chat/completions,
     so it isn't listed in /api/v1/models and doesn't go through
@@ -8686,7 +8743,7 @@ async def synthesize_speech(text: str) -> Optional[tuple]:
                 OPENROUTER_TTS_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
@@ -8700,7 +8757,7 @@ async def synthesize_speech(text: str) -> Optional[tuple]:
                 pcm_bytes = await resp.read()
                 return pcm_bytes, sample_rate
     except Exception as e:
-        logging.warning(f"TTS call failed: {e}")
+        logging.warning(f"TTS call failed: {type(e).__name__}: {e}")
         return None
 
 
