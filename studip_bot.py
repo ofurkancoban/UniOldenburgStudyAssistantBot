@@ -3665,6 +3665,7 @@ async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer("Sending to WhatsApp...")
 
     text = query.message.text or query.message.caption or "No text found"
+    text = text.replace(EXAM_DATES_FOOTER, "").rstrip()
     success, message = await _send_text_to_whatsapp(text)
     if success:
         await query.edit_message_reply_markup(reply_markup=None)  # Remove button after sending
@@ -11414,12 +11415,16 @@ def render_file_exam_events(events: list, header: str) -> list:
     return lines
 
 
+# Bot-only hint under the new exam dates; forward_to_whatsapp leaves it out.
+EXAM_DATES_FOOTER = "They're now in 📚 My Exam Dates, the weekly study plan and the exam reminders."
+
+
 async def notify_new_file_exam_events(bot, new_events: list) -> None:
     if not new_events:
         return
     lines = render_file_exam_events(new_events, "📄 <b>New exam dates</b> <i>(course files / StuMS)</i>")
-    lines.append("They're now in 📚 My Exam Dates, the weekly study plan and the exam reminders.")
-    await broadcast(bot, "\n".join(lines), disable_notification=False)
+    lines.append(EXAM_DATES_FOOTER)
+    await broadcast(bot, "\n".join(lines), disable_notification=False, reply_markup=WA_FORWARD_ASK_MARKUP)
 
 
 async def check_file_exam_reminders(bot, registered: list) -> None:
@@ -11456,7 +11461,7 @@ async def check_file_exam_reminders(bot, registered: list) -> None:
             f"📎 <i>{html.escape(e['source'])}</i>",
             "━━━━━━━━━━━━━━━━━",
         ])
-        await broadcast(bot, text, disable_notification=False)
+        await broadcast(bot, text, disable_notification=False, reply_markup=WA_FORWARD_ASK_MARKUP)
         # Mark every threshold already passed too, so a reminder that was
         # missed (bot down) isn't followed by a burst of older ones.
         reminded[key] = sorted(sent | set(due))
