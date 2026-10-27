@@ -559,16 +559,25 @@ def base_module_code(code: str) -> str:
     return MODULE_CODE_SUFFIX_RE.sub("", (code or "").lower())
 
 
+def is_passed_exam(exam: dict) -> bool:
+    """The study planner marks a module the student already completed as
+    "Passed"/"Bestanden". Its exam unit still carries a date (e.g. the
+    module's generic portfolio date), which isn't an exam for any course
+    the student takes now under another module."""
+    return (exam.get("status") or "").strip().lower() in ("passed", "bestanden")
+
+
 def filter_exams_by_module_codes(exams: list[dict], module_codes: set[str]) -> list[dict]:
     """Keep only exam entries whose base module code matches one of the given
     Stud.IP module codes. This is far more reliable than matching by title: Stud.IP
     course names and StuMS exam titles often differ completely (e.g. the Stud.IP
     course "Machine Learning with Scikit-Learn" is actually module 'inf536',
     listed in StuMS as "Computational Intelligence") while the module code itself
-    is shared between both systems.
+    is shared between both systems. Modules already passed are left out
+    (see is_passed_exam).
     """
     normalized = {c.lower() for c in module_codes}
-    return [e for e in exams if base_module_code(e.get("code", "")) in normalized]
+    return [e for e in exams if base_module_code(e.get("code", "")) in normalized and not is_passed_exam(e)]
 
 
 async def get_all_exam_dates(session) -> list[dict]:

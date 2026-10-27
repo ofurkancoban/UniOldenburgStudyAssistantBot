@@ -35,7 +35,7 @@ from telegram.constants import ChatAction
 from asyncio import CancelledError
 from studip_session import StudIPSession
 from fast_enroll import run_fast_enroll, load_pending, list_pending_jobs, save_pending_job, clear_pending_job, get_semester_options, get_open_courses, enroll_now, decline_course, get_course_type_map
-from exam_reminder import check_exam_reminders, check_exam_date_reminders, check_grade_reminders, get_open_exam_registrations, get_registered_exams, get_registered_exam_schedule, get_all_exam_dates, filter_exams_by_module_codes, base_module_code, submit_exam_action, get_grades, compute_transcript_summary, load_exam_cache, save_exam_cache
+from exam_reminder import check_exam_reminders, check_exam_date_reminders, check_grade_reminders, get_open_exam_registrations, get_registered_exams, get_registered_exam_schedule, get_all_exam_dates, filter_exams_by_module_codes, base_module_code, is_passed_exam, submit_exam_action, get_grades, compute_transcript_summary, load_exam_cache, save_exam_cache
 
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
 
@@ -11265,7 +11265,9 @@ async def refresh_stums_exam_sittings(session, all_exams: Optional[list] = None)
             continue
         seen = {}
         for e in all_exams:
-            if base_module_code(e.get("code", "")) not in course_codes or not e.get("exam_date"):
+            # A course listed under several modules (e.g. a core elective
+            # pool) must not take the date of one the student already passed.
+            if base_module_code(e.get("code", "")) not in course_codes or not e.get("exam_date") or is_passed_exam(e):
                 continue
             date_iso = str(e["exam_date"])[:10]
             times = re.findall(r"\b(\d{1,2}:\d{2})", e.get("exam_date_display") or "")
