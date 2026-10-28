@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 import html
 import re
 import tempfile
+import time
 import aiohttp
 import logging
 import os
@@ -84,6 +85,22 @@ HF_TOKEN = os.getenv("HF_TOKEN", "")
 FAL_KEY = os.getenv("FAL_KEY", "")
 FAL_GEMINI_TRYON_MODEL = os.getenv("FAL_GEMINI_TRYON_MODEL", "fal-ai/nano-banana-2/edit")
 FAL_TRYON_MODEL = os.getenv("FAL_TRYON_MODEL", "fal-ai/fashn/tryon/v1.6")
+# GWDG's academic AI service (SAIA, free with an academic account). One
+# quota of 2 requests/10 s, 400/day and 3000/month covers text, vision and
+# image calls together, so every GWDG call falls back to the previous
+# provider (OpenRouter, Cloudflare, the other try-on models) when it fails
+# or the quota runs out. Picked after a live comparison on the bot's own
+# prompts: Gemma 4 was right on every text task and answered in under a
+# second every time, and tagged item photos best per second (~1 s, 14/15
+# types right). DeepSeek V4 Flash made the best outfit picks (2-7 s) but
+# sometimes stalls for 15-30 s, so it only gets the outfit pick, which can
+# wait that long.
+GWDG_API_KEY = os.getenv("GWDG_API_KEY", "")
+GWDG_API_URL = os.getenv("GWDG_API_URL", "https://chat-ai.academiccloud.de/v1")
+GWDG_TEXT_MODEL = os.getenv("GWDG_TEXT_MODEL", "gemma-4-31b-it")
+GWDG_OUTFIT_MODEL = os.getenv("GWDG_OUTFIT_MODEL", "deepseek-v4-flash-0731")
+GWDG_VISION_MODEL = os.getenv("GWDG_VISION_MODEL", "gemma-4-31b-it")
+GWDG_IMAGE_EDIT_SERVICE = os.getenv("GWDG_IMAGE_EDIT_SERVICE", "image-edit-2511")
 # University of Oldenburg's coordinates, for the daily-plan weather snapshot
 # (see get_weather_snapshot) — configurable in case the bot is ever reused
 # for a different campus.
@@ -2145,12 +2162,12 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
 
     user_text = f"{weather_line}\n\nWardrobe:\n" + "\n".join(lines)
     raw = None
-    # Free models get rate-limited upstream now and then; the default model
-    # is the backup.
-    for model in dict.fromkeys((OUTFIT_OPENROUTER_MODEL, OPENROUTER_MODEL)):
+    # Free models get rate-limited upstream now and then; the default
+    # models are the backup.
+    for model, gwdg_model in ((OUTFIT_OPENROUTER_MODEL, GWDG_OUTFIT_MODEL), (OPENROUTER_MODEL, GWDG_TEXT_MODEL)):
         raw = await _call_openrouter(
             OUTFIT_RECOMMENDATION_SYSTEM_PROMPT, user_text,
-            temperature=0.9, timeout=OUTFIT_AI_TIMEOUT_SECONDS, reasoning=False, model=model,
+            temperature=0.9, timeout=OUTFIT_AI_TIMEOUT_SECONDS, reasoning=False, model=model, gwdg_model=gwdg_model,
         )
         if raw:
             break
@@ -8681,14 +8698,72 @@ _ai_patience: contextvars.ContextVar = contextvars.ContextVar("_ai_patience", de
 AI_RETRY_PAUSE_SECONDS = 5
 
 
-async def _call_openrouter(system_prompt: str, user_text: str, temperature: float = 0, timeout: Optional[float] = None, reasoning: bool = True, model: Optional[str] = None) -> Optional[str]:
-    """_call_openrouter_once, retried and with a longer timeout while
-    _ai_patience is set. An explicit timeout always wins."""
+# GWDG answers 429 when a quota window is used up. A burst (2 requests /
+# 10 s) is waited out once; a used-up hour/day/month makes _call_gwdg_chat
+# skip GWDG until it resets, so callers go straight to their fallback.
+GWDG_BURST_WAIT_SECONDS = 6
+GWDG_SHORT_TIMEOUT_SECONDS = 8
+_gwdg_blocked_until = 0.0
+
+
+async def _post_gwdg_chat(session, body: dict, timeout: float) -> tuple:
+    """(status, json body or None, headers) of one GWDG chat request."""
+    async with session.post(
+        f"{GWDG_API_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {GWDG_API_KEY}"},
+        json=body,
+        timeout=aiohttp.ClientTimeout(total=timeout),
+    ) as resp:
+        data = await resp.json(content_type=None) if resp.status == 200 else None
+        return resp.status, data, resp.headers
+
+
+async def _call_gwdg_chat(messages: list, model: str, temperature: float = 0, timeout: float = 15) -> Optional[str]:
+    """One chat completion on GWDG's OpenAI-compatible API. Returns the
+    assistant text, or None if unconfigured, rate limited or failed, so the
+    caller can fall back to another provider."""
+    global _gwdg_blocked_until
+    if not GWDG_API_KEY or time.monotonic() < _gwdg_blocked_until:
+        return None
+    body = {"model": model, "temperature": temperature, "messages": messages}
+    try:
+        async with aiohttp.ClientSession() as session:
+            status, data, headers = await _post_gwdg_chat(session, body, timeout)
+            if status == 429:
+                exhausted = next((w for w in ("month", "day", "hour") if headers.get(f"x-ratelimit-remaining-requests-{w}") == "0"), None)
+                if exhausted:
+                    wait = int(headers.get(f"x-ratelimit-reset-requests-{exhausted}", 3600))
+                    _gwdg_blocked_until = time.monotonic() + wait
+                    logging.warning(f"GWDG {exhausted} quota used up, using fallbacks for {wait}s")
+                    return None
+                await asyncio.sleep(GWDG_BURST_WAIT_SECONDS)
+                status, data, headers = await _post_gwdg_chat(session, body, timeout)
+            if status != 200:
+                logging.warning(f"GWDG call failed: HTTP {status}")
+                return None
+            text = data["choices"][0]["message"]["content"] or ""
+            return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip() or None
+    except Exception as e:
+        logging.warning(f"GWDG call failed: {type(e).__name__}: {e}")
+        return None
+
+
+async def _call_openrouter(system_prompt: str, user_text: str, temperature: float = 0, timeout: Optional[float] = None, reasoning: bool = True, model: Optional[str] = None, gwdg_model: Optional[str] = None) -> Optional[str]:
+    """One text completion: GWDG (GWDG_TEXT_MODEL) first, OpenRouter if that
+    fails. Retried and with a longer timeout while _ai_patience is set. An
+    explicit timeout always wins. `gwdg_model` overrides GWDG_TEXT_MODEL;
+    `reasoning` and `model` only apply to the OpenRouter call."""
     patience = _ai_patience.get()
     timeout = timeout or (patience[0] if patience else 15)
     attempts = patience[1] if patience else 1
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}]
+    # GWDG usually answers in 1-3 s but sometimes stalls for 15 s+; on the
+    # short interactive calls, give up on it early and let OpenRouter answer.
+    gwdg_timeout = timeout if timeout > 15 else min(timeout, GWDG_SHORT_TIMEOUT_SECONDS)
     for attempt in range(attempts):
-        result = await _call_openrouter_once(system_prompt, user_text, temperature, timeout, reasoning, model)
+        result = await _call_gwdg_chat(messages, gwdg_model or GWDG_TEXT_MODEL, temperature, gwdg_timeout)
+        if result is None:
+            result = await _call_openrouter_once(system_prompt, user_text, temperature, timeout, reasoning, model)
         if result is not None:
             return result
         if attempt + 1 < attempts:
@@ -8877,16 +8952,25 @@ TAG_WARDROBE_ITEM_PROMPT = """You're looking at a photo of a single clothing ite
 
 
 async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
-    """Auto-tag a newly uploaded clothing-item photo via Cloudflare Workers
-    AI's free-tier vision model (text output, not image-generating, so it's
-    cheap against the account's daily Neuron allowance). Returns
-    {"type", "color", "warmth", "label"} or None on any failure (missing
-    config, non-2xx, unparsable JSON) — caller must not catalog a garbage
-    entry on None, and should let the user retry."""
-    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
-        return None
+    """Auto-tag a newly uploaded clothing-item photo via GWDG's vision
+    model (GWDG_VISION_MODEL), falling back to Cloudflare Workers AI's
+    free-tier one. Returns {"type", "color", "warmth", "label"} or None on
+    any failure (missing config, non-2xx, unparsable JSON); the caller must
+    not catalog a garbage entry on None, and should let the user retry."""
     import base64
     b64 = base64.b64encode(image_bytes).decode("ascii")
+    raw = await _call_gwdg_chat(
+        [{"role": "user", "content": [
+            {"type": "text", "text": TAG_WARDROBE_ITEM_PROMPT},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        ]}],
+        GWDG_VISION_MODEL, timeout=30,
+    )
+    tags = _extract_json_object(raw) if raw else None
+    if tags:
+        return tags
+    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
+        return None
     url = CLOUDFLARE_AI_URL.format(account_id=CLOUDFLARE_ACCOUNT_ID, model=CLOUDFLARE_VISION_MODEL)
     try:
         async with aiohttp.ClientSession() as session:
@@ -8909,9 +8993,82 @@ async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
                     return None
                 data = await resp.json()
                 raw = data.get("result", {}).get("response")
-                return _extract_json_object(raw)
+                # Some Workers AI models return the JSON already parsed.
+                return raw if isinstance(raw, dict) else _extract_json_object(raw)
     except Exception as e:
         logging.warning(f"Cloudflare tagging call failed: {e}")
+        return None
+
+
+def _tryon_prompt(garments: list) -> str:
+    """Instruction for the multi-image try-on models (Nano Banana, GWDG's
+    Qwen edit): image 1 is the person, then one image per garment."""
+    garment_lines = "\n".join(f"- Image {i + 2}: {item.get('label', 'clothing item')} ({item.get('type', 'item')})" for i, (item, _) in enumerate(garments))
+    return (
+        "Virtual try-on. Image 1 is a photo of a person. Dress this exact person in ALL of the "
+        "clothing items shown in the other images:\n"
+        f"{garment_lines}\n"
+        "Reproduce each garment faithfully (color, cut, fit, length, logos, prints). Layer outerwear "
+        "over tops, put the shoes on the feet and any cap or beanie on the head. Keep each pair of "
+        "trousers at its real length and leg width as shown in its image: full-length trousers and "
+        "jeans fall all the way to the shoes with a natural break, and straight, relaxed or wide legs "
+        "stay straight, relaxed or wide. Never crop, roll up or taper a hem unless the garment itself "
+        "is cropped. The person always wears plain white crew socks with the shoes; they only show "
+        "where the trousers naturally leave the ankle bare, so never shorten trousers to reveal "
+        "them. Keep the person's "
+        "face, identity, hair, skin tone, body shape and pose exactly as in Image 1, and keep the "
+        "original background and lighting. Show the full body from head to feet. Photorealistic "
+        "photo, no text."
+    )
+
+
+GWDG_GARMENT_DESCRIBE_PROMPT = (
+    "For each product photo below write ONE line: the item name I give, then a precise visual description "
+    "for an image generator: exact colors, material, fit and length, closures, hood, pockets, and every logo "
+    "or print with its position, size and colors. No people, no brand history. Lines only."
+)
+
+
+async def generate_outfit_tryon_gwdg(reference_bytes: bytes, garments: list) -> Optional[bytes]:
+    """Free fallback for generate_outfit_tryon_gemini on GWDG (two calls of
+    its shared quota). Its image edit model (Qwen-Image-Edit-2511) swaps in
+    a different person when it gets the garment photos too, so the vision
+    model first describes the garments in text and the edit call only sees
+    the reference photo plus that text: the person stays, the garments come
+    out close but less exact than Nano Banana. Returns the PNG bytes, or
+    None if unconfigured or a call failed."""
+    if not GWDG_API_KEY or not garments:
+        return None
+    import base64
+    content = [{"type": "text", "text": GWDG_GARMENT_DESCRIBE_PROMPT}]
+    for item, data in garments:
+        content.append({"type": "text", "text": f"Item: {item.get('label', 'clothing item')} ({item.get('type', 'item')})"})
+        content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")}})
+    description = await _call_gwdg_chat([{"role": "user", "content": content}], GWDG_VISION_MODEL, temperature=0.2, timeout=60)
+    if not description:
+        return None
+    prompt = (
+        "Dress the man in Picture 1 in this outfit, each item reproduced exactly as described:\n"
+        f"{description}\n"
+        "Outerwear worn open over the top, shoes on the feet, any cap or beanie on the head. Keep him exactly "
+        "the same person: identical face, beard, hair, skin tone, body shape, pose, framing, background and "
+        "lighting. Trousers are full length, reaching the shoes with a natural break, never cropped or "
+        "tapered. Plain white crew socks. Photorealistic full-body photo from head to feet, no text, no collage."
+    )
+    form = aiohttp.FormData()
+    form.add_field("prompt", prompt)
+    form.add_field("image", reference_bytes, filename="picture1.jpg", content_type="image/jpeg")
+    headers = {"Authorization": f"Bearer {GWDG_API_KEY}", "inference-service": GWDG_IMAGE_EDIT_SERVICE}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"{GWDG_API_URL}/images/edits", headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=180)) as resp:
+                body = await resp.read()
+                if resp.status == 200 and resp.content_type.startswith("image/"):
+                    return body
+                logging.warning(f"GWDG try-on failed: HTTP {resp.status} {body[:200]!r}")
+                return None
+    except Exception as e:
+        logging.warning(f"GWDG try-on failed: {e}")
         return None
 
 
@@ -8940,26 +9097,9 @@ async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -
                 f.write(data)
             urls.append(await fal_client.upload_file_async(path))
 
-        garment_lines = "\n".join(f"- Image {i + 2}: {item.get('label', 'clothing item')} ({item.get('type', 'item')})" for i, (item, _) in enumerate(garments))
-        prompt = (
-            "Virtual try-on. Image 1 is a photo of a person. Dress this exact person in ALL of the "
-            "clothing items shown in the other images:\n"
-            f"{garment_lines}\n"
-            "Reproduce each garment faithfully (color, cut, fit, length, logos, prints). Layer outerwear "
-            "over tops, put the shoes on the feet and any cap or beanie on the head. Keep each pair of "
-            "trousers at its real length and leg width as shown in its image: full-length trousers and "
-            "jeans fall all the way to the shoes with a natural break, and straight, relaxed or wide legs "
-            "stay straight, relaxed or wide. Never crop, roll up or taper a hem unless the garment itself "
-            "is cropped. The person always wears plain white crew socks with the shoes; they only show "
-            "where the trousers naturally leave the ankle bare, so never shorten trousers to reveal "
-            "them. Keep the person's "
-            "face, identity, hair, skin tone, body shape and pose exactly as in Image 1, and keep the "
-            "original background and lighting. Show the full body from head to feet. Photorealistic "
-            "photo, no text."
-        )
         result = await fal_client.subscribe_async(
             FAL_GEMINI_TRYON_MODEL,
-            arguments={"prompt": prompt, "image_urls": urls, "num_images": 1, "output_format": "png"},
+            arguments={"prompt": _tryon_prompt(garments), "image_urls": urls, "num_images": 1, "output_format": "png"},
         )
         image_url = result["images"][0]["url"]
         async with aiohttp.ClientSession() as session:
@@ -9241,7 +9381,8 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
 async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items: list[dict]) -> Optional[bytes]:
     """Dress the reference photo in the chosen outfit. First tries the
     Gemini model with every visible item in one call (see
-    generate_outfit_tryon_gemini). If that fails, picks one
+    generate_outfit_tryon_gemini), then GWDG's free describe-and-edit
+    (see generate_outfit_tryon_gwdg). If both fail, picks one
     representative upper-body garment (the outermost layer if the outfit
     has layering, e.g. a coat over a t-shirt, since none of these models
     stack multiple garments visually in one region) and one bottom,
@@ -9272,9 +9413,10 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
         data = await _fetch_wardrobe_item_bytes(bot, it)
         if data:
             garments.append((it, data))
-    image_bytes = await generate_outfit_tryon_gemini(reference_bytes, garments)
-    if image_bytes:
-        return image_bytes
+    for provider in (generate_outfit_tryon_gemini, generate_outfit_tryon_gwdg):
+        image_bytes = await provider(reference_bytes, garments)
+        if image_bytes:
+            return image_bytes
 
     upper_item = next((it for it in reversed(chosen_items) if it.get("type") == "outerwear"), None) \
         or next((it for it in chosen_items if it.get("type") == "top"), None)
