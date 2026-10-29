@@ -663,11 +663,22 @@ def add_wardrobe_item(user_id, tags: dict, file_id: Optional[str] = None, image_
         "color": tags.get("color", ""),
         "warmth": tags.get("warmth", "medium"),
         "label": tags.get("label", "clothing item"),
+        "description": tags.get("description"),
         "added_at": datetime.now().isoformat(),
     }
     entry["items"].append(item)
     save_wardrobe(wardrobe)
     return item
+
+
+def save_wardrobe_item_descriptions(descriptions: dict) -> None:
+    """Store {item_id: description} on the matching items, any user."""
+    wardrobe = load_wardrobe()
+    for entry in wardrobe.values():
+        for it in entry.get("items", []):
+            if it["id"] in descriptions:
+                it["description"] = descriptions[it["id"]]
+    save_wardrobe(wardrobe)
 
 
 def remove_wardrobe_item(user_id, item_id: str) -> None:
@@ -897,6 +908,9 @@ _console_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %
 root_logger = logging.getLogger()
 root_logger.addHandler(_file_handler)
 root_logger.addHandler(_console_handler)
+# httpx logs every request URL at INFO, and Telegram's URLs carry the bot
+# token (api.telegram.org/bot<token>/...), so it would end up in the logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ── single-instance lock ───────────────────────────────────────────────────────
 LOCK_FILE = ".bot_instance.lock"
@@ -1109,6 +1123,19 @@ async def unified_watcher_controller(app):
                         logging.error(f"❌ Exam file scan failed: {e}")
                     cache = load_general_cache()
                     cache["last_exam_file_scan"] = now.date().isoformat()
+                    save_general_cache(cache)
+
+            # Course material search index: once a day, only new/changed files.
+            if GWDG_API_KEY and now.hour >= COURSE_INDEX_HOUR:
+                cache = load_general_cache()
+                if cache.get("last_course_index") != now.date().isoformat():
+                    try:
+                        logging.info("🔎 Indexing course files for questions...")
+                        await index_course_files(session)
+                    except Exception as e:
+                        logging.error(f"❌ Course file indexing failed: {e}")
+                    cache = load_general_cache()
+                    cache["last_course_index"] = now.date().isoformat()
                     save_general_cache(cache)
 
             # Regular calendar reminders
@@ -1984,7 +2011,7 @@ async def build_food_recommendation() -> Optional[dict]:
 OUTFIT_RECOMMENDATION_SYSTEM_PROMPT = """You are picking a coherent, weather-appropriate outfit for a student from their own wardrobe, using only the candidate items listed (each with an id, type, subtype, color, and warmth level). Follow this layering logic based on today's forecast high temperature and whether rain is expected:
 - Below 5°C ("very cold"): full layering — a top (prefer subtype=sweater, else shirt/t-shirt) + a light_jacket AND a coat together if both are available (worn as mid layer + outer shell) + pants.
 - 5-12°C ("cold"): a top + exactly ONE outerwear item (a coat if available, else a light_jacket) + pants.
-- 12-18°C ("mild"): a top + pants; add a light_jacket if rain is expected OR if the morning low is below 8°C (the high alone can be misleading on a day that starts cold).
+- 12-18°C ("mild"): a top + pants; add a light_jacket if rain is expected OR if the morning low is below 10°C (the high alone can be misleading on a day that starts cold).
 - 18-24°C ("warm"): a top (prefer subtype=t-shirt) + pants or shorts, preferring shorts (subtype=shorts) when available; add a light_jacket only if rain is expected.
 - 24°C and above ("hot"): a top (prefer subtype=t-shirt) + shorts, preferring shorts over pants even if rain is expected — just add a light_jacket too if one's available on a rainy hot day.
 Never pick two tops or two bottoms. Also always include exactly one "shoes" item and one headwear "accessory" item (a cap/beanie/hat, not socks or other accessories) if any such items are present in the candidate list — these can't be shown in the outfit image, but still name them in your reasoning. Some items are tagged "[worn in the last couple days, prefer an alternative if one fits]" — pick a different item of that same type when a suitable alternative exists in the list, but don't force an unsuitable combination just to avoid a repeat.
@@ -1995,6 +2022,39 @@ Among the weather-appropriate options, pick the combination whose colors work be
 - Don't clash warm and cool brights (e.g. bordeaux with bright blue), and avoid near-matches that look like a mistake (e.g. a black top under a slightly different black jacket).
 - Repeat a color: shoes or headwear that echo a color from the top/outerwear tie the outfit together.
 Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie and the coat since it'll be cold and dry, plus the beanie and trainers.'>", "color_tip": "<one short sentence on the colors: why they work together (e.g. 'The olive jacket and olive trainers frame the neutral black tee and light denim.'), or a concrete swap from the list that would match better if the weather forced a weaker combination>"}. Use only ids from the given list."""
+
+
+# A morning low under this needs a jacket even on a mild (12-18°C) day:
+# a foggy 8.4°C start in just a t-shirt was the trigger for raising it
+# from 8.
+COLD_MORNING_CELSIUS = 10
+
+
+def _outerwear_required(weather: Optional[dict]) -> bool:
+    """Whether today's weather calls for an outer layer, per the band
+    rules in OUTFIT_RECOMMENDATION_SYSTEM_PROMPT."""
+    if not weather:
+        return False
+    band = _temperature_band(weather.get("temp_max"))
+    temp_min = weather.get("temp_min")
+    is_wet = bool(weather.get("is_wet"))
+    if band in ("very_cold", "cold"):
+        return True
+    if band == "mild":
+        return is_wet or (temp_min is not None and temp_min < COLD_MORNING_CELSIUS)
+    return band == "warm" and is_wet
+
+
+def _add_required_outerwear(items: list[dict], chosen: list[dict], weather: Optional[dict], recent_ids: set) -> list[dict]:
+    """Models sometimes skip the jacket on a mild day with a cold morning
+    despite the prompt; add one when the weather needs it and none was
+    picked: a coat when it's cold, else a light jacket."""
+    if not _outerwear_required(weather) or any(it.get("type") == "outerwear" for it in chosen):
+        return chosen
+    pool = _prefer_unworn([it for it in items if it.get("type") == "outerwear"], recent_ids)
+    preferred = "coat" if _temperature_band(weather.get("temp_max")) in ("very_cold", "cold") else "light_jacket"
+    outer = next((it for it in pool if it.get("subtype") == preferred), None) or (pool[0] if pool else None)
+    return chosen + [outer] if outer else chosen
 
 
 def _temperature_band(temp_max: Optional[float]) -> str:
@@ -2036,7 +2096,7 @@ def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict], recent_id
     band = _temperature_band(weather.get("temp_max") if weather else None)
     is_wet = bool(weather.get("is_wet")) if weather else False
     temp_min = weather.get("temp_min") if weather else None
-    cold_morning = temp_min is not None and temp_min < 8
+    cold_morning = temp_min is not None and temp_min < COLD_MORNING_CELSIUS
     recent_ids = recent_ids or set()
 
     tops = _prefer_unworn([it for it in items if it.get("type") == "top"], recent_ids)
@@ -2157,6 +2217,8 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
     if weather:
         is_wet = weather.get("is_wet")
         weather_line = f"Weather: {weather.get('description', 'unknown')}, {weather.get('temp_min')}-{weather.get('temp_max')}°C ({band}), {'rain expected' if is_wet else 'dry'}."
+        if _outerwear_required(weather):
+            weather_line += " An outerwear item is required today."
     else:
         weather_line = "Weather: no data available today — pick something reasonably versatile (mild band)."
 
@@ -2182,6 +2244,7 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
     if not chosen_items:
         return None
     pre_ids = {it["id"] for it in chosen_items}
+    chosen_items = _add_required_outerwear(items, chosen_items, weather, recent_ids)
     chosen_items = _add_mandatory_shoes_and_headwear(items, chosen_items)
     forced_extras = [it["label"] for it in chosen_items if it["id"] not in pre_ids]
 
@@ -2189,7 +2252,8 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
     description = reasoning or " + ".join(it["label"] for it in chosen_items)
     if reasoning and forced_extras:
         # The LLM/heuristic reasoning may not mention the mandatory
-        # shoes/headwear add-ons (see _add_mandatory_shoes_and_headwear) -
+        # outerwear/shoes/headwear add-ons (see _add_required_outerwear,
+        # _add_mandatory_shoes_and_headwear) -
         # make sure they're always named in what the user sees.
         description += " + " + " + ".join(forced_extras)
     # Only the LLM pick reasons about colors; the heuristic fallback has no tip.
@@ -8545,13 +8609,57 @@ async def _recognize_in_language(recognizer, audio, language: str):
         return None, e
 
 
+GWDG_WHISPER_MODEL = os.getenv("GWDG_WHISPER_MODEL", "whisper-large-v3")
+
+
+async def transcribe_with_whisper(ogg_path: str) -> Optional[str]:
+    """Transcribe a voice note with GWDG's Whisper (takes the OGG as is,
+    detects the language itself). In a side-by-side test it kept English
+    course names inside Turkish sentences ("Advanced Microeconomics
+    dersinin..."), which Google's one-language-per-call endpoint dropped,
+    and heard "Mensa" where Google heard "Manisa". The course names go in
+    as a vocabulary hint. None if GWDG is unset or the call failed."""
+    if not GWDG_API_KEY or time.monotonic() < _gwdg_blocked_until:
+        return None
+    hint = ", ".join(["Stud.IP", "StuMS", "Mensa"] + sorted(set(courses_map.values())))[:800]
+    form = aiohttp.FormData()
+    form.add_field("model", GWDG_WHISPER_MODEL)
+    form.add_field("response_format", "json")
+    form.add_field("prompt", hint)
+    with open(ogg_path, "rb") as f:
+        form.add_field("file", f.read(), filename="voice.ogg", content_type="audio/ogg")
+    try:
+        await _gwdg_throttle()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{GWDG_API_URL}/audio/transcriptions",
+                headers={"Authorization": f"Bearer {GWDG_API_KEY}"},
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                _record_gwdg_quota(resp.headers)
+                if resp.status != 200:
+                    logging.warning(f"Whisper transcription failed: HTTP {resp.status}")
+                    return None
+                data = await resp.json(content_type=None)
+        return (data.get("text") or "").strip() or None
+    except Exception as e:
+        logging.warning(f"Whisper transcription failed: {type(e).__name__}: {e}")
+        return None
+
+
 async def transcribe_voice_message(ogg_path: str) -> str:
-    """Convert a Telegram voice note (OGG/Opus) to text using SpeechRecognition's
-    free Google Web Speech endpoint, trying Turkish and English concurrently.
+    """Convert a Telegram voice note (OGG/Opus) to text: GWDG's Whisper
+    first (see transcribe_with_whisper), else SpeechRecognition's free
+    Google Web Speech endpoint, trying Turkish and English concurrently.
     Requires ffmpeg on PATH for the OGG->WAV conversion (via pydub). Raises
     RuntimeError with a user-facing message on any failure (missing ffmpeg,
     unclear audio in both languages, network issue, ...).
     """
+    text = await transcribe_with_whisper(ogg_path)
+    if text:
+        return text
+
     import speech_recognition as sr
     from pydub import AudioSegment
 
@@ -8704,16 +8812,50 @@ AI_RETRY_PAUSE_SECONDS = 5
 GWDG_BURST_WAIT_SECONDS = 6
 GWDG_SHORT_TIMEOUT_SECONDS = 8
 _gwdg_blocked_until = 0.0
+# Remaining/limit per quota window as of the last GWDG response, e.g.
+# {"day": (312, 400), "month": (2650, 3000)}; shown by /healthcheck.
+_gwdg_quota: dict = {}
+
+
+# GWDG allows 2 requests per 10 s per key; spacing the bot's own calls
+# keeps a burst (a voice note: transcription, intent, search, answer) from
+# being refused.
+GWDG_BURST_REQUESTS = 2
+GWDG_BURST_WINDOW_SECONDS = 10.5
+_gwdg_recent_calls: list = []
+_gwdg_throttle_lock = asyncio.Lock()
+
+
+async def _gwdg_throttle() -> None:
+    """Wait until another GWDG request fits into the burst window."""
+    async with _gwdg_throttle_lock:
+        now = time.monotonic()
+        del _gwdg_recent_calls[:-GWDG_BURST_REQUESTS]
+        if len(_gwdg_recent_calls) == GWDG_BURST_REQUESTS:
+            wait = _gwdg_recent_calls[0] + GWDG_BURST_WINDOW_SECONDS - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+        _gwdg_recent_calls.append(time.monotonic())
+
+
+def _record_gwdg_quota(headers) -> None:
+    for window in ("day", "month"):
+        remaining = headers.get(f"x-ratelimit-remaining-requests-{window}")
+        limit = headers.get(f"x-ratelimit-limit-requests-{window}")
+        if remaining is not None and limit is not None:
+            _gwdg_quota[window] = (int(remaining), int(limit))
 
 
 async def _post_gwdg_chat(session, body: dict, timeout: float) -> tuple:
     """(status, json body or None, headers) of one GWDG chat request."""
+    await _gwdg_throttle()
     async with session.post(
         f"{GWDG_API_URL}/chat/completions",
         headers={"Authorization": f"Bearer {GWDG_API_KEY}"},
         json=body,
         timeout=aiohttp.ClientTimeout(total=timeout),
     ) as resp:
+        _record_gwdg_quota(resp.headers)
         data = await resp.json(content_type=None) if resp.status == 200 else None
         return resp.status, data, resp.headers
 
@@ -9023,30 +9165,47 @@ def _tryon_prompt(garments: list) -> str:
 
 
 GWDG_GARMENT_DESCRIBE_PROMPT = (
-    "For each product photo below write ONE line: the item name I give, then a precise visual description "
-    "for an image generator: exact colors, material, fit and length, closures, hood, pockets, and every logo "
-    "or print with its position, size and colors. No people, no brand history. Lines only."
+    "Describe the clothing item in this product photo in ONE line for an image generator: exact colors, "
+    "material, fit and length, closures, hood, pockets, and every logo or print with its position, size and "
+    "colors. No people, no brand history, no item name, just the description."
 )
 
 
+async def describe_wardrobe_item(item: dict, image_bytes: bytes) -> Optional[str]:
+    """One-line visual description of a garment photo by GWDG's vision
+    model, stored on the wardrobe item (see add_wardrobe_item) so the GWDG
+    try-on can dress the reference photo from text without describing the
+    garments again each time. None if GWDG is unset or the call failed."""
+    import base64
+    content = [
+        {"type": "text", "text": f"{GWDG_GARMENT_DESCRIBE_PROMPT}\nItem: {item.get('label', 'clothing item')} ({item.get('type', 'item')})"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")}},
+    ]
+    return await _call_gwdg_chat([{"role": "user", "content": content}], GWDG_VISION_MODEL, temperature=0.2, timeout=30)
+
+
 async def generate_outfit_tryon_gwdg(reference_bytes: bytes, garments: list) -> Optional[bytes]:
-    """Free fallback for generate_outfit_tryon_gemini on GWDG (two calls of
-    its shared quota). Its image edit model (Qwen-Image-Edit-2511) swaps in
-    a different person when it gets the garment photos too, so the vision
-    model first describes the garments in text and the edit call only sees
-    the reference photo plus that text: the person stays, the garments come
-    out close but less exact than Nano Banana. Returns the PNG bytes, or
-    None if unconfigured or a call failed."""
+    """Free fallback for generate_outfit_tryon_gemini on GWDG. Its image
+    edit model (Qwen-Image-Edit-2511) swaps in a different person when it
+    gets the garment photos too, so it only sees the reference photo plus
+    each garment's text description (see describe_wardrobe_item): the
+    person stays, the garments come out close but less exact than Nano
+    Banana. Items without a stored description are described now and the
+    description saved. Returns the PNG bytes, or None if unconfigured or a
+    call failed."""
     if not GWDG_API_KEY or not garments:
         return None
-    import base64
-    content = [{"type": "text", "text": GWDG_GARMENT_DESCRIBE_PROMPT}]
+    lines = []
     for item, data in garments:
-        content.append({"type": "text", "text": f"Item: {item.get('label', 'clothing item')} ({item.get('type', 'item')})"})
-        content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")}})
-    description = await _call_gwdg_chat([{"role": "user", "content": content}], GWDG_VISION_MODEL, temperature=0.2, timeout=60)
-    if not description:
-        return None
+        text = item.get("description")
+        if not text:
+            text = await describe_wardrobe_item(item, data)
+            if not text:
+                return None
+            item["description"] = text
+            save_wardrobe_item_descriptions({item["id"]: text})
+        lines.append(f"- {item.get('label', 'clothing item')} ({item.get('type', 'item')}): {text}")
+    description = "\n".join(lines)
     prompt = (
         "Dress the man in Picture 1 in this outfit, each item reproduced exactly as described:\n"
         f"{description}\n"
@@ -9060,8 +9219,10 @@ async def generate_outfit_tryon_gwdg(reference_bytes: bytes, garments: list) -> 
     form.add_field("image", reference_bytes, filename="picture1.jpg", content_type="image/jpeg")
     headers = {"Authorization": f"Bearer {GWDG_API_KEY}", "inference-service": GWDG_IMAGE_EDIT_SERVICE}
     try:
+        await _gwdg_throttle()
         async with aiohttp.ClientSession() as session:
             async with session.post(f"{GWDG_API_URL}/images/edits", headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=180)) as resp:
+                _record_gwdg_quota(resp.headers)
                 body = await resp.read()
                 if resp.status == 200 and resp.content_type.startswith("image/"):
                     return body
@@ -9725,6 +9886,63 @@ async def build_ai_weekly_plan_narration(events: list, week_start, week_end, nam
 STUDY_PLAN_SUPPORTED_EXTENSIONS = (".pdf", ".pptx", ".html")
 
 
+# A scanned or handwritten PDF gives pypdf next to nothing (55 characters
+# from 13 pages of handwritten exercise notes, where Docling's OCR read
+# ~7,000); typed slides give it 400+ per page.
+DOCLING_MIN_CHARS_PER_PAGE = 100
+
+
+async def convert_with_docling(filename: str, content: bytes) -> Optional[str]:
+    """Markdown text of a document via GWDG's Docling service (layout
+    analysis + OCR), or None if GWDG is unset, rate limited or failed."""
+    if not GWDG_API_KEY or time.monotonic() < _gwdg_blocked_until:
+        return None
+    form = aiohttp.FormData()
+    form.add_field("files", content, filename=filename)
+    try:
+        await _gwdg_throttle()
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{GWDG_API_URL}/documents/convert/file",
+                headers={"Authorization": f"Bearer {GWDG_API_KEY}", "accept": "application/json"},
+                data=form,
+                timeout=aiohttp.ClientTimeout(total=300),
+            ) as resp:
+                _record_gwdg_quota(resp.headers)
+                if resp.status != 200:
+                    logging.warning(f"Docling conversion failed for {filename}: HTTP {resp.status}")
+                    return None
+                data = await resp.json(content_type=None)
+        return ((data.get("document") or {}).get("md_content") or "").strip() or None
+    except Exception as e:
+        logging.warning(f"Docling conversion failed for {filename}: {type(e).__name__}: {e}")
+        return None
+
+
+async def extract_text_from_file_async(filename: str, content: bytes) -> Optional[str]:
+    """extract_text_from_file, with GWDG Docling as the fallback for PDFs
+    and PPTX files the local parsers get (almost) no text from, typically
+    scans and handwritten notes. Typed files never use the quota."""
+    text = extract_text_from_file(filename, content)
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in (".pdf", ".pptx"):
+        return text
+    pages = 1
+    if ext == ".pdf":
+        try:
+            import pypdf
+            pages = max(1, len(pypdf.PdfReader(io.BytesIO(content)).pages))
+        except Exception:
+            pass
+    if text and len(text.strip()) >= DOCLING_MIN_CHARS_PER_PAGE * pages:
+        return text
+    converted = await convert_with_docling(filename, content)
+    if converted and len(converted) > len((text or "").strip()):
+        logging.info(f"Docling read {filename}: {len((text or '').strip())} -> {len(converted)} characters")
+        return converted
+    return text
+
+
 def extract_text_from_file(filename: str, content: bytes) -> Optional[str]:
     """Extract plain text from a downloaded lecture file, for topic
     summarization (HTML covers reveal.js/Quarto slide decks). Any extension
@@ -9819,6 +10037,213 @@ async def _list_course_files(cid, skip_folder_re=None) -> list:
     return out
 
 
+# ── Course material search (questions answered from the course files) ──────
+# Every enrolled course's PDF/PPTX/HTML files are split into passages and
+# embedded with GWDG's e5-mistral-7b-instruct, once a day and only for new
+# or changed files; a spoken question then gets the closest passages added
+# to its context (see search_course_material, _route_voice_intent).
+COURSE_INDEX_PATH = "course_index.json"
+GWDG_EMBEDDING_MODEL = os.getenv("GWDG_EMBEDDING_MODEL", "e5-mistral-7b-instruct")
+COURSE_INDEX_HOUR = 8  # daily, on the first watcher cycle from this hour on
+COURSE_INDEX_CHUNK_CHARS = 1200
+COURSE_INDEX_OVERLAP_CHARS = 150
+COURSE_INDEX_MAX_CHUNKS_PER_FILE = 80
+COURSE_INDEX_BATCH = 16
+# Embedding requests per daily run, so a first full index can't eat the
+# day's shared GWDG quota; whatever is left gets indexed the next day.
+COURSE_INDEX_MAX_CALLS = 60
+COURSE_SEARCH_TOP_K = 5
+# Passages that answered a test question scored 0.70-0.84, unrelated ones
+# (course passages for a weather question) about 0.55.
+COURSE_SEARCH_MIN_SCORE = 0.65
+# e5 expects an instruction on the query side only.
+COURSE_SEARCH_INSTRUCTION = "Instruct: Given a student's question, retrieve passages from the course material that answer it\nQuery: "
+
+
+def load_course_index() -> dict:
+    """{"files": {"<cid>|<rel_path>": {"course", "file", "size",
+    "modified_ts", "chunks": [{"text", "vec"}]}}}, vec being the
+    normalized embedding as base64 float16."""
+    if os.path.exists(COURSE_INDEX_PATH):
+        try:
+            with open(COURSE_INDEX_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load course index: {e}")
+    return {"files": {}}
+
+
+def save_course_index(data: dict) -> None:
+    try:
+        tmp = COURSE_INDEX_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, COURSE_INDEX_PATH)
+    except Exception as e:
+        logging.error(f"Failed to save course index: {e}")
+
+
+def _pack_vector(vec: list) -> str:
+    import base64
+    import struct
+    norm = sum(x * x for x in vec) ** 0.5 or 1.0
+    return base64.b64encode(struct.pack(f"<{len(vec)}e", *(x / norm for x in vec))).decode("ascii")
+
+
+def _unpack_vector(packed: str) -> tuple:
+    import base64
+    import struct
+    raw = base64.b64decode(packed)
+    return struct.unpack(f"<{len(raw) // 2}e", raw)
+
+
+def _chunk_text(text: str) -> list:
+    """~COURSE_INDEX_CHUNK_CHARS passages, cut at line breaks where
+    possible, overlapping a little so a sentence split across two is
+    still found whole in one of them."""
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    chunks, start = [], 0
+    while start < len(text) and len(chunks) < COURSE_INDEX_MAX_CHUNKS_PER_FILE:
+        end = min(len(text), start + COURSE_INDEX_CHUNK_CHARS)
+        if end < len(text):
+            cut = text.rfind("\n", start + COURSE_INDEX_CHUNK_CHARS // 2, end)
+            end = cut if cut > 0 else end
+        chunk = text[start:end].strip()
+        if len(chunk) > 40:
+            chunks.append(chunk)
+        if end >= len(text):
+            break
+        start = max(end - COURSE_INDEX_OVERLAP_CHARS, start + 1)
+    return chunks
+
+
+async def embed_texts(texts: list) -> Optional[list]:
+    """Embedding vectors for texts via GWDG (one request), or None."""
+    if not GWDG_API_KEY or not texts or time.monotonic() < _gwdg_blocked_until:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            for attempt in range(2):
+                await _gwdg_throttle()
+                async with session.post(
+                    f"{GWDG_API_URL}/embeddings",
+                    headers={"Authorization": f"Bearer {GWDG_API_KEY}"},
+                    json={"model": GWDG_EMBEDDING_MODEL, "input": texts},
+                    timeout=aiohttp.ClientTimeout(total=120),
+                ) as resp:
+                    _record_gwdg_quota(resp.headers)
+                    status = resp.status
+                    data = await resp.json(content_type=None) if status == 200 else None
+                if status != 429 or attempt:
+                    break
+                await asyncio.sleep(GWDG_BURST_WAIT_SECONDS)
+        if status != 200:
+            logging.warning(f"GWDG embeddings failed: HTTP {status}")
+            return None
+        return [d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"])]
+    except Exception as e:
+        logging.warning(f"GWDG embeddings failed: {type(e).__name__}: {e}")
+        return None
+
+
+async def index_course_files(session) -> dict:
+    """Bring course_index.json up to date with every enrolled course's
+    files: new or changed ones are downloaded, read (Docling for scans),
+    chunked and embedded; files gone from Stud.IP are dropped. Stops after
+    COURSE_INDEX_MAX_CALLS embedding requests and continues next run.
+    Returns {"indexed": n_files, "chunks": n_chunks, "removed": n}."""
+    stats = {"indexed": 0, "chunks": 0, "removed": 0}
+    if not GWDG_API_KEY:
+        return stats
+    await _ensure_watched_courses_map(session)
+    index = load_course_index()
+    files_index = index.setdefault("files", {})
+    seen, calls = set(), 0
+    for cid, course_name in list(courses_map.items()):
+        try:
+            files = await _list_course_files(cid)
+        except Exception as e:
+            logging.warning(f"index_course_files: list_files failed for {cid}: {e}")
+            continue
+        for folder, f in files:
+            name, url = f.get("name"), f.get("url")
+            if not name or not url or os.path.splitext(name)[1].lower() not in STUDY_PLAN_SUPPORTED_EXTENSIONS:
+                continue
+            if _file_size_mb(f.get("size")) > STUDY_PLAN_MAX_FILE_MB:
+                continue
+            rel = f"{folder}/{name}" if folder else name
+            key = f"{cid}|{rel}"
+            seen.add(key)
+            dt = _parse_file_date_v2(f.get("modified"), f.get("modified_iso"))
+            modified_ts = None if dt == datetime.min else int(dt.timestamp())
+            size = str(f.get("size", "-")).strip()
+            old = files_index.get(key)
+            if old and old.get("size") == size and old.get("modified_ts") == modified_ts:
+                continue
+            if calls >= COURSE_INDEX_MAX_CALLS:
+                continue
+            try:
+                async with await global_session.get(url) as resp:
+                    if resp.status != 200:
+                        continue
+                    content = await resp.read()
+            except Exception as e:
+                logging.warning(f"index_course_files: download failed for {rel}: {e}")
+                continue
+            text = await extract_text_from_file_async(name, content)
+            chunks = _chunk_text(text or "")
+            vectors = []
+            for i in range(0, len(chunks), COURSE_INDEX_BATCH):
+                if calls >= COURSE_INDEX_MAX_CALLS:
+                    break
+                batch = await embed_texts([f"{course_name} | {rel}\n{c}" for c in chunks[i:i + COURSE_INDEX_BATCH]])
+                calls += 1
+                if batch is None:
+                    break
+                vectors += batch
+            if len(vectors) != len(chunks):
+                continue  # incomplete: retried next run
+            files_index[key] = {
+                "course": course_name, "file": rel, "size": size, "modified_ts": modified_ts,
+                "chunks": [{"text": c, "vec": _pack_vector(v)} for c, v in zip(chunks, vectors)],
+            }
+            stats["indexed"] += 1
+            stats["chunks"] += len(chunks)
+            save_course_index(index)
+    enrolled = set(courses_map)
+    for key in [k for k in files_index if k not in seen and k.split("|", 1)[0] in enrolled]:
+        del files_index[key]
+        stats["removed"] += 1
+    for key in [k for k in files_index if k.split("|", 1)[0] not in enrolled]:
+        del files_index[key]
+        stats["removed"] += 1
+    save_course_index(index)
+    logging.info(f"index_course_files: {stats}, {calls} embedding calls")
+    return stats
+
+
+async def search_course_material(question: str, top_k: int = COURSE_SEARCH_TOP_K) -> list:
+    """The top_k indexed passages closest to the question that clear
+    COURSE_SEARCH_MIN_SCORE, as [{"course", "file", "text", "score"}],
+    best first; [] if there is no index or the query couldn't be
+    embedded."""
+    files_index = load_course_index().get("files", {})
+    if not files_index:
+        return []
+    vectors = await embed_texts([COURSE_SEARCH_INSTRUCTION + question])
+    if not vectors:
+        return []
+    norm = sum(x * x for x in vectors[0]) ** 0.5 or 1.0
+    query = [x / norm for x in vectors[0]]
+    scored = []
+    for entry in files_index.values():
+        for chunk in entry.get("chunks", []):
+            score = sum(a * b for a, b in zip(query, _unpack_vector(chunk["vec"])))
+            scored.append((score, entry, chunk))
+    scored.sort(key=lambda x: -x[0])
+    return [{"course": e["course"], "file": e["file"], "text": c["text"], "score": round(sc, 3)} for sc, e, c in scored[:top_k] if sc >= COURSE_SEARCH_MIN_SCORE]
+
+
 async def collect_course_topics(session) -> dict:
     """Scan every ENROLLED course's files (top level plus one folder level
     down, since many courses keep each week's slides in a dated folder
@@ -9888,7 +10313,7 @@ async def collect_course_topics(session) -> dict:
                     logging.warning(f"collect_course_topics: download failed for {key}: {e}")
                     continue
 
-                text = extract_text_from_file(name, content)
+                text = await extract_text_from_file_async(name, content)
                 if not text:
                     continue
                 summary = await summarize_lecture_file(name, text)
@@ -11480,7 +11905,7 @@ async def scan_course_files_for_exams(session) -> list:
                 except Exception as e:
                     logging.warning(f"scan_course_files_for_exams: download failed for {key}: {e}")
                     continue
-                passages = _exam_passages(extract_text_from_file(name, content) or "")
+                passages = _exam_passages(await extract_text_from_file_async(name, content) or "")
                 if passages:
                     events = await extract_exam_events(course_name, name, passages)
                     if events is None:
@@ -11831,7 +12256,7 @@ async def build_qa_context(user_id=None) -> str:
     return "\n\n".join(parts) if parts else "No data could be loaded right now."
 
 
-QA_SYSTEM_PROMPT = """You are a helpful university assistant answering a spoken question from a student, using ONLY the data provided below the question — never invent facts that aren't in it. Answer conversationally and concisely (2-4 sentences), in plain spoken sentences suitable both for reading as a text message and for being read aloud as a voice message: no markdown, no bullet points, no emojis, no headers. If the data doesn't contain enough to answer, say so honestly rather than guessing. If weather data is given and the question is about the weather or what to wear/bring, answer using the condition (dry/rainy/etc — that matters more than the exact temperature) with a practical suggestion."""
+QA_SYSTEM_PROMPT = """You are a helpful university assistant answering a spoken question from a student, using ONLY the data provided below the question: never invent facts that aren't in it. Answer conversationally and concisely (2-4 sentences), in plain spoken sentences suitable both for reading as a text message and for being read aloud as a voice message: no markdown, no bullet points, no emojis, no headers. If the data doesn't contain enough to answer, say so honestly rather than guessing. If weather data is given and the question is about the weather or what to wear/bring, answer using the condition (dry/rainy/etc, that matters more than the exact temperature) with a practical suggestion. Course material excerpts, when given, are passages from the student's own course files picked by similarity to the question: use them for questions about lecture content, assignments or course organisation, mention which course or file the answer comes from, and ignore excerpts that don't actually answer the question."""
 
 
 async def answer_question_with_context(question: str, context_data: str, name: Optional[str] = None) -> Optional[str]:
@@ -12250,6 +12675,8 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if not tags:
             await status_msg.edit_text("⚠️ Couldn't recognize that item — try a clearer photo of just this one piece of clothing, or /status to cancel.")
             return  # pending_step stays set so a retry just works
+        # Best effort: without it the GWDG try-on describes the item later.
+        tags["description"] = await describe_wardrobe_item(tags, image_bytes)
         item = add_wardrobe_item(user_id, tags, file_id=file_id)
         context.user_data.pop("pending_step", None)
         subtype_note = f"/{item['subtype']}" if item.get("subtype") else ""
@@ -12736,6 +13163,11 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
         qa_user_id = update.effective_user.id if update.effective_user else None
         try:
             context_data = await build_qa_context(user_id=qa_user_id)
+            passages = await search_course_material(transcript)
+            if passages:
+                context_data += "\n\nCourse material excerpts (from the student's Stud.IP course files, closest to the question first):\n" + "\n\n".join(
+                    f"[{p['course']} | {p['file']}]\n{p['text']}" for p in passages
+                )
             name = (get_user_name(qa_user_id) if qa_user_id is not None else None) or get_primary_user_name()
             answer = await answer_question_with_context(transcript, context_data, name=name)
         except Exception as e:
@@ -12930,6 +13362,7 @@ HEALTH_CHECK_LABELS = {
     "whatsapp": "📱 WhatsApp",
     "weather": "🌤️ Weather (Open-Meteo)",
     "openrouter": "🤖 OpenRouter (AI features)",
+    "gwdg": "🎓 GWDG AI (text, tagging, try-on fallback)",
 }
 
 
@@ -13003,16 +13436,36 @@ async def check_openrouter_health(live: bool = False) -> tuple[bool, str]:
         return False, str(e)[:150]
 
 
+async def check_gwdg_health(live: bool = False) -> tuple[bool, str]:
+    """(ok, detail). Optional service, so an unset key is fine. Reports
+    what's left of the shared daily/monthly quota as of the last GWDG
+    response; `live=True` makes one minimal call first, which also
+    refreshes those numbers. A used-up quota counts as a failure (the
+    fallbacks are in use until it resets)."""
+    if not GWDG_API_KEY:
+        return True, "Not configured (optional)"
+    if live:
+        result = await _call_gwdg_chat([{"role": "user", "content": "Reply with exactly one word: OK"}], GWDG_TEXT_MODEL, timeout=20)
+        if not result:
+            return False, "No answer, OpenRouter/Cloudflare fallbacks in use"
+    quota = " · ".join(f"{remaining}/{limit} left {'today' if window == 'day' else 'this month'}" for window, (remaining, limit) in _gwdg_quota.items())
+    if time.monotonic() < _gwdg_blocked_until:
+        resume = datetime.now(TZ_BERLIN) + timedelta(seconds=_gwdg_blocked_until - time.monotonic())
+        return False, f"Quota used up, fallbacks in use until {resume:%d.%m %H:%M}" + (f" ({quota})" if quota else "")
+    return True, ("OK · " + quota) if quota else ("OK" if live else "Key configured")
+
+
 async def run_health_checks(live_openrouter: bool = False) -> dict:
     """Run every subsystem check and return {key: (ok, detail)} for
-    "studip", "whatsapp", "weather", "openrouter" (see HEALTH_CHECK_LABELS
+    "studip", "whatsapp", "weather", "openrouter", "gwdg" (see HEALTH_CHECK_LABELS
     for display names). Each check is independently best-effort — one
     failing never blocks or skews the others."""
     studip = await check_studip_health()
     whatsapp = await check_whatsapp_health()
     weather = await check_weather_health()
     openrouter = await check_openrouter_health(live=live_openrouter)
-    return {"studip": studip, "whatsapp": whatsapp, "weather": weather, "openrouter": openrouter}
+    gwdg = await check_gwdg_health(live=live_openrouter)
+    return {"studip": studip, "whatsapp": whatsapp, "weather": weather, "openrouter": openrouter, "gwdg": gwdg}
 
 
 async def healthcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
