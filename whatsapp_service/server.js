@@ -2,13 +2,14 @@ import dotenvModule from 'dotenv';
 dotenvModule.config({ path: '../.env' });
 
 import express from 'express';
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, jidNormalizedUser } from '@whiskeysockets/baileys';
+import makeWASocket, { DisconnectReason, jidNormalizedUser } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
 import qrcodeTerminal from 'qrcode-terminal';
 import qrcode from 'qrcode';
 import FormData from 'form-data';
 import https from 'https';
 import fs from 'fs';
+import { useResilientAuthState } from './auth_state.js';
 
 // The libsignal dependency (used internally by Baileys for the Signal
 // protocol encryption) calls console.info()/console.warn() directly with
@@ -113,10 +114,10 @@ let disconnectAlertPending = false;
 // (Re)creates the socket and attaches all event listeners. Baileys has no
 // destroy+reinitialize pair like whatsapp-web.js did - "reconnecting" here
 // just means discarding the old socket reference and building a fresh one,
-// reusing the same useMultiFileAuthState folder so a still-valid session
+// reusing the same auth folder (see auth_state.js) so a still-valid session
 // restores silently with no new QR.
 async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+    const { state, saveCreds } = await useResilientAuthState(AUTH_DIR, { onAlert: (text) => sendTextToTelegram(text) });
 
     sock = makeWASocket({
         auth: state,

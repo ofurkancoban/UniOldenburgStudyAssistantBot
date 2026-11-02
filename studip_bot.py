@@ -22,6 +22,7 @@ import subprocess
 from bs4 import BeautifulSoup
 import html
 import re
+import shutil
 import tempfile
 import time
 import aiohttp
@@ -13363,7 +13364,12 @@ HEALTH_CHECK_LABELS = {
     "weather": "🌤️ Weather (Open-Meteo)",
     "openrouter": "🤖 OpenRouter (AI features)",
     "gwdg": "🎓 GWDG AI (text, tagging, try-on fallback)",
+    "disk": "💾 Server disk",
 }
+
+# Below this much free space the disk counts as unhealthy: a full disk
+# breaks every cache write and once truncated the WhatsApp session file.
+DISK_MIN_FREE_GB = 5
 
 
 async def check_studip_health() -> tuple[bool, str]:
@@ -13455,9 +13461,23 @@ async def check_gwdg_health(live: bool = False) -> tuple[bool, str]:
     return True, ("OK · " + quota) if quota else ("OK" if live else "Key configured")
 
 
+def check_disk_health() -> tuple[bool, str]:
+    """(ok, detail) for the disk the bot's files live on; unhealthy below
+    DISK_MIN_FREE_GB free."""
+    try:
+        usage = shutil.disk_usage(os.path.dirname(os.path.abspath(__file__)))
+    except OSError as e:
+        return False, str(e)[:150]
+    free_gb = usage.free / 1024 ** 3
+    detail = f"{free_gb:.1f} GB free ({usage.used / usage.total:.0%} used)"
+    if free_gb < DISK_MIN_FREE_GB:
+        return False, f"Almost full, {detail}. Cache and WhatsApp session writes will fail."
+    return True, detail
+
+
 async def run_health_checks(live_openrouter: bool = False) -> dict:
     """Run every subsystem check and return {key: (ok, detail)} for
-    "studip", "whatsapp", "weather", "openrouter", "gwdg" (see HEALTH_CHECK_LABELS
+    "studip", "whatsapp", "weather", "openrouter", "gwdg", "disk" (see HEALTH_CHECK_LABELS
     for display names). Each check is independently best-effort — one
     failing never blocks or skews the others."""
     studip = await check_studip_health()
@@ -13465,7 +13485,8 @@ async def run_health_checks(live_openrouter: bool = False) -> dict:
     weather = await check_weather_health()
     openrouter = await check_openrouter_health(live=live_openrouter)
     gwdg = await check_gwdg_health(live=live_openrouter)
-    return {"studip": studip, "whatsapp": whatsapp, "weather": weather, "openrouter": openrouter, "gwdg": gwdg}
+    disk = check_disk_health()
+    return {"studip": studip, "whatsapp": whatsapp, "weather": weather, "openrouter": openrouter, "gwdg": gwdg, "disk": disk}
 
 
 async def healthcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

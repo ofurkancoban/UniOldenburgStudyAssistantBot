@@ -46,3 +46,4 @@ whatsapp_service/qr.png
 
 # Debug / Temp
 *.html
+whatsapp_service/baileys_auth.broken-*/
