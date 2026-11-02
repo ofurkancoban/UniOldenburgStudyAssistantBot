@@ -101,6 +101,8 @@ async function sendTextToTelegram(text, replyMarkup) {
 let sock = null;
 let isAuthenticated = false;
 let isReconnecting = false;
+let reconnectFailures = 0; // consecutive closes since the last open, drives the reconnect backoff
+let sessionLoggedOut = false; // true after WhatsApp rejected the saved session (logged out), so /request_qr knows reusing it is pointless
 let hasEverConnected = false; // true once the connection has opened at least once this process - never reset, so /status can tell "waiting for the first-ever QR" apart from "was connected, session dropped"
 const announcedGroupIds = new Set();
 const discoveredGroups = new Map(); // groupId -> { name, lastSeen }
@@ -139,6 +141,8 @@ async function connectToWhatsApp() {
             console.log('WhatsApp Client is ready!');
             isAuthenticated = true;
             isReconnecting = false;
+            sessionLoggedOut = false;
+            reconnectFailures = 0;
             hasEverConnected = true;
             if (disconnectAlertPending) {
                 disconnectAlertPending = false;
@@ -155,8 +159,26 @@ async function connectToWhatsApp() {
                 // A real logout (force_new_qr, or the account was unlinked from
                 // the phone) - the saved session is dead, auto-reconnecting
                 // with it would just loop. Wait for an explicit /request_qr or
-                // /force_new_qr instead of retrying on our own.
+                // /force_new_qr instead of retrying on our own. The reconnect
+                // that got here is over, so clear the guard: otherwise every
+                // later QR request is skipped as "already in progress".
+                isReconnecting = false;
+                sessionLoggedOut = true;
                 console.log('WhatsApp session logged out - not auto-reconnecting. Use /request_qr or /force_new_qr to relink.');
+                sendTextToTelegram('🔴 WhatsApp logged this session out. Tap "📲 Request WA QR" in /status to link it again with a new QR code.');
+                return;
+            }
+
+            // Whatever attempt produced this close is over, so the guard must
+            // not keep blocking the next one (it used to stay set forever
+            // when a close arrived before the connection ever opened).
+            isReconnecting = false;
+
+            if (!state.creds.me) {
+                // Never paired: this is the QR running out, not an outage.
+                // Retrying would just post QR codes to Telegram in a loop.
+                console.log(`WhatsApp QR expired without a scan (${reasonText}).`);
+                sendTextToTelegram('⌛ The WhatsApp QR code expired without a scan. Tap "📲 Request WA QR" in /status for a new one when your phone is at hand.');
                 return;
             }
 
@@ -171,7 +193,13 @@ async function connectToWhatsApp() {
                 disconnectAlertPending = true;
                 sendTextToTelegram(`🔴 WhatsApp disconnected (${reasonText}) — attempting to reconnect automatically. Forwarding won't work until this recovers.`);
             }
-            reconnectClient(`disconnected: ${reasonText}`);
+            // Back off (5 s doubling up to 5 min) so a connection that keeps
+            // failing right away doesn't spin.
+            const delay = Math.min(5000 * 2 ** reconnectFailures, 5 * 60 * 1000);
+            reconnectFailures += 1;
+            setTimeout(() => {
+                if (!isAuthenticated) reconnectClient(`disconnected: ${reasonText}`);
+            }, delay);
         }
     });
 
@@ -265,6 +293,13 @@ app.post('/request_qr', async (req, res) => {
     // over a stale in-memory flag. NOTE: if a valid session is still saved
     // on disk, this just silently restores it and no QR is sent - use
     // /force_new_qr to guarantee a real QR even when currently connected.
+    // A session WhatsApp already logged out can never restore, so start a
+    // fresh one straight away instead of retrying it.
+    if (sessionLoggedOut) {
+        res.json({ status: 'waiting', message: 'The saved session was logged out by WhatsApp. A new QR code will be sent shortly.' });
+        await reconnectClient('manual /request_qr after logout', { forceLogout: true });
+        return;
+    }
     res.json({ status: 'waiting', message: 'Reconnecting. If a saved session is still valid it will restore silently; otherwise a QR code will be sent shortly.' });
     await reconnectClient('manual /request_qr');
 });
