@@ -743,7 +743,7 @@ def get_cached_outfit_today(user_id) -> Optional[dict]:
     return None
 
 
-def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[str], color_tip: str = "") -> None:
+def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[str], color_tip: str = "", item_labels: Optional[list] = None) -> None:
     cache = load_general_cache()
     all_cached = cache.setdefault("outfit_today_cache", {})
     all_cached[str(user_id)] = {
@@ -751,18 +751,34 @@ def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[
         "description": description,
         "color_tip": color_tip,
         "photo_file_id": photo_file_id,
+        "item_labels": item_labels or [],
     }
     save_general_cache(cache)
 
 
+TELEGRAM_CAPTION_LIMIT = 1024
+
+
 def outfit_caption(outfit: dict) -> str:
     """HTML caption for an outfit pick (fresh or cached): the description,
-    then the color-harmony note when there is one. Item labels can hold a
-    bare "&" ("Jack & Jones"), so both parts are escaped."""
-    caption = f"👔 <b>Today's outfit:</b> {html.escape(outfit['description'])}"
+    the list of chosen items, then the color-harmony note when there is
+    one. Item labels can hold a bare "&" ("Jack & Jones"), so everything is
+    escaped. The description is shortened if needed so the whole caption
+    fits Telegram's photo caption limit."""
+    labels = outfit.get("item_labels") or [it["label"] for it in outfit.get("chosen_items", [])]
+    tail = ""
+    if labels:
+        tail += "\n\n🧾 <b>Items:</b>\n" + "\n".join(f"• {html.escape(label)}" for label in labels)
     if outfit.get("color_tip"):
-        caption += f"\n🎨 {html.escape(outfit['color_tip'])}"
-    return caption
+        tail += f"\n\n🎨 {html.escape(outfit['color_tip'])}"
+    head = "👔 <b>Today's outfit:</b> "
+    description = outfit["description"]
+    room = TELEGRAM_CAPTION_LIMIT - len(head) - len(tail)
+    if len(html.escape(description)) > room:
+        while description and len(html.escape(description)) + 3 > room:
+            description = description[:-1]
+        description = description.rstrip() + "..."
+    return head + html.escape(description) + tail
 
 
 def get_recently_worn_item_ids(user_id) -> set:
@@ -2873,7 +2889,7 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
         await query.message.reply_text(caption, parse_mode="HTML")
 
     record_worn_items(user_id, [it["id"] for it in outfit["chosen_items"]])
-    save_cached_outfit_today(user_id, outfit["description"], photo_file_id, outfit.get("color_tip", ""))
+    save_cached_outfit_today(user_id, outfit["description"], photo_file_id, outfit.get("color_tip", ""), [it["label"] for it in outfit["chosen_items"]])
 
 
 async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4258,11 +4274,14 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     # Studierendenwerk's public Speiseplan site — same as the standalone
     # "What should I eat?" delivery.
     photo_url = None
+    photo_caption = None
     if food and food.get("dish"):
         try:
             photo_url = await fetch_dish_photo_url(food["dish"])
         except Exception as e:
             logging.warning(f"Summary food photo fetch error: {e}")
+        place = f" ({_friendly_menu_category_label(food['category'])})" if food.get("category") else ""
+        photo_caption = f"🍽️ <b>Today's lunch pick{html.escape(place)}:</b> {html.escape(food['dish'])}"
 
     # 5. Daily outfit suggestion with virtual try-on image — opt-in (toggle
     # in /status), skipped entirely (not just "no image") if the wardrobe is
@@ -4310,6 +4329,7 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     return {
         "text": final_text,
         "photo_url": photo_url,
+        "photo_caption": photo_caption,
         "outfits": outfits,
         "voice_path": voice_path,
     }
@@ -4364,7 +4384,7 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
     if prepared.get("photo_url"):
         for uid in user_ids:
             try:
-                await bot.send_photo(chat_id=uid, photo=prepared["photo_url"])
+                await bot.send_photo(chat_id=uid, photo=prepared["photo_url"], caption=prepared.get("photo_caption"), parse_mode="HTML")
             except Exception as e:
                 logging.error(f"Failed to send lunch photo to {uid}: {e}")
 
@@ -4397,7 +4417,7 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
                     # the weather-aware reasoning is useful on its own.
                     await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
                 record_worn_items(uid, [it["id"] for it in outfit["chosen_items"]])
-                save_cached_outfit_today(uid, outfit["description"], photo_file_id, outfit.get("color_tip", ""))
+                save_cached_outfit_today(uid, outfit["description"], photo_file_id, outfit.get("color_tip", ""), [it["label"] for it in outfit["chosen_items"]])
             except Exception as e:
                 logging.warning(f"Outfit suggestion failed for {uid}: {e}")
 
