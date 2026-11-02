@@ -18,12 +18,14 @@ This project offers two distinct ways to interact with Stud.IP. You can select y
 
 | Feature | 🚀 Browser-less (Standard) | 🌐 Playwright (Legacy) |
 | :--- | :--- | :--- |
-| **Logic** | Direct JSON/HTML requests | Simulated Browser (Chromium) |
+| **Logic** | Stud.IP's own JSON:API (HTML pages as fallback) | Simulated Browser (Chromium) |
 | **Speed** | ⚡ Instant Sync | 🐢 Slower (Browser overhead) |
 | **RAM Usage** | ~50MB - 100MB | ~500MB - 1GB+ |
 | **Stability** | High (No browser crashes) | Medium (Requires display/driver) |
 | **Best For** | Production/Cloud Servers | Local Desktop / Debugging |
 | **File** | `studip_bot.py` | `studip_bot_playwright.py` |
+
+Courses, files and folders, announcements, messages and forum posts are read from Stud.IP's own JSON:API (`/jsonapi.php/v1`), using the same logged-in session as the web pages, so no API registration is needed. Each of them falls back to reading the HTML page if the API ever fails. Logging in (SSO with TOTP), enrolment and everything from StuMS (exam dates, registration, grades) still go through the web pages, since there is no API for them.
 
 ---
 
@@ -49,7 +51,7 @@ The bot runs a state-of-the-art background loop that tracks:
 *   **📢 Announcements**: Instant forwarding of course updates and news.
 *   **📁 File Manager**: Detects new uploads. Download files **directly** with one click.
 *   **💬 Forum Discussions**: Stay in the loop with new posts and full conversation history.
-*   **📨 Direct Messages**: Never miss an important message from lecturers or peers.
+*   **📨 Direct Messages**: Never miss an important message from lecturers or peers. The inbox is checked every 30 seconds on its own, so a new message reaches Telegram within about half a minute.
 *   **🟢 WhatsApp Integration**: Forward any announcement or message directly to a target WhatsApp group with the tap of a button. The bot runs a local Node.js microservice to handle secure WhatsApp sessions.
 *   **👀 Watch Previous Semester Too**: `/status` has a toggle (off by default) that extends Announcements, File Manager, and Forum Discussions above to also watch the semester right before your current one, not just your active courses (Direct Messages aren't course-scoped, so this doesn't change those). Useful if a retake course or a module you're still following doesn't show up in the new term. Flip it anytime from `/status`; takes effect on the next check cycle, no restart needed.
 

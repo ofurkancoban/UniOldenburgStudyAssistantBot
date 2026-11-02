@@ -116,6 +116,7 @@ FILE_WATCHER_INTERVAL = 2 * 60 * 60
 # ── global runtime state ───────────────────────────────────────────────────────
 global_session = None
 global_watcher_paused = False
+message_poll_task = None  # see message_poll_loop
 unified_watcher_task = None
 watcher_controller_running = False
 global_message_watcher = None
@@ -1236,14 +1237,8 @@ async def unified_watcher_controller(app):
                 general_cache["last_health_check"] = now.isoformat()
                 save_general_cache(general_cache)
 
-            # 1️⃣ MESSAGE CHECK
-            try:
-                logging.info("📨 Checking messages...")
-                await check_new_messages(app.bot, admin_id, silent=True)
-            except Exception as e:
-                logging.error(f"❌ Message check failed: {e}")
-
-            await asyncio.sleep(30)
+            # 1️⃣ MESSAGES: checked every MESSAGE_POLL_SECONDS by
+            # message_poll_loop, not once per cycle.
 
             # 2️⃣ ANNOUNCEMENT CHECK
             try:
@@ -1289,6 +1284,9 @@ async def start_unified_watcher(app):
 
     logging.info("🚀 Starting unified watcher controller...")
     unified_watcher_task = asyncio.create_task(unified_watcher_controller(app))
+    global message_poll_task
+    if message_poll_task is None or message_poll_task.done():
+        message_poll_task = asyncio.create_task(message_poll_loop(app))
 
     # Check initial state
     await asyncio.sleep(5)
@@ -1302,12 +1300,13 @@ async def stop_unified_watcher():
     """Stop the unified watcher"""
     global unified_watcher_task, watcher_controller_running
 
-    if unified_watcher_task and not unified_watcher_task.done():
-        unified_watcher_task.cancel()
-        try:
-            await unified_watcher_task
-        except asyncio.CancelledError:
-            pass
+    for task in (unified_watcher_task, message_poll_task):
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
     watcher_controller_running = False
     logging.info("🛑 Unified watcher controller stopped")
@@ -1315,6 +1314,22 @@ async def stop_unified_watcher():
 
 # ── course listing ────────────────────────────────────────────────────────────
 async def list_courses(semester_id: str = None):
+    """[(name, cid), ...] of the user's courses in semester_id (the current
+    semester when None), via the JSON:API with the my_courses page as
+    fallback. Also records every course in courses_map."""
+    try:
+        courses = await _list_courses_api(semester_id)
+        if courses:
+            for name, cid in courses:
+                courses_map[cid] = name
+            logging.info(f"✅ {len(courses)} courses from the Stud.IP API.")
+            return courses
+    except Exception as e:
+        logging.warning(f"list_courses: API failed ({e}), falling back to the my_courses page")
+    return await _list_courses_html(semester_id)
+
+
+async def _list_courses_html(semester_id: str = None):
     """
     Extract courses from the 'my_courses' page.
     Uses multi-method strategy: Vuex Store analysis (modern) and DOM Scrapy (legacy).
@@ -3055,7 +3070,174 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# ── Stud.IP JSON:API ───────────────────────────────────────────────────────────
+# Stud.IP's own REST API (JSON:API), authenticated with the same logged-in
+# session cookie as the HTML pages, so it needs no extra registration.
+# Courses, folders/files, announcements and messages come from here; each
+# caller falls back to the old HTML scraping if the API call fails, and the
+# API results are shaped exactly like the scraped ones (same keys, ids, URLs,
+# size strings and timestamps), so existing caches keep matching.
+STUDIP_API_URL = f"{BASE_URL}/jsonapi.php/v1"
+STUDIP_API_PAGE_LIMIT = 100
+_studip_api_user_id = None
+_studip_api_semester_starts = None  # {semester_id: start datetime}, fetched once per process
+_studip_api_current_semester = None
+STUDIP_STUDYGROUP_COURSE_TYPE = 99  # study groups, which my_courses lists separately
+_FOLDER_ID_RE = re.compile(r"files/index/([0-9a-f]{32})")
+
+
+class StudipApiError(Exception):
+    pass
+
+
+async def studip_api_get(path: str, params: Optional[dict] = None, _retry: bool = True) -> dict:
+    """GET one JSON:API resource ("/users/me" or a "/jsonapi.php/..." link).
+    Logs in again once on a 401; raises StudipApiError otherwise."""
+    session = global_session or await login_studip()
+    url = BASE_URL + path if path.startswith("/jsonapi.php") else STUDIP_API_URL + path
+    async with await session.get(url, params=params) as r:
+        status, text = r.status, await r.text()
+    if status == 401 and _retry:
+        await session.login(force=True)
+        return await studip_api_get(path, params, _retry=False)
+    if status != 200:
+        raise StudipApiError(f"{path}: HTTP {status}")
+    try:
+        return json.loads(text)
+    except ValueError as e:
+        raise StudipApiError(f"{path}: response is not JSON") from e
+
+
+async def studip_api_get_all(path: str, params: Optional[dict] = None) -> tuple[list, list]:
+    """Every page of a JSON:API collection, as (data, included)."""
+    params = dict(params or {}, **{"page[limit]": STUDIP_API_PAGE_LIMIT})
+    data, included, offset = [], [], 0
+    while True:
+        params["page[offset]"] = offset
+        page = await studip_api_get(path, params)
+        data += page.get("data", [])
+        included += page.get("included", [])
+        offset += STUDIP_API_PAGE_LIMIT
+        total = page.get("meta", {}).get("page", {}).get("total", 0)
+        if not page.get("data") or offset >= total:
+            return data, included
+
+
+async def studip_api_user_id() -> str:
+    global _studip_api_user_id
+    if not _studip_api_user_id:
+        _studip_api_user_id = (await studip_api_get("/users/me"))["data"]["id"]
+    return _studip_api_user_id
+
+
+def _api_rel_id(resource: dict, name: str) -> Optional[str]:
+    data = (resource.get("relationships", {}).get(name) or {}).get("data")
+    return data.get("id") if isinstance(data, dict) else None
+
+
+def _api_names(included: list) -> dict:
+    """{user_id: formatted name} from a response's included users."""
+    return {u["id"]: u["attributes"].get("formatted-name") or "Unknown" for u in included if u.get("type") == "users"}
+
+
+def _api_html_to_text(content: Optional[str]) -> str:
+    """Plain text of an API HTML field, same cleaning as the scraped pages."""
+    return clean_html_text(BeautifulSoup(content or "", "lxml"))
+
+
+def _api_berlin(iso: Optional[str]) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(iso).astimezone(TZ_BERLIN) if iso else None
+    except ValueError:
+        return None
+
+
+async def _list_courses_api(semester_id: Optional[str] = None) -> list:
+    """(name, cid) for the user's courses in semester_id (the current
+    semester when None, which is what every no-argument caller means), like
+    the my_courses page: study groups are left out, and a course without an
+    end semester runs unlimited, is listed in every semester and gets
+    " (unrestricted)" appended, exactly as that page names it."""
+    global _studip_api_semester_starts, _studip_api_current_semester
+    if _studip_api_semester_starts is None:
+        semesters, _ = await studip_api_get_all("/semesters")
+        _studip_api_semester_starts = {x["id"]: datetime.fromisoformat(x["attributes"]["start"]) for x in semesters}
+        _studip_api_current_semester = next((x["id"] for x in semesters if x["attributes"].get("is-current")), None)
+    starts = _studip_api_semester_starts
+    courses, _ = await studip_api_get_all(f"/users/{await studip_api_user_id()}/courses")
+    target = starts.get(semester_id or _studip_api_current_semester)
+    result = []
+    for c in courses:
+        if c["attributes"].get("course-type") == STUDIP_STUDYGROUP_COURSE_TYPE:
+            continue
+        start_id, end_id = _api_rel_id(c, "start-semester"), _api_rel_id(c, "end-semester")
+        if target and end_id:
+            if starts.get(start_id, target) > target or starts.get(end_id, target) < target:
+                continue
+        name = (c["attributes"].get("title") or "").strip()
+        if name:
+            result.append((name if end_id else f"{name} (unrestricted)", c["id"]))
+    return result
+
+
+async def _list_files_api(cid, folder_url=None) -> list:
+    """One folder level of a course in list_files' format: the course's root
+    folder, or the folder a list_files folder "url" points to."""
+    if folder_url:
+        m = _FOLDER_ID_RE.search(folder_url)
+        if not m:
+            raise StudipApiError(f"no folder id in {folder_url}")
+        folder_id = m.group(1)
+    else:
+        folders, _ = await studip_api_get_all(f"/courses/{cid}/folders")
+        root = next((f for f in folders if f["attributes"].get("folder-type") == "RootFolder"), None) \
+            or next((f for f in folders if not _api_rel_id(f, "parent")), None)
+        if not root:
+            return []
+        folder_id = root["id"]
+
+    def stamps(resource):
+        dt = _api_berlin(resource["attributes"].get("chdate"))
+        return (dt.strftime("%d.%m.%Y %H:%M"), dt.isoformat()) if dt else ("-", None)
+
+    items = []
+    subfolders, _ = await studip_api_get_all(f"/folders/{folder_id}/folders")
+    for f in subfolders:
+        modified, modified_iso = stamps(f)
+        items.append({
+            "type": "folder", "name": f["attributes"].get("name", "Unknown Folder"),
+            "url": f"{BASE_URL}/dispatch.php/course/files/index/{f['id']}?cid={cid}",
+            "size": "-", "modified": modified, "modified_iso": modified_iso,
+        })
+    file_refs, _ = await studip_api_get_all(f"/folders/{folder_id}/file-refs")
+    for f in file_refs:
+        modified, modified_iso = stamps(f)
+        download = (f.get("meta") or {}).get("download-url")
+        rs = f["attributes"].get("filesize")
+        if isinstance(rs, int):
+            size_str = f"{rs/(1024*1024):.1f} MB" if rs > 1024*1024 else f"{rs/1024:.1f} KB" if rs > 1024 else f"{rs} B"
+        else:
+            size_str = "-"
+        items.append({
+            "type": "file", "name": f["attributes"].get("name", "Unknown File"),
+            "url": urljoin(BASE_URL, download) if download else None,
+            "size": size_str, "modified": modified, "modified_iso": modified_iso,
+        })
+    return items
+
+
 async def list_files(cid, folder_url=None):
+    """Files and folders of one course folder level (the root folder when
+    folder_url is None), via the JSON:API with the HTML file table as
+    fallback."""
+    try:
+        return await _list_files_api(cid, folder_url)
+    except Exception as e:
+        logging.warning(f"list_files: API failed for {cid} ({e}), falling back to the HTML page")
+    return await _list_files_html(cid, folder_url)
+
+
+async def _list_files_html(cid, folder_url=None):
     """Extract files/folders from Stud.IP file table browser-less."""
     global global_session
     url = _normalize_url(folder_url) if folder_url else f"{BASE_URL}/dispatch.php/course/files?cid={cid}"
@@ -3527,6 +3709,31 @@ def _parse_ann_date(s: str) -> datetime:
     return datetime.min
 
 
+async def _course_announcements_api(cid, course_name) -> list:
+    """The course's currently published announcements from the JSON:API, in
+    the same shape (and with the same "cid:news_id" key) as the ones scraped
+    from the course overview page."""
+    news, included = await studip_api_get_all(f"/courses/{cid}/news", {"include": "author"})
+    names = _api_names(included)
+    now = datetime.now(TZ_BERLIN)
+    result = []
+    for n in news:
+        a = n["attributes"]
+        start, end = _api_berlin(a.get("publication-start")), _api_berlin(a.get("publication-end"))
+        if (start and start > now) or (end and end < now):
+            continue
+        dt = _api_berlin(a.get("publication-start") or a.get("mkdate"))
+        date_s = dt.strftime("%d/%m/%y") if dt else ""
+        result.append({
+            "key": f"{cid}:{n['id']}", "cid": cid, "course": course_name,
+            "subject": a.get("title") or "(No subject)",
+            "sender": names.get(_api_rel_id(n, "author"), "Unknown"),
+            "date": date_s, "dt": _parse_ann_date(date_s).isoformat(),
+            "body": _api_html_to_text(a.get("content")) or "(No content)",
+        })
+    return result
+
+
 async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
     """Parallel announcement checking for new items"""
     global global_session, courses_map
@@ -3559,6 +3766,10 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
 
         async def check_single_course_announcements(course_name, cid):
             async with semaphore:
+                try:
+                    return course_name, cid, await _course_announcements_api(cid, course_name)
+                except Exception as e:
+                    logging.warning(f"Announcements API failed for {course_name} ({e}), falling back to the overview page")
                 try:
                     url = f"{BASE_URL}/dispatch.php/course/overview?cid={cid}"
                     async with await session.get(url) as r:
@@ -4576,39 +4787,103 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
 
 
 
+# How many of the newest inbox messages each check compares against the
+# cache (the overview page showed about this many).
+MESSAGE_CHECK_LIMIT = 20
+# The inbox is one small API request, so it's polled on its own short loop
+# (see message_poll_loop) instead of once per multi-minute watcher cycle.
+MESSAGE_POLL_SECONDS = 30
+
+
+def _api_message(m: dict, names: dict) -> dict:
+    """A JSON:API message in the shape the scraped overview rows had (plus
+    its body), keeping the old read URL so cached entries stay comparable."""
+    a = m["attributes"]
+    dt = _api_berlin(a.get("mkdate"))
+    return {
+        "id": m["id"], "title": a.get("subject") or "(No subject)",
+        "sender": names.get(_api_rel_id(m, "sender"), "Unknown"),
+        "date": dt.strftime("%d/%m/%y %H:%M") if dt else "Unknown",
+        "url": f"{BASE_URL}/dispatch.php/messages/read/{m['id']}/rec",
+        "body": _api_html_to_text(a.get("message")) or "No content found.",
+    }
+
+
+async def _fetch_messages_api(limit: int = MESSAGE_CHECK_LIMIT) -> list:
+    """The newest `limit` inbox messages, newest first, bodies included."""
+    page = await studip_api_get(f"/users/{await studip_api_user_id()}/inbox", {"page[limit]": limit, "include": "sender"})
+    names = _api_names(page.get("included", []))
+    return [_api_message(m, names) for m in page.get("data", [])]
+
+
+async def _fetch_messages_html(session) -> list:
+    """Overview-page rows (no bodies), the fallback when the API fails."""
+    url = f"{BASE_URL}/dispatch.php/messages/overview"
+    async with await session.get(url) as resp:
+        html_text = await resp.text()
+
+    # lxml, not html.parser: see the comment in check_new_announcements_parallel
+    # on the same inline-SVG-icon parse-tree corruption bug.
+    soup = BeautifulSoup(html_text, "lxml")
+    rows = soup.select("table#messages tbody tr[id^='message_']")
+    all_messages = []
+    for tr in rows:
+        link_tag = tr.select_one("td.title a[href*='dispatch.php/messages/read/']")
+        if not link_tag: continue
+        href = link_tag["href"].strip()
+        title = link_tag.get_text(strip=True)
+        sender_tag = tr.select_one("td:nth-of-type(3)")
+        sender = sender_tag.get_text(strip=True) if sender_tag else "Unknown"
+        date_tag = tr.select_one("td:nth-of-type(4)")
+        date = date_tag.get_text(strip=True) if date_tag else "Unknown"
+
+        if not href.startswith('http'):
+            href = f"{BASE_URL}/{href.lstrip('/')}"
+
+        all_messages.append({
+            "id": tr["id"].replace("message_", ""), "title": title, "sender": sender, "date": date, "url": href,
+        })
+    return all_messages
+
+
+async def message_poll_loop(app) -> None:
+    """Checks the inbox every MESSAGE_POLL_SECONDS, so a new Stud.IP message
+    reaches Telegram within about half a minute. Skips while the watchers
+    are paused or no logged-in session exists yet."""
+    admin_id = next(iter(ALLOWED_USER_IDS), None)
+    while True:
+        await asyncio.sleep(MESSAGE_POLL_SECONDS)
+        if global_watcher_paused or global_session is None or admin_id is None:
+            continue
+        try:
+            await check_new_messages(app.bot, admin_id, silent=True)
+        except Exception as e:
+            logging.error(f"❌ Message poll failed: {e}")
+
+
+_message_check_lock = asyncio.Lock()
+
+
 async def check_new_messages(bot, chat_id, silent: bool = False):
-    """Fetch Stud.IP messages fully (content included) and send in order (newest last)."""
+    """Fetch Stud.IP messages fully (content included) and send in order
+    (newest last). Serialized, since the fast poll loop and the manual
+    check can overlap and both rewrite the cache."""
+    async with _message_check_lock:
+        return await _check_new_messages(bot, chat_id, silent)
+
+
+async def _check_new_messages(bot, chat_id, silent: bool = False):
     global global_session
     session = global_session
     if not silent:
         await bot.send_message(chat_id=chat_id, text="📨 Checking messages...", disable_notification=True)
 
     try:
-        url = f"{BASE_URL}/dispatch.php/messages/overview"
-        async with await session.get(url) as resp:
-            html_text = await resp.text()
-
-        # lxml, not html.parser — see the comment in check_new_announcements_parallel
-        # on the same inline-SVG-icon parse-tree corruption bug.
-        soup = BeautifulSoup(html_text, "lxml")
-        rows = soup.select("table#messages tbody tr[id^='message_']")
-        all_messages = []
-        for tr in rows:
-            link_tag = tr.select_one("td.title a[href*='dispatch.php/messages/read/']")
-            if not link_tag: continue
-            href = link_tag["href"].strip()
-            title = link_tag.get_text(strip=True)
-            sender_tag = tr.select_one("td:nth-of-type(3)")
-            sender = sender_tag.get_text(strip=True) if sender_tag else "Unknown"
-            date_tag = tr.select_one("td:nth-of-type(4)")
-            date = date_tag.get_text(strip=True) if date_tag else "Unknown"
-
-            if not href.startswith('http'):
-                href = f"{BASE_URL}/{href.lstrip('/')}"
-
-            all_messages.append({
-                "id": tr["id"].replace("message_", ""), "title": title, "sender": sender, "date": date, "url": href,
-            })
+        try:
+            all_messages = await _fetch_messages_api()
+        except Exception as e:
+            logging.warning(f"check_new_messages: API failed ({e}), falling back to the overview page")
+            all_messages = await _fetch_messages_html(session)
 
         old_messages = []
         if os.path.exists(CACHE_FILE):
@@ -4625,9 +4900,10 @@ async def check_new_messages(bot, chat_id, silent: bool = False):
                 await bot.send_message(chat_id=chat_id, text="☑️ No new messages found.", disable_notification=True)
             return False
 
-        # Use the existing fetch_message_body with our instance
+        # API messages already carry their body; scraped rows don't.
         for msg in new_messages:
-            msg["body"] = await fetch_message_body(session, msg["url"])
+            if "body" not in msg:
+                msg["body"] = await fetch_message_body(session, msg["url"])
 
         # Update cache with new messages prepended or appended
         # Best to just store all recent ones
@@ -6199,33 +6475,39 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             logging.info(f"📨 Opening message ID {msg_id} via direct URL...")
 
-            msg_url = f"https://elearning.uni-oldenburg.de/dispatch.php/messages/read/{msg_id}/rec"
-            async with await global_session.get(msg_url) as resp:
-                html = await resp.text()
+            try:
+                page = await studip_api_get(f"/messages/{msg_id}", {"include": "sender"})
+                msg = _api_message(page["data"], _api_names(page.get("included", [])))
+                subject, sender_name, date_str, content = msg["title"], msg["sender"], msg["date"], msg["body"]
+            except Exception as api_err:
+                logging.warning(f"Message {msg_id}: API failed ({api_err}), reading the HTML page")
+                msg_url = f"https://elearning.uni-oldenburg.de/dispatch.php/messages/read/{msg_id}/rec"
+                async with await global_session.get(msg_url) as resp:
+                    html = await resp.text()
 
-            # lxml, not html.parser — see the comment in check_new_announcements_parallel
-            # on the same inline-SVG-icon parse-tree corruption bug.
-            soup = BeautifulSoup(html, "lxml")
+                # lxml, not html.parser — see the comment in check_new_announcements_parallel
+                # on the same inline-SVG-icon parse-tree corruption bug.
+                soup = BeautifulSoup(html, "lxml")
 
-            # Extract information
-            subject_tag = soup.select_one("#ui-id-7, .message-subject, h1")
-            subject = subject_tag.get_text(strip=True) if subject_tag else "(No subject)"
+                # Extract information
+                subject_tag = soup.select_one("#ui-id-7, .message-subject, h1")
+                subject = subject_tag.get_text(strip=True) if subject_tag else "(No subject)"
 
-            # Try to find elements by labels
-            sender_name = "Unknown"
-            date_str = "-"
-            for row in soup.select("tr"):
-                th = row.select_one("th, td:first-child")
-                td = row.select_one("td")
-                if th and td:
-                    label = th.get_text(strip=True).lower()
-                    if "from" in label or "von" in label:
-                        sender_name = td.get_text(strip=True)
-                    elif "date" in label or "datum" in label:
-                        date_str = td.get_text(strip=True)
+                # Try to find elements by labels
+                sender_name = "Unknown"
+                date_str = "-"
+                for row in soup.select("tr"):
+                    th = row.select_one("th, td:first-child")
+                    td = row.select_one("td")
+                    if th and td:
+                        label = th.get_text(strip=True).lower()
+                        if "from" in label or "von" in label:
+                            sender_name = td.get_text(strip=True)
+                        elif "date" in label or "datum" in label:
+                            date_str = td.get_text(strip=True)
 
-            body_container = soup.select_one("div.formatted-content, .message-content, .formatted-content.ck-content")
-            content = clean_html_text(body_container) if body_container else "No content found."
+                body_container = soup.select_one("div.formatted-content, .message-content, .formatted-content.ck-content")
+                content = clean_html_text(body_container) if body_container else "No content found."
 
             # Send to Telegram
             header = (
