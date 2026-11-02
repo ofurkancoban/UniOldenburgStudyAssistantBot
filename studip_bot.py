@@ -756,29 +756,15 @@ def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[
     save_general_cache(cache)
 
 
-TELEGRAM_CAPTION_LIMIT = 1024
-
-
 def outfit_caption(outfit: dict) -> str:
-    """HTML caption for an outfit pick (fresh or cached): the description,
-    the list of chosen items, then the color-harmony note when there is
-    one. Item labels can hold a bare "&" ("Jack & Jones"), so everything is
-    escaped. The description is shortened if needed so the whole caption
-    fits Telegram's photo caption limit."""
+    """HTML caption for an outfit pick (fresh or cached): just the chosen
+    items as a bullet list. Falls back to the description for a cached pick
+    saved before item labels were stored. Labels can hold a bare "&"
+    ("Jack & Jones"), so they're escaped."""
     labels = outfit.get("item_labels") or [it["label"] for it in outfit.get("chosen_items", [])]
-    tail = ""
-    if labels:
-        tail += "\n\n🧾 <b>Items:</b>\n" + "\n".join(f"• {html.escape(label)}" for label in labels)
-    if outfit.get("color_tip"):
-        tail += f"\n\n🎨 {html.escape(outfit['color_tip'])}"
-    head = "👔 <b>Today's outfit:</b> "
-    description = outfit["description"]
-    room = TELEGRAM_CAPTION_LIMIT - len(head) - len(tail)
-    if len(html.escape(description)) > room:
-        while description and len(html.escape(description)) + 3 > room:
-            description = description[:-1]
-        description = description.rstrip() + "..."
-    return head + html.escape(description) + tail
+    if not labels:
+        return f"👔 <b>Today's outfit:</b> {html.escape(outfit['description'])}"
+    return "👔 <b>Today's outfit:</b>\n" + "\n".join(f"• {html.escape(label)}" for label in labels)
 
 
 def get_recently_worn_item_ids(user_id) -> set:
