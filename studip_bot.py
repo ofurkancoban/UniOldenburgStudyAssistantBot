@@ -5484,6 +5484,7 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("📲 Request WA QR", callback_data="request_wa_qr")],
             [InlineKeyboardButton("🔄 Force New WA QR", callback_data="force_wa_qr")],
             [InlineKeyboardButton("🔍 Detect WA Groups", callback_data="detect_wa_groups")],
+            [InlineKeyboardButton("🧪 Send WA Test Message", callback_data="wa_test_message")],
         ]
         await query.message.reply_text("📱 WhatsApp menu:", reply_markup=InlineKeyboardMarkup(keyboard))
 
@@ -5539,6 +5540,26 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
                     await query.message.reply_text(f"ℹ️ {data.get('message', 'QR request processed.')}")
         except Exception as e:
             logging.error(f"Failed to force new WA QR: {e}")
+            await query.message.reply_text("❌ WhatsApp service unreachable. Make sure it's running.")
+
+    elif query.data == "wa_test_message":
+        # Sends to the linked account's own chat ("Message yourself"), never
+        # to the shared group, so it's safe to tap any time.
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id is None or not is_user_allowed(user_id):
+            await query.message.reply_text("Not authorized to use this bot.")
+            return
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post("http://localhost:3838/send_test", timeout=15) as resp:
+                    data = await resp.json()
+            if data.get("success"):
+                await query.message.reply_text(f"✅ Test message sent to your own WhatsApp chat ({data.get('to', 'own number')}).")
+            else:
+                await query.message.reply_text(f"❌ WhatsApp test failed: {data.get('error', 'unknown error')}")
+        except Exception as e:
+            logging.error(f"WhatsApp test message failed: {e}")
             await query.message.reply_text("❌ WhatsApp service unreachable. Make sure it's running.")
 
     elif query.data == "detect_wa_groups":
@@ -13751,7 +13772,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(show_last_announcements, pattern="^show_last_announcements$"))
         app.add_handler(CallbackQueryHandler(show_last_files, pattern="^show_last_files$"))
         app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
-        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|force_wa_qr|detect_wa_groups|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu)$"))
+        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|force_wa_qr|detect_wa_groups|wa_test_message|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu)$"))
         app.add_handler(CallbackQueryHandler(handle_exam_buttons, pattern="^(exam_menu|exam_noop|exam_cancel|exam_ask\\|.*|exam_do\\|.*)$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_wa_ask, pattern="^examopen_wa_ask\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_wa_confirm, pattern="^examopen_wa_confirm\\|.*$"))

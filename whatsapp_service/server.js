@@ -98,6 +98,10 @@ async function sendTextToTelegram(text, replyMarkup) {
     }
 }
 
+// Attached to the "reconnected" alert; handled by studip_bot.py, which
+// calls /send_test below.
+const TEST_MESSAGE_KEYBOARD = { inline_keyboard: [[{ text: '🧪 Send WA Test Message', callback_data: 'wa_test_message' }]] };
+
 let sock = null;
 let isAuthenticated = false;
 let isReconnecting = false;
@@ -146,7 +150,7 @@ async function connectToWhatsApp() {
             hasEverConnected = true;
             if (disconnectAlertPending) {
                 disconnectAlertPending = false;
-                sendTextToTelegram('🟢 WhatsApp reconnected — forwarding is back up.');
+                sendTextToTelegram('🟢 WhatsApp reconnected — forwarding is back up.', TEST_MESSAGE_KEYBOARD);
             }
         }
 
@@ -387,6 +391,27 @@ function noteSendFailureAndReconnect(chatId) {
     console.log(`sendMessage returned no message for ${chatId} - triggering a background reconnect for next time`);
     reconnectClient(`sendMessage returned no message for ${chatId}`);
 }
+
+// Sends a short test message to the linked account's own chat ("Message
+// yourself"), never to a group, to confirm sending works end to end.
+app.post('/send_test', async (req, res) => {
+    if (!isAuthenticated || !sock?.user?.id) {
+        return res.status(503).json({ error: 'WhatsApp client is not ready yet or needs a QR scan.' });
+    }
+    try {
+        const ownJid = jidNormalizedUser(sock.user.id);
+        const time = new Date().toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
+        const sent = await sock.sendMessage(ownJid, { text: `✅ UniAssistant WhatsApp test message (${time}). Sending works.` });
+        if (!sent) {
+            return res.status(502).json({ error: 'WhatsApp did not confirm the message was sent.' });
+        }
+        console.log('Test message sent to own chat.');
+        res.json({ success: true, to: `+${ownJid.split('@')[0]}` });
+    } catch (err) {
+        console.error('Error sending test message:', err);
+        res.status(500).json({ error: err && err.message ? err.message : String(err) });
+    }
+});
 
 // API endpoint to send a message
 app.post('/send', async (req, res) => {
