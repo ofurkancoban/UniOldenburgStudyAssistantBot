@@ -9170,9 +9170,33 @@ async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
         return None
 
 
-def _tryon_prompt(garments: list) -> str:
-    """Instruction for the multi-image try-on models (Nano Banana, GWDG's
-    Qwen edit): image 1 is the person, then one image per garment."""
+# Full-body poses for the Nano Banana try-on, one picked at random per
+# image for variety. Each keeps the whole outfit visible: no crossed arms
+# or props covering prints, logos, shoes or headwear.
+TRYON_POSES = (
+    "standing relaxed, weight on one leg, arms loosely at the sides",
+    "walking toward the camera mid-stride, arms swinging naturally",
+    "standing with one hand in a trouser pocket, the other arm relaxed",
+    "turned three-quarters to the left, head turned back to the camera",
+    "turned three-quarters to the right, head turned back to the camera",
+    "standing casually, one hand lightly touching the collar or the cap",
+    "relaxed stance, looking off to the side with a slight smile",
+    "standing with both thumbs hooked in the front trouser pockets",
+)
+
+
+def _tryon_prompt(garments: list, pose: Optional[str] = None) -> str:
+    """Instruction for the Nano Banana try-on: image 1 is the person, then
+    one image per garment. With `pose` the person is shown in that pose
+    (see TRYON_POSES), otherwise in the pose of Image 1."""
+    pose_text = (
+        f"and keep the original background and lighting, but show the person in this pose: {pose}. "
+        "The pose must keep every garment, the shoes and any cap or beanie fully visible. "
+        "Give the person a calm, relaxed, natural expression with the lips closed: at most a faint "
+        "closed-mouth smile, no teeth showing, never a posed or forced smile. Soft eyes and a relaxed "
+        "brow, jaw and shoulders, never tense, stern or frowning. Only the expression changes, the "
+        "face stays clearly the same person."
+    ) if pose else "and pose exactly as in Image 1, and keep the original background and lighting."
     garment_lines = "\n".join(f"- Image {i + 2}: {item.get('label', 'clothing item')} ({item.get('type', 'item')})" for i, (item, _) in enumerate(garments))
     return (
         "Virtual try-on. Image 1 is a photo of a person. Dress this exact person in ALL of the "
@@ -9186,9 +9210,8 @@ def _tryon_prompt(garments: list) -> str:
         "is cropped. The person always wears plain white crew socks with the shoes; they only show "
         "where the trousers naturally leave the ankle bare, so never shorten trousers to reveal "
         "them. Keep the person's "
-        "face, identity, hair, skin tone, body shape and pose exactly as in Image 1, and keep the "
-        "original background and lighting. Show the full body from head to feet. Photorealistic "
-        "photo, no text."
+        "face, identity, hair, skin tone and body shape exactly as in Image 1, "
+        f"{pose_text} Show the full body from head to feet. Photorealistic photo, no text."
     )
 
 
@@ -9288,7 +9311,7 @@ async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -
 
         result = await fal_client.subscribe_async(
             FAL_GEMINI_TRYON_MODEL,
-            arguments={"prompt": _tryon_prompt(garments), "image_urls": urls, "num_images": 1, "output_format": "png"},
+            arguments={"prompt": _tryon_prompt(garments, random.choice(TRYON_POSES)), "image_urls": urls, "num_images": 1, "output_format": "png"},
         )
         image_url = result["images"][0]["url"]
         async with aiohttp.ClientSession() as session:
