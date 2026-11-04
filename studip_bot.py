@@ -3239,12 +3239,12 @@ def _status_group_view(group: str) -> tuple:
             [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="status_group_toggle|semester|watch_prev")],
         ]
     else:
-        study_plan = get_weekly_study_plan_enabled()
-        title = f"🎓 <b>Studies</b>\n\nWeekly Study Plan (Sunday evening): {'✅ On' if study_plan else '🔲 Off'}"
+        title = "📄 <b>Official Documents &amp; Tuition</b>\n\nDownload official StuMS PDF certificates, transcript, and semester fee status:"
         rows = [
-            [InlineKeyboardButton("🎓 Enrollment", callback_data="enrollment_menu"), InlineKeyboardButton("📝 Exams", callback_data="exam_menu")],
-            [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary"), InlineKeyboardButton("📄 PDF Documents", callback_data="stums_docs_menu")],
-            [InlineKeyboardButton("💶 Tuition & Fees", callback_data="tuition_status"), InlineKeyboardButton(f"{'✅' if study_plan else '🔲'} Weekly Plan", callback_data="status_group_toggle|studies|study_plan")],
+            [InlineKeyboardButton("📄 Immatrikulationsbescheinigung", callback_data="stums_doc|immatrikulation")],
+            [InlineKeyboardButton("📄 Studienbescheinigung", callback_data="stums_doc|studienbescheinigung")],
+            [InlineKeyboardButton("📄 BAföG-Bescheinigung", callback_data="stums_doc|bafoeg")],
+            [InlineKeyboardButton("💶 Tuition & Fees", callback_data="tuition_status"), InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
         ]
     return title, InlineKeyboardMarkup(rows)
 
@@ -5905,8 +5905,13 @@ async def _render_files_courses_for_semester(sender, semester_id: str):
         await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
         return
 
-    change_semester_row = [[InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|files")]]
-    await _send_courses_menu(sender, courses, extra_buttons=change_semester_row)
+    extra_buttons = [
+        [
+            InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|files"),
+            InlineKeyboardButton("🎯 Track Courses", callback_data="sp_track_menu"),
+        ]
+    ]
+    await _send_courses_menu(sender, courses, extra_buttons=extra_buttons)
 
 
 async def handle_files_browse(sender):
@@ -7124,7 +7129,7 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             await study_buttons[text](update, context)
             return
         # Check all buttons
-        if "📚" in text or "files" in text.lower():
+        if "📁" in text or "📚" in text or "⬇️" in text or "files" in text.lower():
             data = ["files"]
         elif "📅" in text or "schedule" in text.lower() or "calendar" in text.lower():
             data = ["calendar"]
@@ -7134,6 +7139,8 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             data = ["menu"]
         elif "📊" in text or "progress" in text.lower():
             data = ["progress"]
+        elif "📝" in text or "exam" in text.lower():
+            data = ["exams"]
         elif "🔄" in text or "🔁" in text or "check" in text.lower():
             data = ["check"]
         elif "⚙️" in text or "ℹ️" in text or "status" in text.lower():
@@ -7170,6 +7177,8 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
                 await send_tasks_menu(sender)
             elif data[0] == "progress":
                 await progress_command(update, context)
+            elif data[0] == "exams":
+                await exams_command(update, context)
             elif data[0] == "start":
                 await start(update, context)
             elif data[0] == "files":
@@ -9181,7 +9190,7 @@ async def delete_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.text:
             return
         text = _normalize_button_text(update.message.text)
-        if text.startswith(("📚", "📅", "✅", "📊", "🔄", "⚙️", "⬇️", "🔁", "ℹ️", "🍽️", "📘", "🎯")):
+        if text.startswith(("📁", "⬇️", "📚", "📅", "✅", "🍽️", "📘", "📊", "📝", "🔄", "⚙️", "🔁", "ℹ️", "🎯")):
             return
         await update.message.delete()
     except Exception:
@@ -9195,9 +9204,9 @@ def get_main_keyboard():
     """Main persistent reply keyboard with 3 rows of 3 buttons (9 buttons)"""
     return ReplyKeyboardMarkup(
         [
-            ["📚 Courses", "📅 Schedule", "✅ Tasks"],
+            ["📁 Files", "📅 Schedule", "✅ Tasks"],
             ["🍽️ Mensa", "📘 Study Plan", "📊 Progress"],
-            ["🎯 Courses", "🔄 Check", "⚙️ Status"]
+            ["📝 Exams", "🔄 Check", "⚙️ Status"]
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -9220,18 +9229,41 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎓 <b>Uni Oldenburg Assistant</b>\n\n"
         "Welcome! Your personal Stud.IP companion is ready.\n\n"
         "<b>Dashboard Navigation:</b>\n"
-        "• 📚 <b>Courses:</b> Browse course documents & materials\n"
+        "• 📁 <b>Files:</b> Browse course documents & materials\n"
         "• 📅 <b>Schedule:</b> Today's lecture timetable & calendar\n"
         "• ✅ <b>Tasks:</b> Manage personal tasks & deadlines\n"
         "• 🍽️ <b>Mensa:</b> Today's cafeteria food menu\n"
         "• 📘 <b>Study Plan:</b> Weekly study schedule & modules\n"
         "• 📊 <b>Progress:</b> Track study progress & completion\n"
-        "• 🎯 <b>Courses:</b> Configure tracked courses\n"
+        "• 📝 <b>Exams:</b> Open exam registrations & dates\n"
         "• 🔄 <b>Check:</b> Instantly scan for new files & grades\n"
-        "• ⚙️ <b>Status:</b> System health, WhatsApp & settings\n",
+        "• ⚙️ <b>Status:</b> Documents, tuition, WhatsApp & settings\n",
         parse_mode="HTML",
         reply_markup=get_main_keyboard()
     )
+
+
+# ── /exams command ───────────────────────────────────────────────────────────
+async def exams_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle 📝 Exams button and /exams command."""
+    message = update.effective_message
+    if not message:
+        return
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None or not is_user_allowed(user_id):
+        await message.reply_text("Not authorized to use this bot.")
+        return
+    status_msg = await message.reply_text("📝 Loading exams from StuMS...", disable_notification=True)
+    await _show_typing(message)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Loading exams...")
+    try:
+        await send_exam_registration_menu(message)
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
 
 # ── /check and /watch commands ───────────────────────────────────────────────
@@ -15603,9 +15635,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [login_btn, InlineKeyboardButton("🚪 Logout", callback_data="studip_logout")],
-        [InlineKeyboardButton("👤 Profile", callback_data="status_group|profile"), InlineKeyboardButton("📆 Semester", callback_data="status_group|semester")],
-        [InlineKeyboardButton("🎓 Studies", callback_data="status_group|studies"), InlineKeyboardButton("👔 Wardrobe", callback_data="outfit_menu")],
-        [InlineKeyboardButton("📱 WhatsApp", callback_data="wa_menu"), InlineKeyboardButton("🍽️ Mensa Food", callback_data="mensa_food")],
+        [InlineKeyboardButton("📄 Documents & Tuition", callback_data="status_group|docs_tuition"), InlineKeyboardButton("📆 Semester & iCal", callback_data="status_group|semester")],
+        [InlineKeyboardButton("👔 Wardrobe & Weather", callback_data="outfit_menu"), InlineKeyboardButton("📱 WhatsApp Gateway", callback_data="wa_menu")],
+        [InlineKeyboardButton("🎯 Tracked Courses", callback_data="sp_track_menu"), InlineKeyboardButton("👤 Profile", callback_data="status_group|profile")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -15686,6 +15718,8 @@ async def main():
         # Command & Callback handlers
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("check", check_command))
+        app.add_handler(CommandHandler("exams", exams_command))
+        app.add_handler(CommandHandler("exam", exams_command))
         app.add_handler(CommandHandler("studyplan", study_plan_command))
         app.add_handler(CommandHandler("progress", progress_command))
         app.add_handler(CommandHandler("trackcourses", track_courses_command))
