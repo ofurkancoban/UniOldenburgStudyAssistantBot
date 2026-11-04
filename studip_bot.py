@@ -9202,7 +9202,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Send keyboard IMMEDIATELY - not conditional on anything
-    welcome_msg = await update.message.reply_text(
+    await update.message.reply_text(
         "🎓 <b>Uni Oldenburg Assistant</b>\n\n"
         "Welcome! Your personal Stud.IP companion is ready.\n\n"
         "<b>Dashboard Navigation:</b>\n"
@@ -9215,14 +9215,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=get_main_keyboard()
     )
-
-    # Then do other operations
-    try:
-        courses = await list_courses()
-        # Keep keyboard when sending courses
-        await _send_courses_menu(update.message, courses)
-    except Exception as e:
-        logging.warning(f"Course loading failed but keyboard should be visible: {e}")
 
 
 # ── /check and /watch commands ───────────────────────────────────────────────
