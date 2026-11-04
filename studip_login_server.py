@@ -187,35 +187,59 @@ _GATE_PAGE = """<!DOCTYPE html>
 
 _STATUS_BAR_SNIPPET = """
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
-<div id="_bot_bar" style="position:fixed;bottom:12px;right:12px;z-index:999999;display:flex;gap:8px;align-items:center;background:#0f172a;color:#f8fafc;padding:8px 12px;border-radius:999px;box-shadow:0 4px 16px rgba(0,0,0,.35);font:12px/1.2 -apple-system,BlinkMacSystemFont,sans-serif;">
-  <span>__STATUS_TEXT__</span>
-  <a href="/_bot/entry?relogin=1" onclick="try{sessionStorage.removeItem('_bot_close_hint_dismissed');}catch(e){}" style="color:#93c5fd;text-decoration:none;font-weight:600;padding:4px 6px;">Sign in again</a>
-  <button type="button" onclick="if(window.Telegram&&Telegram.WebApp&&Telegram.WebApp.initData){Telegram.WebApp.close();}else{window.close();}" style="background:#2563eb;color:#fff;border:0;border-radius:999px;padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;">Done</button>
+<div id="_bot_bar" style="position:fixed;bottom:max(14px,env(safe-area-inset-bottom,14px));right:14px;z-index:999999;display:flex;gap:10px;align-items:center;background:rgba(15,23,42,0.88);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);color:#f8fafc;padding:7px 12px;border-radius:999px;box-shadow:0 8px 24px rgba(0,0,0,0.35);border:1px solid rgba(255,255,255,0.12);font:12px/1.2 -apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif;">
+  <span style="font-weight:500;display:flex;align-items:center;gap:6px;">__STATUS_TEXT__</span>
+  <a href="/_bot/entry?relogin=1" onclick="try{sessionStorage.removeItem('_bot_close_hint_dismissed');}catch(e){}" style="color:#93c5fd;text-decoration:none;font-weight:600;padding:2px 6px;border-radius:6px;background:rgba(255,255,255,0.06);">Relink</a>
+  <button type="button" onclick="if(window.Telegram&&Telegram.WebApp&&Telegram.WebApp.initData){Telegram.WebApp.close();}else{window.close();}" style="background:#2563eb;color:#fff;border:0;border-radius:999px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;box-shadow:0 2px 6px rgba(37,99,235,0.35);">Done</button>
 </div>
 """
 
 _CONNECTED_BANNER_SNIPPET = """
 <style>
-@keyframes _botBounceTopLeft {
-  0%, 100% { transform: translate(0, 0); }
-  50% { transform: translate(-4px, -4px); }
+@keyframes _botSlideIn {
+  0% { transform: translateY(-24px) scale(0.97); opacity: 0; }
+  100% { transform: translateY(0) scale(1); opacity: 1; }
+}
+@keyframes _botPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.05); }
 }
 </style>
-<div id="_bot_close_banner" style="display:none;position:fixed;top:10px;left:10px;right:10px;z-index:1000000;background:linear-gradient(135deg,#065f46,#047857);color:#ecfdf5;padding:12px 14px;border-radius:14px;box-shadow:0 8px 24px rgba(0,0,0,.4);border:1px solid rgba(167,243,208,.35);font:13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;align-items:center;gap:10px;">
-  <span style="font-size:22px;line-height:1;display:inline-block;animation:_botBounceTopLeft 1.2s ease-in-out infinite;">↖️</span>
-  <div style="flex:1;">
-    <div style="font-weight:700;font-size:14px;color:#fff;">✅ Login successful &amp; Bot connected!</div>
-    <div style="font-size:12px;color:#d1fae5;margin-top:2px;">You can now close this window using the <b>✕</b> button at the top-left.</div>
+<div id="_bot_close_banner" style="display:none;position:fixed;top:max(12px,env(safe-area-inset-top,12px));left:12px;right:12px;z-index:1000000;background:rgba(15,23,42,0.92);backdrop-filter:blur(24px);-webkit-backdrop-filter:blur(24px);color:#f8fafc;padding:12px 14px;border-radius:18px;box-shadow:0 14px 34px -4px rgba(0,0,0,0.5), 0 4px 14px rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.14);font:13px/1.4 -apple-system,BlinkMacSystemFont,'SF Pro Text','Segoe UI',sans-serif;align-items:center;gap:12px;animation:_botSlideIn 0.35s cubic-bezier(0.16,1,0.3,1) forwards;">
+  <div style="width:38px;height:38px;border-radius:12px;background:linear-gradient(135deg,#10b981,#059669);display:flex;align-items:center;justify-content:center;flex-shrink:0;box-shadow:0 4px 14px rgba(16,185,129,0.4);animation:_botPulse 2.5s ease-in-out infinite;">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+      <polyline points="20 6 9 17 4 12"></polyline>
+    </svg>
   </div>
-  <button type="button" onclick="try{sessionStorage.setItem('_bot_close_hint_dismissed','1');}catch(e){}document.getElementById('_bot_close_banner').style.display='none';" style="background:rgba(255,255,255,.18);color:#fff;border:0;border-radius:8px;padding:6px 10px;font-size:12px;font-weight:600;cursor:pointer;">Hide</button>
+  <div style="flex:1;min-width:0;">
+    <div style="font-weight:700;font-size:14px;color:#ffffff;letter-spacing:-0.2px;">Login Successful</div>
+    <div style="font-size:12px;color:#94a3b8;margin-top:2px;line-height:1.3;">Bot connected &amp; session synced. Tap <b>Done</b> to return.</div>
+  </div>
+  <div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">
+    <button type="button" onclick="if(window.Telegram&&Telegram.WebApp&&Telegram.WebApp.initData){Telegram.WebApp.close();}else{window.close();}" style="background:linear-gradient(135deg,#2563eb,#1d4ed8);color:#ffffff;border:none;border-radius:10px;padding:8px 14px;font-size:12px;font-weight:600;cursor:pointer;box-shadow:0 2px 8px rgba(37,99,235,0.4);white-space:nowrap;">Done</button>
+    <button type="button" aria-label="Dismiss banner" onclick="try{sessionStorage.setItem('_bot_close_hint_dismissed','1');}catch(e){}document.getElementById('_bot_close_banner').style.display='none';var b=document.getElementById('_bot_bar');if(b)b.style.display='flex';" style="background:rgba(255,255,255,0.08);color:#94a3b8;border:none;border-radius:10px;width:30px;height:30px;display:flex;align-items:center;justify-content:center;cursor:pointer;font-size:14px;padding:0;">✕</button>
+  </div>
 </div>
 <script>
 (function(){
   try {
+    var banner = document.getElementById('_bot_close_banner');
+    var botBar = document.getElementById('_bot_bar');
     if (sessionStorage.getItem('_bot_close_hint_dismissed') !== '1') {
-      var el = document.getElementById('_bot_close_banner');
-      if (el) el.style.display = 'flex';
-      if (window.Telegram && Telegram.WebApp && Telegram.WebApp.HapticFeedback && !sessionStorage.getItem('_bot_haptic_done')) {
+      if (banner) banner.style.display = 'flex';
+      if (botBar) botBar.style.display = 'none';
+    } else {
+      if (banner) banner.style.display = 'none';
+      if (botBar) botBar.style.display = 'flex';
+    }
+    if (window.Telegram && Telegram.WebApp) {
+      Telegram.WebApp.ready();
+      if (Telegram.WebApp.MainButton) {
+        Telegram.WebApp.MainButton.setText("Done (Return to Bot)").show().onClick(function(){
+          Telegram.WebApp.close();
+        });
+      }
+      if (Telegram.WebApp.HapticFeedback && !sessionStorage.getItem('_bot_haptic_done')) {
         sessionStorage.setItem('_bot_haptic_done', '1');
         Telegram.WebApp.HapticFeedback.notificationOccurred('success');
       }
