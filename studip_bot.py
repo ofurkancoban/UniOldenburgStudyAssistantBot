@@ -8747,12 +8747,14 @@ async def handle_studip_message_reply_cancel(update: Update, context: ContextTyp
 # ── Feature 9: 1-Minute Audio "Podcast" Summary for Course PDFs/Slides ────────
 
 FILE_AUDIO_SUMMARY_SYSTEM_PROMPT = (
-    "You are an engaging university study podcast host. Summarize the core concepts, "
-    "key takeaways, definitions, and any important dates or formulas from the provided "
-    "course document into a clear, natural spoken script that takes about 60 seconds to "
-    "read aloud (130 to 165 words). Speak directly to the student in English. Do not use "
-    "markdown formatting, bullet symbols, or special characters - write smooth, natural "
-    "spoken sentences."
+    "You are an expert academic tutor providing a concise, high-yield summary of a university lecture document (slides or notes). "
+    "Your goal is to give the student a clear, intellectually solid understanding of what this document actually teaches.\n\n"
+    "Guidelines:\n"
+    "1. No podcast fluff or fake enthusiasm: Do NOT use podcast intros, hype, greetings, or sign-offs (e.g. avoid 'Hey everyone', 'Welcome back', 'Buckle up', 'Tune in next time'). Get straight to the subject.\n"
+    "2. Filter out administrative noise: Completely ignore professor contact info, syllabus disclaimers, course logistics, copyright notices, and slide numbers.\n"
+    "3. Focus on core substance: Identify the central topic and explain the 2 to 4 key concepts, theoretical models, mechanisms, or quantitative methods presented.\n"
+    "4. Tone and structure: Professional, clear, engaging, and academic. Explain the intuition behind the concepts and why they matter in the context of the course.\n"
+    "5. Format: Write in natural, smooth spoken English (130 to 170 words, about 60 seconds reading pace). Do NOT use markdown bold/italics, bullet points, asterisks, or numbered lists, as this will be read aloud via text-to-speech."
 )
 
 
@@ -12170,7 +12172,14 @@ def extract_text_from_file(filename: str, content: bytes) -> Optional[str]:
     return None
 
 
-LECTURE_FILE_TOPIC_SYSTEM_PROMPT = """You're given raw extracted text from one university lecture file (slides or notes). Respond with a single short line (max ~12 words) naming the specific topic(s) covered - e.g. "Dijkstra's algorithm and shortest paths" or "Kant's categorical imperative, lecture 4" - not a generic description like "lecture slides" or "course material". No markdown, no quotes, just the one line."""
+LECTURE_FILE_TOPIC_SYSTEM_PROMPT = (
+    "You are given raw extracted text from a university lecture file (slides or notes). "
+    "Respond with a single concise line (max 10-12 words) naming the specific academic topic or model covered "
+    "(e.g., 'Linear Regression and OLS Estimation' or 'Nash Equilibrium and Dynamic Games'). "
+    "Ignore administrative text, syllabus notices, and course titles. "
+    "Never return generic phrases like 'lecture slides', 'course overview', or 'chapter 1'. "
+    "No markdown, no quotes, plain text only."
+)
 
 
 async def summarize_lecture_file(filename: str, extracted_text: str) -> Optional[str]:
