@@ -15,6 +15,7 @@ which uses a tense difference in its wording:
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -42,6 +43,10 @@ ENROLLMENT_INFO_URL = (
 GRADES_URL = (
     f"{STUMS_BASE}/qisserver/pages/sul/examAssessment/personExamsReadonly.xhtml"
     "?_flowId=examsOverviewForPerson-flow&navigationPosition=hisinoneMeinStudium%2CexamAssessmentForStudent&recordRequest=true"
+)
+STUDY_SERVICE_URL = (
+    f"{STUMS_BASE}/qisserver/pages/cm/stu/studyService/start.xhtml"
+    "?_flowId=studyservice-flow&navigationPosition=hisinoneMeinStudium%2ChisinoneStudyservice&recordRequest=true"
 )
 
 EXAM_CACHE_PATH = "exam_reminder_cache.json"
@@ -1159,43 +1164,73 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
     cache = load_exam_cache()
     known_grades = cache.get("known_grades", {})
 
+    # Initial baseline seeding: record existing grades without blast-alerting historical exams
+    if not known_grades:
+        for entry in grades:
+            st = (entry.get("status_title") or "").lower()
+            if st in FINAL_GRADE_STATUSES:
+                known_grades[entry["number"]] = {"status_title": st, "grade": entry.get("grade")}
+        cache["known_grades"] = known_grades
+        save_exam_cache(cache)
+        logging.info(f"🎓 Seeded {len(known_grades)} historical grades into baseline cache.")
+        return
+
     for entry in grades:
         status_title = (entry.get("status_title") or "").lower()
         if status_title not in FINAL_GRADE_STATUSES:
             continue
 
         number = entry["number"]
-        fingerprint = {"status_title": status_title, "grade": entry.get("grade")}
+        grade_val = (entry.get("grade") or "").strip()
+        fingerprint = {"status_title": status_title, "grade": grade_val or None}
         if known_grades.get(number) == fingerprint:
             continue  # already notified about this exact result
 
-        icon = "✅" if status_title == "passed" else "❌"
-        grade_line = f"🔢 <b>Grade:</b> {entry['grade']}\n" if entry.get("grade") else ""
-        credit_line = f"🎓 <b>Credits:</b> {entry['credit_points']}\n" if entry.get("credit_points") else ""
+        is_passed = status_title == "passed"
+        icon = "🎉" if is_passed else "❌"
+        congrats_header = "🎉 <b>CONGRATULATIONS! NEW EXAM GRADE</b>" if is_passed else "📋 <b>NEW EXAM RESULT ANNOUNCED</b>"
+        congrats_line = "🥳 <i>Tebrikler! Dersi başarıyla geçtiniz.</i>\n" if is_passed else ""
 
-        # Personal message with the actual grade — no WA-forward button, since
+        praise = ""
+        if is_passed and grade_val:
+            try:
+                val_f = float(grade_val.replace(",", "."))
+                if val_f <= 1.3:
+                    praise = " 🌟 <i>(Outstanding / Sehr gut!)</i>"
+                elif val_f <= 2.0:
+                    praise = " 👏 <i>(Great result / Gut!)</i>"
+            except ValueError:
+                pass
+
+        grade_line = f"🔢 <b>Grade:</b> <b>{html.escape(grade_val)}</b>{praise}\n" if grade_val else ""
+        credit_val = entry.get("credit_points")
+        credit_line = f"🎓 <b>Credits:</b> <b>+{html.escape(credit_val)} ECTS</b>\n" if credit_val else ""
+
+        # Personal message with the actual grade - no WA-forward button, since
         # this can carry personal grade info that shouldn't end up in a shared
         # (e.g. department) WhatsApp group by an accidental tap.
         personal_text = (
-            f"{icon} <b>EXAM RESULT AVAILABLE</b>\n"
+            f"{congrats_header}\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"📘 <b>Course:</b> {entry.get('title')}\n"
-            f"📊 <b>Status:</b> {status_title.capitalize()}\n"
+            f"{congrats_line}"
+            f"📘 <b>Course:</b> {html.escape(entry.get('title') or 'Module')}\n"
+            f"📊 <b>Status:</b> <b>{html.escape(status_title.capitalize())}</b>\n"
             f"{grade_line}"
             f"{credit_line}"
             "━━━━━━━━━━━━━━━━━"
         )
-        # Separate, grade-free announcement — safe to forward, so it carries the
+        # Separate, grade-free announcement - safe to forward, so it carries the
         # WA button instead.
         announcement_text = (
             "📢 <b>NEW EXAM RESULT ANNOUNCED</b>\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"📘 <b>Course:</b> {entry.get('title')}\n"
+            f"📘 <b>Course:</b> {html.escape(entry.get('title') or 'Module')}\n"
+            "ℹ️ <i>Results are now online on StuMS.</i>\n"
             "━━━━━━━━━━━━━━━━━"
         )
         try:
-            await broadcast_fn(bot, personal_text)
-            await broadcast_fn(bot, announcement_text, reply_markup=WA_FORWARD_MARKUP)
+            await broadcast_fn(bot, personal_text, parse_mode="HTML")
+            await broadcast_fn(bot, announcement_text, parse_mode="HTML", reply_markup=WA_FORWARD_MARKUP)
             logging.info(f"🎓 Notified: grade result for {entry.get('title')} ({number})")
         except Exception as e:
             logging.error(f"exam_reminder: failed to send grade notification for {number}: {e}")
@@ -1203,3 +1238,364 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
         known_grades[number] = fingerprint
         cache["known_grades"] = known_grades
         save_exam_cache(cache)
+
+
+async def check_tuition_reminders(session, bot, broadcast_fn, force: bool = False) -> None:
+    """Check tuition fee (Rückmeldung) status on StuMS and send proactive alerts if
+    unpaid invoices exist or when payment is received."""
+    now = datetime.now()
+    today = now.date()
+    today_str = today.isoformat()
+
+    cache = load_exam_cache()
+    t_state = cache.get("tuition_status", {})
+    last_check_ts = t_state.get("last_check_ts", 0)
+
+    # Check at most once every 6 hours unless forced
+    if not force and (now.timestamp() - last_check_ts < 6 * 3600):
+        return
+
+    try:
+        t_data = await get_tuition_status(session)
+    except Exception as exc:
+        logging.debug(f"check_tuition_reminders: fetch failed ({exc})")
+        return
+
+    has_open = bool(t_data.get("has_open_payments", False))
+    open_invoices = t_data.get("open_invoices", [])
+    was_open = bool(t_state.get("has_open_payments", False))
+    last_alert_date = t_state.get("last_alert_date")
+
+    t_state["last_check_ts"] = int(now.timestamp())
+    t_state["has_open_payments"] = has_open
+
+    # 1. Payment cleared notification
+    if was_open and not has_open:
+        cleared_text = (
+            "🎉 <b>SEMESTER FEE PAYMENT RECEIVED!</b>\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            "✅ Your semester fee payment has been confirmed by Uni Oldenburg.\n"
+            "🎓 <b>Re-registration (Rückmeldung) is complete!</b>\n"
+            "━━━━━━━━━━━━━━━━━"
+        )
+        try:
+            await broadcast_fn(bot, cleared_text, parse_mode="HTML")
+            logging.info("💶 Tuition fee cleared notification sent.")
+        except Exception as exc:
+            logging.error(f"Failed to send tuition clearance alert: {exc}")
+
+    # 2. Open payment alert
+    elif has_open and open_invoices:
+        inv = open_invoices[0]
+        due_str = inv.get("due_date", "").strip()
+        period = inv.get("period", "Upcoming Semester")
+        to_pay = inv.get("to_pay", "")
+        purpose = inv.get("purpose", "Semesterbeitrag / Rückmeldung")
+
+        days_left = None
+        if due_str:
+            for fmt in ("%d.%m.%Y", "%Y-%m-%d"):
+                try:
+                    due_date = datetime.strptime(due_str, fmt).date()
+                    days_left = (due_date - today).days
+                    break
+                except ValueError:
+                    pass
+
+        should_alert = False
+        if not was_open:
+            should_alert = True
+        elif last_alert_date != today_str:
+            if days_left is not None:
+                if days_left <= 14:
+                    should_alert = True
+                else:
+                    last_alert_dt = datetime.fromisoformat(last_alert_date).date() if last_alert_date else None
+                    if not last_alert_dt or (today - last_alert_dt).days >= 3:
+                        should_alert = True
+            else:
+                should_alert = True
+
+        if should_alert:
+            days_badge = ""
+            if days_left is not None:
+                if days_left < 0:
+                    days_badge = f" ⚠️ <b>OVERDUE by {abs(days_left)} days!</b>"
+                elif days_left == 0:
+                    days_badge = " ⚠️ <b>DUE TODAY!</b>"
+                elif days_left == 1:
+                    days_badge = " ⚠️ <b>DUE TOMORROW!</b>"
+                else:
+                    days_badge = f" <i>(in {days_left} days)</i>"
+
+            alert_text = (
+                "💶 <b>SEMESTER FEE DUE (RÜCKMELDUNG)</b>\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                f"🎓 <b>Semester:</b> {html.escape(period)}\n"
+                f"💰 <b>Amount:</b> <b>{html.escape(to_pay)}</b>\n"
+                f"📅 <b>Due Date:</b> <b>{html.escape(due_str)}</b>{days_badge}\n"
+                f"🔖 <b>Purpose:</b> {html.escape(purpose)}\n"
+                "━━━━━━━━━━━━━━━━━\n"
+                "ℹ️ <i>Please transfer the semester fee to complete your re-registration. Run /tuition to see payment details.</i>"
+            )
+            try:
+                await broadcast_fn(bot, alert_text, parse_mode="HTML")
+                t_state["last_alert_date"] = today_str
+                logging.info(f"💶 Tuition due reminder sent for {period} ({to_pay}).")
+            except Exception as exc:
+                logging.error(f"Failed to send tuition due alert: {exc}")
+
+    cache["tuition_status"] = t_state
+    save_exam_cache(cache)
+
+
+# ── StuMS Official PDF Documents & Tuition / Fee Status ────────────────────────
+
+STUMS_DOCUMENTS = {
+    "imma": {
+        "label": "📄 Immatrikulationsbescheinigung (+ BAföG)",
+        "filename": "Immatrikulationsbescheinigung.pdf",
+        "source": "studyservice",
+        "button_id": "studyserviceForm:report:reports:reportButtons:jobConfigurationButtons:0:jobConfigurationButtons:0:job2",
+        "label_match": "immatrikulationsbescheinigung",
+    },
+    "verlauf": {
+        "label": "📈 Studienverlaufsbescheinigung",
+        "filename": "Studienverlaufsbescheinigung.pdf",
+        "source": "studyservice",
+        "button_id": "studyserviceForm:report:reports:reportButtons:jobConfigurationButtons:0:jobConfigurationButtons:1:job2",
+        "label_match": "studienverlaufsbescheinigung",
+    },
+    "transcript_en": {
+        "label": "🇬🇧 Transcript of Records (English)",
+        "filename": "Transcript_of_Records_EN.pdf",
+        "source": "grades",
+        "button_id": "examsReadonly:exaReports:fieldset_exaReports:printReport_2",
+        "label_match": "leistungsübersicht englisch",
+    },
+    "transcript_de": {
+        "label": "🇩🇪 Leistungsübersicht (Deutsch)",
+        "filename": "Leistungsuebersicht_DE.pdf",
+        "source": "grades",
+        "button_id": "examsReadonly:exaReports:fieldset_exaReports:printReport_1",
+        "label_match": "leistungsübersicht deutsch",
+    },
+    "grades_en": {
+        "label": "🇬🇧 Grade Certificate / Notenbescheinigung (EN)",
+        "filename": "Grade_Certificate_EN.pdf",
+        "source": "grades",
+        "button_id": "examsReadonly:exaReports:fieldset_exaReports:printReport_4",
+        "label_match": "notenbescheinigung englisch",
+    },
+    "grades_de": {
+        "label": "🇩🇪 Notenbescheinigung (DE)",
+        "filename": "Notenbescheinigung_DE.pdf",
+        "source": "grades",
+        "button_id": "examsReadonly:exaReports:fieldset_exaReports:printReport_3",
+        "label_match": "notenbescheinigung deutsch",
+    },
+    "reg_exams": {
+        "label": "📝 Registered Exams / Angemeldete Prüfungen",
+        "filename": "Angemeldete_Pruefungen.pdf",
+        "source": "grades",
+        "button_id": "examsReadonly:exaReports:fieldset_exaReports:printReport_0",
+        "label_match": "angemeldete prüfungen",
+    },
+}
+
+
+def _build_jsf_form_payload(form, clicked_id: str, label_match: Optional[str] = None) -> dict:
+    """Build a standard JSF form submission payload including the clicked button's
+    `name` attribute (which in HISinOne's `studyserviceForm` differs from its `id`)."""
+    payload: dict[str, str] = {}
+    for inp in form.find_all("input"):
+        name = inp.get("name")
+        if not name:
+            continue
+        itype = (inp.get("type") or "").lower()
+        if itype in ("submit", "button", "image", "reset"):
+            continue
+        if itype in ("checkbox", "radio") and not inp.has_attr("checked"):
+            continue
+        payload[name] = inp.get("value", "")
+
+    for sel in form.find_all("select"):
+        name = sel.get("name")
+        if not name:
+            continue
+        opt = sel.find("option", selected=True) or sel.find("option")
+        payload[name] = opt.get("value", "") if opt else ""
+
+    btn = form.find(id=clicked_id)
+    if not btn and label_match:
+        needle = label_match.lower()
+        for candidate in form.find_all(["button", "input"]):
+            txt = (candidate.get_text(" ", strip=True) or candidate.get("value") or candidate.get("title") or "").lower()
+            if needle in txt:
+                btn = candidate
+                break
+
+    if btn:
+        btn_name = btn.get("name") or btn.get("id") or clicked_id
+        payload[btn_name] = btn.get("value", "")
+    else:
+        payload[clicked_id] = ""
+    return payload
+
+
+async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
+    """Download an official PDF certificate from StuMS (`STUMS_DOCUMENTS[doc_key]`).
+
+    Returns `(pdf_bytes, filename)` or raises `RuntimeError` on failure.
+    """
+    spec = STUMS_DOCUMENTS.get(doc_key)
+    if not spec:
+        raise RuntimeError(f"Unknown document key: {doc_key}")
+
+    referer = await _establish_stums_session(session)
+
+    if spec["source"] == "grades":
+        async with await session.get(GRADES_URL, allow_redirects=True, headers={"Referer": referer}) as r:
+            html_text = await r.text()
+            page_url = str(r.url)
+        if "Login notwendig" in html_text:
+            raise RuntimeError("StuMS session expired while opening My Achievements.")
+
+        soup = BeautifulSoup(html_text, "html.parser")
+        form = soup.find("form", id="examsReadonly")
+        if not form:
+            raise RuntimeError("Could not find the reports form on StuMS.")
+
+        payload = _build_jsf_form_payload(form, spec["button_id"], spec.get("label_match"))
+        action_url = urljoin(page_url, form.get("action") or "")
+        async with await session.post(action_url, data=payload, allow_redirects=True, headers={"Referer": page_url}) as r2:
+            raw = await r2.read()
+            ctype = (r2.headers.get("Content-Type") or "").lower()
+            resp_url = str(r2.url)
+    else:
+        async with await session.get(STUDY_SERVICE_URL, allow_redirects=True, headers={"Referer": referer}) as r:
+            html_text = await r.text()
+            page_url = str(r.url)
+        if "Login notwendig" in html_text:
+            raise RuntimeError("StuMS session expired while opening Student Service.")
+
+        soup = BeautifulSoup(html_text, "html.parser")
+        form = soup.find("form", id="studyserviceForm")
+        if not form:
+            raise RuntimeError("Could not find studyserviceForm on StuMS.")
+
+        # Step 1: Switch to the Reports tab if the report button isn't already rendered
+        if not form.find(id=spec["button_id"]):
+            tab_payload = _build_jsf_form_payload(form, "studyserviceForm:report_TabBtn", "reports")
+            tab_action_url = urljoin(page_url, form.get("action") or "")
+            async with await session.post(tab_action_url, data=tab_payload, allow_redirects=True, headers={"Referer": page_url}) as r_tab:
+                html_text = await r_tab.text()
+                page_url = str(r_tab.url)
+            soup = BeautifulSoup(html_text, "html.parser")
+            form = soup.find("form", id="studyserviceForm")
+            if not form:
+                raise RuntimeError("Could not switch to the Reports tab on StuMS.")
+
+        payload = _build_jsf_form_payload(form, spec["button_id"], spec.get("label_match"))
+        action_url = urljoin(page_url, form.get("action") or "")
+        async with await session.post(action_url, data=payload, allow_redirects=True, headers={"Referer": page_url}) as r2:
+            raw = await r2.read()
+            ctype = (r2.headers.get("Content-Type") or "").lower()
+            resp_url = str(r2.url)
+
+    if raw.startswith(b"%PDF") or "application/pdf" in ctype:
+        return raw, spec["filename"]
+
+    # HISinOne Student Service often returns an HTML page with a `rds?state=docdownload&docId=...` redirect/link
+    html_after = raw.decode("utf-8", errors="ignore")
+    m = re.search(r"(/qisserver/rds\?state=docdownload[^\"'\s<>]+)", html_after)
+    if m:
+        dl_path = html_after[m.start(1):m.end(1)].replace("&amp;", "&")
+        dl_url = urljoin(STUMS_BASE, dl_path)
+        async with await session.get(dl_url, allow_redirects=True, headers={"Referer": resp_url}) as r_dl:
+            pdf_bytes = await r_dl.read()
+        if pdf_bytes.startswith(b"%PDF"):
+            return pdf_bytes, spec["filename"]
+
+    raise RuntimeError("StuMS did not return a valid PDF document.")
+
+
+def _parse_invoice_table_rows(container) -> list[dict]:
+    """Extract invoice rows `[Period, Due date, Purpose, To Pay, Credit]` from a StuMS invoice table."""
+    if not container:
+        return []
+    rows = []
+    tbody = container.find("tbody") or container
+    for tr in tbody.find_all("tr"):
+        cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if len(cells) < 5:
+            continue
+        # Skip empty placeholder rows
+        if not any(cells[:5]):
+            continue
+        rows.append({
+            "period": cells[0],
+            "due_date": cells[1],
+            "purpose": cells[2],
+            "to_pay": cells[3],
+            "credit": cells[4],
+        })
+    return rows
+
+
+async def get_tuition_status(session) -> dict:
+    """Fetch open and paid semester fee invoices (*Semesterbeitrag* / *Rückmeldung*)
+    from StuMS Student Service (`Payments` tab).
+    """
+    referer = await _establish_stums_session(session)
+    async with await session.get(STUDY_SERVICE_URL, allow_redirects=True, headers={"Referer": referer}) as r:
+        html_text = await r.text()
+        page_url = str(r.url)
+    if "Login notwendig" in html_text:
+        raise RuntimeError("StuMS session expired while opening Student Service.")
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    form = soup.find("form", id="studyserviceForm")
+    if not form:
+        raise RuntimeError("Could not find studyserviceForm on StuMS.")
+
+    # Switch to the Payments tab (`studyserviceForm:billsAndPayment_TabBtn`)
+    tab_payload = _build_jsf_form_payload(form, "studyserviceForm:billsAndPayment_TabBtn", "payments")
+    action_url = urljoin(page_url, form.get("action") or "")
+    async with await session.post(action_url, data=tab_payload, allow_redirects=True, headers={"Referer": page_url}) as r2:
+        pay_html = await r2.text()
+
+    pay_soup = BeautifulSoup(pay_html, "html.parser")
+
+    # 1. Open / unpaid invoices
+    open_fs = pay_soup.find(id=lambda x: x and x.endswith("fieldSetInvoiceOffen"))
+    open_text = open_fs.get_text(" ", strip=True) if open_fs else ""
+    open_invoices = _parse_invoice_table_rows(open_fs)
+    no_open_flag = (
+        "no open payments" in open_text.lower()
+        or "keine offenen" in open_text.lower()
+    )
+    has_open = bool(open_invoices) and not no_open_flag
+
+    # 2. Paid / all invoices
+    paid_table = (
+        pay_soup.find(id=lambda x: x and x.endswith("dataTableSalesInvoicesOffenTable"))
+        or pay_soup.find(id=lambda x: x and x.endswith("fieldSetInvoicePaid"))
+    )
+    paid_invoices = _parse_invoice_table_rows(paid_table)
+
+    # 3. Current enrollment / reregistration status message if shown on page
+    status_banner = ""
+    for msg_div in pay_soup.select(".message_info, .box_info, .status_info"):
+        t = msg_div.get_text(" ", strip=True)
+        if t and len(t) < 240:
+            status_banner = t
+            break
+
+    return {
+        "has_open_payments": has_open,
+        "open_invoices": open_invoices,
+        "paid_invoices": paid_invoices,
+        "status_banner": status_banner,
+    }
+

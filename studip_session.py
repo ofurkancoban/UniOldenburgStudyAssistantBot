@@ -11,6 +11,9 @@ import base64
 import json
 import re
 from urllib.parse import urljoin, urlparse, parse_qs
+from yarl import URL
+
+import studip_oauth
 
 class StudIPSession:
     """
@@ -18,10 +21,13 @@ class StudIPSession:
     Using aiohttp for high performance and non-blocking operation in bots.
     """
     
-    def __init__(self, username, password, totp_secret, cookie_file="studip_cookies.json"):
+    def __init__(self, username, password, totp_secret, cookie_file="studip_cookies.json", totp_code=None):
         self.username = username
         self.password = password
         self.totp_secret = totp_secret
+        # A pre-generated 6-digit code (typed by the user in the /login form).
+        # Used once, then cleared - the secret-based generator takes over.
+        self.totp_code = totp_code
         self.cookie_file = cookie_file
         self.session = None
         self.headers = {
@@ -29,6 +35,8 @@ class StudIPSession:
         }
         self.logger = logging.getLogger("StudIPSession")
         self._lock = asyncio.Lock()
+        self.last_interactive_activity = 0.0
+        self.explicitly_logged_out = False
 
     async def __aenter__(self):
         await self.ensure_session()
@@ -44,6 +52,9 @@ class StudIPSession:
             await self.load_cookies()
 
     def _get_totp_token(self):
+        if self.totp_code:
+            code, self.totp_code = self.totp_code, None  # one-shot
+            return code
         if not self.totp_secret:
             return ""
         try:
@@ -58,64 +69,123 @@ class StudIPSession:
             return ""
 
     async def save_cookies(self):
-        if not self.session: return
-        cookies = {}
+        if not self.session:
+            return
+        entries = []
         for cookie in self.session.cookie_jar:
-             cookies[cookie.key] = cookie.value
-        with open(self.cookie_file, 'w') as f:
-            json.dump(cookies, f)
-        self.logger.info(f"Cookies saved to {self.cookie_file}")
+            entries.append({
+                "key": cookie.key,
+                "value": cookie.value,
+                "domain": cookie["domain"] or "elearning.uni-oldenburg.de",
+                "path": cookie["path"] or "/",
+            })
+        try:
+            from studip_vault import write_vault_file
+            write_vault_file(self.cookie_file, entries, mode=0o600)
+            self.logger.info(f"Encrypted cookies saved to {self.cookie_file} (mode 0600)")
+        except Exception as exc:
+            self.logger.error(f"Failed to save encrypted cookies to {self.cookie_file}: {exc}")
 
     async def load_cookies(self):
         if os.path.exists(self.cookie_file):
             try:
-                with open(self.cookie_file, 'r') as f:
-                    cookies = json.load(f)
-                    if self.session:
-                        self.session.cookie_jar.update_cookies(cookies)
-                self.logger.info(f"Cookies loaded from {self.cookie_file}")
+                from studip_vault import read_vault_file
+                data = read_vault_file(self.cookie_file, auto_migrate=True)
+                if data is None:
+                    with open(self.cookie_file, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                if self.session and data:
+                    if isinstance(data, list):
+                        for entry in data:
+                            key = entry.get("key")
+                            val = entry.get("value")
+                            dom = (entry.get("domain") or "elearning.uni-oldenburg.de").lstrip(".")
+                            path = entry.get("path") or "/"
+                            if key is not None and val is not None:
+                                self.session.cookie_jar.update_cookies(
+                                    {key: val},
+                                    response_url=URL(f"https://{dom}{path}"),
+                                )
+                    elif isinstance(data, dict):
+                        for key, val in data.items():
+                            if key in ("JSESSIONID", "UrnNovellNidpClusterMemberId", "_PA_SDK_SSO_") or key.startswith("x-oidp-"):
+                                dom = "idp.uni-oldenburg.de"
+                            else:
+                                dom = "elearning.uni-oldenburg.de"
+                            self.session.cookie_jar.update_cookies(
+                                {key: val},
+                                response_url=URL(f"https://{dom}/"),
+                            )
+                self.logger.info(f"Encrypted cookies loaded from {self.cookie_file}")
                 return True
             except Exception as e:
                 self.logger.error(f"Failed to load cookies: {e}")
         return False
 
-    async def is_logged_in(self):
-        """
-        Check if the session is currently authenticated.
-        """
+    async def is_html_logged_in(self) -> bool:
+        """Check if the browser-less HTML cookie session is currently authenticated."""
         await self.ensure_session()
         try:
-            # Check a known authenticated page
             async with self.session.get("https://elearning.uni-oldenburg.de/dispatch.php/start", allow_redirects=True) as r:
                 text = await r.text()
                 url = str(r.url)
-                
-                # Markers of NOT being logged in
+
                 is_guest = '"username":"nobody"' in text or '"me":{"username":"nobody"}' in text
                 is_login_page = "/dispatch.php/login" in url or "index.php?again=yes" in url
-                
-                # Markers of BEING logged in
+
                 has_logout = "logout" in text.lower()
                 has_sidebar = "sidebar-widget" in text
                 has_my_courses = "/dispatch.php/my_courses" in text
                 has_user_id = "STUDIP.USER_ID" in text
-                
+
                 if (has_logout or has_sidebar or has_my_courses or has_user_id) and not is_guest and not is_login_page:
-                    self.logger.debug(f"is_logged_in: True (markers found at {url})")
+                    self.logger.debug(f"is_html_logged_in: True (markers found at {url})")
                     return True
-                
-                self.logger.info(f"is_logged_in: False (markers missing or Guest state at {url})")
+
+                self.logger.info(f"is_html_logged_in: False (markers missing or Guest state at {url})")
                 return False
         except Exception as e:
-            self.logger.error(f"is_logged_in check failed: {e}")
+            self.logger.error(f"is_html_logged_in check failed: {e}")
             return False
+
+    async def is_logged_in(self, allow_oauth: bool = True) -> bool:
+        """Check if the session is authenticated (via HTML cookie or OAuth2 token)."""
+        if await self.is_html_logged_in():
+            return True
+        if allow_oauth:
+            try:
+                token = await studip_oauth.get_access_token()
+                if token:
+                    return True
+            except Exception as exc:
+                self.logger.warning(f"OAuth check failed: {exc}")
+        return False
 
     async def login(self, force=False):
         async with self._lock:
             await self.ensure_session()
-            if not force and await self.is_logged_in():
-                 self.logger.info("Session already logged in.")
-                 return True
+            if not force and (
+                self.explicitly_logged_out
+                or (time.time() - self.last_interactive_activity < 180)
+            ):
+                return await self.is_logged_in()
+
+            if not force and await self.is_html_logged_in():
+                self.logger.info("Session already logged in.")
+                self.explicitly_logged_out = False
+                return True
+
+            has_headless_creds = bool(
+                self.username and self.password and (self.totp_secret or self.totp_code)
+            )
+            if not has_headless_creds and not os.path.exists(self.cookie_file):
+                if not force:
+                    try:
+                        if await studip_oauth.get_access_token():
+                            return True
+                    except Exception:
+                        pass
+                return False
 
             self.logger.info("Starting fresh async browser-less login (NetIQ optimized)...")
 
@@ -124,18 +194,88 @@ class StudIPSession:
             login_link_cancel = f"{elearn}/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
 
             # 1. Prime the session before triggering the login flow.
-            async with self.session.get(start_url) as r:
-                pass
-
             try:
+                async with self.session.get(start_url) as r:
+                    pass
                 await self._run_sso_flow(login_link_cancel, referer=start_url)
-            except RuntimeError as e:
-                self.logger.error(f"Login failed: {e}")
+                self.explicitly_logged_out = False
+                await self.save_cookies()
+                self.logger.info("✅ Login successful.")
+                return True
+            except Exception as e:
+                self.logger.warning(f"SSO login flow did not complete: {e}")
+                if not force:
+                    try:
+                        if await studip_oauth.get_access_token():
+                            self.logger.info("Using active OAuth2 token session.")
+                            return True
+                    except Exception:
+                        pass
                 return False
 
+    async def keep_alive(self) -> None:
+        """Keep OAuth2 tokens, Stud.IP web session, and NetIQ IDP cookies warm."""
+        if self.explicitly_logged_out or (time.time() - self.last_interactive_activity < 180):
+            return
+        if not os.path.exists(self.cookie_file) and studip_oauth.load_tokens() is None:
+            return
+        await self.ensure_session()
+        try:
+            await studip_oauth.get_access_token()
+        except Exception as exc:
+            self.logger.debug(f"OAuth keep-alive skipped: {exc}")
+
+        for sso_url in (
+            "https://login.uni-oldenburg.de/nidp/app",
+            "https://auth.uni-oldenburg.de/osp/a/TOP/auth/app/",
+            "https://stums.uni-oldenburg.de/qisserver/api/identityprovider/redirect/2/login",
+        ):
+            try:
+                async with self.session.get(sso_url, allow_redirects=True, timeout=15) as _:
+                    pass
+            except Exception as exc:
+                self.logger.debug(f"SSO keep-alive skipped for {sso_url}: {exc}")
+
+        try:
+            if not await self.is_html_logged_in():
+                # Try silent SSO renewal if NetIQ IDP cookies are still warm
+                elearn = "https://elearning.uni-oldenburg.de"
+                login_link_cancel = f"{elearn}/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
+                await self._run_sso_flow(login_link_cancel, referer=f"{elearn}/dispatch.php/my_courses")
             await self.save_cookies()
-            self.logger.info("✅ Login successful.")
-            return True
+        except Exception as exc:
+            self.logger.debug(f"Web session keep-alive renewal skipped: {exc}")
+
+    async def logout(self) -> None:
+        """Terminate Stud.IP + NetIQ SSO sessions, clear cookies and OAuth2 tokens."""
+        async with self._lock:
+            self.explicitly_logged_out = True
+            self.username = ""
+            self.password = ""
+            self.totp_secret = ""
+            self.totp_code = None
+            if self.session and not self.session.closed:
+                for url in (
+                    "https://elearning.uni-oldenburg.de/dispatch.php/logout",
+                    "https://auth.uni-oldenburg.de/osp/a/TOP/auth/app/logout",
+                    "https://login.uni-oldenburg.de/nidp/app/logout",
+                ):
+                    try:
+                        async with self.session.get(url, allow_redirects=True, timeout=10) as _:
+                            pass
+                    except Exception as exc:
+                        self.logger.debug(f"Upstream logout request skipped for {url}: {exc}")
+                self.session.cookie_jar.clear()
+
+            for path in (self.cookie_file, f"{self.cookie_file}.tmp"):
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                except OSError as exc:
+                    self.logger.warning(f"Could not remove {path}: {exc}")
+
+            studip_oauth.clear_tokens()
+            self.logger.info("🚪 Stud.IP session, SSO cookies, and OAuth2 tokens cleared.")
 
     async def sso_handoff(self, entry_url: str, success_host: str, referer: str = None) -> str:
         """Run the same NetIQ SSO state machine as `login()`, but to reach a different
@@ -148,12 +288,15 @@ class StudIPSession:
 
         Returns the final URL once `success_host` is reached, or raises RuntimeError.
         """
+        if self.explicitly_logged_out or (time.time() - self.last_interactive_activity < 180):
+            raise RuntimeError("Interactive login or logout active; skipping background SSO handoff.")
         await self.ensure_session()
 
         async def is_done(url, _text):
             return urlparse(url).netloc == success_host
 
         final_url, _ = await self._run_sso_flow(entry_url, referer=referer, is_done=is_done)
+        await self.save_cookies()
         return final_url
 
     async def _run_sso_flow(self, entry_url: str, referer: str = None, is_done=None):
@@ -250,7 +393,7 @@ class StudIPSession:
         async def check_done(url, text):
             if is_done:
                 return await is_done(url, text)
-            return await self.is_logged_in()
+            return await self.is_html_logged_in()
 
         # 1. Entry
         async with self.session.get(entry_url, headers={"Referer": referer} if referer else None) as r:
@@ -276,6 +419,8 @@ class StudIPSession:
 
             # A. Legacy Login Page (Ecom fields)
             if "ecom_user_id" in page_text and "ecom_password" not in page_text:
+                if not self.username:
+                    raise RuntimeError("Interactive login required (no stored username)")
                 self.logger.info(f"Step {i+1}: Username Submission")
                 action, method, payload = get_payload(soup, {"Ecom_User_ID": self.username, "loginButton2": "true"})
                 action = urljoin(curr_url, action)
@@ -284,6 +429,8 @@ class StudIPSession:
                 continue
 
             if "ecom_password" in page_text:
+                if not self.password:
+                    raise RuntimeError("Interactive login required (no stored password)")
                 self.logger.info(f"Step {i+1}: Password Submission (Legacy)")
                 action, method, payload = get_payload(soup, {"Ecom_Password": self.password, "loginButton2": "true"})
                 action = urljoin(curr_url, action)
@@ -302,10 +449,14 @@ class StudIPSession:
                     is_otp = any(x in page_text for x in ["one time password", "totp code", "google authenticator"])
 
                 if is_otp:
-                    self.logger.info(f"Step {i+1}: TOTP Submission (Contract)")
                     token = self._get_totp_token()
+                    if not token:
+                        raise RuntimeError("Interactive login required (no 2FA token available)")
+                    self.logger.info(f"Step {i+1}: TOTP Submission (Contract)")
                     action, method, payload = get_payload(soup, {"nffc": token, "loginButton2": "Next"})
                 else:
+                    if not self.password:
+                        raise RuntimeError("Interactive login required (no stored password)")
                     self.logger.info(f"Step {i+1}: Password Submission (Contract)")
                     action, method, payload = get_payload(soup, {"nffc": self.password, "loginButton2": "Next"})
 
@@ -322,12 +473,34 @@ class StudIPSession:
             return curr_url, curr_text
         raise RuntimeError(f"SSO flow did not complete; stuck at {curr_url}")
 
+    async def _bearer_headers(self, url: str) -> dict:
+        """OAuth bearer header for JSON:API requests (empty for anything else).
+
+        Stud.IP's OAuth tokens are accepted by /jsonapi.php/ only; regular
+        dispatch.php pages still authenticate through the cookie jar.
+        """
+        if "/jsonapi.php/" not in url:
+            return {}
+        try:
+            token = await studip_oauth.get_access_token()
+        except Exception as exc:  # never let a token problem break a request
+            self.logger.warning(f"OAuth token unavailable: {exc}")
+            return {}
+        return {"Authorization": f"Bearer {token}"} if token else {}
+
+    async def _merged_headers(self, url: str, extra: dict | None) -> dict | None:
+        headers = dict(extra or {})
+        headers.update(await self._bearer_headers(url))
+        return headers or None
+
     async def get(self, url, **kwargs):
         await self.ensure_session()
+        kwargs["headers"] = await self._merged_headers(url, kwargs.get("headers"))
         return self.session.get(url, **kwargs)
 
     async def post(self, url, **kwargs):
         await self.ensure_session()
+        kwargs["headers"] = await self._merged_headers(url, kwargs.get("headers"))
         return self.session.post(url, **kwargs)
 
     async def close(self):

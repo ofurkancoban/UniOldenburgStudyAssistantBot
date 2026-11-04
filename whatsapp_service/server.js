@@ -29,6 +29,43 @@ const PORT = process.env.PORT || 3838;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ALLOWED_USER_IDS = process.env.ALLOWED_USER_IDS ? process.env.ALLOWED_USER_IDS.split(',') : [];
 const AUTH_DIR = 'baileys_auth';
+const LOCK_FILE = 'whatsapp_service.lock';
+
+function acquireProcessLock() {
+    try {
+        if (fs.existsSync(LOCK_FILE)) {
+            const content = fs.readFileSync(LOCK_FILE, 'utf8').trim();
+            const oldPid = parseInt(content, 10);
+            if (!isNaN(oldPid) && oldPid !== process.pid) {
+                try {
+                    process.kill(oldPid, 0);
+                    console.error(`FATAL: Another WhatsApp service is already running (PID ${oldPid}). Exiting immediately.`);
+                    process.exit(1);
+                } catch (e) {
+                    console.log(`Cleaning up stale lock file from dead PID ${oldPid}`);
+                }
+            }
+        }
+        fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'w' });
+    } catch (err) {
+        console.error('Warning: Error handling process lock:', err);
+    }
+}
+
+function releaseProcessLock() {
+    try {
+        if (fs.existsSync(LOCK_FILE)) {
+            const content = fs.readFileSync(LOCK_FILE, 'utf8').trim();
+            if (parseInt(content, 10) === process.pid) {
+                fs.unlinkSync(LOCK_FILE);
+            }
+        }
+    } catch (err) {
+        // ignore
+    }
+}
+
+acquireProcessLock();
 
 // Safety net: an error from an internal async path not awaited by our own
 // try/catch is an unhandled rejection/exception and would otherwise exit
@@ -39,6 +76,11 @@ process.on('unhandledRejection', (err) => {
     console.error('Unhandled rejection (kept process alive):', err);
 });
 process.on('uncaughtException', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+        console.error('FATAL: Port in use (EADDRINUSE). Exiting immediately to prevent conflict loop.');
+        releaseProcessLock();
+        process.exit(1);
+    }
     console.error('Uncaught exception (kept process alive):', err);
 });
 
@@ -108,6 +150,9 @@ let isReconnecting = false;
 let reconnectFailures = 0; // consecutive closes since the last open, drives the reconnect backoff
 let sessionLoggedOut = false; // true after WhatsApp rejected the saved session (logged out), so /request_qr knows reusing it is pointless
 let hasEverConnected = false; // true once the connection has opened at least once this process - never reset, so /status can tell "waiting for the first-ever QR" apart from "was connected, session dropped"
+let consecutiveConflictCount = 0;
+let isConflictPaused = false;
+let stableConnectionTimer = null;
 const announcedGroupIds = new Set();
 const discoveredGroups = new Map(); // groupId -> { name, lastSeen }
 
@@ -146,18 +191,38 @@ async function connectToWhatsApp() {
             isAuthenticated = true;
             isReconnecting = false;
             sessionLoggedOut = false;
-            reconnectFailures = 0;
             hasEverConnected = true;
-            if (disconnectAlertPending) {
-                disconnectAlertPending = false;
-                sendTextToTelegram('🟢 WhatsApp reconnected — forwarding is back up.', TEST_MESSAGE_KEYBOARD);
+
+            // Clear any prior stability check
+            if (stableConnectionTimer) {
+                clearTimeout(stableConnectionTimer);
             }
+
+            // Require 30 seconds of continuous uptime before resetting
+            // failure/conflict counters and announcing reconnection.
+            // This prevents "alert spam" and ping-pong wars during conflict storms.
+            stableConnectionTimer = setTimeout(() => {
+                reconnectFailures = 0;
+                consecutiveConflictCount = 0;
+                isConflictPaused = false;
+                console.log('WhatsApp connection confirmed stable (30s+ uninterrupted).');
+                if (disconnectAlertPending) {
+                    disconnectAlertPending = false;
+                    sendTextToTelegram('🟢 WhatsApp reconnected — forwarding is back up.', TEST_MESSAGE_KEYBOARD);
+                }
+            }, 30000);
         }
 
         if (connection === 'close') {
             isAuthenticated = false;
+            if (stableConnectionTimer) {
+                clearTimeout(stableConnectionTimer);
+                stableConnectionTimer = null;
+            }
+
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const reasonText = lastDisconnect?.error?.message || String(lastDisconnect?.error || 'unknown');
+            const isConflict = statusCode === 440 || reasonText.toLowerCase().includes('conflict');
 
             if (statusCode === DisconnectReason.loggedOut) {
                 // A real logout (force_new_qr, or the account was unlinked from
@@ -187,6 +252,20 @@ async function connectToWhatsApp() {
             }
 
             console.log('WhatsApp client disconnected:', reasonText);
+
+            if (isConflict) {
+                consecutiveConflictCount += 1;
+                console.warn(`WhatsApp session conflict detected (consecutive count: ${consecutiveConflictCount})`);
+
+                // Circuit breaker: stop infinite ping-pong if another client is actively reconnecting
+                if (consecutiveConflictCount >= 3) {
+                    isConflictPaused = true;
+                    console.error('Multiple consecutive session conflicts detected. Pausing auto-reconnect to break ping-pong loop.');
+                    sendTextToTelegram('⚠️ WhatsApp session conflict detected: Another active session/device is competing for this connection. Auto-reconnect paused to prevent loop. Tap "📲 Request WA QR" in /status when ready.');
+                    return;
+                }
+            }
+
             // Proactive alert instead of only showing up passively in /status -
             // an outage could otherwise go unnoticed for hours. Only the first
             // close event of an outage alerts (see disconnectAlertPending);
@@ -197,12 +276,16 @@ async function connectToWhatsApp() {
                 disconnectAlertPending = true;
                 sendTextToTelegram(`🔴 WhatsApp disconnected (${reasonText}) — attempting to reconnect automatically. Forwarding won't work until this recovers.`);
             }
-            // Back off (5 s doubling up to 5 min) so a connection that keeps
-            // failing right away doesn't spin.
-            const delay = Math.min(5000 * 2 ** reconnectFailures, 5 * 60 * 1000);
+
+            // Back off: conflicts start at 30 s; standard blips start at 5 s
+            const baseDelay = isConflict ? 30000 : 5000;
+            const delay = Math.min(baseDelay * 2 ** reconnectFailures, 5 * 60 * 1000);
             reconnectFailures += 1;
+            console.log(`Scheduling reconnect attempt in ${Math.round(delay / 1000)} seconds...`);
             setTimeout(() => {
-                if (!isAuthenticated) reconnectClient(`disconnected: ${reasonText}`);
+                if (!isAuthenticated && !isConflictPaused) {
+                    reconnectClient(`disconnected: ${reasonText}`);
+                }
             }, delay);
         }
     });
@@ -262,6 +345,18 @@ async function reconnectClient(reason, { forceLogout = false } = {}) {
     isAuthenticated = false;
     console.log(`Re-initializing WhatsApp client (${reason})...`);
 
+    // Cleanly tear down existing socket and listeners before creating a new one
+    if (sock) {
+        try {
+            sock.ev.removeAllListeners();
+            if (sock.ws) {
+                sock.ws.close();
+            }
+        } catch (err) {
+            // ignore
+        }
+    }
+
     if (forceLogout) {
         try {
             if (sock) await sock.logout();
@@ -280,6 +375,7 @@ async function reconnectClient(reason, { forceLogout = false } = {}) {
             // ignore - socket may already be closed
         }
     }
+    sock = null;
 
     try {
         await connectToWhatsApp();
@@ -291,14 +387,11 @@ async function reconnectClient(reason, { forceLogout = false } = {}) {
 }
 
 app.post('/request_qr', async (req, res) => {
-    // Always force a fresh connection attempt on explicit request, even if
-    // isAuthenticated is (possibly stale) true - the operator only calls
-    // this when the connection is actually broken, so trust the request
-    // over a stale in-memory flag. NOTE: if a valid session is still saved
-    // on disk, this just silently restores it and no QR is sent - use
-    // /force_new_qr to guarantee a real QR even when currently connected.
-    // A session WhatsApp already logged out can never restore, so start a
-    // fresh one straight away instead of retrying it.
+    // Reset circuit breakers when operator explicitly requests reconnection
+    isConflictPaused = false;
+    consecutiveConflictCount = 0;
+    reconnectFailures = 0;
+
     if (sessionLoggedOut) {
         res.json({ status: 'waiting', message: 'The saved session was logged out by WhatsApp. A new QR code will be sent shortly.' });
         await reconnectClient('manual /request_qr after logout', { forceLogout: true });
@@ -312,16 +405,16 @@ app.post('/request_qr', async (req, res) => {
 // the saved session first. Use this to link a different phone/account or when
 // the connection is stuck in a way a plain reconnect can't fix.
 app.post('/force_new_qr', async (req, res) => {
+    isConflictPaused = false;
+    consecutiveConflictCount = 0;
+    reconnectFailures = 0;
     res.json({ status: 'waiting', message: 'Logging out and generating a brand new QR code. It will be sent to you shortly.' });
     await reconnectClient('manual /force_new_qr', { forceLogout: true });
 });
 
-// API endpoint to check authentication status. isAuthenticated alone can't
-// tell "never set up yet, waiting for the first QR" apart from "was
-// connected, the session just dropped" - isReconnecting/hasEverConnected
-// let a caller (see /status in studip_bot.py) show that distinction.
+// API endpoint to check authentication status.
 app.get('/status', (req, res) => {
-    res.json({ isAuthenticated, isReconnecting, hasEverConnected });
+    res.json({ isAuthenticated, isReconnecting, hasEverConnected, isConflictPaused });
 });
 
 // API endpoint to set WA_GROUP_ID at runtime (persisted to .env by the Telegram bot)
@@ -480,18 +573,23 @@ app.post('/send', async (req, res) => {
     }
 });
 
-app.listen(PORT, () => {
-    console.log(`WhatsApp service listening on port ${PORT}`);
-});
-
 // Graceful shutdown on exit (PM2 restart/stop)
 const cleanupAndExit = async () => {
     console.log('\nShutting down WhatsApp service...');
+    if (stableConnectionTimer) {
+        clearTimeout(stableConnectionTimer);
+        stableConnectionTimer = null;
+    }
     try {
-        if (sock) sock.end(undefined);
+        if (sock) {
+            sock.ev.removeAllListeners();
+            if (sock.ws) sock.ws.close();
+            sock.end(undefined);
+        }
     } catch (err) {
         // Ignore errors during shutdown
     }
+    releaseProcessLock();
     process.exit(0);
 };
 
@@ -499,4 +597,20 @@ process.on('SIGINT', cleanupAndExit);
 process.on('SIGTERM', cleanupAndExit);
 process.on('SIGQUIT', cleanupAndExit);
 
-connectToWhatsApp();
+const server = app.listen(PORT, () => {
+    console.log(`WhatsApp service listening on port ${PORT}`);
+    // Start WhatsApp connection ONLY after the HTTP port is bound
+    connectToWhatsApp();
+});
+
+server.on('error', (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+        console.error(`FATAL: Port ${PORT} is already in use by another process. Exiting immediately to prevent conflict loop.`);
+        releaseProcessLock();
+        process.exit(1);
+    } else {
+        console.error('Server listen error:', err);
+        releaseProcessLock();
+        process.exit(1);
+    }
+});

@@ -24,6 +24,10 @@ messages_cache.json
 forum_cache.json
 link_cache.json
 studip_cookies.json
+studip_cookies.json.tmp
+studip_oauth_tokens.json
+studip_oauth_tokens.json.tmp
+studip_oauth_tokens.json.bak
 fastenroll_pending.json
 exam_reminder_cache.json
 tasks_cache.json
@@ -39,6 +43,7 @@ wardrobe.json
 whatsapp_service/node_modules/
 whatsapp_service/baileys_auth/
 whatsapp_service/qr.png
+whatsapp_service/*.lock
 
 # IDE & OS
 .idea/

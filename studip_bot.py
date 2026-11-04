@@ -2,13 +2,14 @@ import asyncio
 import contextvars
 import logging
 import io
+import signal
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, InputMediaPhoto, WebAppInfo, MenuButtonWebApp, MenuButtonDefault
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 import pyotp
 import uuid
@@ -36,17 +37,22 @@ from zoneinfo import ZoneInfo
 from telegram.constants import ChatAction
 from asyncio import CancelledError
 from studip_session import StudIPSession
+import studip_oauth
+from studip_login_server import LoginServer
+from studip_tunnel import QuickTunnel
 from fast_enroll import run_fast_enroll, load_pending, list_pending_jobs, save_pending_job, clear_pending_job, get_semester_options, get_open_courses, enroll_now, decline_course, get_course_type_map
-from exam_reminder import check_exam_reminders, check_exam_date_reminders, check_grade_reminders, get_open_exam_registrations, get_registered_exams, get_registered_exam_schedule, get_all_exam_dates, filter_exams_by_module_codes, base_module_code, is_passed_exam, submit_exam_action, get_grades, compute_transcript_summary, load_exam_cache, save_exam_cache
+from exam_reminder import check_exam_reminders, check_exam_date_reminders, check_grade_reminders, check_tuition_reminders, get_open_exam_registrations, get_registered_exams, get_registered_exam_schedule, get_all_exam_dates, filter_exams_by_module_codes, base_module_code, is_passed_exam, submit_exam_action, get_grades, compute_transcript_summary, load_exam_cache, save_exam_cache, STUMS_DOCUMENTS, download_stums_document, get_tuition_status
 
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
 
 # ── env / asyncio ──────────────────────────────────────────────────────────────
 load_dotenv()
 
-USERNAME = os.getenv("USERNAME")
-PASSWORD = os.getenv("PASSWORD")
-TOTP_SECRET = os.getenv("TOTP_SECRET")
+# Credentials are never stored in .env or in memory; authentication happens via
+# the Telegram Mini App (/login) which persists only cookies & OAuth2 tokens.
+USERNAME = ""
+PASSWORD = ""
+TOTP_SECRET = ""
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ALLOWED_USER_IDS_ENV = os.getenv("ALLOWED_USER_IDS", "").strip()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -117,6 +123,7 @@ FILE_WATCHER_INTERVAL = 2 * 60 * 60
 global_session = None
 global_watcher_paused = False
 message_poll_task = None  # see message_poll_loop
+session_keepalive_task = None  # see session_keepalive_loop
 unified_watcher_task = None
 watcher_controller_running = False
 global_message_watcher = None
@@ -361,7 +368,7 @@ def _breadcrumb(user_id: int) -> str:
 
 def _status_emoji(status: str) -> str:
     """Return an emoji based on the event status."""
-    return {"ongoing": "⏳", "upcoming": "⏰", "past": "✅"}.get(status, "⚪")
+    return {"ongoing": "⏳", "upcoming": "⏰", "past": "✅", "cancelled": "🚫"}.get(status, "⚪")
 
 
 def _safe_loc(loc: str) -> str:
@@ -570,11 +577,8 @@ USER_NAMES_CACHE_PATH = "user_names.json"
 
 
 def load_user_names() -> dict:
-    """Return {"<user_id>": "Display Name"} for every user who's set a name
-    via /status's "👤 Set Your Name" — keyed per user_id (not global) since
-    ALLOWED_USER_IDS can list more than one person, and the AI-narrated
-    daily-plan voice message (see build_ai_daily_plan_narration) addresses
-    each of them by their own name."""
+    """Return {"<user_id>": "Display Name"} for users, synced automatically
+    from Stud.IP via /users/me."""
     if os.path.exists(USER_NAMES_CACHE_PATH):
         try:
             with open(USER_NAMES_CACHE_PATH, "r", encoding="utf-8") as f:
@@ -584,18 +588,36 @@ def load_user_names() -> dict:
     return {}
 
 
-def get_user_name(user_id) -> Optional[str]:
-    return load_user_names().get(str(user_id))
+def save_studip_user_name(name: str) -> None:
+    """Save the name fetched from Stud.IP for all allowed users so get_user_name()
+    and get_primary_user_name() automatically return it."""
+    if not name:
+        return
+    names = load_user_names()
+    for uid in ALLOWED_USER_IDS:
+        names[str(uid)] = name
+    names["studip_name"] = name
+    try:
+        tmp = USER_NAMES_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(names, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, USER_NAMES_CACHE_PATH)
+    except Exception as e:
+        logging.error(f"Could not save Stud.IP user name: {e}")
+
+
+def get_user_name(user_id=None) -> Optional[str]:
+    names = load_user_names()
+    if user_id is not None and str(user_id) in names:
+        return names[str(user_id)]
+    return names.get("studip_name") or get_primary_user_name()
 
 
 def get_primary_user_name() -> Optional[str]:
-    """Return whichever name is set across ALLOWED_USER_IDS. Currently every
-    allowed user_id is the same person on a different device, so one shared
-    name personalizes the daily-plan narration for all of them rather than
-    generating a separate one per recipient — see prepare_morning_summary and
-    send_daily_plan_voice, both of which fall back to this when no specific
-    user_id is available."""
+    """Return name synced from Stud.IP across ALLOWED_USER_IDS."""
     names = load_user_names()
+    if names.get("studip_name"):
+        return names["studip_name"]
     for uid in ALLOWED_USER_IDS:
         name = names.get(str(uid))
         if name:
@@ -1042,8 +1064,245 @@ async def login_studip(notify=None):
         raise RuntimeError("Failed to log in to Stud.IP.")
 
 
-# ── unified watcher controller ─────────────────────────────────────────────────
+# ── web / Mini App login ──────────────────────────────────────────────────────
+login_server: Optional[LoginServer] = None
+quick_tunnel: Optional[QuickTunnel] = None
+_menu_app = None
+_last_notified_studip_cookie: Optional[str] = None
 
+
+def _login_public_url() -> str:
+    """Live public address of the login page, tunnel first."""
+    if quick_tunnel and quick_tunnel.url:
+        return quick_tunnel.url
+    return os.getenv("LOGIN_PUBLIC_URL", "").strip()
+
+
+def _get_or_init_session() -> StudIPSession:
+    global global_session
+    if global_session is None:
+        global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
+    return global_session
+
+
+async def _on_proxy_session_authenticated() -> None:
+    """Called when the user completes login in the proxied Stud.IP Mini App."""
+    global _studip_api_user_id, _studip_user_profile, _last_notified_studip_cookie
+    session = _get_or_init_session()
+    session.explicitly_logged_out = False
+    session.last_interactive_activity = 0.0
+    await session.save_cookies()
+
+    studip_cookie = None
+    if session.session:
+        for c in session.session.cookie_jar:
+            if c.key == "Studip_Session":
+                studip_cookie = c.value
+                break
+
+    need_oauth = studip_oauth.is_expired(studip_oauth.load_tokens())
+    is_new_session = bool(studip_cookie and studip_cookie != _last_notified_studip_cookie)
+
+    if is_new_session or need_oauth:
+        _studip_api_user_id = None
+        _studip_user_profile = None
+        try:
+            await studip_oauth.authorize_with_session(session)
+            await get_studip_user_profile()
+        except Exception as exc:
+            logging.warning(f"⚠️ OAuth consent after proxy login failed: {exc}")
+
+    if is_new_session:
+        _last_notified_studip_cookie = studip_cookie
+        if _menu_app is not None:
+            for uid in ALLOWED_USER_IDS or []:
+                try:
+                    await _menu_app.bot.send_message(
+                        chat_id=uid,
+                        text="✅ Signed in to Stud.IP. Your session and OAuth2 token are active and will be kept alive automatically.",
+                    )
+                except Exception as exc:
+                    logging.warning(f"⚠️ Could not send login confirmation to {uid}: {exc}")
+
+
+def _get_login_server() -> LoginServer:
+    global login_server
+    if login_server is None:
+        login_server = LoginServer(
+            _perform_web_login,
+            bot_token=TELEGRAM_TOKEN,
+            allowed_user_ids=set(ALLOWED_USER_IDS),
+            base_url_provider=_login_public_url,
+            session_provider=_get_or_init_session,
+            on_session_authenticated=_on_proxy_session_authenticated,
+        )
+    return login_server
+
+
+async def _clear_menu_button(app) -> None:
+    """Reset the chat menu button to Telegram's default so the Stud.IP button is removed."""
+    try:
+        await app.bot.set_chat_menu_button(menu_button=MenuButtonDefault())
+    except Exception as exc:
+        logging.debug(f"Could not reset default menu button: {exc}")
+    for uid in ALLOWED_USER_IDS or []:
+        try:
+            await app.bot.set_chat_menu_button(
+                chat_id=uid,
+                menu_button=MenuButtonDefault(),
+            )
+            logging.info("🧹 Removed Stud.IP menu button for %s", uid)
+        except Exception as exc:
+            logging.warning(f"⚠️ Could not reset menu button for {uid}: {exc}")
+
+
+async def _on_tunnel_url(url: str) -> None:
+    """Log when cloudflared hands us a tunnel URL."""
+    logging.info("🌐 Tunnel URL ready: %s", url)
+
+
+async def _start_login_infra(app) -> None:
+    """Start the login page and, optionally, the Cloudflare tunnel."""
+    global quick_tunnel, _menu_app, _last_notified_studip_cookie
+
+    _menu_app = app
+    if global_session and global_session.session:
+        for c in global_session.session.cookie_jar:
+            if c.key == "Studip_Session":
+                _last_notified_studip_cookie = c.value
+                break
+    mode = os.getenv("CLOUDFLARE_TUNNEL", "").strip().lower()
+    server = _get_login_server()
+
+    if mode == "quick":
+        quick_tunnel = QuickTunnel(server.port, on_url_change=_on_tunnel_url)
+        try:
+            await quick_tunnel.start()
+        except Exception as exc:
+            logging.error(f"❌ Cloudflare quick tunnel failed: {exc}")
+            quick_tunnel = None
+
+    await server.start()
+    logging.info("🔐 Login page available at %s", server.base_url())
+    await _clear_menu_button(app)
+
+
+async def _perform_web_login(username: str, password: str, totp: str) -> tuple[bool, str]:
+    """Log in with credentials typed into the login page, then forget them.
+
+    Called by LoginServer. The password lives only in this call; what survives
+    is the session cookie plus an OAuth refresh token.
+    """
+    global global_session
+
+    session = global_session
+    if session is None:
+        session = StudIPSession(username, password, "", totp_code=totp or None)
+        global_session = session
+    else:
+        session.username = username
+        session.password = password
+        session.totp_code = totp or None
+
+    logging.info("🔐 Login requested from the web login page...")
+    try:
+        ok = await session.login(force=True)
+    except Exception as exc:
+        logging.error(f"❌ Web login crashed: {exc}")
+        return False, "Stud.IP login failed. Please try again."
+
+    if not ok:
+        return False, "Stud.IP login failed. Check your credentials and the 2FA code."
+
+    # Drop the credentials immediately - only the cookie survives.
+    session.password = ""
+    session.totp_code = None
+    global _studip_api_user_id
+    _studip_api_user_id = None
+
+    # Mint an OAuth token so API traffic no longer needs the password either.
+    try:
+        await studip_oauth.authorize_with_session(session)
+    except Exception as exc:
+        logging.warning(f"⚠️ OAuth consent failed after web login: {exc}")
+
+    if _menu_app is not None:
+        for uid in ALLOWED_USER_IDS or []:
+            try:
+                await _menu_app.bot.send_message(
+                    chat_id=uid,
+                    text="✅ Signed in to Stud.IP. Your session and OAuth2 token are active and will be kept alive automatically.",
+                )
+            except Exception as exc:
+                logging.warning(f"⚠️ Could not send login confirmation to {uid}: {exc}")
+
+    return True, ""
+
+
+async def _send_login_prompt(reply_target, user_id: int) -> None:
+    """Send the Stud.IP Mini App login button to a message target."""
+    server = _get_login_server()
+    await server.start()
+
+    public = _login_public_url()
+    if public.startswith("https://"):
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔐 Open Stud.IP (Mini App)", web_app=WebAppInfo(url=server.app_url()))],
+        ])
+        await reply_target.reply_text(
+            "Tap the button below to open Stud.IP and sign in.\n"
+            "Once signed in, your session and OAuth2 token will be kept alive automatically.",
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    else:
+        link = server.new_link(user_id)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔐 Open login page", url=link)
+        ]])
+        await reply_target.reply_text(
+            "Tap the button to open the login page (valid for 10 minutes).\n"
+            f"Same Wi-Fi required - the page is served at {server.base_url()}.",
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+
+
+async def _perform_logout() -> None:
+    """Log out of Stud.IP + NetIQ SSO and wipe stored cookies and OAuth2 tokens."""
+    global global_session, _studip_api_user_id, _studip_user_profile, _last_notified_studip_cookie
+    _studip_api_user_id = None
+    _studip_user_profile = None
+    _last_notified_studip_cookie = None
+    if global_session is not None:
+        await global_session.logout()
+    else:
+        studip_oauth.clear_tokens()
+
+
+async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/login - open the Stud.IP login page (Mini App or browser)."""
+    user = update.effective_user
+    if ALLOWED_USER_IDS and user.id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("⛔ Not authorised.")
+        return
+    await _send_login_prompt(update.message, user.id)
+
+
+async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/logout - sign out of Stud.IP and clear stored session cookies & OAuth2 tokens."""
+    user = update.effective_user
+    if ALLOWED_USER_IDS and user.id not in ALLOWED_USER_IDS:
+        await update.message.reply_text("⛔ Not authorised.")
+        return
+    await _perform_logout()
+    await update.message.reply_text(
+        "🚪 Logged out from Stud.IP. Saved session cookies and OAuth2 tokens have been cleared.\n"
+        "Use /login or the 🔐 Login button under ℹ️ Status whenever you want to sign in again."
+    )
+
+
+# ── unified watcher controller ─────────────────────────────────────────────────
 async def unified_watcher_controller(app):
     """Centrally manage all watchers - with a single task"""
     global watcher_controller_running, global_watcher_paused, global_session
@@ -1067,6 +1326,13 @@ async def unified_watcher_controller(app):
         try:
             if global_watcher_paused:
                 logging.info("⏸️ Watcher controller paused")
+                await asyncio.sleep(30)
+                continue
+
+            if global_session is not None and (
+                global_session.explicitly_logged_out
+                or (time.time() - getattr(global_session, "last_interactive_activity", 0.0) < 180)
+            ):
                 await asyncio.sleep(30)
                 continue
 
@@ -1150,6 +1416,12 @@ async def unified_watcher_controller(app):
             except Exception as e:
                 logging.error(f"❌ Calendar reminder check failed: {e}")
 
+            # Automatic course cancellation & room change alerts
+            try:
+                await check_course_schedule_changes(session, app.bot)
+            except Exception as e:
+                logging.error(f"❌ Course schedule change check failed: {e}")
+
             # Personal task reminders (local JSON, no network calls needed)
             try:
                 await check_task_reminders(app.bot)
@@ -1168,6 +1440,12 @@ async def unified_watcher_controller(app):
                 await check_grade_reminders(session, app.bot, broadcast)
             except Exception as e:
                 logging.error(f"❌ Grade reminder check failed: {e}")
+
+            try:
+                logging.info("💶 Checking tuition / fee status...")
+                await check_tuition_reminders(session, app.bot, broadcast)
+            except Exception as e:
+                logging.error(f"❌ Tuition reminder check failed: {e}")
 
             # Upcoming exam dates change far less often; throttle to every 3 hours.
             EXAM_DATE_CHECK_INTERVAL_SECONDS = 3 * 3600
@@ -1274,6 +1552,23 @@ async def unified_watcher_controller(app):
             await asyncio.sleep(120)
 
 
+SESSION_KEEPALIVE_SECONDS = 600  # 10 min keep-alive for OAuth + Stud.IP/NetIQ cookies
+
+
+async def session_keepalive_loop():
+    """Periodically refresh OAuth2 tokens and touch Stud.IP / NetIQ IDP cookies
+    so a single /login session stays alive indefinitely without re-entering credentials."""
+    while True:
+        await asyncio.sleep(SESSION_KEEPALIVE_SECONDS)
+        try:
+            if global_session is not None:
+                await global_session.keep_alive()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logging.debug(f"Session keep-alive error: {exc}")
+
+
 async def start_unified_watcher(app):
     """Start the unified watcher"""
     global unified_watcher_task, watcher_controller_running
@@ -1284,9 +1579,11 @@ async def start_unified_watcher(app):
 
     logging.info("🚀 Starting unified watcher controller...")
     unified_watcher_task = asyncio.create_task(unified_watcher_controller(app))
-    global message_poll_task
+    global message_poll_task, session_keepalive_task
     if message_poll_task is None or message_poll_task.done():
         message_poll_task = asyncio.create_task(message_poll_loop(app))
+    if session_keepalive_task is None or session_keepalive_task.done():
+        session_keepalive_task = asyncio.create_task(session_keepalive_loop())
 
     # Check initial state
     await asyncio.sleep(5)
@@ -1300,7 +1597,7 @@ async def stop_unified_watcher():
     """Stop the unified watcher"""
     global unified_watcher_task, watcher_controller_running
 
-    for task in (unified_watcher_task, message_poll_task):
+    for task in (unified_watcher_task, message_poll_task, session_keepalive_task):
         if task and not task.done():
             task.cancel()
             try:
@@ -2909,15 +3206,17 @@ def _status_group_view(group: str) -> tuple:
     the on/off toggles, which go through status_group_toggle so the
     submenu redraws in place instead of being replaced by a confirmation."""
     if group == "profile":
-        title = "👤 <b>Profile</b>"
+        studip_name = get_primary_user_name() or "Connected"
+        title = f"👤 <b>Profile</b>\n\nName: <b>{studip_name}</b>\n<i>(Automatically synced from Stud.IP)</i>"
         rows = [
-            [InlineKeyboardButton("👤 Set Your Name", callback_data="set_user_name")],
             [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
         ]
     elif group == "semester":
         watch_prev = get_watch_previous_semester_enabled()
         title = f"📆 <b>Semester &amp; Calendar</b>\n\nWatch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
         rows = [
+            [InlineKeyboardButton("🗓️ Weekly Timetable (Stundenplan)", callback_data="calendar_timetable")],
+            [InlineKeyboardButton("📅 Weekly Calendar View", callback_data="calendar_weekly")],
             [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
             [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="status_group_toggle|semester|watch_prev")],
             [InlineKeyboardButton("📅 Change iCal Link", callback_data="change_ical_link")],
@@ -2929,6 +3228,8 @@ def _status_group_view(group: str) -> tuple:
             [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
             [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
             [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
+            [InlineKeyboardButton("📄 Official Documents (PDF)", callback_data="stums_docs_menu")],
+            [InlineKeyboardButton("💶 Tuition & Fees (Rückmeldung)", callback_data="tuition_status")],
             [InlineKeyboardButton(f"{'✅' if study_plan else '🔲'} Weekly Study Plan", callback_data="status_group_toggle|studies|study_plan")],
         ]
     return title, InlineKeyboardMarkup(rows)
@@ -2945,6 +3246,11 @@ async def handle_status_group(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     parts = query.data.split("|")
     group = parts[1] if len(parts) > 1 else "profile"
+    if group == "profile":
+        try:
+            await get_studip_user_profile()
+        except Exception:
+            pass
     if parts[0] == "status_group_toggle":
         feature = parts[2] if len(parts) > 2 else ""
         if feature == "watch_prev":
@@ -3080,6 +3386,7 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
 STUDIP_API_URL = f"{BASE_URL}/jsonapi.php/v1"
 STUDIP_API_PAGE_LIMIT = 100
 _studip_api_user_id = None
+_studip_user_profile = None
 _studip_api_semester_starts = None  # {semester_id: start datetime}, fetched once per process
 _studip_api_current_semester = None
 STUDIP_STUDYGROUP_COURSE_TYPE = 99  # study groups, which my_courses lists separately
@@ -3092,12 +3399,17 @@ class StudipApiError(Exception):
 
 async def studip_api_get(path: str, params: Optional[dict] = None, _retry: bool = True) -> dict:
     """GET one JSON:API resource ("/users/me" or a "/jsonapi.php/..." link).
-    Logs in again once on a 401; raises StudipApiError otherwise."""
+
+    The bearer header is added by StudIPSession, so API traffic uses the
+    stored OAuth token when there is one and the cookie session otherwise.
+    On a 401 it refreshes the token once, then falls back to a full login."""
     session = global_session or await login_studip()
     url = BASE_URL + path if path.startswith("/jsonapi.php") else STUDIP_API_URL + path
     async with await session.get(url, params=params) as r:
         status, text = r.status, await r.text()
     if status == 401 and _retry:
+        if studip_oauth.load_tokens() and await studip_oauth.get_access_token(force_refresh=True):
+            return await studip_api_get(path, params, _retry=False)
         await session.login(force=True)
         return await studip_api_get(path, params, _retry=False)
     if status != 200:
@@ -3123,11 +3435,43 @@ async def studip_api_get_all(path: str, params: Optional[dict] = None) -> tuple[
             return data, included
 
 
+async def get_studip_user_profile() -> dict:
+    """Fetch profile of the currently authenticated user from Stud.IP /users/me."""
+    global _studip_api_user_id, _studip_user_profile
+    if _studip_user_profile:
+        return _studip_user_profile
+    try:
+        res = await studip_api_get("/users/me")
+        user = res.get("data", {})
+        _studip_api_user_id = user.get("id")
+        attrs = user.get("attributes", {})
+        formatted_name = (attrs.get("formatted-name") or "").strip()
+        given_name = (attrs.get("given-name") or "").strip()
+        family_name = (attrs.get("family-name") or "").strip()
+        username = (attrs.get("username") or "").strip()
+        display_name = formatted_name or given_name or username
+        _studip_user_profile = {
+            "id": _studip_api_user_id,
+            "username": username,
+            "formatted_name": formatted_name,
+            "given_name": given_name,
+            "family_name": family_name,
+            "display_name": display_name,
+        }
+        if display_name:
+            save_studip_user_name(display_name)
+        return _studip_user_profile
+    except Exception as exc:
+        logging.warning(f"Could not fetch Stud.IP user profile: {exc}")
+        return _studip_user_profile or {}
+
+
 async def studip_api_user_id() -> str:
     global _studip_api_user_id
     if not _studip_api_user_id:
-        _studip_api_user_id = (await studip_api_get("/users/me"))["data"]["id"]
-    return _studip_api_user_id
+        profile = await get_studip_user_profile()
+        _studip_api_user_id = profile.get("id")
+    return _studip_api_user_id or ""
 
 
 def _api_rel_id(resource: dict, name: str) -> Optional[str]:
@@ -3183,11 +3527,11 @@ async def _list_courses_api(semester_id: Optional[str] = None) -> list:
 async def _list_files_api(cid, folder_url=None) -> list:
     """One folder level of a course in list_files' format: the course's root
     folder, or the folder a list_files folder "url" points to."""
-    if folder_url:
-        m = _FOLDER_ID_RE.search(folder_url)
-        if not m:
-            raise StudipApiError(f"no folder id in {folder_url}")
+    m = _FOLDER_ID_RE.search(folder_url) if folder_url else None
+    if m:
         folder_id = m.group(1)
+    elif folder_url and "dispatch.php/course/files" not in folder_url:
+        raise StudipApiError(f"no folder id in {folder_url}")
     else:
         folders, _ = await studip_api_get_all(f"/courses/{cid}/folders")
         root = next((f for f in folders if f["attributes"].get("folder-type") == "RootFolder"), None) \
@@ -3212,7 +3556,6 @@ async def _list_files_api(cid, folder_url=None) -> list:
     file_refs, _ = await studip_api_get_all(f"/folders/{folder_id}/file-refs")
     for f in file_refs:
         modified, modified_iso = stamps(f)
-        download = (f.get("meta") or {}).get("download-url")
         rs = f["attributes"].get("filesize")
         if isinstance(rs, int):
             size_str = f"{rs/(1024*1024):.1f} MB" if rs > 1024*1024 else f"{rs/1024:.1f} KB" if rs > 1024 else f"{rs} B"
@@ -3220,7 +3563,11 @@ async def _list_files_api(cid, folder_url=None) -> list:
             size_str = "-"
         items.append({
             "type": "file", "name": f["attributes"].get("name", "Unknown File"),
-            "url": urljoin(BASE_URL, download) if download else None,
+            # The meta download-url points at sendfile.php, which only accepts
+            # the cookie session. The JSON:API content endpoint also works with
+            # a bearer token, so use that instead.
+            "url": f"{STUDIP_API_URL}/file-refs/{f['id']}/content"
+                   if f["attributes"].get("is-downloadable", True) else None,
             "size": size_str, "modified": modified, "modified_iso": modified_iso,
         })
     return items
@@ -3598,6 +3945,7 @@ def get_show_last_keyboard():
         [InlineKeyboardButton("📨 Show Last 5 Messages", callback_data="show_last_messages")],
         [InlineKeyboardButton("📁 Show Last 5 Files", callback_data="show_last_files")],
         [InlineKeyboardButton("💬 Show Last 5 Forum Posts", callback_data="show_last_forum_posts")],
+        [InlineKeyboardButton("⚡ Activity Stream", callback_data="activity_stream")],
     ]
     return InlineKeyboardMarkup(kb)
 
@@ -3651,7 +3999,7 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for f in last5:
         sid = _short_id()
-        link_cache[sid] = {"cid": f["cid"], "name": f["name"], "ts": datetime.now().timestamp()}
+        link_cache[sid] = {"cid": f["cid"], "name": f["name"], "course": f["course"], "ts": datetime.now().timestamp()}
 
         text = (
             "━━━━━━━━━━━━━━━━━\n"
@@ -3664,8 +4012,10 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━"
         )
 
-        btn = InlineKeyboardButton("📥 Download", callback_data=f"file|{sid}")
-        markup = InlineKeyboardMarkup([[btn]])
+        btn_rows = [[InlineKeyboardButton("📥 Download", callback_data=f"file|{sid}")]]
+        if os.path.splitext(f["name"] or "")[1].lower() in (".pdf", ".pptx", ".html"):
+            btn_rows.append([InlineKeyboardButton("🎧 1-Min Audio Summary", callback_data=f"file_audio_sum|{sid}")])
+        markup = InlineKeyboardMarkup(btn_rows)
 
         await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
         await asyncio.sleep(0.3)
@@ -4275,6 +4625,7 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False):
                         link_cache[sid] = {
                             "cid": it["cid"],
                             "name": it["name"],
+                            "course": it["course"],
                             "url": it.get("url"),
                             "ts": datetime.now().timestamp(),
                             "user_id": next(iter(ALLOWED_USER_IDS), None)
@@ -4293,9 +4644,11 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False):
                             "━━━━━━━━━━━━━━━━━━"
                         )
 
-                        # Create download button
-                        download_button = InlineKeyboardButton("📥 Download", callback_data=f"file|{sid}")
-                        keyboard = InlineKeyboardMarkup([[download_button]])
+                        # Create download button (+ 1-Min Audio Summary for PDF/PPTX/HTML)
+                        btn_rows = [[InlineKeyboardButton("📥 Download", callback_data=f"file|{sid}")]]
+                        if os.path.splitext(it.get("name") or "")[1].lower() in (".pdf", ".pptx", ".html"):
+                            btn_rows.append([InlineKeyboardButton("🎧 1-Min Audio Summary", callback_data=f"file_audio_sum|{sid}")])
+                        keyboard = InlineKeyboardMarkup(btn_rows)
 
                         # Send message with button
                         await broadcast(bot, text, parse_mode="HTML", reply_markup=keyboard)
@@ -4800,9 +5153,11 @@ def _api_message(m: dict, names: dict) -> dict:
     its body), keeping the old read URL so cached entries stay comparable."""
     a = m["attributes"]
     dt = _api_berlin(a.get("mkdate"))
+    sender_id = _api_rel_id(m, "sender")
     return {
         "id": m["id"], "title": a.get("subject") or "(No subject)",
-        "sender": names.get(_api_rel_id(m, "sender"), "Unknown"),
+        "sender": names.get(sender_id, "Unknown"),
+        "sender_id": sender_id,
         "date": dt.strftime("%d/%m/%y %H:%M") if dt else "Unknown",
         "url": f"{BASE_URL}/dispatch.php/messages/read/{m['id']}/rec",
         "body": _api_html_to_text(a.get("message")) or "No content found.",
@@ -4854,6 +5209,12 @@ async def message_poll_loop(app) -> None:
     while True:
         await asyncio.sleep(MESSAGE_POLL_SECONDS)
         if global_watcher_paused or global_session is None or admin_id is None:
+            continue
+        if (
+            global_session.explicitly_logged_out
+            or (time.time() - getattr(global_session, "last_interactive_activity", 0.0) < 180)
+            or (not os.path.exists(global_session.cookie_file) and studip_oauth.load_tokens() is None)
+        ):
             continue
         try:
             await check_new_messages(app.bot, admin_id, silent=True)
@@ -4930,10 +5291,20 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
             # of thing anyone forwards to the WhatsApp group, so skip the button
             # for those rather than offering an action that's never used.
             subject = (msg.get("title") or "").strip()
+            sender_name = (msg.get("sender") or "").strip()
+            can_reply = bool(
+                msg.get("id")
+                and sender_name.lower() not in ("", "unknown", "system", "stud.ip")
+                and not subject.lower().startswith("enrolment in course")
+            )
             if subject.lower().startswith("enrolment in course"):
                 markup = None
             else:
-                markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+                btn_rows = []
+                if can_reply:
+                    btn_rows.append([InlineKeyboardButton("↩️ Reply on Stud.IP", callback_data=f"msg_reply|{msg['id']}")])
+                btn_rows.append([InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")])
+                markup = InlineKeyboardMarkup(btn_rows)
             await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup)
         return True
     except Exception as e:
@@ -5172,19 +5543,14 @@ def _get_course_icon(title: str) -> str:
 
 
 def clean_course_title(raw_title: str) -> str:
-    """Remove course type (e.g. Vorlesung:) and course code (e.g. 2.02.861)."""
+    """Remove course type (e.g. Vorlesung:) and course code (e.g. 2.02.861 or 2.02.681a)."""
     if not raw_title:
         return ""
-    if ":" in raw_title:
-        # Split by first colon, take the right part
-        _, rest = raw_title.split(":", 1)
-        rest = rest.strip()
-        # Remove course code if it exists (e.g. "2.02.861 Name")
-        match = re.match(r'^[\d\.]+\b\s*(.*)$', rest)
-        if match:
-            return match.group(1).strip()
-        return rest
-    return raw_title.strip()
+    rest = raw_title.split(":", 1)[1].strip() if ":" in raw_title else raw_title.strip()
+    match = re.match(r"^\d+(?:\.\d+)+[a-zA-Z]?\s+(.*)$", rest)
+    if match:
+        return match.group(1).strip()
+    return rest
 
 
 # NOTE: get_calendar_events is defined further below in the Calendar helpers section.
@@ -5318,7 +5684,13 @@ async def show_last_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "━━━━━━━━━━━━━━━━━"
         )
 
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        raw_sender = (msg.get("sender") or "").strip().lower()
+        raw_subj = (msg.get("title") or "").strip().lower()
+        msg_markup = None
+        if msg.get("id") and raw_sender not in ("", "unknown", "system", "stud.ip") and not raw_subj.startswith("enrolment in course"):
+            msg_markup = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Reply on Stud.IP", callback_data=f"msg_reply|{msg['id']}")]])
+
+        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=msg_markup)
         await asyncio.sleep(0.3)  # Rate limiting
 
     # Show Quick Access button
@@ -5746,7 +6118,35 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    if query.data == "fastenroll_menu":
+    if query.data == "studip_login":
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id is None or not is_user_allowed(user_id):
+            await query.message.reply_text("Not authorized to use this bot.")
+            return
+        await _send_login_prompt(query.message, user_id)
+
+    elif query.data == "studip_logout":
+        user_id = update.effective_user.id if update.effective_user else None
+        if user_id is None or not is_user_allowed(user_id):
+            await query.message.reply_text("Not authorized to use this bot.")
+            return
+        await _perform_logout()
+        try:
+            if query.message and query.message.text and "Logged in:" in query.message.text:
+                updated_html = query.message.text_html.replace("🔑 Logged in: ✅ Yes", "🔑 Logged in: ❌ No")
+                await query.edit_message_text(
+                    updated_html,
+                    parse_mode="HTML",
+                    reply_markup=query.message.reply_markup,
+                )
+        except Exception:
+            pass
+        await query.message.reply_text(
+            "🚪 Logged out from Stud.IP. Saved session cookies and OAuth2 tokens have been cleared.\n"
+            "Tap 🔐 Login or use /login whenever you want to sign in again."
+        )
+
+    elif query.data == "fastenroll_menu":
         user_id = update.effective_user.id if update.effective_user else None
         if user_id is None or not is_user_allowed(user_id):
             await query.message.reply_text("Not authorized to use this bot.")
@@ -6269,9 +6669,13 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         with open(temp_path, "wb") as f:
                             f.write(content)
 
+                        doc_markup = None
+                        if os.path.splitext(fname or "")[1].lower() in (".pdf", ".pptx", ".html"):
+                            doc_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 1-Min Audio Summary", callback_data=f"file_audio_sum|{sid}")]])
                         await query.message.reply_document(
                             document=open(temp_path, "rb"),
-                            filename=fname
+                            filename=fname,
+                            reply_markup=doc_markup,
                         )
                         os.remove(temp_path)
                         logging.info(f"✅ Downloaded via cached URL: {fname}")
@@ -6325,10 +6729,14 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     with open(temp_path, "wb") as f:
                         f.write(content)
 
+                    doc_markup = None
+                    if os.path.splitext(fname or "")[1].lower() in (".pdf", ".pptx", ".html"):
+                        doc_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 1-Min Audio Summary", callback_data=f"file_audio_sum|{sid}")]])
                     await query.message.reply_document(
                         document=open(temp_path, "rb"),
                         filename=fname,
-                        caption=f"✅ {fname}"
+                        caption=f"✅ {fname}",
+                        reply_markup=doc_markup,
                     )
                     os.remove(temp_path)
                     logging.info(f"✅ Successfully downloaded: {fname}")
@@ -6639,6 +7047,31 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return True
 
+    if step == "studip_msg_reply":
+        target = context.user_data.pop("studip_reply_target", None)
+        context.user_data.pop("pending_step", None)
+        reply_body = text.strip()
+        if not reply_body or not target or not target.get("recipient_id"):
+            await update.effective_message.reply_text("⚠️ Reply cancelled or empty.", reply_markup=get_main_keyboard())
+            return True
+        status_msg = await update.effective_message.reply_text("📤 Sending reply on Stud.IP...")
+        try:
+            await send_studip_message(
+                recipient_id=target["recipient_id"],
+                subject=target.get("subject") or "Re: Message",
+                message_body=reply_body,
+            )
+            await status_msg.edit_text(
+                f"✅ <b>Reply sent on Stud.IP!</b>\n"
+                f"👤 <b>To:</b> {html.escape(target.get('sender', 'Recipient'))}\n"
+                f"📘 <b>Subject:</b> {html.escape(target.get('subject', 'Re:'))}",
+                parse_mode="HTML",
+            )
+        except Exception as exc:
+            logging.error(f"Failed to send Stud.IP reply: {exc}")
+            await status_msg.edit_text(f"❌ Failed to send reply on Stud.IP:\n<code>{html.escape(str(exc)[:200])}</code>", parse_mode="HTML")
+        return True
+
     # Unknown/stale step — clear it so the user isn't stuck.
     context.user_data.pop("pending_step", None)
     return False
@@ -6739,97 +7172,387 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             pass
 
 
-# ── Calendar helpers ──────────────────────────────────────────────────────────
+# ── Calendar, Schedule & Activity Stream helpers ──────────────────────────────
 
-async def get_calendar_events(session, week_start, days: int = 7) -> list:
-    """Fetch calendar events from the user's personal Stud.IP iCal export URL,
-    for `days` days starting at week_start (a week by default)."""
+async def fetch_user_schedule_api(timestamp: Optional[int] = None) -> list[dict]:
+    """Fetch the user's weekly semester timetable (`/users/{id}/schedule`) via JSON:API.
+    Note: `/schedule` does not accept `page[limit]`, so we call `studip_api_get` directly.
+    """
+    uid = await studip_api_user_id()
+    params = {"filter[timestamp]": int(timestamp)} if timestamp else None
+    payload = await studip_api_get(f"/users/{uid}/schedule", params=params)
+    slots = []
+    for item in payload.get("data", []):
+        attr = item.get("attributes", {})
+        rec = attr.get("recurrence") or {}
+        owner_id = _api_rel_id(item, "owner")
+        locs = attr.get("locations") or []
+        loc_str = ", ".join(str(x).strip() for x in locs if str(x).strip())
+        slots.append({
+            "id": item.get("id"),
+            "type": item.get("type"),
+            "title": (attr.get("title") or "Unknown Course").strip(),
+            "description": (attr.get("description") or "").strip(),
+            "start": attr.get("start") or "00:00",
+            "end": attr.get("end") or "00:00",
+            "weekday": int(attr.get("weekday") or 1),
+            "location": loc_str,
+            "recurrence": rec,
+            "course_id": owner_id,
+        })
+    slots.sort(key=lambda s: (s["weekday"], s["start"], s["title"]))
+    return slots
+
+
+async def _get_calendar_events_api(week_start, days: int = 7) -> list[dict]:
+    """Fetch and merge calendar events for `[week_start, week_start + days)` from:
+      1. `/users/{id}/schedule` (recurring `seminar-cycle-dates` + schedule entries)
+      2. `/courses/{cid}/events` (concrete `course-events` with `is-cancelled`, `location`, `topics`)
+      3. `/users/{id}/events` (personal user calendar events)
+    """
+    uid = await studip_api_user_id()
+    week_end = week_start + timedelta(days=days)
+    mid_dt = datetime.combine(week_start + timedelta(days=max(0, days // 2)), datetime.min.time(), tzinfo=TZ_BERLIN)
+    mid_ts = int(mid_dt.timestamp())
+    now = datetime.now(TZ_BERLIN)
+
+    schedule_slots = await fetch_user_schedule_api(timestamp=mid_ts)
+
+    # Map (course_id, weekday, start_hm) -> cycle location & recurrence info
+    cycle_locs: dict[tuple, str] = {}
+    course_ids: set[str] = set()
+    for slot in schedule_slots:
+        cid = slot.get("course_id")
+        if cid:
+            course_ids.add(cid)
+            if slot.get("location"):
+                cycle_locs[(cid, slot["weekday"], slot["start"][:5])] = slot["location"]
+
+    events: list[dict] = []
+    seen_keys: set[tuple] = set()
+
+    def _status_for(start_dt: datetime, end_dt: datetime, is_cancelled: bool) -> str:
+        if is_cancelled:
+            return "cancelled"
+        if end_dt < now:
+            return "past"
+        if start_dt <= now <= end_dt:
+            return "ongoing"
+        return "upcoming"
+
+    # 1. Fetch concrete course-events for all schedule courses in parallel
+    async def _fetch_course_evs(cid: str) -> tuple[str, list]:
+        try:
+            data, _ = await studip_api_get_all(f"/courses/{cid}/events")
+            return cid, data
+        except Exception as exc:
+            logging.debug(f"_get_calendar_events_api: /courses/{cid}/events failed: {exc}")
+            return cid, []
+
+    course_results = await asyncio.gather(*(_fetch_course_evs(cid) for cid in sorted(course_ids)))
+    courses_with_concrete_events: set[str] = set()
+
+    for cid, ev_list in course_results:
+        if ev_list:
+            courses_with_concrete_events.add(cid)
+        for ev in ev_list:
+            attr = ev.get("attributes", {})
+            start_dt = _api_berlin(attr.get("start"))
+            end_dt = _api_berlin(attr.get("end"))
+            if not start_dt or not end_dt:
+                continue
+            if not (week_start <= start_dt.date() < week_end):
+                continue
+            title = (attr.get("title") or "Unknown Event").strip()
+            start_hm = start_dt.strftime("%H:%M")
+            loc = (attr.get("location") or "").strip() or cycle_locs.get((cid, start_dt.isoweekday(), start_hm), "")
+            is_cancelled = bool(attr.get("is-cancelled", False))
+            meta = ev.get("meta") or {}
+            raw_topics = meta.get("topics") or []
+            topics = [
+                (t.get("title") if isinstance(t, dict) else str(t)).strip()
+                for t in raw_topics
+                if (t.get("title") if isinstance(t, dict) else str(t))
+            ]
+            desc = (attr.get("description") or "").strip()
+            key = (start_dt.isoformat(), clean_course_title(title).lower())
+            seen_keys.add(key)
+            events.append({
+                "id": ev.get("id"),
+                "title": title,
+                "day": start_dt.strftime("%A, %d.%m.%Y"),
+                "time": f"{start_dt.strftime('%H:%M')} – {end_dt.strftime('%H:%M')}",
+                "location": loc,
+                "url": f"{BASE_URL}/dispatch.php/course/times?cid={cid}",
+                "date_key": start_dt.date(),
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "status": _status_for(start_dt, end_dt, is_cancelled),
+                "is_cancelled": is_cancelled,
+                "categories": (attr.get("categories") or "").strip(),
+                "description": desc,
+                "topics": topics,
+                "course_id": cid,
+            })
+
+    # 2. Expand seminar-cycle-dates for any slot whose course did not return concrete events
+    for slot in schedule_slots:
+        cid = slot.get("course_id")
+        if cid and cid in courses_with_concrete_events:
+            continue
+        rec = slot.get("recurrence") or {}
+        dtstart = _api_berlin(rec.get("DTSTART"))
+        until = _api_berlin(rec.get("UNTIL"))
+        interval = int(rec.get("INTERVAL") or 1)
+        exdates = {
+            _api_berlin(x).date()
+            for x in (rec.get("EXDATES") or [])
+            if _api_berlin(x) is not None
+        }
+        for offset in range(days):
+            d = week_start + timedelta(days=offset)
+            if d.isoweekday() != slot["weekday"]:
+                continue
+            if dtstart and d < dtstart.date():
+                continue
+            if until and d > until.date():
+                continue
+            if dtstart and interval > 1:
+                weeks_diff = (d - dtstart.date()).days // 7
+                if weeks_diff % interval != 0:
+                    continue
+            sh, sm = (int(x) for x in slot["start"][:5].split(":"))
+            eh, em = (int(x) for x in slot["end"][:5].split(":"))
+            start_dt = datetime(d.year, d.month, d.day, sh, sm, tzinfo=TZ_BERLIN)
+            end_dt = datetime(d.year, d.month, d.day, eh, em, tzinfo=TZ_BERLIN)
+            is_cancelled = d in exdates
+            title = slot["title"]
+            key = (start_dt.isoformat(), clean_course_title(title).lower())
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            events.append({
+                "id": f"sch_{slot.get('id')}_{d.isoformat()}",
+                "title": title,
+                "day": start_dt.strftime("%A, %d.%m.%Y"),
+                "time": f"{start_dt.strftime('%H:%M')} – {end_dt.strftime('%H:%M')}",
+                "location": slot.get("location") or "",
+                "url": f"{BASE_URL}/dispatch.php/course/times?cid={cid}" if cid else "",
+                "date_key": d,
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "status": _status_for(start_dt, end_dt, is_cancelled),
+                "is_cancelled": is_cancelled,
+                "categories": "",
+                "description": slot.get("description") or "",
+                "topics": [],
+                "course_id": cid,
+            })
+
+    # 3. Personal user events (`/users/{id}/events`)
+    try:
+        user_evs, _ = await studip_api_get_all(f"/users/{uid}/events", {"filter[timestamp]": mid_ts})
+        for uev in user_evs:
+            attr = uev.get("attributes", {})
+            start_dt = _api_berlin(attr.get("start"))
+            end_dt = _api_berlin(attr.get("end"))
+            if not start_dt or not end_dt:
+                continue
+            if not (week_start <= start_dt.date() < week_end):
+                continue
+            title = (attr.get("title") or "Personal Event").strip()
+            key = (start_dt.isoformat(), clean_course_title(title).lower())
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            is_cancelled = bool(attr.get("is-cancelled", False))
+            events.append({
+                "id": uev.get("id"),
+                "title": title,
+                "day": start_dt.strftime("%A, %d.%m.%Y"),
+                "time": f"{start_dt.strftime('%H:%M')} – {end_dt.strftime('%H:%M')}",
+                "location": (attr.get("location") or "").strip(),
+                "url": "",
+                "date_key": start_dt.date(),
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "status": _status_for(start_dt, end_dt, is_cancelled),
+                "is_cancelled": is_cancelled,
+                "categories": (attr.get("categories") or "").strip(),
+                "description": (attr.get("description") or "").strip(),
+                "topics": [],
+                "course_id": None,
+            })
+    except Exception as exc:
+        logging.debug(f"_get_calendar_events_api: /users/{uid}/events skipped: {exc}")
+
+    events.sort(key=lambda e: e["start_dt"])
+    return events
+
+
+async def _get_calendar_events_ical(session, week_start, days: int = 7) -> list[dict]:
+    """Fetch calendar events from the user's personal Stud.IP iCal export URL."""
     ical_url = os.getenv("STUDIP_ICAL_URL")
-    
     if not ical_url:
-        logging.error("❌ No STUDIP_ICAL_URL set in environment variables.")
         return []
-        
     try:
         import icalendar
         import recurring_ical_events
     except ImportError:
-        logging.error("❌ icalendar or recurring_ical_events not installed. Run: pip install icalendar recurring-ical-events")
+        logging.error("❌ icalendar or recurring_ical_events not installed.")
         return []
 
     try:
         logging.info(f"📅 Fetching ICS Calendar from: {ical_url[:50]}...")
-        async with await session.get(ical_url, allow_redirects=True) as r:
+        s = session or global_session or await login_studip()
+        async with await s.get(ical_url, allow_redirects=True) as r:
             if r.status != 200:
                 logging.warning(f"ICS Calendar API returned {r.status}")
                 return []
             raw_data = await r.read()
-            raw_text = raw_data.decode('utf-8', errors='ignore')
+            raw_text = raw_data.decode("utf-8", errors="ignore")
 
-        # Parse the calendar
         cal = icalendar.Calendar.from_ical(raw_text)
-        
-        # Get events for the requested week
         end_date = week_start + timedelta(days=days)
-        # Use recurring_ical_events to expand RRULEs automatically and filter by date boundary
         week_events = recurring_ical_events.of(cal).between(week_start, end_date)
-        
+
         events = []
         now = datetime.now(ZoneInfo("Europe/Berlin"))
         for event in week_events:
-            title = str(event.get('SUMMARY', 'Unknown Event'))
-            location = str(event.get('LOCATION', ''))
-            url_link = str(event.get('URL', ''))
-            
-            start_dt = event['DTSTART'].dt
-            end_dt = event['DTEND'].dt
-            
-            # icalendar returns date or datetime depending on whether it's an all-day event
+            title = str(event.get("SUMMARY", "Unknown Event"))
+            location = str(event.get("LOCATION", ""))
+            url_link = str(event.get("URL", ""))
+
+            start_dt = event["DTSTART"].dt
+            end_dt = event["DTEND"].dt
+
             if not isinstance(start_dt, datetime):
-                # Convert purely 'date' to 'datetime' at midnight
                 start_dt = datetime.combine(start_dt, datetime.min.time()).replace(tzinfo=ZoneInfo("Europe/Berlin"))
             if not isinstance(end_dt, datetime):
                 end_dt = datetime.combine(end_dt, datetime.min.time()).replace(tzinfo=ZoneInfo("Europe/Berlin"))
-            
-            # Ensure timezone-aware comparisons by converting all to local time
+
             try:
                 start_dt = start_dt.astimezone(ZoneInfo("Europe/Berlin"))
                 end_dt = end_dt.astimezone(ZoneInfo("Europe/Berlin"))
             except ValueError:
-                # If naive, just replace tzinfo
                 start_dt = start_dt.replace(tzinfo=ZoneInfo("Europe/Berlin"))
                 end_dt = end_dt.replace(tzinfo=ZoneInfo("Europe/Berlin"))
-            
-            # Determine status
+
             if end_dt < now:
                 status = "past"
             elif start_dt <= now <= end_dt:
                 status = "ongoing"
             else:
                 status = "upcoming"
-                
-            day_str = start_dt.strftime("%A, %d.%m.%Y")
-            time_str = f"{start_dt.strftime('%H:%M')} – {end_dt.strftime('%H:%M')}"
-            date_key = start_dt.date()
-                
+
             events.append({
+                "id": str(ev.get("uid", "")),
                 "title": title,
-                "day": day_str,
-                "time": time_str,
+                "day": start_dt.strftime("%A, %d.%m.%Y"),
+                "time": f"{start_dt.strftime('%H:%M')} – {end_dt.strftime('%H:%M')}",
                 "location": location,
                 "url": url_link,
-                "date_key": date_key,
+                "date_key": start_dt.date(),
                 "start_dt": start_dt,
                 "end_dt": end_dt,
-                "status": status
+                "status": status,
+                "is_cancelled": False,
+                "categories": "",
+                "description": "",
+                "topics": [],
+                "course_id": None,
             })
 
-        # Sort by date + time using the real datetime object
         events.sort(key=lambda e: e["start_dt"])
         return events
     except Exception as exc:
-        logging.error(f"get_calendar_events error: {exc}")
+        logging.error(f"_get_calendar_events_ical error: {exc}")
         return []
+
+
+async def get_calendar_events(session, week_start, days: int = 7) -> list:
+    """Fetch calendar events for `days` days starting at `week_start`.
+
+    Combines Stud.IP's JSON:API (`/users/{id}/schedule`, `/courses/{cid}/events`,
+    `/users/{id}/events`) with `STUDIP_ICAL_URL` when configured:
+      - Works with zero `.env` iCal configuration via OAuth2 / JSON:API.
+      - Enriches events with `is_cancelled`, `topics`, and `description` from JSON:API
+        while preserving full room bookings (`LOCATION`) from iCal when present.
+    """
+    api_events: list[dict] = []
+    try:
+        api_events = await _get_calendar_events_api(week_start, days=days)
+    except Exception as exc:
+        logging.warning(f"get_calendar_events: JSON:API fetch failed ({exc}), falling back to iCal")
+
+    ical_events = await _get_calendar_events_ical(session, week_start, days=days)
+
+    if not ical_events:
+        return api_events
+    if not api_events:
+        return ical_events
+
+    # Merge iCal room names with JSON:API cancellation/topic/description metadata
+    api_by_key = {
+        (ev["start_dt"].isoformat(), clean_course_title(ev["title"]).lower()): ev
+        for ev in api_events
+    }
+    merged: list[dict] = []
+    matched_keys: set[tuple] = set()
+
+    for iev in ical_events:
+        key = (iev["start_dt"].isoformat(), clean_course_title(iev["title"]).lower())
+        aev = api_by_key.get(key)
+        if aev:
+            matched_keys.add(key)
+            if not iev.get("location") and aev.get("location"):
+                iev["location"] = aev["location"]
+            iev["is_cancelled"] = aev.get("is_cancelled", False)
+            if iev["is_cancelled"]:
+                iev["status"] = "cancelled"
+            iev["categories"] = aev.get("categories") or ""
+            iev["description"] = aev.get("description") or ""
+            iev["topics"] = aev.get("topics") or []
+            iev["course_id"] = aev.get("course_id")
+            if not iev.get("url") and aev.get("url"):
+                iev["url"] = aev["url"]
+        merged.append(iev)
+
+    # Append any JSON:API events not present in iCal (e.g. cancelled sessions or personal events)
+    for key, aev in api_by_key.items():
+        if key not in matched_keys:
+            merged.append(aev)
+
+    merged.sort(key=lambda e: e["start_dt"])
+    return merged
+
+
+def _format_event_markdown_block(ev: dict) -> str:
+    """Format a single calendar event block for daily/weekly Markdown views,
+    including cancellation status, topics, and session notes from JSON:API."""
+    original_title = ev.get("title", "")
+    is_cancelled = bool(ev.get("is_cancelled", False))
+    status = "🚫" if is_cancelled else _status_emoji(ev.get("status"))
+    course_icon = _get_course_icon(original_title)
+    display_title = clean_course_title(original_title)
+    loc_icon = _get_location_emoji(ev.get("location", ""))
+    duration = ev["time"]
+    cancelled_tag = " *(CANCELLED)*" if is_cancelled else ""
+
+    lines = [
+        f"{status} {course_icon} *{display_title}*{cancelled_tag}",
+        f"   🕒 `{duration}`",
+        f"   {loc_icon} {_safe_loc(ev.get('location', ''))}",
+    ]
+    topics = ev.get("topics") or []
+    if topics:
+        safe_topics = ", ".join(str(t).replace("*", "").replace("_", "").replace("`", "") for t in topics[:2])
+        lines.append(f"   📌 _Topic: {safe_topics}_")
+    desc = (ev.get("description") or "").strip()
+    if desc:
+        safe_desc = desc.replace("*", "").replace("_", "").replace("`", "").replace("\n", " ")[:120]
+        lines.append(f"   📝 _{safe_desc}_")
+    return "\n".join(lines)
 
 
 async def send_daily_calendar(sender, events: list, target_date, week_start):
@@ -6857,22 +7580,7 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
         )
         
         lines = [header]
-        course_blocks = []
-        for ev in today_events:
-            original_title = ev.get("title", "")
-            status = _status_emoji(ev.get("status"))
-            course_icon = _get_course_icon(original_title)
-            display_title = clean_course_title(original_title)
-            loc_icon = _get_location_emoji(ev.get("location", ""))
-            duration = ev["time"] # Already formatted as HH:MM – HH:MM
-
-            block = (
-                f"{status} {course_icon} *{display_title}*\n"
-                f"   🕒 `{duration}`\n"
-                f"   {loc_icon} {_safe_loc(ev['location'])}"
-            )
-            course_blocks.append(block)
-            
+        course_blocks = [_format_event_markdown_block(ev) for ev in today_events]
         lines.append("\n\n".join(course_blocks))
         lines.append("━━━━━━━━━━━━━━━━━━")
         text = "\n".join(lines) + weather_block
@@ -6880,14 +7588,14 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
     keyboard = [
         [
             InlineKeyboardButton("📆 Week Plan", callback_data="calendar_weekly"),
+            InlineKeyboardButton("🗓️ Timetable", callback_data="calendar_timetable"),
         ],
         [
-            InlineKeyboardButton("📚 My Exam Dates", callback_data="exam_dates_list"),
-        ],
-        [
+            InlineKeyboardButton("⚡ Activity Stream", callback_data="activity_stream"),
             InlineKeyboardButton("🔔 Upcoming", callback_data="upcoming_dashboard"),
         ],
         [
+            InlineKeyboardButton("📚 My Exam Dates", callback_data="exam_dates_list"),
             InlineKeyboardButton("🔊 Listen", callback_data="calendar_today_voice"),
         ],
     ]
@@ -7001,21 +7709,7 @@ async def send_weekly_calendar(sender, events: list, week_start):
             lines.append(f"\n{day_emoji} *{day_name}, {dk:%d.%m.%Y}*")
             lines.append("━━━━━━━━━━━━━━━━━━")
 
-            day_courses = []
-            for event in events_by_day[dk]:
-                original_title = event.get("title", "")
-                status = _status_emoji(event.get("status"))
-                course_icon = _get_course_icon(original_title)
-                display_title = clean_course_title(original_title)
-                loc_icon = _get_location_emoji(event.get("location", ""))
-                duration = event["time"]
-
-                block = (
-                    f"{status} {course_icon} *{display_title}*\n"
-                    f"   🕒 `{duration}`\n"
-                    f"   {loc_icon} {_safe_loc(event['location'])}"
-                )
-                day_courses.append(block)
+            day_courses = [_format_event_markdown_block(event) for event in events_by_day[dk]]
             
             lines.append("\n\n".join(day_courses))
 
@@ -7049,7 +7743,12 @@ async def send_weekly_calendar(sender, events: list, week_start):
             InlineKeyboardButton("➡️ Next Week", callback_data=f"calendar_week|{next_week.isoformat()}"),
         ],
         [
+            InlineKeyboardButton("🗓️ Timetable", callback_data="calendar_timetable"),
+            InlineKeyboardButton("⚡ Activity Stream", callback_data="activity_stream"),
+        ],
+        [
             InlineKeyboardButton("🔊 Listen", callback_data=f"calendar_weekly_voice|{week_start.isoformat()}"),
+            InlineKeyboardButton("📅 Today", callback_data="calendar_today"),
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -7191,6 +7890,895 @@ async def handle_calendar_weekly(update: Update, context: ContextTypes.DEFAULT_T
     except Exception as e:
         logging.error(f"Calendar weekly error: {e}")
         await query.edit_message_text(f"❌ Error loading weekly schedule: {str(e)[:200]}")
+
+
+_ISO_WEEKDAY_LABELS = {
+    1: "Monday",
+    2: "Tuesday",
+    3: "Wednesday",
+    4: "Thursday",
+    5: "Friday",
+    6: "Saturday",
+    7: "Sunday",
+}
+
+
+async def build_timetable_text(session=None) -> str:
+    """Build a formatted HTML string for the user's recurring semester timetable
+    (`/users/{id}/schedule`), enriched with room locations from the current week's
+    calendar events when Stud.IP's `/schedule` leaves a room blank."""
+    slots = await fetch_user_schedule_api()
+    if not slots:
+        return "🗓️ <b>Semester Timetable (Stundenplan)</b>\n━━━━━━━━━━━━━━━━━\nℹ️ No recurring timetable slots found for the current semester."
+
+    # Enrich blank locations from the current week's merged calendar events
+    room_lookup: dict[tuple, str] = {}
+    try:
+        today = datetime.now(TZ_BERLIN).date()
+        week_start = today - timedelta(days=today.weekday())
+        week_evs = await get_calendar_events(session=session or global_session, week_start=week_start, days=14)
+        for ev in week_evs:
+            loc = (ev.get("location") or "").strip()
+            if not loc:
+                continue
+            wday = ev["start_dt"].isoweekday()
+            hm = ev["start_dt"].strftime("%H:%M")
+            room_lookup.setdefault((wday, hm, clean_course_title(ev["title"]).lower()), loc)
+    except Exception as exc:
+        logging.debug(f"build_timetable_text room enrichment skipped: {exc}")
+
+    by_day: dict[int, list[dict]] = {}
+    for s in slots:
+        by_day.setdefault(s["weekday"], []).append(s)
+
+    lines = ["🗓️ <b>Semester Timetable (Stundenplan)</b>", "━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+    for wday in sorted(by_day.keys()):
+        day_name = _ISO_WEEKDAY_LABELS.get(wday, f"Day {wday}")
+        day_emoji = _get_day_emoji(day_name)
+        lines.append(f"\n{day_emoji} <b>{day_name}</b>")
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        for s in by_day[wday]:
+            raw_title = s["title"]
+            clean_t = clean_course_title(raw_title)
+            icon = _get_course_icon(raw_title)
+            start_hm = s["start"][:5]
+            end_hm = s["end"][:5]
+            loc = s.get("location") or room_lookup.get((wday, start_hm, clean_t.lower()), "")
+            loc_icon = _get_location_emoji(loc)
+            rec = s.get("recurrence") or {}
+            interval = int(rec.get("INTERVAL") or 1)
+            freq_badge = " <i>(every 2 weeks)</i>" if interval == 2 else ""
+            lines.append(
+                f"{icon} <b>{html.escape(clean_t)}</b>{freq_badge}\n"
+                f"   🕒 <code>{start_hm} – {end_hm}</code>\n"
+                f"   {loc_icon} {html.escape(_safe_loc(loc))}"
+            )
+    return "\n".join(lines)
+
+
+async def handle_calendar_timetable(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle `calendar_timetable` callback — shows the semester timetable from `/users/{id}/schedule`."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    try:
+        status_msg = await query.edit_message_text("🗓️ Loading semester timetable...")
+        await _show_typing(query)
+        stop_evt, anim_task = _start_loading_animation(status_msg, "Loading semester timetable...")
+        try:
+            text = await build_timetable_text(session=global_session)
+        finally:
+            await _stop_loading_animation(stop_evt, anim_task)
+
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("📅 Today", callback_data="calendar_today"),
+                InlineKeyboardButton("📆 Week Plan", callback_data="calendar_weekly"),
+            ],
+            [
+                InlineKeyboardButton("⚡ Activity Stream", callback_data="activity_stream"),
+            ],
+        ])
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception as e:
+        logging.error(f"Timetable error: {e}")
+        await query.edit_message_text(f"❌ Error loading timetable: {str(e)[:200]}")
+
+
+async def timetable_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/timetable - show the recurring semester timetable from `/users/{id}/schedule`."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    status_msg = await update.message.reply_text("🗓️ Loading semester timetable...", disable_notification=True)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Loading semester timetable...")
+    try:
+        text = await build_timetable_text(session=global_session)
+    except Exception as e:
+        logging.error(f"timetable_command error: {e}")
+        await status_msg.edit_text(f"❌ Error loading timetable: {str(e)[:200]}")
+        return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📅 Today", callback_data="calendar_today"),
+            InlineKeyboardButton("📆 Week Plan", callback_data="calendar_weekly"),
+        ],
+        [
+            InlineKeyboardButton("⚡ Activity Stream", callback_data="activity_stream"),
+        ],
+    ])
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+_ACTIVITY_TYPE_ICONS = {
+    "news": "📢",
+    "documents": "📁",
+    "forum": "💬",
+    "blubber": "💭",
+    "wiki": "📝",
+    "courseware": "📘",
+    "participants": "👥",
+    "schedule": "📅",
+    "message": "✉️",
+}
+
+
+async def fetch_activity_stream_api(limit: int = 20, activity_filter: Optional[str] = None) -> list[dict]:
+    """Fetch recent activities across all courses via `/users/{id}/activitystream`."""
+    uid = await studip_api_user_id()
+    fetch_limit = max(limit * 3, 40) if activity_filter else limit
+    page = await studip_api_get(
+        f"/users/{uid}/activitystream",
+        params={"page[limit]": min(fetch_limit, 100), "include": "actor,object,context"},
+    )
+    included_index = {
+        (inc.get("type"), inc.get("id")): inc
+        for inc in page.get("included", [])
+        if inc.get("type") and inc.get("id")
+    }
+
+    results = []
+    for item in page.get("data", []):
+        attr = item.get("attributes", {})
+        act_type = (attr.get("activity-type") or "other").strip().lower()
+        if activity_filter:
+            if activity_filter == "forum" and act_type not in ("forum", "blubber", "wiki"):
+                continue
+            elif activity_filter != "forum" and act_type != activity_filter:
+                continue
+
+        rels = item.get("relationships", {})
+        actor_ref = (rels.get("actor") or {}).get("data") or {}
+        ctx_ref = (rels.get("context") or {}).get("data") or {}
+        obj_ref = (rels.get("object") or {}).get("data") or {}
+
+        actor_inc = included_index.get((actor_ref.get("type"), actor_ref.get("id")), {})
+        ctx_inc = included_index.get((ctx_ref.get("type"), ctx_ref.get("id")), {})
+        obj_inc = included_index.get((obj_ref.get("type"), obj_ref.get("id")), {})
+
+        actor_name = (actor_inc.get("attributes") or {}).get("formatted-name") or ""
+        ctx_title = (ctx_inc.get("attributes") or {}).get("title") or ""
+        if not ctx_title and ctx_ref.get("type") == "courses" and ctx_ref.get("id") in courses_map:
+            ctx_title = courses_map[ctx_ref["id"]]
+
+        obj_attrs = obj_inc.get("attributes") or {}
+        obj_title = (obj_attrs.get("title") or obj_attrs.get("name") or "").strip()
+
+        mk_dt = _api_berlin(attr.get("mkdate"))
+        when_str = mk_dt.strftime("%d.%m.%Y %H:%M") if mk_dt else ""
+        raw_content = attr.get("content") or ""
+        summary = _api_html_to_text(raw_content) if raw_content else ""
+        if len(summary) > 180:
+            summary = summary[:177].rstrip() + "..."
+
+        results.append({
+            "id": item.get("id"),
+            "title": (attr.get("title") or "Activity").strip(),
+            "verb": (attr.get("verb") or "").strip(),
+            "activity_type": act_type,
+            "actor_name": actor_name.strip(),
+            "course_name": clean_course_title(ctx_title) if ctx_title else "",
+            "object_title": obj_title,
+            "when": when_str,
+            "summary": summary,
+        })
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+async def build_activity_stream_text(activity_filter: Optional[str] = None, limit: int = 10) -> tuple[str, InlineKeyboardMarkup]:
+    """Render the Stud.IP activity stream (`/users/{id}/activitystream`) as HTML + filter buttons."""
+    items = await fetch_activity_stream_api(limit=limit, activity_filter=activity_filter)
+    filter_labels = {
+        None: "All Activities",
+        "documents": "Files & Documents",
+        "news": "Announcements",
+        "forum": "Forum, Blubber & Wiki",
+    }
+    header_sub = filter_labels.get(activity_filter, "All Activities")
+    lines = [
+        f"⚡ <b>Stud.IP Activity Stream</b> ({html.escape(header_sub)})",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if not items:
+        lines.append("ℹ️ No matching activities found in the recent stream.")
+    else:
+        for act in items:
+            icon = _ACTIVITY_TYPE_ICONS.get(act["activity_type"], "🔔")
+            course_line = f"📘 <b>{html.escape(act['course_name'])}</b>\n" if act["course_name"] else ""
+            obj_line = f"📄 <i>{html.escape(act['object_title'])}</i>\n" if (act["object_title"] and act["object_title"] != act["course_name"]) else ""
+            summary_line = f"💬 {html.escape(act['summary'])}\n" if (act["summary"] and act["summary"] != act["object_title"]) else ""
+            lines.append(
+                f"{icon} <b>{html.escape(act['title'])}</b>\n"
+                f"{course_line}"
+                f"{obj_line}"
+                f"{summary_line}"
+                f"🕒 <code>{html.escape(act['when'])}</code>"
+            )
+            lines.append("━━━━━━━━━━━━━━━━━━")
+
+    def _fbtn(label: str, fval: Optional[str]) -> InlineKeyboardButton:
+        active = "● " if activity_filter == fval else ""
+        cb = f"activity_stream|{fval}" if fval else "activity_stream"
+        return InlineKeyboardButton(f"{active}{label}", callback_data=cb)
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            _fbtn("🌐 All", None),
+            _fbtn("📁 Files", "documents"),
+            _fbtn("📢 News", "news"),
+            _fbtn("💬 Forum/Wiki", "forum"),
+        ],
+        [
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"activity_stream|{activity_filter}" if activity_filter else "activity_stream"),
+            InlineKeyboardButton("📅 Calendar", callback_data="calendar_today"),
+        ],
+    ])
+    return "\n".join(lines), keyboard
+
+
+async def handle_activity_stream(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle `activity_stream` and `activity_stream|<filter>` callbacks."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    parts = (query.data or "").split("|", 1)
+    activity_filter = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
+
+    try:
+        text, markup = await build_activity_stream_text(activity_filter=activity_filter, limit=10)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    except Exception as e:
+        if "Message is not modified" in str(e):
+            return
+        logging.error(f"Activity stream error: {e}")
+        await query.edit_message_text(f"❌ Error loading activity stream: {str(e)[:200]}")
+
+
+async def activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/activity - show the recent Stud.IP activity stream (`/users/{id}/activitystream`)."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    status_msg = await update.message.reply_text("⚡ Loading Stud.IP activity stream...", disable_notification=True)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Loading Stud.IP activity stream...")
+    try:
+        text, markup = await build_activity_stream_text(activity_filter=None, limit=10)
+    except Exception as e:
+        logging.error(f"activity_command error: {e}")
+        await status_msg.edit_text(f"❌ Error loading activity stream: {str(e)[:200]}")
+        return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
+
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+# ── Feature 4: Automatic Course Cancellation, Reschedule & Room Change Alerts ──
+
+async def check_course_schedule_changes(session, bot) -> None:
+    """Inspect upcoming course sessions over the next 14 days and weekly timetable slots
+    via Stud.IP JSON:API (/users/{id}/schedule, /courses/{cid}/events, /users/{id}/events)
+    and notify immediately if:
+      - A session is cancelled (🚫 COURSE SESSION CANCELLED)
+      - A previously cancelled session is restored (🟢 COURSE SESSION RESTORED)
+      - A room / location changes (📍 COURSE ROOM CHANGED)
+      - A session time is rescheduled (⏰ COURSE SESSION RESCHEDULED)
+      - A new course is added to the weekly timetable (📅 NEW COURSE ADDED TO TIMETABLE)
+      - An existing timetable slot changes day/time/room (🔄 TIMETABLE SCHEDULE UPDATED)
+      - A course slot is removed from the weekly timetable (ℹ️ COURSE REMOVED FROM TIMETABLE)
+    """
+    now = datetime.now(TZ_BERLIN)
+    today = now.date()
+    wa_kb = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+
+    # 1. Concrete Course & User Calendar Events (14 days ahead)
+    try:
+        events = await _get_calendar_events_api(today, days=14)
+    except Exception as exc:
+        logging.debug(f"check_course_schedule_changes events fetch skipped: {exc}")
+        events = []
+
+    general_cache = load_general_cache()
+    ev_state: dict = general_cache.get("course_events_state", {})
+    ev_updated = False
+
+    for ev in events:
+        start_dt = ev.get("start_dt")
+        end_dt = ev.get("end_dt")
+        if not start_dt or not end_dt:
+            continue
+        raw_title = (ev.get("title") or "Course").strip()
+        clean_t = clean_course_title(raw_title) or raw_title
+        ev_id = ev.get("id") or f"{start_dt.isoformat()}|{clean_t.lower()}"
+        cur_cancelled = bool(ev.get("is_cancelled", False))
+        cur_loc = (ev.get("location") or "").strip()
+        cur_time = f"{start_dt:%H:%M} - {end_dt:%H:%M}"
+        date_str = start_dt.strftime("%a, %d.%m.%Y")
+        prev = ev_state.get(ev_id)
+
+        if end_dt >= now:
+            if prev is None:
+                # First sighting: only alert if already explicitly marked as cancelled
+                if cur_cancelled:
+                    loc_line = f"📍 <b>Room:</b> {html.escape(cur_loc)}\n" if cur_loc else ""
+                    alert_text = (
+                        "🚫 <b>COURSE SESSION CANCELLED</b>\n"
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"📘 <b>Course:</b> {html.escape(clean_t)}\n"
+                        f"📅 <b>Date:</b> {date_str}\n"
+                        f"🕒 <b>Time:</b> <code>{cur_time}</code>\n"
+                        f"{loc_line}"
+                        "━━━━━━━━━━━━━━━━━"
+                    )
+                    await broadcast(bot, alert_text, parse_mode="HTML", disable_notification=False, reply_markup=wa_kb)
+            else:
+                was_cancelled = bool(prev.get("is_cancelled", False))
+                old_loc = (prev.get("location") or "").strip()
+                old_time = prev.get("time") or cur_time
+                old_date = prev.get("date") or date_str
+
+                if cur_cancelled and not was_cancelled:
+                    loc_line = f"📍 <b>Room:</b> {html.escape(cur_loc or old_loc)}\n" if (cur_loc or old_loc) else ""
+                    alert_text = (
+                        "🚫 <b>COURSE SESSION CANCELLED</b>\n"
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"📘 <b>Course:</b> {html.escape(clean_t)}\n"
+                        f"📅 <b>Date:</b> {date_str}\n"
+                        f"🕒 <b>Time:</b> <code>{cur_time}</code>\n"
+                        f"{loc_line}"
+                        "━━━━━━━━━━━━━━━━━"
+                    )
+                    await broadcast(bot, alert_text, parse_mode="HTML", disable_notification=False, reply_markup=wa_kb)
+                elif not cur_cancelled and was_cancelled:
+                    loc_line = f"📍 <b>Room:</b> {html.escape(cur_loc or old_loc)}\n" if (cur_loc or old_loc) else ""
+                    alert_text = (
+                        "🟢 <b>COURSE SESSION RESTORED</b>\n"
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"📘 <b>Course:</b> {html.escape(clean_t)}\n"
+                        f"📅 <b>Date:</b> {date_str}\n"
+                        f"🕒 <b>Time:</b> <code>{cur_time}</code>\n"
+                        f"{loc_line}"
+                        "ℹ️ <i>This previously cancelled session will take place.</i>\n"
+                        "━━━━━━━━━━━━━━━━━"
+                    )
+                    await broadcast(bot, alert_text, parse_mode="HTML", disable_notification=False, reply_markup=wa_kb)
+                elif not cur_cancelled and old_loc and cur_loc and old_loc != cur_loc:
+                    alert_text = (
+                        "📍 <b>COURSE ROOM CHANGED</b>\n"
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"📘 <b>Course:</b> {html.escape(clean_t)}\n"
+                        f"📅 <b>Date:</b> {date_str} (<code>{cur_time}</code>)\n"
+                        f"🚪 <b>Previous Room:</b> <s>{html.escape(old_loc)}</s>\n"
+                        f"🏛️ <b>New Room:</b> <b>{html.escape(cur_loc)}</b>\n"
+                        "━━━━━━━━━━━━━━━━━"
+                    )
+                    await broadcast(bot, alert_text, parse_mode="HTML", disable_notification=False, reply_markup=wa_kb)
+                elif not cur_cancelled and (old_date != date_str or old_time != cur_time):
+                    alert_text = (
+                        "⏰ <b>COURSE SESSION RESCHEDULED</b>\n"
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"📘 <b>Course:</b> {html.escape(clean_t)}\n"
+                        f"📅 <b>Date:</b> {date_str}\n"
+                        f"🕒 <b>Previous Time:</b> <s>{html.escape(old_time)}</s>\n"
+                        f"🕒 <b>New Time:</b> <b>{html.escape(cur_time)}</b>\n"
+                        f"📍 <b>Room:</b> {html.escape(cur_loc or 'TBA')}\n"
+                        "━━━━━━━━━━━━━━━━━"
+                    )
+                    await broadcast(bot, alert_text, parse_mode="HTML", disable_notification=False, reply_markup=wa_kb)
+
+        new_entry = {
+            "is_cancelled": cur_cancelled,
+            "location": cur_loc,
+            "time": cur_time,
+            "date": date_str,
+            "ts": int(now.timestamp()),
+        }
+        if prev != new_entry:
+            ev_state[ev_id] = new_entry
+            ev_updated = True
+
+    # Prune entries older than 21 days
+    cutoff_ts = int(now.timestamp()) - 21 * 86400
+    for k in [k for k, v in ev_state.items() if isinstance(v, dict) and v.get("ts", 0) < cutoff_ts]:
+        ev_state.pop(k, None)
+        ev_updated = True
+
+    # 2. Weekly Recurring Timetable Slots (/users/{id}/schedule)
+    try:
+        current_slots = await fetch_user_schedule_api()
+    except Exception as exc:
+        logging.debug(f"check_course_schedule_changes schedule fetch skipped: {exc}")
+        current_slots = None
+
+    sched_state: dict = general_cache.get("user_schedule_slots", {})
+    sched_updated = False
+
+    if current_slots is not None:
+        new_sched_map = {}
+        for s in current_slots:
+            sid = s.get("id") or f"{s['weekday']}_{s['start']}_{s['title']}"
+            new_sched_map[sid] = {
+                "title": clean_course_title(s["title"]) or s["title"],
+                "weekday": s["weekday"],
+                "weekday_name": _ISO_WEEKDAY_LABELS.get(s["weekday"], f"Day {s['weekday']}"),
+                "start": s["start"][:5],
+                "end": s["end"][:5],
+                "location": s.get("location") or "",
+            }
+
+        if sched_state:
+            # Check for added slots
+            for sid, sdata in new_sched_map.items():
+                if sid not in sched_state:
+                    loc_line = f"📍 <b>Room:</b> {html.escape(sdata['location'])}\n" if sdata["location"] else ""
+                    alert_text = (
+                        "📅 <b>NEW COURSE ADDED TO TIMETABLE</b>\n"
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"📘 <b>Course:</b> {html.escape(sdata['title'])}\n"
+                        f"📆 <b>Day:</b> {sdata['weekday_name']}\n"
+                        f"🕒 <b>Time:</b> <code>{sdata['start']} - {sdata['end']}</code>\n"
+                        f"{loc_line}"
+                        "━━━━━━━━━━━━━━━━━"
+                    )
+                    await broadcast(bot, alert_text, parse_mode="HTML", disable_notification=False, reply_markup=wa_kb)
+                    sched_updated = True
+                else:
+                    prev_s = sched_state[sid]
+                    time_changed = (prev_s.get("weekday") != sdata["weekday"]) or (prev_s.get("start") != sdata["start"]) or (prev_s.get("end") != sdata["end"])
+                    loc_changed = bool(prev_s.get("location") and sdata["location"] and prev_s["location"] != sdata["location"])
+                    if time_changed or loc_changed:
+                        prev_wday = prev_s.get("weekday_name", f"Day {prev_s.get('weekday')}")
+                        prev_desc = f"{prev_wday} {prev_s.get('start')}-{prev_s.get('end')}"
+                        new_desc = f"{sdata['weekday_name']} {sdata['start']}-{sdata['end']}"
+                        loc_info = f"\n📍 <b>Room:</b> {html.escape(sdata['location'])}" if sdata["location"] else ""
+                        alert_text = (
+                            "🔄 <b>TIMETABLE SCHEDULE UPDATED</b>\n"
+                            "━━━━━━━━━━━━━━━━━\n"
+                            f"📘 <b>Course:</b> {html.escape(sdata['title'])}\n"
+                            f"🕒 <b>Previous Slot:</b> <s>{html.escape(prev_desc)}</s>\n"
+                            f"🕒 <b>New Slot:</b> <b>{html.escape(new_desc)}</b>"
+                            f"{loc_info}\n"
+                            "━━━━━━━━━━━━━━━━━"
+                        )
+                        await broadcast(bot, alert_text, parse_mode="HTML", disable_notification=False, reply_markup=wa_kb)
+                        sched_updated = True
+
+            # Check for removed slots
+            for sid, prev_s in sched_state.items():
+                if sid not in new_sched_map:
+                    prev_wday = prev_s.get("weekday_name", f"Day {prev_s.get('weekday')}")
+                    prev_desc = f"{prev_wday} {prev_s.get('start')}-{prev_s.get('end')}"
+                    alert_text = (
+                        "ℹ️ <b>COURSE REMOVED FROM TIMETABLE</b>\n"
+                        "━━━━━━━━━━━━━━━━━\n"
+                        f"📘 <b>Course:</b> {html.escape(prev_s.get('title', 'Unknown'))}\n"
+                        f"🕒 <b>Previous Slot:</b> {html.escape(prev_desc)}\n"
+                        "━━━━━━━━━━━━━━━━━"
+                    )
+                    await broadcast(bot, alert_text, parse_mode="HTML", disable_notification=False, reply_markup=wa_kb)
+                    sched_updated = True
+        else:
+            sched_updated = True  # Initial baseline seeding
+
+        general_cache["user_schedule_slots"] = new_sched_map
+
+    if ev_updated or sched_updated:
+        general_cache["course_events_state"] = ev_state
+        save_general_cache(general_cache)
+
+
+# ── Feature 3: Direct Stud.IP Message Reply (`POST /jsonapi.php/v1/messages`) ─
+
+async def send_studip_message(recipient_id: str, subject: str, message_body: str, _retry: bool = True) -> dict:
+    """Send a Stud.IP internal message via `POST /jsonapi.php/v1/messages`."""
+    session = global_session or await login_studip()
+    url = f"{STUDIP_API_URL}/messages"
+    payload = {
+        "data": {
+            "type": "messages",
+            "attributes": {
+                "subject": subject,
+                "message": message_body,
+                "priority": "normal",
+            },
+            "relationships": {
+                "recipients": {
+                    "data": [{"type": "users", "id": recipient_id}],
+                }
+            },
+        }
+    }
+    headers = {
+        "Content-Type": "application/vnd.api+json",
+        "Accept": "application/vnd.api+json",
+    }
+    async with await session.post(url, data=json.dumps(payload), headers=headers) as r:
+        status, resp_text = r.status, await r.text()
+    if status == 401 and _retry:
+        if studip_oauth.load_tokens() and await studip_oauth.get_access_token(force_refresh=True):
+            return await send_studip_message(recipient_id, subject, message_body, _retry=False)
+        await session.login(force=True)
+        return await send_studip_message(recipient_id, subject, message_body, _retry=False)
+    if status not in (200, 201, 202, 204):
+        raise StudipApiError(f"POST /messages failed: HTTP {status} ({resp_text[:180]})")
+    try:
+        return json.loads(resp_text) if resp_text.strip() else {"ok": True}
+    except ValueError:
+        return {"ok": True}
+
+
+async def handle_studip_message_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle `msg_reply|<msg_id>` callback to initiate a direct Stud.IP message reply."""
+    query = update.callback_query
+    await query.answer()
+
+    if not is_user_allowed(query.from_user.id):
+        return
+
+    parts = (query.data or "").split("|", 1)
+    msg_id = parts[1].strip() if len(parts) > 1 else ""
+    if not msg_id:
+        await query.message.reply_text("⚠️ Invalid message ID.")
+        return
+
+    cached_msg = next((m for m in load_message_cache() if m.get("id") == msg_id), None)
+    sender_id = (cached_msg or {}).get("sender_id")
+    sender_name = (cached_msg or {}).get("sender") or "Unknown"
+    orig_subject = (cached_msg or {}).get("title") or "(No subject)"
+
+    # If `sender_id` wasn't cached yet, resolve it live from `/messages/{msg_id}?include=sender`
+    if not sender_id:
+        try:
+            doc = await studip_api_get(f"/messages/{msg_id}", {"include": "sender"})
+            data = doc.get("data") or {}
+            sender_id = _api_rel_id(data, "sender")
+            names = _api_names(doc.get("included", []))
+            if sender_id and sender_id in names:
+                sender_name = names[sender_id]
+            subj = (data.get("attributes") or {}).get("subject")
+            if subj:
+                orig_subject = subj
+        except Exception as exc:
+            logging.warning(f"Could not resolve sender_id for message {msg_id}: {exc}")
+
+    if not sender_id:
+        await query.message.reply_text("⚠️ Could not determine the Stud.IP sender for this message.")
+        return
+
+    reply_subject = orig_subject if orig_subject.lower().startswith("re:") else f"Re: {orig_subject}"
+    context.user_data["pending_step"] = "studip_msg_reply"
+    context.user_data["studip_reply_target"] = {
+        "msg_id": msg_id,
+        "recipient_id": sender_id,
+        "sender": sender_name,
+        "subject": reply_subject,
+    }
+
+    cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Reply", callback_data="msg_reply_cancel")]])
+    await query.message.reply_text(
+        "↩️ <b>Reply on Stud.IP</b>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>To:</b> {html.escape(sender_name)}\n"
+        f"📘 <b>Subject:</b> {html.escape(reply_subject)}\n\n"
+        "✍️ Type your reply below (or send a voice message):",
+        parse_mode="HTML",
+        reply_markup=cancel_kb,
+    )
+
+
+async def handle_studip_message_reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel a pending Stud.IP message reply."""
+    query = update.callback_query
+    await query.answer("Reply cancelled")
+    context.user_data.pop("pending_step", None)
+    context.user_data.pop("studip_reply_target", None)
+    await query.edit_message_text("❌ Stud.IP reply cancelled.")
+
+
+# ── Feature 9: 1-Minute Audio "Podcast" Summary for Course PDFs/Slides ────────
+
+FILE_AUDIO_SUMMARY_SYSTEM_PROMPT = (
+    "You are an engaging university study podcast host. Summarize the core concepts, "
+    "key takeaways, definitions, and any important dates or formulas from the provided "
+    "course document into a clear, natural spoken script that takes about 60 seconds to "
+    "read aloud (130 to 165 words). Speak directly to the student in English. Do not use "
+    "markdown formatting, bullet symbols, or special characters - write smooth, natural "
+    "spoken sentences."
+)
+
+
+async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle `file_audio_sum|<sid>` callback: extract text from the PDF/slide deck,
+    generate a 1-minute spoken summary via LLM, and send it as a Telegram voice note."""
+    query = update.callback_query
+    await query.answer("Generating 1-min audio summary...")
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    parts = (query.data or "").split("|", 1)
+    sid = parts[1].strip() if len(parts) > 1 else ""
+    info = link_cache.get(sid, {})
+    cid = info.get("cid")
+    fname = info.get("name")
+    course_name = info.get("course") or (courses_map.get(cid) if cid else "") or "Course"
+
+    if not cid or not fname:
+        await query.message.reply_text("⚠️ File reference expired. Please open the file list again.")
+        return
+
+    status_msg = await query.message.reply_text(
+        f"🎧 <b>Preparing 1-Min Audio Summary...</b>\n📄 <i>{html.escape(fname)}</i>",
+        parse_mode="HTML",
+    )
+    stop_evt, anim_task = _start_loading_animation(status_msg, f"Preparing 1-Min Audio Summary for {fname}...")
+
+    try:
+        session = global_session or await login_studip()
+        file_url = info.get("url")
+        content = None
+
+        if file_url:
+            try:
+                async with await session.get(file_url) as r:
+                    if r.status == 200:
+                        content = await r.read()
+            except Exception:
+                content = None
+
+        if not content:
+            fresh_url = await get_fresh_file_url(cid, fname, info.get("current_url"))
+            if fresh_url:
+                info["url"] = fresh_url
+                link_cache[sid] = {**info, "ts": datetime.now().timestamp()}
+                async with await session.get(fresh_url) as r:
+                    if r.status == 200:
+                        content = await r.read()
+
+        if not content:
+            await _stop_loading_animation(stop_evt, anim_task)
+            await status_msg.edit_text(f"⚠️ Could not download <b>{html.escape(fname)}</b> from Stud.IP.", parse_mode="HTML")
+            return
+
+        extracted = await extract_text_from_file_async(fname, content)
+        if not extracted or len(extracted.strip()) < 40:
+            await _stop_loading_animation(stop_evt, anim_task)
+            await status_msg.edit_text(
+                f"⚠️ Could not extract readable text from <b>{html.escape(fname)}</b>.",
+                parse_mode="HTML",
+            )
+            return
+
+        user_prompt = (
+            f"Course: {clean_course_title(course_name)}\n"
+            f"File: {fname}\n\n"
+            f"Extracted document content:\n{extracted[:12000]}"
+        )
+        script = await _call_openrouter(
+            FILE_AUDIO_SUMMARY_SYSTEM_PROMPT,
+            user_prompt,
+            temperature=0.3,
+            timeout=35,
+            reasoning=False,
+        )
+        if not script:
+            await _stop_loading_animation(stop_evt, anim_task)
+            await status_msg.edit_text("⚠️ AI summary service is temporarily unavailable. Please try again shortly.")
+            return
+
+        clean_script = script.strip().strip('"')
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
+
+    summary_card = (
+        f"🎧 <b>1-Minute Study Summary</b>\n"
+        f"📘 <b>{html.escape(clean_course_title(course_name))}</b>\n"
+        f"📄 <i>{html.escape(fname)}</i>\n"
+        "━━━━━━━━━━━━━━━━━\n"
+        f"{html.escape(clean_script)}"
+    )
+    await status_msg.edit_text(summary_card[:4000], parse_mode="HTML")
+    await _try_send_voice(query.message, clean_script)
+
+
+# ── Feature 1 & 2: Official StuMS PDF Documents (`/documents`) & Tuition (`/tuition`) ─
+
+def _stums_documents_keyboard() -> InlineKeyboardMarkup:
+    rows = []
+    for key, spec in STUMS_DOCUMENTS.items():
+        rows.append([InlineKeyboardButton(spec["label"], callback_data=f"stums_doc|{key}")])
+    rows.append([InlineKeyboardButton("💶 Tuition & Fees (Rückmeldung)", callback_data="tuition_status")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def handle_stums_documents_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Display the official StuMS PDF certificates download menu."""
+    query = update.callback_query
+    await query.answer()
+    if not is_user_allowed(query.from_user.id):
+        return
+    text = (
+        "📄 <b>Official StuMS Documents (PDF)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Select any official certificate below to generate and download it directly from StuMS:"
+    )
+    await query.message.reply_text(text, parse_mode="HTML", reply_markup=_stums_documents_keyboard())
+
+
+async def documents_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/documents - open the official StuMS PDF certificates menu."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    text = (
+        "📄 <b>Official StuMS Documents (PDF)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Select any official certificate below to generate and download it directly from StuMS:"
+    )
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=_stums_documents_keyboard())
+
+
+async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle `stums_doc|<doc_key>` callback: fetch official PDF from StuMS and send to Telegram."""
+    query = update.callback_query
+    await query.answer("Fetching document from StuMS...")
+    if not is_user_allowed(query.from_user.id):
+        return
+
+    parts = (query.data or "").split("|", 1)
+    doc_key = parts[1].strip() if len(parts) > 1 else ""
+    spec = STUMS_DOCUMENTS.get(doc_key)
+    if not spec:
+        await query.message.reply_text("⚠️ Unknown document type.")
+        return
+
+    status_msg = await query.message.reply_text(
+        f"⏳ Generating <b>{html.escape(spec['label'])}</b> from StuMS...",
+        parse_mode="HTML",
+    )
+    stop_evt, anim_task = _start_loading_animation(status_msg, f"Generating {spec['label']}...")
+    try:
+        session = global_session or await login_studip()
+        pdf_bytes, filename = await download_stums_document(session, doc_key)
+    except Exception as exc:
+        logging.error(f"StuMS document download failed for {doc_key}: {exc}")
+        await _stop_loading_animation(stop_evt, anim_task)
+        await status_msg.edit_text(
+            f"❌ Failed to download <b>{html.escape(spec['label'])}</b>:\n<code>{html.escape(str(exc)[:220])}</code>",
+            parse_mode="HTML",
+        )
+        return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+    await query.message.reply_document(
+        document=io.BytesIO(pdf_bytes),
+        filename=filename,
+        caption=f"✅ <b>{html.escape(spec['label'])}</b>",
+        parse_mode="HTML",
+    )
+
+
+async def build_tuition_status_text(session=None) -> tuple[str, InlineKeyboardMarkup]:
+    """Fetch and format the StuMS tuition / semester fee (*Rückmeldung*) status."""
+    sess = session or global_session or await login_studip()
+    info = await get_tuition_status(sess)
+
+    lines = [
+        "💶 <b>Tuition &amp; Semester Fees (Rückmeldung)</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    if info.get("has_open_payments") and info.get("open_invoices"):
+        lines.append("⚠️ <b>OPEN PAYMENT DUE</b>")
+        for inv in info["open_invoices"]:
+            lines.append(
+                f"🗓️ <b>Semester:</b> {html.escape(inv['period'])}\n"
+                f"💰 <b>Amount Due:</b> <b>{html.escape(inv['to_pay'])}</b> (Paid: {html.escape(inv['credit'])})\n"
+                f"⏰ <b>Due Date:</b> <code>{html.escape(inv['due_date'])}</code>\n"
+                f"🔖 <b>Purpose (Verwendungszweck):</b> <code>{html.escape(inv['purpose'])}</code>"
+            )
+            lines.append("━━━━━━━━━━━━━━━━━━")
+    else:
+        lines.append("✅ <b>All semester fees are paid!</b> (No open payments)")
+        lines.append("━━━━━━━━━━━━━━━━━━")
+
+    paid = info.get("paid_invoices") or []
+    if paid:
+        lines.append("\n🧾 <b>Recent Semester Fee History</b>")
+        for inv in list(reversed(paid))[:4]:
+            lines.append(
+                f"• <b>{html.escape(inv['period'])}</b>\n"
+                f"  💳 Paid: <code>{html.escape(inv['credit'])}</code> / Due: <code>{html.escape(inv['to_pay'])}</code>\n"
+                f"  📅 Due Date: <code>{html.escape(inv['due_date'])}</code> | Ref: <code>{html.escape(inv['purpose'])}</code>"
+            )
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📄 Download Enrollment Certificate (PDF)", callback_data="stums_doc|imma")],
+        [InlineKeyboardButton("📄 All Official Documents", callback_data="stums_docs_menu")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="tuition_status")],
+    ])
+    return "\n".join(lines), kb
+
+
+async def handle_tuition_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle `tuition_status` callback."""
+    query = update.callback_query
+    await query.answer()
+    if not is_user_allowed(query.from_user.id):
+        return
+
+    status_msg = await query.message.reply_text("💶 Checking StuMS tuition & fee account...")
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Checking StuMS tuition & fee account...")
+    try:
+        text, kb = await build_tuition_status_text(session=global_session)
+    except Exception as exc:
+        logging.error(f"Tuition status error: {exc}")
+        await _stop_loading_animation(stop_evt, anim_task)
+        await status_msg.edit_text(f"❌ Error checking tuition status:\n<code>{html.escape(str(exc)[:220])}</code>", parse_mode="HTML")
+        return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
+
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+async def tuition_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tuition - check open and paid semester fees (*Semesterbeitrag* / *Rückmeldung*) on StuMS."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    status_msg = await update.message.reply_text("💶 Checking StuMS tuition & fee account...", disable_notification=True)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Checking StuMS tuition & fee account...")
+    try:
+        text, kb = await build_tuition_status_text(session=global_session)
+    except Exception as exc:
+        logging.error(f"tuition_command error: {exc}")
+        await status_msg.edit_text(f"❌ Error checking tuition status:\n<code>{html.escape(str(exc)[:220])}</code>", parse_mode="HTML")
+        return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
+
+    await status_msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 def _exam_registration_status_line(exam: dict) -> str:
@@ -8666,9 +10254,7 @@ async def handle_enrollment_menu(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_set_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle set_user_name callback (from /status) — ask for a display name,
-    stored per user_id (see save_user_name) so the AI-narrated daily-plan
-    voice message can address each allowed user by their own name."""
+    """Handle set_user_name callback - notify that display name is automatically fetched from Stud.IP."""
     query = update.callback_query
     await query.answer()
 
@@ -8676,10 +10262,17 @@ async def handle_set_user_name(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_user_allowed(user_id):
         return
 
-    context.user_data["pending_step"] = "user_name"
-    current = get_user_name(user_id)
-    prompt = f"👤 What should I call you? (Currently: {current})" if current else "👤 What should I call you?"
-    await query.message.reply_text(prompt)
+    try:
+        profile = await get_studip_user_profile()
+        name = profile.get("formatted_name") or profile.get("given_name")
+    except Exception:
+        name = None
+    if not name:
+        name = get_primary_user_name() or "Stud.IP"
+    await query.message.reply_text(
+        f"👤 Your name is automatically synchronized from Stud.IP: <b>{name}</b>",
+        parse_mode="HTML",
+    )
 
 
 async def handle_set_weather_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11739,6 +13332,7 @@ async def track_courses_command(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         text, markup = render_track_menu(await _load_track_menu_progress())
         await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+
     except Exception as e:
         logging.exception("track_courses_command failed")
         await status_msg.edit_text(f"❌ Could not load courses: {e}")
@@ -11814,6 +13408,7 @@ async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows, _ = await _load_progress_rows(refresh=True)
         text, markup = render_progress_overview(rows)
         await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
+
     except Exception as e:
         logging.exception("progress_command failed")
         await status_msg.edit_text(f"❌ Could not load progress: {e}")
@@ -13659,20 +15254,10 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _restart_process():
-    global wa_process
     # Give the reply above a moment to actually reach Telegram before we tear things down.
     await asyncio.sleep(0.5)
 
-    if wa_process:
-        logging.info("Stopping WhatsApp microservice before restart...")
-        try:
-            wa_process.terminate()
-            wa_process.wait(timeout=5)
-        except Exception:
-            try:
-                wa_process.kill()
-            except Exception:
-                pass
+    stop_whatsapp_microservice()
 
     # os.execv replaces the current process image in place (same PID), which
     # works the same whether pm2 is managing us or not - pm2 just sees its
@@ -13962,9 +15547,15 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     watch_prev = get_watch_previous_semester_enabled()
     text += f"\n👀 Watch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
 
-    user_id_for_name = update.effective_user.id if update.effective_user else None
-    display_name = get_user_name(user_id_for_name) if user_id_for_name else None
-    text += f"\n👤 Your Name: {display_name or 'Not set'}"
+    studip_name = None
+    try:
+        profile = await get_studip_user_profile()
+        studip_name = profile.get("formatted_name") or profile.get("given_name")
+    except Exception:
+        pass
+    if not studip_name:
+        studip_name = get_primary_user_name()
+    text += f"\n👤 Name: {studip_name or 'Not connected'} (from Stud.IP)"
 
     weather_location = load_weather_location()
     weather_location_label = f"{weather_location['name']}, {weather_location['country']}" if weather_location else "Uni Oldenburg (default)"
@@ -13976,7 +15567,17 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     study_plan_enabled = get_weekly_study_plan_enabled()
     text += f"\n📘 Weekly Study Plan: {'✅ On' if study_plan_enabled else '🔲 Off'}"
 
+    public_login = _login_public_url()
+    if public_login.startswith("https://"):
+        login_btn = InlineKeyboardButton(
+            "🔐 Login",
+            web_app=WebAppInfo(url=_get_login_server().app_url()),
+        )
+    else:
+        login_btn = InlineKeyboardButton("🔐 Login", callback_data="studip_login")
+
     keyboard = [
+        [login_btn, InlineKeyboardButton("🚪 Logout", callback_data="studip_logout")],
         [InlineKeyboardButton("👤 Profile", callback_data="status_group|profile")],
         [InlineKeyboardButton("📆 Semester & Calendar", callback_data="status_group|semester")],
         [InlineKeyboardButton("🎓 Studies", callback_data="status_group|studies")],
@@ -14053,10 +15654,9 @@ async def main():
         global global_session
         global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
         
-        logging.info("🔐 Logging in to Stud.IP...")
+        logging.info("🔐 Checking Stud.IP session...")
         if not await global_session.login():
-            logging.error("❌ Login failed. Please check your USERNAME, PASSWORD, and TOTP_SECRET.")
-            return
+            logging.warning("⚠️ Not logged in to Stud.IP yet. Starting bot so you can sign in via /login.")
 
         app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -14074,26 +15674,40 @@ async def main():
         app.add_handler(CommandHandler("status", status_command))
         app.add_handler(CommandHandler("healthcheck", healthcheck_command))
         app.add_handler(CommandHandler("menu", menu_command))
+        app.add_handler(CommandHandler("timetable", timetable_command))
+        app.add_handler(CommandHandler("activity", activity_command))
+        app.add_handler(CommandHandler("documents", documents_command))
+        app.add_handler(CommandHandler("tuition", tuition_command))
+        app.add_handler(CommandHandler("login", login_command))
+        app.add_handler(CommandHandler("logout", logout_command))
         app.add_handler(CommandHandler("restart", restart_command))
         
         app.add_handler(CallbackQueryHandler(show_last_messages, pattern="^show_last_messages$"))
+        app.add_handler(CallbackQueryHandler(handle_studip_message_reply_start, pattern=r"^msg_reply\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_studip_message_reply_cancel, pattern=r"^msg_reply_cancel$"))
+        app.add_handler(CallbackQueryHandler(handle_file_audio_summary, pattern=r"^file_audio_sum\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_stums_documents_menu, pattern=r"^stums_docs_menu$"))
+        app.add_handler(CallbackQueryHandler(handle_stums_doc_download, pattern=r"^stums_doc\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_tuition_status, pattern=r"^tuition_status$"))
         app.add_handler(CallbackQueryHandler(handle_forward_wa_ask, pattern="^forward_wa$"))
         app.add_handler(CallbackQueryHandler(forward_to_whatsapp, pattern="^forward_wa_confirm$"))
         app.add_handler(CallbackQueryHandler(handle_forward_wa_cancel, pattern="^forward_wa_cancel$"))
         app.add_handler(CallbackQueryHandler(show_last_announcements, pattern="^show_last_announcements$"))
         app.add_handler(CallbackQueryHandler(show_last_files, pattern="^show_last_files$"))
         app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
-        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(start_watchers|stop_watchers|request_wa_qr|force_wa_qr|detect_wa_groups|wa_test_message|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu)$"))
+        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(studip_login|studip_logout|start_watchers|stop_watchers|request_wa_qr|force_wa_qr|detect_wa_groups|wa_test_message|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu)$"))
         app.add_handler(CallbackQueryHandler(handle_exam_buttons, pattern="^(exam_menu|exam_noop|exam_cancel|exam_ask\\|.*|exam_do\\|.*)$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_wa_ask, pattern="^examopen_wa_ask\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_wa_confirm, pattern="^examopen_wa_confirm\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_mute_ask, pattern="^examopen_mute_ask\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_mute_confirm, pattern="^examopen_mute_confirm\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_cancel, pattern="^examopen_cancel$"))
-        app.add_handler(CallbackQueryHandler(set_wa_group_handler, pattern="^set_wa_group\|.*$"))
+        app.add_handler(CallbackQueryHandler(set_wa_group_handler, pattern=r"^set_wa_group\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_today, pattern="^calendar_today$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_today_voice, pattern="^calendar_today_voice$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_weekly, pattern="^calendar_weekly$"))
+        app.add_handler(CallbackQueryHandler(handle_calendar_timetable, pattern="^calendar_timetable$"))
+        app.add_handler(CallbackQueryHandler(handle_activity_stream, pattern=r"^activity_stream(\|.*)?$"))
         app.add_handler(CallbackQueryHandler(handle_exam_dates_list, pattern="^exam_dates_list$"))
         app.add_handler(CallbackQueryHandler(handle_exam_files_scan, pattern="^exam_files_scan$"))
         app.add_handler(CallbackQueryHandler(handle_all_exam_dates, pattern="^exam_dates_all$"))
@@ -14129,9 +15743,9 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_course_deenroll_ask, pattern="^course_deenroll_ask\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_deenroll_confirm, pattern="^course_deenroll_confirm\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_course_deenroll_cancel, pattern="^course_deenroll_cancel$"))
-        app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern="^calendar_week\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern=r"^calendar_week\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_calendar_weekly_voice, pattern="^calendar_weekly_voice\\|.*$"))
-        app.add_handler(CallbackQueryHandler(menu_button_handler, pattern="^menu_nav\|.*$"))
+        app.add_handler(CallbackQueryHandler(menu_button_handler, pattern=r"^menu_nav\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_menu_preferences_button, pattern="^menu_prefs$"))
         app.add_handler(CallbackQueryHandler(handle_menu_recommend_button, pattern="^menu_recommend$"))
         app.add_handler(CallbackQueryHandler(handle_menu_photos_button, pattern=r"^menu_photos\|.*$"))
@@ -14163,7 +15777,40 @@ async def main():
         # Explicitly initialize and start the application
         await app.initialize()
         await app.start()
-        
+
+        # Register command list in Telegram's popup menu
+        try:
+            from telegram import BotCommand
+            commands = [
+                BotCommand("menu", "Interactive quick navigation menu"),
+                BotCommand("timetable", "Weekly timetable (Stundenplan)"),
+                BotCommand("activity", "Recent Stud.IP activity stream"),
+                BotCommand("documents", "Official university documents (PDF)"),
+                BotCommand("tuition", "Tuition & semester fee status"),
+                BotCommand("check", "Check courses for updates now"),
+                BotCommand("studyplan", "Weekly study plan"),
+                BotCommand("progress", "Credit & module progress"),
+                BotCommand("status", "Bot status and settings"),
+                BotCommand("login", "Sign in to Stud.IP (Mini App)"),
+                BotCommand("logout", "Sign out and clear session"),
+            ]
+            await app.bot.set_my_commands(commands)
+            logging.info("✅ Telegram bot commands registered successfully")
+        except Exception as exc:
+            logging.warning(f"Could not register Telegram bot commands: {exc}")
+
+        # Login page (+ optional Cloudflare tunnel + menu button)
+        try:
+            await _start_login_infra(app)
+        except Exception as exc:
+            logging.error(f"⚠️ Login infrastructure failed to start: {exc}")
+
+        # Pre-fetch Stud.IP profile to sync user name
+        try:
+            await get_studip_user_profile()
+        except Exception as exc:
+            logging.debug(f"Initial Stud.IP profile sync skipped: {exc}")
+
         logging.info("🚀 Starting unified watcher...")
         # Run watcher in background task
         asyncio.create_task(start_unified_watcher(app))
@@ -14176,9 +15823,16 @@ async def main():
         logging.info("💬 Bot is now online and listening for messages.")
 
         # Run until the process is stopped
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: stop_event.set())
+            except (NotImplementedError, RuntimeError):
+                pass
+
         try:
-            while True:
-                await asyncio.sleep(3600)
+            await stop_event.wait()
         except (KeyboardInterrupt, asyncio.CancelledError):
             logging.info("🛑 Stop signal received.")
 
@@ -14186,6 +15840,7 @@ async def main():
         logging.error(f"❌ Fatal error in main: {e}", exc_info=True)
     finally:
         logging.info("🧹 Cleaning up...")
+        stop_whatsapp_microservice()
         if app:
             try:
                 if app.updater and app.updater.running:
@@ -14196,31 +15851,113 @@ async def main():
             except Exception as se:
                 logging.error(f"Error during app shutdown: {se}")
             
+        if quick_tunnel:
+            try:
+                await quick_tunnel.stop()
+            except Exception:
+                pass
+        if login_server:
+            try:
+                await login_server.stop()
+            except Exception:
+                pass
+
         if global_session:
             await global_session.close()
         
         release_instance_lock()
         logging.info("✅ Bot shutdown complete")
 
+def _cleanup_stale_whatsapp_service(wa_dir: str):
+    """Ensure no stale or orphaned node server.js is running before startup."""
+    lock_file = os.path.join(wa_dir, "whatsapp_service.lock")
+    if os.path.exists(lock_file):
+        try:
+            with open(lock_file, "r") as f:
+                old_pid = int(f.read().strip())
+            if old_pid != os.getpid() and psutil.pid_exists(old_pid):
+                try:
+                    os.kill(old_pid, signal.SIGTERM)
+                    time.sleep(0.5)
+                    if psutil.pid_exists(old_pid):
+                        os.kill(old_pid, signal.SIGKILL)
+                    logging.info(f"Cleaned up stale WhatsApp service process (PID {old_pid})")
+                except (ProcessLookupError, OSError):
+                    pass
+            try:
+                os.remove(lock_file)
+            except OSError:
+                pass
+        except Exception as e:
+            logging.debug(f"Error reading WhatsApp lock file: {e}")
+
+    port = int(os.environ.get("PORT", "3838"))
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                logging.warning(f"Port {port} is occupied by an existing process. Terminating stale process...")
+                if os.name != 'nt':
+                    subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=5)
+                time.sleep(1)
+    except Exception as e:
+        logging.debug(f"Port check/cleanup skipped: {e}")
+
+
+def start_whatsapp_microservice():
+    global wa_process
+    wa_service_dir = os.path.join(os.path.dirname(__file__), "whatsapp_service")
+    if not os.path.exists(wa_service_dir):
+        return
+    _cleanup_stale_whatsapp_service(wa_service_dir)
+    logging.info("Starting WhatsApp microservice...")
+    kwargs = {}
+    if os.name != 'nt':
+        kwargs['preexec_fn'] = os.setsid
+    try:
+        wa_process = subprocess.Popen(["node", "server.js"], cwd=wa_service_dir, **kwargs)
+    except Exception as exc:
+        logging.error(f"Failed to start WhatsApp microservice: {exc}")
+
+
+def stop_whatsapp_microservice():
+    global wa_process
+    if wa_process is None:
+        return
+    logging.info("Stopping WhatsApp microservice...")
+    try:
+        if os.name != 'nt':
+            try:
+                pgid = os.getpgid(wa_process.pid)
+                os.killpg(pgid, signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                pass
+        else:
+            wa_process.terminate()
+
+        try:
+            wa_process.wait(timeout=5)
+        except (subprocess.TimeoutExpired, Exception):
+            if os.name != 'nt':
+                try:
+                    pgid = os.getpgid(wa_process.pid)
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+            else:
+                wa_process.kill()
+    except Exception as e:
+        logging.warning(f"Error stopping WhatsApp microservice: {e}")
+    finally:
+        wa_process = None
+
+
 if __name__ == "__main__":
     import asyncio
     import atexit
 
-    # Start WhatsApp microservice automatically
-    wa_service_dir = os.path.join(os.path.dirname(__file__), "whatsapp_service")
-    if os.path.exists(wa_service_dir):
-        logging.info("Starting WhatsApp microservice...")
-        # Start node directly instead of npm via shell to avoid zombie processes on restart
-        wa_process = subprocess.Popen(["node", "server.js"], cwd=wa_service_dir)
-
-        def cleanup_wa():
-            logging.info("Stopping WhatsApp microservice...")
-            wa_process.terminate()
-            try:
-                wa_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                wa_process.kill()
-            
-        atexit.register(cleanup_wa)
+    start_whatsapp_microservice()
+    atexit.register(stop_whatsapp_microservice)
 
     asyncio.run(main())
