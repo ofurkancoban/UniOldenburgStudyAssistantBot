@@ -3061,7 +3061,7 @@ def _food_preferences_management_view(category="main"):
 
     text += (
         "Select a category below to browse the Mensa legend and toggle ingredients to avoid. "
-        "You can also reply directly with text or voice (e.g. <i>\"no pork, no mushrooms\"</i>)."
+        "Dishes containing avoided ingredients will be filtered out automatically."
     )
 
     keyboard = [
@@ -3090,8 +3090,7 @@ def _food_preferences_management_view(category="main"):
 
 
 async def handle_menu_preferences_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle menu_prefs callback — show the management view and set pending_step
-    so a typed/voice reply is still picked up as more foods to avoid."""
+    """Handle menu_prefs callback — show the interactive legend management view."""
     query = update.callback_query
     await query.answer()
 
@@ -3099,7 +3098,6 @@ async def handle_menu_preferences_button(update: Update, context: ContextTypes.D
     if not is_user_allowed(user_id):
         return
 
-    context.user_data["pending_step"] = "food_preferences"
     text, keyboard = _food_preferences_management_view(category="main")
     try:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
@@ -7241,20 +7239,6 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.effective_message.reply_text("✅ iCal link successfully updated!", reply_markup=get_main_keyboard())
         return True
 
-    if step == "food_preferences":
-        context.user_data.pop("pending_step", None)
-        result = await extract_food_preferences(text)
-        if not result["avoid_codes"] and not result["avoid_keywords"]:
-            await update.effective_message.reply_text("🤷 Couldn't pick out any specific ingredient from that — try naming foods directly, e.g. \"pork, fish, mushrooms\".")
-            return True
-        existing = load_food_preferences()
-        merged_codes = sorted(set(existing["avoid_codes"]) | set(result["avoid_codes"]))
-        merged_keywords = sorted(set(existing["avoid_keywords"]) | set(result["avoid_keywords"]))
-        save_food_preferences(merged_codes, merged_keywords)
-        named = [ALLERGEN_CODE_NAMES.get(c, c) for c in result["avoid_codes"]] + result["avoid_keywords"]
-        await update.effective_message.reply_text(f"🚫 Noted — won't show: {', '.join(named)}", reply_markup=get_main_keyboard())
-        return True
-
     if step == "user_name":
         context.user_data.pop("pending_step", None)
         name = text.strip()[:50]
@@ -10895,7 +10879,7 @@ async def transcribe_voice_message(ogg_path: str) -> str:
 VOICE_INTENTS = [
     "create_task", "create_exam_reminder_task", "course_enroll", "course_deenroll",
     "exam_register", "exam_deregister", "check_grades", "check_exam_dates",
-    "check_status", "show_menu", "set_food_preferences", "remove_food_preferences",
+    "check_status", "show_menu",
     "show_last_file", "list_course_files", "exam_dates_all", "upcoming_dashboard",
     "calendar_today", "calendar_weekly", "set_default_semester", "run_check",
     "fastenroll_list", "read_daily_plan", "read_weekly_plan", "ask_question", "recommend_meal", "unclear",
@@ -10917,8 +10901,6 @@ INTENT_LABELS = {
     "check_status": "ℹ️ Show bot status",
     "show_menu": "🍽️ Show today's menu",
     "recommend_meal": "🍽️ Recommend something to eat",
-    "set_food_preferences": "🚫 Set food preferences",
-    "remove_food_preferences": "✅ Allow a food again",
     "show_last_file": "📄 Show a course's latest file",
     "list_course_files": "📁 List a course's files",
     "exam_dates_all": "📋 Show all exam dates",
@@ -10947,8 +10929,6 @@ Intents, each with example phrasings in both languages:
 - check_status: "bot durumunu göster" / "show bot status"
 - show_menu: "bugünün yemek menüsünü göster" / "what's on the menu today" / "yemekhanede ne var" — wants to see the full menu
 - recommend_meal: "bugün ne yesem" / "what should I eat today" / "recommend me something for lunch" / "yemekhaneden ne önerirsin" — wants ONE dish picked for them, not the full menu
-- set_food_preferences: "domuz eti yemiyorum" / "I don't eat pork" / "mantar ve balık istemiyorum, menüde gösterme"
-- remove_food_preferences: "artık balık yiyorum" / "I eat fish now" / "stop avoiding mushrooms" / "domuz etini tekrar göster" — reverses an earlier set_food_preferences for the named food(s)
 - show_last_file: "Computational Intelligence dersinin son dosyasını göster" / "list the last file of Computational Intelligence" / "show me the latest file for Linear Algebra" — asks for only the single most recently uploaded file of a named course
 - list_course_files: "Linear Algebra dersinin dosyalarını listele" / "list the files of Linear Algebra" / "show me all files for Computational Economics" — asks to see every file of a named course, not just the latest one
 - exam_dates_all: "tüm sınav tarihlerini göster" / "show every exam date" / "list all exams in the curriculum" — every exam across the whole curriculum, not just mine
@@ -14510,35 +14490,6 @@ async def classify_voice_intent(transcript: str) -> dict:
     return {"intent": "unclear", "query": None, "alternatives": []}
 
 
-def _food_preferences_system_prompt() -> str:
-    code_table = ", ".join(f"{code}={name}" for code, name in ALLERGEN_CODE_NAMES.items())
-    return (
-        "You extract food/ingredient dislikes from a spoken sentence (Turkish or English) "
-        "for a university dining-hall bot. The bot's dishes are tagged with these official "
-        f"ingredient/allergen codes: {code_table}. For each ingredient the user says they "
-        "don't eat: if it matches one of those codes, put the code in \"avoid_codes\"; "
-        "otherwise put its English name in \"avoid_keywords\" (translate if the user spoke "
-        "Turkish, since dish descriptions are in English). Ignore anything in the sentence "
-        "that isn't a food/ingredient.\n\n"
-        "Respond with strict JSON only, no other text: "
-        '{"avoid_codes": ["<code>", ...], "avoid_keywords": ["<english word>", ...]}'
-    )
-
-
-async def extract_food_preferences(transcript: str) -> dict:
-    """Extract avoided allergen codes / free-text ingredient keywords from a
-    spoken statement like "domuz eti ve mantar yemiyorum" or "I don't eat
-    pork or mushrooms". Always returns {"avoid_codes": [...], "avoid_keywords":
-    [...]}; falls back to empty lists on any failure."""
-    raw = await _call_openrouter(_food_preferences_system_prompt(), transcript)
-    parsed = _extract_json_object(raw)
-    if not parsed:
-        return {"avoid_codes": [], "avoid_keywords": []}
-    codes = [c for c in parsed.get("avoid_codes", []) if isinstance(c, str) and c in ALLERGEN_CODE_NAMES]
-    keywords = [str(k).strip().lower() for k in parsed.get("avoid_keywords", []) if k]
-    return {"avoid_codes": codes, "avoid_keywords": keywords}
-
-
 TASK_SUGGESTION_SYSTEM_PROMPT = """You read one announcement or forum post from a university course and decide whether it mentions a concrete task or deadline the student should be reminded about — a submission deadline, an exam/quiz date, something they need to bring/do/upload by a specific day. Ignore anything with no actionable date (general course info, a topic being "covered later in the semester", opinions, small talk, a reply that doesn't add a new date).
 
 Respond with strict JSON only, no other text: {"has_task": true/false, "task_text": "<short actionable summary in English, e.g. 'Submit problem set 3' or 'Upload presentation slides'>" or null, "due_date": "<YYYY-MM-DD>" or null, "due_time": "<HH:MM 24h>" or null}.
@@ -15208,32 +15159,6 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
             await message.reply_text("❌ Couldn't reach the Mensa menu right now — try again in a bit.")
             return
         await _deliver_food_recommendation(message, result)
-        return
-
-    if intent == "set_food_preferences":
-        extracted = await extract_food_preferences(transcript)
-        if not extracted["avoid_codes"] and not extracted["avoid_keywords"]:
-            await message.reply_text("🤷 Couldn't pick out any specific ingredient from that — try naming foods directly, e.g. \"pork, fish, mushrooms\".")
-            return
-        existing = load_food_preferences()
-        merged_codes = sorted(set(existing["avoid_codes"]) | set(extracted["avoid_codes"]))
-        merged_keywords = sorted(set(existing["avoid_keywords"]) | set(extracted["avoid_keywords"]))
-        save_food_preferences(merged_codes, merged_keywords)
-        named = [ALLERGEN_CODE_NAMES.get(c, c) for c in extracted["avoid_codes"]] + extracted["avoid_keywords"]
-        await message.reply_text(f"🚫 Noted — won't show: {', '.join(named)}")
-        return
-
-    if intent == "remove_food_preferences":
-        extracted = await extract_food_preferences(transcript)
-        if not extracted["avoid_codes"] and not extracted["avoid_keywords"]:
-            await message.reply_text("🤷 Couldn't pick out any specific ingredient from that — try naming foods directly, e.g. \"fish, mushrooms\".")
-            return
-        existing = load_food_preferences()
-        remaining_codes = sorted(set(existing["avoid_codes"]) - set(extracted["avoid_codes"]))
-        remaining_keywords = sorted(set(existing["avoid_keywords"]) - set(extracted["avoid_keywords"]))
-        save_food_preferences(remaining_codes, remaining_keywords)
-        named = [ALLERGEN_CODE_NAMES.get(c, c) for c in extracted["avoid_codes"]] + extracted["avoid_keywords"]
-        await message.reply_text(f"✅ Okay, showing again: {', '.join(named)}")
         return
 
     if intent == "course_enroll":
