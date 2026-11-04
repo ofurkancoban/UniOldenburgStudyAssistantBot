@@ -3448,7 +3448,7 @@ def _status_group_view(group: str) -> tuple:
         title = f"📆 <b>Semester &amp; Calendar</b>\n\nWatch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
         rows = [
             [InlineKeyboardButton("🗓️ Timetable", callback_data="calendar_timetable"), InlineKeyboardButton("📅 Weekly View", callback_data="calendar_weekly")],
-            [InlineKeyboardButton("📆 Default Semester", callback_data="set_default_semester"), InlineKeyboardButton("🔗 Change iCal", callback_data="change_ical_link")],
+            [InlineKeyboardButton("📆 Default Semester", callback_data="set_default_semester")],
             [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="status_group_toggle|semester|watch_prev")],
         ]
     else:
@@ -6530,10 +6530,6 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=InlineKeyboardMarkup(kb)
         )
 
-    elif query.data == "change_ical_link":
-        context.user_data["pending_step"] = "ical_link"
-        await query.message.reply_text("Please type the new iCal link (STUDIP_ICAL_URL):", reply_markup=get_main_keyboard())
-
 
 async def send_exam_registration_menu(message):
     """Show currently open-for-registration and currently-registered exams on
@@ -7229,16 +7225,6 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
     if step in ("task_text", "task_time"):
         return await _handle_task_wizard_reply(update, context, step, text)
 
-    if step == "ical_link":
-        new_link = text
-        import dotenv
-        env_path = ".env"
-        dotenv.set_key(env_path, "STUDIP_ICAL_URL", new_link)
-        os.environ["STUDIP_ICAL_URL"] = new_link
-        context.user_data.pop("pending_step", None)
-        await update.effective_message.reply_text("✅ iCal link successfully updated!", reply_markup=get_main_keyboard())
-        return True
-
     if step == "user_name":
         context.user_data.pop("pending_step", None)
         name = text.strip()[:50]
@@ -7621,141 +7607,152 @@ async def _get_calendar_events_api(week_start, days: int = 7) -> list[dict]:
     return events
 
 
-async def _get_calendar_events_ical(session, week_start, days: int = 7) -> list[dict]:
-    """Fetch calendar events from the user's personal Stud.IP iCal export URL."""
-    ical_url = os.getenv("STUDIP_ICAL_URL")
-    if not ical_url:
-        return []
-    try:
-        import icalendar
-        import recurring_ical_events
-    except ImportError:
-        logging.error("❌ icalendar or recurring_ical_events not installed.")
-        return []
+_COURSE_ROOMS_CACHE: dict[str, tuple[float, dict]] = {}
+_COURSE_ROOMS_LOCK = asyncio.Lock()
+
+
+async def _fetch_course_rooms_map(session, cid: str) -> dict:
+    """Fetch and parse room assignments for a course from its details page.
+
+    Returns a dict mapping:
+      ("date", datetime.date, "HH:MM") -> room_name
+      ("recurring", weekday_int, "HH:MM") -> room_name
+      ("course_default", None) -> room_name
+    """
+    if not cid:
+        return {}
+
+    now_ts = time.time()
+    async with _COURSE_ROOMS_LOCK:
+        cached = _COURSE_ROOMS_CACHE.get(cid)
+        if cached and (now_ts - cached[0] < 86400):
+            return cached[1]
+
+    s = session or global_session
+    if not s:
+        try:
+            s = await login_studip()
+        except Exception:
+            return {}
+
+    url = f"{BASE_URL}/dispatch.php/course/details?sem_id={cid}"
+    rooms_map: dict = {}
+    default_room = None
 
     try:
-        logging.info(f"📅 Fetching ICS Calendar from: {ical_url[:50]}...")
-        s = session or global_session or await login_studip()
-        async with await s.get(ical_url, allow_redirects=True) as r:
+        async with await s.get(url) as r:
             if r.status != 200:
-                logging.warning(f"ICS Calendar API returned {r.status}")
-                return []
-            raw_data = await r.read()
-            raw_text = raw_data.decode("utf-8", errors="ignore")
+                return {}
+            html = await r.text()
 
-        cal = icalendar.Calendar.from_ical(raw_text)
-        end_date = week_start + timedelta(days=days)
-        week_events = recurring_ical_events.of(cal).between(week_start, end_date)
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "html.parser")
 
-        events = []
-        now = datetime.now(ZoneInfo("Europe/Berlin"))
-        for event in week_events:
-            title = str(event.get("SUMMARY", "Unknown Event"))
-            location = str(event.get("LOCATION", ""))
-            url_link = str(event.get("URL", ""))
+        weekday_map = {
+            "monday": 0, "montag": 0, "mo": 0,
+            "tuesday": 1, "dienstag": 1, "di": 1,
+            "wednesday": 2, "mittwoch": 2, "mi": 2,
+            "thursday": 3, "donnerstag": 3, "do": 3,
+            "friday": 4, "freitag": 4, "fr": 4,
+            "saturday": 5, "samstag": 5, "sa": 5,
+            "sunday": 6, "sonntag": 6, "so": 6,
+        }
 
-            start_dt = event["DTSTART"].dt
-            end_dt = event["DTEND"].dt
+        for art in soup.find_all("article"):
+            h1 = art.find("h1")
+            if not h1 or not any(k in h1.get_text().lower() for k in ["room", "raum", "termine", "times"]):
+                continue
 
-            if not isinstance(start_dt, datetime):
-                start_dt = datetime.combine(start_dt, datetime.min.time()).replace(tzinfo=ZoneInfo("Europe/Berlin"))
-            if not isinstance(end_dt, datetime):
-                end_dt = datetime.combine(end_dt, datetime.min.time()).replace(tzinfo=ZoneInfo("Europe/Berlin"))
+            for h4 in art.find_all("h4"):
+                room_a = h4.find("a")
+                room_name = (room_a.get_text(strip=True) if room_a else h4.get_text(strip=True)).strip()
+                if not room_name or room_name.lower() in ("no room", "kein raum"):
+                    continue
 
-            try:
-                start_dt = start_dt.astimezone(ZoneInfo("Europe/Berlin"))
-                end_dt = end_dt.astimezone(ZoneInfo("Europe/Berlin"))
-            except ValueError:
-                start_dt = start_dt.replace(tzinfo=ZoneInfo("Europe/Berlin"))
-                end_dt = end_dt.replace(tzinfo=ZoneInfo("Europe/Berlin"))
+                if not default_room:
+                    default_room = room_name
 
-            if end_dt < now:
-                status = "past"
-            elif start_dt <= now <= end_dt:
-                status = "ongoing"
-            else:
-                status = "upcoming"
+                ul = h4.find_next_sibling("ul")
+                if not ul:
+                    continue
 
-            events.append({
-                "id": str(ev.get("uid", "")),
-                "title": title,
-                "day": start_dt.strftime("%A, %d.%m.%Y"),
-                "time": f"{start_dt.strftime('%H:%M')} – {end_dt.strftime('%H:%M')}",
-                "location": location,
-                "url": url_link,
-                "date_key": start_dt.date(),
-                "start_dt": start_dt,
-                "end_dt": end_dt,
-                "status": status,
-                "is_cancelled": False,
-                "categories": "",
-                "description": "",
-                "topics": [],
-                "course_id": None,
-            })
+                for li in ul.find_all("li"):
+                    txt = li.get_text(" ", strip=True)
+                    time_m = re.search(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", txt)
+                    start_hm = time_m.group(1).zfill(5) if time_m else None
+                    if not start_hm:
+                        continue
 
-        events.sort(key=lambda e: e["start_dt"])
-        return events
+                    date_m = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{2,4})\b", txt)
+                    is_from = bool(re.search(r"(from|ab)\s+\d{1,2}\.\d{1,2}\.\d{2,4}", txt, re.IGNORECASE))
+
+                    if date_m and not is_from:
+                        d, m, y = map(int, date_m.groups())
+                        if y < 100:
+                            y += 2000
+                        try:
+                            rooms_map[("date", date(y, m, d), start_hm)] = room_name
+                        except ValueError:
+                            pass
+                    else:
+                        weekday = None
+                        for wname, wday in weekday_map.items():
+                            if re.search(r"\b" + wname + r"\b", txt, re.IGNORECASE):
+                                weekday = wday
+                                break
+                        if weekday is not None:
+                            rooms_map[("recurring", weekday, start_hm)] = room_name
+
+        if default_room:
+            rooms_map[("course_default", None)] = default_room
+
+        async with _COURSE_ROOMS_LOCK:
+            _COURSE_ROOMS_CACHE[cid] = (now_ts, rooms_map)
+
+        return rooms_map
     except Exception as exc:
-        logging.error(f"_get_calendar_events_ical error: {exc}")
-        return []
+        logging.debug(f"_fetch_course_rooms_map error for cid {cid}: {exc}")
+        return {}
 
 
 async def get_calendar_events(session, week_start, days: int = 7) -> list:
-    """Fetch calendar events for `days` days starting at `week_start`.
+    """Fetch calendar events for `days` days starting at `week_start` natively from Stud.IP.
 
-    Combines Stud.IP's JSON:API (`/users/{id}/schedule`, `/courses/{cid}/events`,
-    `/users/{id}/events`) with `STUDIP_ICAL_URL` when configured:
-      - Works with zero `.env` iCal configuration via OAuth2 / JSON:API.
-      - Enriches events with `is_cancelled`, `topics`, and `description` from JSON:API
-        while preserving full room bookings (`LOCATION`) from iCal when present.
+    Retrieves events and cancellations via JSON:API, and enriches room allocations
+    from course details. Fully eliminates dependency on external iCal URLs.
     """
-    api_events: list[dict] = []
-    try:
-        api_events = await _get_calendar_events_api(week_start, days=days)
-    except Exception as exc:
-        logging.warning(f"get_calendar_events: JSON:API fetch failed ({exc}), falling back to iCal")
+    events = await _get_calendar_events_api(week_start, days=days)
+    if not events:
+        return []
 
-    ical_events = await _get_calendar_events_ical(session, week_start, days=days)
-
-    if not ical_events:
-        return api_events
-    if not api_events:
-        return ical_events
-
-    # Merge iCal room names with JSON:API cancellation/topic/description metadata
-    api_by_key = {
-        (ev["start_dt"].isoformat(), clean_course_title(ev["title"]).lower()): ev
-        for ev in api_events
+    cids_to_fetch = {
+        ev.get("course_id")
+        for ev in events
+        if ev.get("course_id") and not ev.get("location")
     }
-    merged: list[dict] = []
-    matched_keys: set[tuple] = set()
 
-    for iev in ical_events:
-        key = (iev["start_dt"].isoformat(), clean_course_title(iev["title"]).lower())
-        aev = api_by_key.get(key)
-        if aev:
-            matched_keys.add(key)
-            if not iev.get("location") and aev.get("location"):
-                iev["location"] = aev["location"]
-            iev["is_cancelled"] = aev.get("is_cancelled", False)
-            if iev["is_cancelled"]:
-                iev["status"] = "cancelled"
-            iev["categories"] = aev.get("categories") or ""
-            iev["description"] = aev.get("description") or ""
-            iev["topics"] = aev.get("topics") or []
-            iev["course_id"] = aev.get("course_id")
-            if not iev.get("url") and aev.get("url"):
-                iev["url"] = aev["url"]
-        merged.append(iev)
+    if cids_to_fetch:
+        tasks = [_fetch_course_rooms_map(session, cid) for cid in cids_to_fetch]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        cid_rooms = {
+            cid: res for cid, res in zip(cids_to_fetch, results)
+            if isinstance(res, dict)
+        }
 
-    # Append any JSON:API events not present in iCal (e.g. cancelled sessions or personal events)
-    for key, aev in api_by_key.items():
-        if key not in matched_keys:
-            merged.append(aev)
+        for ev in events:
+            if not ev.get("location") and ev.get("course_id"):
+                cid = ev["course_id"]
+                rooms = cid_rooms.get(cid, {})
+                sdt = ev.get("start_dt")
+                if rooms and sdt:
+                    start_hm = sdt.strftime("%H:%M")
+                    date_key = ("date", sdt.date(), start_hm)
+                    rec_key = ("recurring", sdt.weekday(), start_hm)
+                    loc = rooms.get(date_key) or rooms.get(rec_key) or rooms.get(("course_default", None))
+                    if loc:
+                        ev["location"] = loc
 
-    merged.sort(key=lambda e: e["start_dt"])
-    return merged
+    return events
 
 
 def _format_event_markdown_block(ev: dict) -> str:
@@ -12943,7 +12940,7 @@ def _semester_lecture_start(today):
 
 async def count_lectures_held(session, course_candidates: list) -> dict:
     """{cid: number of lecture sessions already held this semester}, from
-    the iCal feed. Only "Vorlesung"/"Lecture"/"Seminar" entries count
+    the Stud.IP calendar. Only "Vorlesung"/"Lecture"/"Seminar" entries count
     (exercises repeat the lecture's material), and cancelled ones
     ("fällt aus") are skipped. This is what "covered in class" means for
     the behind-schedule check: the first N lecture units of a course."""
@@ -12970,7 +12967,7 @@ async def count_lectures_held(session, course_candidates: list) -> dict:
 async def _get_lectures_held(session, progress: dict, refresh: bool = False) -> dict:
     """Held-lecture counts, recomputed at most once a day unless refresh
     is set (the progress menu's buttons would otherwise refetch the whole
-    semester's iCal on every tap)."""
+    semester's calendar on every tap)."""
     today_iso = datetime.now(TZ_BERLIN).date().isoformat()
     if not refresh and progress.get("held_date") == today_iso and "held" in progress:
         return progress["held"]
@@ -14851,7 +14848,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Transcribe an incoming voice note. If a wizard step is already pending
-    (e.g. waiting for a task's due time, an iCal link, food preferences), the
+    (e.g. waiting for a task's due time), the
     transcription answers that step; otherwise — a fresh, unprompted voice
     note — it's routed by spoken intent (see classify_voice_intent /
     _route_voice_intent) instead of always assuming a new task."""
@@ -15784,7 +15781,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [login_btn, InlineKeyboardButton("🚪 Logout", callback_data="studip_logout")],
-        [InlineKeyboardButton("📄 Documents & Tuition", callback_data="status_group|docs_tuition"), InlineKeyboardButton("📆 Semester & iCal", callback_data="status_group|semester")],
+        [InlineKeyboardButton("📄 Documents & Tuition", callback_data="status_group|docs_tuition"), InlineKeyboardButton("📆 Semester & Calendar", callback_data="status_group|semester")],
         [InlineKeyboardButton("👔 Wardrobe & Weather", callback_data="outfit_menu"), InlineKeyboardButton("📱 WhatsApp Gateway", callback_data="wa_menu")],
         [InlineKeyboardButton("🎯 Tracked Courses", callback_data="sp_track_menu"), InlineKeyboardButton("👤 Profile", callback_data="status_group|profile")],
     ]
@@ -15901,7 +15898,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(show_last_announcements, pattern="^show_last_announcements$"))
         app.add_handler(CallbackQueryHandler(show_last_files, pattern="^show_last_files$"))
         app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
-        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(studip_login|studip_logout|start_watchers|stop_watchers|request_wa_qr|force_wa_qr|detect_wa_groups|wa_test_message|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu|mensa_food)$"))
+        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(studip_login|studip_logout|start_watchers|stop_watchers|request_wa_qr|force_wa_qr|detect_wa_groups|wa_test_message|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu|mensa_food)$"))
         app.add_handler(CallbackQueryHandler(handle_exam_buttons, pattern="^(exam_menu|exam_noop|exam_cancel|exam_ask\\|.*|exam_do\\|.*)$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_wa_ask, pattern="^examopen_wa_ask\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_wa_confirm, pattern="^examopen_wa_confirm\\|.*$"))
