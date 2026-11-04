@@ -2911,38 +2911,187 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.error(f"Menu command error: {e}")
 
 
-def _food_preferences_management_view():
+FOOD_PREF_CATEGORIES = {
+    "meat": {
+        "title": "🥩 Meat & Animal Products",
+        "keys": ["pork", "beef", "poultry", "lamb", "game", "fish", "pork_gelatin", "beef_gelatin", "calf_rennet"],
+    },
+    "allergens": {
+        "title": "🥜 Common Allergens",
+        "keys": ["milk", "eggs", "peanuts", "crustaceans", "molluscs", "soy", "mustard", "sesame", "celery", "lupin", "sulfites"],
+    },
+    "gluten": {
+        "title": "🌾 Gluten & Grains",
+        "keys": ["wheat", "rye", "barley", "oats", "spelt", "kamut", "hybrid"],
+    },
+    "nuts": {
+        "title": "🌰 Tree Nuts",
+        "keys": ["hazelnuts", "walnuts", "almonds", "cashews", "pistachios", "brazil_nuts", "pecans", "macadamia"],
+    },
+    "additives": {
+        "title": "🧪 Additives & Other",
+        "keys": ["alcohol", "garlic", "colorant", "preservative", "antioxidant", "enhancer", "sulfured", "sweeteners", "caffeine", "phosphate"],
+    },
+}
+
+FOOD_PREF_LEGEND = {
+    # Meat & Animal Products
+    "pork": {"name": "🐷 Pork", "codes": {"S", "Sch", "Su"}, "category": "meat"},
+    "beef": {"name": "🐄 Beef", "codes": {"R"}, "category": "meat"},
+    "poultry": {"name": "🐔 Poultry", "codes": {"G"}, "category": "meat"},
+    "lamb": {"name": "🐑 Lamb", "codes": {"L"}, "category": "meat"},
+    "game": {"name": "🦌 Game / Venison", "codes": {"W"}, "category": "meat"},
+    "fish": {"name": "🐟 Fish", "codes": {"F", "Fi"}, "category": "meat"},
+    "pork_gelatin": {"name": "🍮 Pork Gelatin", "codes": {"SG"}, "category": "meat"},
+    "beef_gelatin": {"name": "🍮 Beef Gelatin", "codes": {"RG"}, "category": "meat"},
+    "calf_rennet": {"name": "🧀 Calf Rennet", "codes": {"KL"}, "category": "meat"},
+
+    # Allergens
+    "milk": {"name": "🥛 Milk / Lactose", "codes": {"Mi"}, "category": "allergens"},
+    "eggs": {"name": "🥚 Eggs", "codes": {"Ei"}, "category": "allergens"},
+    "peanuts": {"name": "🥜 Peanuts", "codes": {"En"}, "category": "allergens"},
+    "crustaceans": {"name": "🦐 Crustaceans", "codes": {"Kr"}, "category": "allergens"},
+    "molluscs": {"name": "🐙 Molluscs", "codes": {"Wt"}, "category": "allergens"},
+    "soy": {"name": "🌱 Soy", "codes": {"So"}, "category": "allergens"},
+    "mustard": {"name": "🌭 Mustard", "codes": {"Sf"}, "category": "allergens"},
+    "sesame": {"name": "🌾 Sesame", "codes": {"Se"}, "category": "allergens"},
+    "celery": {"name": "🥬 Celery", "codes": {"Sl"}, "category": "allergens"},
+    "lupin": {"name": "🫘 Lupin", "codes": {"Lu"}, "category": "allergens"},
+    "sulfites": {"name": "🍷 Sulfites", "codes": {"Sw"}, "category": "allergens"},
+
+    # Gluten
+    "wheat": {"name": "🌾 Wheat", "codes": {"We"}, "category": "gluten"},
+    "rye": {"name": "🌾 Rye", "codes": {"Ro"}, "category": "gluten"},
+    "barley": {"name": "🌾 Barley", "codes": {"Ge"}, "category": "gluten"},
+    "oats": {"name": "🌾 Oats", "codes": {"Ha"}, "category": "gluten"},
+    "spelt": {"name": "🌾 Spelt", "codes": {"Di"}, "category": "gluten"},
+    "kamut": {"name": "🌾 Kamut", "codes": {"Ka"}, "category": "gluten"},
+    "hybrid": {"name": "🌾 Hybrid Strains", "codes": {"Hy"}, "category": "gluten"},
+
+    # Tree Nuts
+    "hazelnuts": {"name": "🌰 Hazelnuts", "codes": {"Hn"}, "category": "nuts"},
+    "walnuts": {"name": "🌰 Walnuts", "codes": {"Wa"}, "category": "nuts"},
+    "almonds": {"name": "🌰 Almonds", "codes": {"Ma"}, "category": "nuts"},
+    "cashews": {"name": "🌰 Cashews", "codes": {"Cn"}, "category": "nuts"},
+    "pistachios": {"name": "🌰 Pistachios", "codes": {"Pi"}, "category": "nuts"},
+    "brazil_nuts": {"name": "🌰 Brazil Nuts", "codes": {"Pa"}, "category": "nuts"},
+    "pecans": {"name": "🌰 Pecans", "codes": {"Pn"}, "category": "nuts"},
+    "macadamia": {"name": "🌰 Macadamia", "codes": {"Mn"}, "category": "nuts"},
+
+    # Additives & Other
+    "alcohol": {"name": "🍷 Alcohol", "codes": {"A"}, "category": "additives"},
+    "garlic": {"name": "🧄 Garlic", "codes": {"Kn"}, "category": "additives"},
+    "colorant": {"name": "🎨 Colorant (1)", "codes": {"1"}, "category": "additives"},
+    "preservative": {"name": "🧪 Preservative (2)", "codes": {"2"}, "category": "additives"},
+    "antioxidant": {"name": "🛡️ Antioxidant (3)", "codes": {"3"}, "category": "additives"},
+    "enhancer": {"name": "🧂 Enhancer (4)", "codes": {"4"}, "category": "additives"},
+    "sulfured": {"name": "💨 Sulfured (5)", "codes": {"5"}, "category": "additives"},
+    "sweeteners": {"name": "🍬 Sweeteners (8)", "codes": {"8"}, "category": "additives"},
+    "phosphate": {"name": "⚗️ Phosphate (10)", "codes": {"10"}, "category": "additives"},
+    "caffeine": {"name": "☕ Caffeine (11)", "codes": {"11"}, "category": "additives"},
+}
+
+
+def _food_preferences_management_view(category="main"):
     """Build the (text, reply_markup) pair for the food-preferences management
-    screen: one "allow again" button per currently-avoided item, plus Clear
-    All when there's more than one. Shared by the initial "⚙️ Food
-    Preferences" tap and by the remove/clear handlers, which re-render the
-    same view in place after acting so the list stays current."""
+    screen. Supports interactive Mensa legend categories (meat, allergens,
+    gluten, nuts, additives) so users can toggle avoid/allow states with
+    single taps, alongside typed or voice input."""
     prefs = load_food_preferences()
-    items = [(code, ALLERGEN_CODE_NAMES.get(code, code)) for code in prefs["avoid_codes"]]
-    items += [(kw, kw) for kw in prefs["avoid_keywords"]]
+    avoid_codes_set = set(prefs.get("avoid_codes", []))
+    avoid_keywords = prefs.get("avoid_keywords", [])
 
-    if not items:
+    if category in FOOD_PREF_CATEGORIES:
+        cat_info = FOOD_PREF_CATEGORIES[category]
+        cat_title = cat_info["title"]
+        keys = cat_info["keys"]
+
         text = (
-            "🚫 <b>Food Preferences</b>\n"
-            "Nothing avoided yet. Tell me what you don't eat — typed or voice, "
-            "e.g. \"no pork, fish, or mushrooms\"."
+            f"🚫 <b>Food Preferences: {cat_title}</b>\n\n"
+            f"Tap an ingredient to toggle between allowed and avoided:\n"
+            f"• 🚫 = Currently Avoided (Filtered from menu)\n"
+            f"• ⚪ = Currently Allowed"
         )
-        return text, None
 
-    text = (
-        "🚫 <b>Food Preferences</b>\n"
-        "Currently avoiding — tap one to allow it again, or tell me more foods to avoid:"
+        buttons = []
+        for key in keys:
+            item = FOOD_PREF_LEGEND[key]
+            is_avoided = bool(avoid_codes_set & item["codes"])
+            prefix = "🚫 " if is_avoided else "⚪ "
+            buttons.append(
+                InlineKeyboardButton(
+                    f"{prefix}{item['name']}",
+                    callback_data=f"foodpref_toggle|{category}|{key}"
+                )
+            )
+
+        # 2 buttons per row
+        keyboard = []
+        for i in range(0, len(buttons), 2):
+            keyboard.append(buttons[i:i + 2])
+
+        keyboard.append([
+            InlineKeyboardButton("◀️ All Categories", callback_data="foodpref_cat|main"),
+            InlineKeyboardButton("🍽️ Mensa Menu", callback_data="menu_nav|2/"),
+        ])
+        return text, InlineKeyboardMarkup(keyboard)
+
+    # Main category overview
+    avoided_items = []
+    accounted_codes = set()
+    for key, item in FOOD_PREF_LEGEND.items():
+        if avoid_codes_set & item["codes"]:
+            avoided_items.append(f"🚫 {item['name']}")
+            accounted_codes.update(item["codes"])
+
+    for code in avoid_codes_set - accounted_codes:
+        code_name = ALLERGEN_CODE_NAMES.get(code, code)
+        avoided_items.append(f"🚫 {code} ({code_name})")
+
+    for kw in avoid_keywords:
+        avoided_items.append(f"🚫 \"{kw}\"")
+
+    text = "🚫 <b>Mensa Food Preferences</b>\n\n"
+    if avoided_items:
+        text += f"<b>Currently avoiding ({len(avoided_items)} items):</b>\n"
+        text += "\n".join(f"• {it}" for it in avoided_items)
+        text += "\n\n"
+    else:
+        text += "<b>Currently avoiding:</b> None (all dishes shown)\n\n"
+
+    text += (
+        "Select a category below to browse the Mensa legend and toggle ingredients to avoid. "
+        "You can also reply directly with text or voice (e.g. <i>\"no pork, no mushrooms\"</i>)."
     )
-    keyboard = [[InlineKeyboardButton(f"✅ Allow {label} again", callback_data=f"foodpref_remove|{raw}")] for raw, label in items]
-    if len(items) > 1:
-        keyboard.append([InlineKeyboardButton("🗑 Clear all", callback_data="foodpref_clear_ask")])
+
+    keyboard = [
+        [
+            InlineKeyboardButton("🥩 Meat & Gelatin", callback_data="foodpref_cat|meat"),
+            InlineKeyboardButton("🥜 Common Allergens", callback_data="foodpref_cat|allergens"),
+        ],
+        [
+            InlineKeyboardButton("🌾 Gluten & Grains", callback_data="foodpref_cat|gluten"),
+            InlineKeyboardButton("🌰 Tree Nuts", callback_data="foodpref_cat|nuts"),
+        ],
+        [
+            InlineKeyboardButton("🧪 Additives & Other", callback_data="foodpref_cat|additives"),
+        ],
+    ]
+
+    # If there are custom keywords, add remove buttons for them
+    for kw in avoid_keywords:
+        keyboard.append([InlineKeyboardButton(f"❌ Remove \"{kw}\"", callback_data=f"foodpref_remove|{kw}")])
+
+    if avoided_items:
+        keyboard.append([InlineKeyboardButton("🗑 Clear All Preferences", callback_data="foodpref_clear_ask")])
+
+    keyboard.append([InlineKeyboardButton("🍽️ Back to Mensa Menu", callback_data="menu_nav|2/")])
     return text, InlineKeyboardMarkup(keyboard)
 
 
 async def handle_menu_preferences_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle menu_prefs callback — show the management view (remove buttons
-    for anything already avoided) and set pending_step so a typed/voice
-    reply is still picked up as more foods to avoid."""
+    """Handle menu_prefs callback — show the management view and set pending_step
+    so a typed/voice reply is still picked up as more foods to avoid."""
     query = update.callback_query
     await query.answer()
 
@@ -2951,8 +3100,11 @@ async def handle_menu_preferences_button(update: Update, context: ContextTypes.D
         return
 
     context.user_data["pending_step"] = "food_preferences"
-    text, keyboard = _food_preferences_management_view()
-    await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+    text, keyboard = _food_preferences_management_view(category="main")
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def handle_menu_photos_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3010,10 +3162,64 @@ async def handle_menu_recommend_button(update: Update, context: ContextTypes.DEF
     await _deliver_food_recommendation(query.message, result)
 
 
+async def handle_foodpref_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle foodpref_cat|<cat_name> callback — navigate to a legend category or back to main."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    cat_name = query.data.split("|")[1] if "|" in query.data else "main"
+    text, keyboard = _food_preferences_management_view(category=cat_name)
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
+async def handle_foodpref_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle foodpref_toggle|<cat_name>|<item_key> callback — toggle avoidance of an ingredient."""
+    query = update.callback_query
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    parts = query.data.split("|")
+    cat_name = parts[1] if len(parts) > 1 else "main"
+    item_key = parts[2] if len(parts) > 2 else ""
+
+    item = FOOD_PREF_LEGEND.get(item_key)
+    if not item:
+        await query.answer("Item not found.")
+        return
+
+    prefs = load_food_preferences()
+    current_codes = set(prefs.get("avoid_codes", []))
+    item_codes = item["codes"]
+
+    is_avoided = bool(current_codes & item_codes)
+    if is_avoided:
+        new_codes = sorted(list(current_codes - item_codes))
+        await query.answer(f"✅ Allowed {item['name']}")
+    else:
+        new_codes = sorted(list(current_codes | item_codes))
+        await query.answer(f"🚫 Now avoiding {item['name']}")
+
+    save_food_preferences(new_codes, prefs.get("avoid_keywords", []))
+
+    text, keyboard = _food_preferences_management_view(category=cat_name)
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
 async def handle_foodpref_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tapped "Allow X again" — remove that one code/keyword and re-render
-    the management view in place. Low-risk (easily re-added), so no
-    confirmation step, unlike Clear All."""
+    """Tapped "Remove" — remove that one code/keyword and re-render
+    the management view in place."""
     query = update.callback_query
     await query.answer()
 
@@ -3027,8 +3233,11 @@ async def handle_foodpref_remove(update: Update, context: ContextTypes.DEFAULT_T
     keywords = [k for k in prefs["avoid_keywords"] if k != value]
     save_food_preferences(codes, keywords)
 
-    text, keyboard = _food_preferences_management_view()
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    text, keyboard = _food_preferences_management_view(category="main")
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def handle_foodpref_clear_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3045,15 +3254,21 @@ async def handle_foodpref_clear_confirm(update: Update, context: ContextTypes.DE
     query = update.callback_query
     await query.answer("Cleared")
     save_food_preferences([], [])
-    text, keyboard = _food_preferences_management_view()
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    text, keyboard = _food_preferences_management_view(category="main")
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def handle_foodpref_clear_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer("Cancelled")
-    text, keyboard = _food_preferences_management_view()
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    text, keyboard = _food_preferences_management_view(category="main")
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except Exception:
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 def _wardrobe_list_view(user_id) -> tuple:
@@ -15806,6 +16021,8 @@ async def main():
         app.add_handler(CallbackQueryHandler(handle_menu_preferences_button, pattern="^menu_prefs$"))
         app.add_handler(CallbackQueryHandler(handle_menu_recommend_button, pattern="^menu_recommend$"))
         app.add_handler(CallbackQueryHandler(handle_menu_photos_button, pattern=r"^menu_photos\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_foodpref_category, pattern=r"^foodpref_cat\|.*$"))
+        app.add_handler(CallbackQueryHandler(handle_foodpref_toggle, pattern=r"^foodpref_toggle\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_remove, pattern="^foodpref_remove\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_ask, pattern="^foodpref_clear_ask$"))
         app.add_handler(CallbackQueryHandler(handle_foodpref_clear_confirm, pattern="^foodpref_clear_confirm$"))
