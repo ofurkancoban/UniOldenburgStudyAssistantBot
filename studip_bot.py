@@ -3223,22 +3223,17 @@ def _status_group_view(group: str) -> tuple:
         watch_prev = get_watch_previous_semester_enabled()
         title = f"📆 <b>Semester &amp; Calendar</b>\n\nWatch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
         rows = [
-            [InlineKeyboardButton("🗓️ Weekly Timetable (Stundenplan)", callback_data="calendar_timetable")],
-            [InlineKeyboardButton("📅 Weekly Calendar View", callback_data="calendar_weekly")],
-            [InlineKeyboardButton("📆 Set Default Semester", callback_data="set_default_semester")],
+            [InlineKeyboardButton("🗓️ Timetable", callback_data="calendar_timetable"), InlineKeyboardButton("📅 Weekly View", callback_data="calendar_weekly")],
+            [InlineKeyboardButton("📆 Default Semester", callback_data="set_default_semester"), InlineKeyboardButton("🔗 Change iCal", callback_data="change_ical_link")],
             [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="status_group_toggle|semester|watch_prev")],
-            [InlineKeyboardButton("📅 Change iCal Link", callback_data="change_ical_link")],
         ]
     else:
         study_plan = get_weekly_study_plan_enabled()
         title = f"🎓 <b>Studies</b>\n\nWeekly Study Plan (Sunday evening): {'✅ On' if study_plan else '🔲 Off'}"
         rows = [
-            [InlineKeyboardButton("🎓 Course Enrollment", callback_data="enrollment_menu")],
-            [InlineKeyboardButton("📝 Exam Registration", callback_data="exam_menu")],
-            [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
-            [InlineKeyboardButton("📄 Official Documents (PDF)", callback_data="stums_docs_menu")],
-            [InlineKeyboardButton("💶 Tuition & Fees (Rückmeldung)", callback_data="tuition_status")],
-            [InlineKeyboardButton(f"{'✅' if study_plan else '🔲'} Weekly Study Plan", callback_data="status_group_toggle|studies|study_plan")],
+            [InlineKeyboardButton("🎓 Enrollment", callback_data="enrollment_menu"), InlineKeyboardButton("📝 Exams", callback_data="exam_menu")],
+            [InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary"), InlineKeyboardButton("📄 PDF Documents", callback_data="stums_docs_menu")],
+            [InlineKeyboardButton("💶 Tuition & Fees", callback_data="tuition_status"), InlineKeyboardButton(f"{'✅' if study_plan else '🔲'} Weekly Plan", callback_data="status_group_toggle|studies|study_plan")],
         ]
     return title, InlineKeyboardMarkup(rows)
 
@@ -6173,12 +6168,13 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.reply_text("Not authorized to use this bot.")
             return
         keyboard = [
-            [InlineKeyboardButton("📲 Request WA QR", callback_data="request_wa_qr")],
-            [InlineKeyboardButton("🔄 Force New WA QR", callback_data="force_wa_qr")],
-            [InlineKeyboardButton("🔍 Detect WA Groups", callback_data="detect_wa_groups")],
-            [InlineKeyboardButton("🧪 Send WA Test Message", callback_data="wa_test_message")],
+            [InlineKeyboardButton("📲 Request QR", callback_data="request_wa_qr"), InlineKeyboardButton("🔄 Refresh QR", callback_data="force_wa_qr")],
+            [InlineKeyboardButton("🔍 Detect Groups", callback_data="detect_wa_groups"), InlineKeyboardButton("🧪 Test Message", callback_data="wa_test_message")],
         ]
-        await query.message.reply_text("📱 WhatsApp menu:", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.message.reply_text("📱 <b>WhatsApp Gateway:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+
+    elif query.data == "mensa_food":
+        await menu_command(update, context)
 
     elif query.data == "fastenroll_new":
         user_id = update.effective_user.id if update.effective_user else None
@@ -7115,20 +7111,22 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             await study_buttons[text](update, context)
             return
         # Check all buttons
-        if "🍽️" in text or "menu" in text.lower():
-            data = ["menu"]
-        elif "📅" in text or "calendar" in text.lower():
+        if "📚" in text or "courses" in text.lower() or "⬇️" in text or "files" in text.lower():
+            data = ["files"]
+        elif "📅" in text or "schedule" in text.lower() or "calendar" in text.lower():
             data = ["calendar"]
         elif "✅" in text or "task" in text.lower():
             data = ["tasks"]
-        elif "⬇️" in text:
-            data = ["files"]
+        elif "📊" in text or "progress" in text.lower():
+            data = ["progress"]
+        elif "🔄" in text or "🔁" in text or "check" in text.lower():
+            data = ["check"]
+        elif "⚙️" in text or "ℹ️" in text or "status" in text.lower():
+            data = ["status"]
+        elif "🍽️" in text or text.lower() in ("menu", "/menu", "mensa", "/mensa"):
+            data = ["menu"]
         elif "start" in text.lower():
             data = ["start"]
-        elif "🔁" in text or "check" in text.lower():
-            data = ["check"]
-        elif "ℹ️" in text or "status" in text.lower():
-            data = ["status"]
         else:
             data = [text.replace("📅", "").strip()] # Fallback for other text commands
         chat_id = message.chat_id
@@ -7157,6 +7155,8 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
                 await send_daily_calendar(sender, events, today, week_start)
             elif data[0] == "tasks":
                 await send_tasks_menu(sender)
+            elif data[0] == "progress":
+                await progress_command(update, context)
             elif data[0] == "start":
                 await start(update, context)
             elif data[0] == "files":
@@ -9168,7 +9168,7 @@ async def delete_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.text:
             return
         text = _normalize_button_text(update.message.text)
-        if text.startswith(("⬇️", "🔁", "ℹ️", "🍽️", "✅", "📅")):
+        if text.startswith(("📚", "📅", "✅", "📊", "🔄", "⚙️", "⬇️", "🔁", "ℹ️", "🍽️", "📘", "🎯")):
             return
         await update.message.delete()
     except Exception:
@@ -9179,12 +9179,11 @@ from telegram import ReplyKeyboardMarkup
 
 
 def get_main_keyboard():
-    """Update main reply keyboard with menu button"""
+    """Main reply keyboard with clean 2x3 layout (menu button removed)"""
     return ReplyKeyboardMarkup(
         [
-            ["⬇️ Files", "🔁 Check", "ℹ️ Status"],
-            ["🍽️ Menu", "✅ Tasks", "📅 Calendar"],
-            ["📘 Study Plan", "📊 Progress", "🎯 Courses"]
+            ["📚 Courses", "📅 Schedule", "✅ Tasks"],
+            ["📊 Progress", "🔄 Check", "⚙️ Status"]
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -9204,15 +9203,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Send keyboard IMMEDIATELY - not conditional on anything
     welcome_msg = await update.message.reply_text(
-        "🤖 Welcome to Stud.IP Bot!\n\n"
-        "⬇️ Files - Browse courses\n"
-        "🔁 Check - Manual check\n"
-        "ℹ️ Status - Bot status\n"
-        "🍽️ Menu - Today's meals\n"
-        "📅 Calendar - Today's schedule\n"
-        "📘 Study Plan - Next week's study sessions\n"
-        "📊 Progress - Study progress, courses you're behind on\n"
-        "🎯 Courses - Choose which courses to track\n",
+        "🎓 <b>Uni Oldenburg Assistant</b>\n\n"
+        "Welcome! Your personal Stud.IP companion is ready.\n\n"
+        "<b>Dashboard Navigation:</b>\n"
+        "• 📚 <b>Courses:</b> Browse course documents & materials\n"
+        "• 📅 <b>Schedule:</b> Today's lecture timetable & calendar\n"
+        "• ✅ <b>Tasks:</b> Manage personal tasks & deadlines\n"
+        "• 📊 <b>Progress:</b> Track study progress & semester plan\n"
+        "• 🔄 <b>Check:</b> Instantly scan for new files & grades\n"
+        "• ⚙️ <b>Status:</b> System health, WhatsApp & settings\n",
+        parse_mode="HTML",
         reply_markup=get_main_keyboard()
     )
 
@@ -9491,11 +9491,10 @@ def parse_task_due_time(text: str):
 
 async def send_tasks_menu(sender):
     keyboard = [
-        [InlineKeyboardButton("➕ Add Task", callback_data="task_add")],
-        [InlineKeyboardButton("📋 My Tasks", callback_data="task_list")],
-        [InlineKeyboardButton("📘 By Course", callback_data="task_by_course")],
+        [InlineKeyboardButton("➕ Add Task", callback_data="task_add"), InlineKeyboardButton("📋 My Tasks", callback_data="task_list")],
+        [InlineKeyboardButton("📘 Filter by Course", callback_data="task_by_course")],
     ]
-    await sender.reply_text("✅ Tasks menu:", reply_markup=InlineKeyboardMarkup(keyboard))
+    await sender.reply_text("✅ <b>Tasks &amp; Deadlines:</b>", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def send_task_list(message, user_id: int):
@@ -15595,11 +15594,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
         [login_btn, InlineKeyboardButton("🚪 Logout", callback_data="studip_logout")],
-        [InlineKeyboardButton("👤 Profile", callback_data="status_group|profile")],
-        [InlineKeyboardButton("📆 Semester & Calendar", callback_data="status_group|semester")],
-        [InlineKeyboardButton("🎓 Studies", callback_data="status_group|studies")],
-        [InlineKeyboardButton("👔 Outfit & Wardrobe", callback_data="outfit_menu")],
-        [InlineKeyboardButton("📱 WhatsApp", callback_data="wa_menu")],
+        [InlineKeyboardButton("👤 Profile", callback_data="status_group|profile"), InlineKeyboardButton("📆 Semester", callback_data="status_group|semester")],
+        [InlineKeyboardButton("🎓 Studies", callback_data="status_group|studies"), InlineKeyboardButton("👔 Wardrobe", callback_data="outfit_menu")],
+        [InlineKeyboardButton("📱 WhatsApp", callback_data="wa_menu"), InlineKeyboardButton("🍽️ Mensa Food", callback_data="mensa_food")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
