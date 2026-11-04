@@ -7117,25 +7117,27 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             "📘 Study Plan": study_plan_command,
             "📊 Progress": progress_command,
             "🎯 Courses": track_courses_command,
+            "🎯 Track Courses": track_courses_command,
+            "🎯 Tracking": track_courses_command,
         }
         if text in study_buttons:
             await study_buttons[text](update, context)
             return
         # Check all buttons
-        if "📚" in text or "courses" in text.lower() or "⬇️" in text or "files" in text.lower():
+        if "📚" in text or "files" in text.lower():
             data = ["files"]
         elif "📅" in text or "schedule" in text.lower() or "calendar" in text.lower():
             data = ["calendar"]
         elif "✅" in text or "task" in text.lower():
             data = ["tasks"]
+        elif "🍽️" in text or "mensa" in text.lower():
+            data = ["menu"]
         elif "📊" in text or "progress" in text.lower():
             data = ["progress"]
         elif "🔄" in text or "🔁" in text or "check" in text.lower():
             data = ["check"]
         elif "⚙️" in text or "ℹ️" in text or "status" in text.lower():
             data = ["status"]
-        elif "🍽️" in text or text.lower() in ("menu", "/menu", "mensa", "/mensa"):
-            data = ["menu"]
         elif "start" in text.lower():
             data = ["start"]
         else:
@@ -9190,11 +9192,12 @@ from telegram import ReplyKeyboardMarkup
 
 
 def get_main_keyboard():
-    """Main reply keyboard with clean 2x3 layout (menu button removed)"""
+    """Main persistent reply keyboard with 3 rows of 3 buttons (9 buttons)"""
     return ReplyKeyboardMarkup(
         [
             ["📚 Courses", "📅 Schedule", "✅ Tasks"],
-            ["📊 Progress", "🔄 Check", "⚙️ Status"]
+            ["🍽️ Mensa", "📘 Study Plan", "📊 Progress"],
+            ["🎯 Courses", "🔄 Check", "⚙️ Status"]
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -9220,7 +9223,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• 📚 <b>Courses:</b> Browse course documents & materials\n"
         "• 📅 <b>Schedule:</b> Today's lecture timetable & calendar\n"
         "• ✅ <b>Tasks:</b> Manage personal tasks & deadlines\n"
-        "• 📊 <b>Progress:</b> Track study progress & semester plan\n"
+        "• 🍽️ <b>Mensa:</b> Today's cafeteria food menu\n"
+        "• 📘 <b>Study Plan:</b> Weekly study schedule & modules\n"
+        "• 📊 <b>Progress:</b> Track study progress & completion\n"
+        "• 🎯 <b>Courses:</b> Configure tracked courses\n"
         "• 🔄 <b>Check:</b> Instantly scan for new files & grades\n"
         "• ⚙️ <b>Status:</b> System health, WhatsApp & settings\n",
         parse_mode="HTML",
@@ -15795,26 +15801,19 @@ async def main():
         await app.initialize()
         await app.start()
 
-        # Register command list in Telegram's popup menu
+        # Clear command list so Telegram's popup menu button does not show a command list
         try:
-            from telegram import BotCommand
-            commands = [
-                BotCommand("menu", "Interactive quick navigation menu"),
-                BotCommand("timetable", "Weekly timetable (Stundenplan)"),
-                BotCommand("activity", "Recent Stud.IP activity stream"),
-                BotCommand("documents", "Official university documents (PDF)"),
-                BotCommand("tuition", "Tuition & semester fee status"),
-                BotCommand("check", "Check courses for updates now"),
-                BotCommand("studyplan", "Weekly study plan"),
-                BotCommand("progress", "Credit & module progress"),
-                BotCommand("status", "Bot status and settings"),
-                BotCommand("login", "Sign in to Stud.IP (Mini App)"),
-                BotCommand("logout", "Sign out and clear session"),
-            ]
-            await app.bot.set_my_commands(commands)
-            logging.info("✅ Telegram bot commands registered successfully")
+            from telegram import BotCommandScopeDefault, BotCommandScopeAllPrivateChats, BotCommandScopeChat
+            await app.bot.delete_my_commands(scope=BotCommandScopeDefault())
+            await app.bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
+            for uid in ALLOWED_USER_IDS or []:
+                try:
+                    await app.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=uid))
+                except Exception:
+                    pass
+            logging.info("🧹 Telegram bot commands and menu list cleared successfully")
         except Exception as exc:
-            logging.warning(f"Could not register Telegram bot commands: {exc}")
+            logging.warning(f"Could not clear Telegram bot commands: {exc}")
 
         # Login page (+ optional Cloudflare tunnel + menu button)
         try:
