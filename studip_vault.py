@@ -1,10 +1,19 @@
 """Encryption vault for Stud.IP session cookies and OAuth2 tokens at rest.
 
 Provides AES-128-CBC + HMAC-SHA256 authenticated encryption via cryptography.fernet.Fernet.
-Derives encryption key from:
-  1. SESSION_ENCRYPTION_KEY environment variable (if set)
-  2. TELEGRAM_TOKEN environment variable (primary default)
-  3. Stable local fallback secret
+Encryption key:
+  1. SESSION_ENCRYPTION_KEY environment variable, if set
+  2. otherwise a random key generated once into `.vault_key` (mode 0600)
+     next to this file
+
+Files written by older versions (key derived from TELEGRAM_TOKEN, or the
+built-in fallback secret) are still readable and get re-encrypted with the
+current key on first read. Rotating TELEGRAM_TOKEN therefore no longer
+locks the stored session out.
+
+Note: the key lives on the same machine as the encrypted files, so this
+protects copies of the files (backups, accidental commits), not a full
+compromise of the host.
 
 Supports:
   - Atomic file write with strict 0600 (read/write only by owner) permissions
@@ -32,59 +41,98 @@ logger = logging.getLogger("StudIPVault")
 ENCRYPTED_MAGIC = "VAULT:v1:"
 
 
-def _derive_fernet_key() -> bytes:
-    """Derive a 32-byte URL-safe base64-encoded key required by Fernet."""
-    secret = (
-        os.getenv("SESSION_ENCRYPTION_KEY", "").strip()
-        or os.getenv("TELEGRAM_TOKEN", "").strip()
-        or "uni-oldenburg-studip-vault-salt-key-2026"
-    )
-    # HKDF-style domain-separated SHA-256 digest
+KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".vault_key")
+_LEGACY_FALLBACK_SECRET = "uni-oldenburg-studip-vault-salt-key-2026"
+
+
+def _key_from_secret(secret: str) -> bytes:
+    """Domain-separated SHA-256 of a high-entropy secret, as a Fernet key."""
     digest = hashlib.sha256(b"studip-vault-key-derivation-v1:" + secret.encode("utf-8")).digest()
     return base64.urlsafe_b64encode(digest)
+
+
+def _load_or_create_key_file() -> bytes:
+    from cryptography.fernet import Fernet
+
+    try:
+        with open(KEY_FILE, "rb") as fh:
+            key = fh.read().strip()
+        if key:
+            return key
+    except OSError:
+        pass
+    key = Fernet.generate_key()
+    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with open(fd, "wb") as fh:
+        fh.write(key)
+    logger.info("Generated a new vault key in %s", KEY_FILE)
+    return key
+
+
+def _primary_key() -> bytes:
+    explicit = os.getenv("SESSION_ENCRYPTION_KEY", "").strip()
+    if explicit:
+        return _key_from_secret(explicit)
+    return _load_or_create_key_file()
+
+
+def _legacy_keys() -> list[bytes]:
+    """Keys older versions encrypted with, accepted for reading only."""
+    keys = []
+    telegram_token = os.getenv("TELEGRAM_TOKEN", "").strip()
+    if telegram_token:
+        keys.append(_key_from_secret(telegram_token))
+    keys.append(_key_from_secret(_LEGACY_FALLBACK_SECRET))
+    return keys
 
 
 def encrypt_payload(data: Any) -> str:
     """Serialize data to JSON and encrypt with Fernet, prefixing with ENCRYPTED_MAGIC."""
     from cryptography.fernet import Fernet
 
-    key = _derive_fernet_key()
-    f = Fernet(key)
+    f = Fernet(_primary_key())
     raw_json = json.dumps(data, ensure_ascii=False).encode("utf-8")
     token = f.encrypt(raw_json).decode("utf-8")
     return f"{ENCRYPTED_MAGIC}{token}"
 
 
-def decrypt_payload(raw_text: str) -> Optional[Any]:
-    """Decrypt payload if encrypted, or parse legacy plain JSON if not."""
+def _decrypt_token(cipher_token: str) -> tuple[Optional[Any], bool]:
+    """(data, used_legacy_key). data is None when no known key fits."""
+    from cryptography.fernet import Fernet, InvalidToken
+
+    raw = cipher_token.encode("utf-8")
+    primary = _primary_key()
+    for key in [primary] + [k for k in _legacy_keys() if k != primary]:
+        try:
+            plain = Fernet(key).decrypt(raw)
+        except InvalidToken:
+            continue
+        return json.loads(plain.decode("utf-8")), key != primary
+    return None, False
+
+
+def decrypt_payload(raw_text: str, _legacy_flag: Optional[list] = None) -> Optional[Any]:
+    """Decrypt payload if encrypted, or parse legacy plain JSON if not.
+
+    `_legacy_flag`, when given, gets True appended if an old key was needed,
+    so the caller can re-encrypt the file with the current key."""
     raw_text = raw_text.strip()
     if not raw_text:
         return None
 
-    if raw_text.startswith(ENCRYPTED_MAGIC):
-        cipher_token = raw_text[len(ENCRYPTED_MAGIC):].strip()
-        from cryptography.fernet import Fernet
-
-        key = _derive_fernet_key()
-        f = Fernet(key)
+    if raw_text.startswith(ENCRYPTED_MAGIC) or raw_text.startswith("gAAAAA"):
+        cipher_token = raw_text[len(ENCRYPTED_MAGIC):].strip() if raw_text.startswith(ENCRYPTED_MAGIC) else raw_text
         try:
-            plain_bytes = f.decrypt(cipher_token.encode("utf-8"))
-            return json.loads(plain_bytes.decode("utf-8"))
+            data, used_legacy = _decrypt_token(cipher_token)
         except Exception as exc:
             logger.error("Failed to decrypt vault payload: %s", exc)
             return None
-
-    # Check if raw text is raw Fernet token without prefix (Fernet tokens start with gAAAAA)
-    if raw_text.startswith("gAAAAA"):
-        from cryptography.fernet import Fernet
-
-        key = _derive_fernet_key()
-        f = Fernet(key)
-        try:
-            plain_bytes = f.decrypt(raw_text.encode("utf-8"))
-            return json.loads(plain_bytes.decode("utf-8"))
-        except Exception:
-            pass
+        if data is None:
+            logger.error("Failed to decrypt vault payload: no known key matches (key changed?)")
+            return None
+        if used_legacy and _legacy_flag is not None:
+            _legacy_flag.append(True)
+        return data
 
     # Fallback: Plaintext legacy JSON (migration scenario)
     try:
@@ -137,12 +185,15 @@ def read_vault_file(path: str, auto_migrate: bool = True) -> Optional[Any]:
         logger.warning("Could not read vault file %s: %s", path, exc)
         return None
 
-    data = decrypt_payload(raw_text)
+    legacy_flag: list = []
+    data = decrypt_payload(raw_text, legacy_flag)
     if data is None:
         return None
 
-    # If it was unencrypted or has looser permissions than 0600, migrate it immediately
-    is_plain = not raw_text.startswith(ENCRYPTED_MAGIC) and not raw_text.startswith("gAAAAA")
+    # Unencrypted, encrypted with an old key, or looser than 0600: rewrite now
+    is_plain = bool(legacy_flag) or (
+        not raw_text.startswith(ENCRYPTED_MAGIC) and not raw_text.startswith("gAAAAA")
+    )
     needs_chmod = False
     try:
         st = os.stat(path)

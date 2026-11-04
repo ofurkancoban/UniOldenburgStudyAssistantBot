@@ -1187,9 +1187,8 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
             continue  # already notified about this exact result
 
         is_passed = status_title == "passed"
-        icon = "🎉" if is_passed else "❌"
         congrats_header = "🎉 <b>CONGRATULATIONS! NEW EXAM GRADE</b>" if is_passed else "📋 <b>NEW EXAM RESULT ANNOUNCED</b>"
-        congrats_line = "🥳 <i>Tebrikler! Dersi başarıyla geçtiniz.</i>\n" if is_passed else ""
+        congrats_line = "🥳 <i>Congratulations, you passed the course!</i>\n" if is_passed else ""
 
         praise = ""
         if is_passed and grade_val:

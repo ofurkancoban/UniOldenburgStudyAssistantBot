@@ -29,6 +29,14 @@ TZ_BERLIN = ZoneInfo("Europe/Berlin")
 # ── env / asyncio ──────────────────────────────────────────────────────────────
 load_dotenv()
 
+# WhatsApp microservice: loopback only, guarded by a shared secret that the
+# spawned Node process inherits through the environment (see server.js).
+import secrets
+WA_SERVICE_URL = f"http://127.0.0.1:{int(os.getenv('PORT', '3838'))}"
+WA_SERVICE_TOKEN = os.getenv("WA_SERVICE_TOKEN", "").strip() or secrets.token_urlsafe(32)
+os.environ["WA_SERVICE_TOKEN"] = WA_SERVICE_TOKEN
+WA_HEADERS = {"X-WA-Service-Token": WA_SERVICE_TOKEN}
+
 USERNAME = os.getenv("USERNAME")
 PASSWORD = os.getenv("PASSWORD")
 TOTP_SECRET = os.getenv("TOTP_SECRET")
@@ -1893,7 +1901,7 @@ async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE
         import aiohttp
         async with aiohttp.ClientSession() as session:
             payload = {"text": text, "groupName": group_name}
-            async with session.post("http://localhost:3838/send", json=payload, timeout=10) as resp:
+            async with session.post(f"{WA_SERVICE_URL}/send", headers=WA_HEADERS, json=payload, timeout=10) as resp:
                 if resp.status == 200:
                     await query.edit_message_reply_markup(reply_markup=None) # Remove button after sending
                     await context.bot.send_message(chat_id=query.message.chat_id, text="✅ Sent to WhatsApp successfully!")
@@ -2920,18 +2928,6 @@ async def check_new_forum_posts_parallel(page, bot, chat_id, silent: bool = Fals
                                 # If no post_id, make one from ThreadID + Date
                                 unique_key = f"{cid}:{post_id if post_id else date_text}"  # Simplified key
 
-                                if unique_key in cached_posts:
-                                    continue
-
-                                # Add to new posts list
-                                new_posts.append({
-                                    "course": current_course_name,
-                                    "thread": current_thread_title if 'current_thread_title' in locals() else thread_title,
-                                    "author": author_text,
-                                    "date": date_text,
-                                    "content": body_text,
-                                    "key": unique_key
-                                })
 
                             # End of posts loop
                             # Continue to next row in main loop
@@ -4006,7 +4002,7 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         import aiohttp
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post("http://localhost:3838/request_qr") as resp:
+                async with session.post(f"{WA_SERVICE_URL}/request_qr", headers=WA_HEADERS) as resp:
                     data = await resp.json()
                     await query.message.reply_text(f"ℹ️ {data.get('message', 'QR request processed.')}")
         except Exception as e:
@@ -4650,7 +4646,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            async with session.get("http://localhost:3838/status", timeout=2) as resp:
+            async with session.get(f"{WA_SERVICE_URL}/status", headers=WA_HEADERS, timeout=2) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     wa_status = "🟢 Connected" if data.get("isAuthenticated") else "🟡 Waiting for QR Scan"

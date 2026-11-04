@@ -52,3 +52,9 @@ whatsapp_service/*.lock
 # Debug / Temp
 *.html
 whatsapp_service/baileys_auth.broken-*/
+
+# Secrets / runtime state added with the vault and tunnel
+.vault_key
+.cloudflared/
+reminders_cache.json
+watch_log.txt.*

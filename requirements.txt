@@ -1,22 +1,23 @@
-asyncio
-nest_asyncio
-aiohttp
-# playwright use for Playwright version.
-pyotp
-beautifulsoup4
-html5lib
-lxml
-python-telegram-bot
-python-dotenv
-psutil
-uuid
-icalendar
-recurring-ical-events
-SpeechRecognition
-pydub
-langdetect
-gradio_client
-fal-client
-pypdf
-python-pptx
-# Verified
+# Core (versions tested together; upper bounds stop a future major release
+# from silently breaking the bot on a fresh install)
+aiohttp>=3.13,<4
+python-telegram-bot>=22.5,<23
+python-dotenv>=1.1,<2
+beautifulsoup4>=4.14,<5
+lxml>=6.0,<7
+pyotp>=2.9,<3
+psutil>=7.1,<8
+cryptography>=45,<47       # studip_vault: encrypted cookies / OAuth tokens
+
+# Voice, documents and AI providers
+SpeechRecognition>=3.17,<4
+pydub>=0.25,<1
+langdetect>=1.0.9,<2
+gradio_client>=2.7,<3
+fal-client>=1.0,<2
+pypdf>=6.1,<7
+python-pptx>=1.0,<2
+
+# Legacy Playwright engine only (studip_bot_playwright.py); setup.sh installs
+# playwright itself when that engine is chosen.
+nest_asyncio>=1.6,<2

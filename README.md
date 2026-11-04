@@ -41,7 +41,7 @@ Courses, files and folders, announcements, messages and forum posts are read fro
     *   **Mensa Menu**: The full cafeteria menu with allergens and special labels (e.g., ⭐ Limited).
     *   **🔊 Spoken briefing, automatically**: right after the text summary, a second message arrives as an actual voice note — a warm, upbeat narration of the day (weather, schedule, today's tasks, *and* the lunch pick, all woven in naturally, clothing advice included) that a free OpenRouter LLM writes fresh every morning (not a fixed template — the opening line and phrasing are different every time), turned into speech by the same free TTS pipeline as **🔊 Listen** (see 🎙️ Voice Commands). No tap needed; if generation or conversion fails, it's skipped quietly and the text summary above still went out. If you've set your name via **/status → "👤 Set Your Name"**, the narration greets you by it.
 *   **Lecture Reminders**: Automatically receive a notification **30 minutes before** each class starts. No more running late across campus! For the day's **first** class specifically, a wet forecast (see 🌤️ Weather above) widens that to **~45 minutes** and adds a heads-up to grab an umbrella — later classes are just a walk across campus, so only the actual leaving-home commute gets the extra lead time.
-*   **📚 Good Times to Study**: The weekly plan (**📆 Week Plan**) flags free windows squeezed *between* two classes on the same day (at least 90 minutes, so there's actually enough time to get something done) as good study time, showing when and what they're sandwiched between. The **🔊 Listen** weekly narration mentions the best one or two naturally too, as a nudge for revision or homework.
+*   **📚 Good Times to Study**: The **📅 Today** view, the **📆 Week Plan** and the morning summary list free study windows between 09:00 and 19:00 on weekdays: before the first class (at least 90 minutes), between two classes (at least 60 minutes), after the last class (at least 90 minutes), or the whole day when there are no classes. On today's view, windows already over are dropped and a running one shows the time left. The **🔊 Listen** weekly narration mentions the best one or two naturally too, as a nudge for revision or homework.
 *   **⏱️ Workload-Aware Planning**: the weekly study plan schedules by *time*, not "one lecture per slot". Each lecture becomes concrete tasks with an estimate: slides by page count (2 min/page), videos by the weekly README's stated recording time (otherwise from file size, calibrated on weeks where the README states it; ×1.25 for pausing and notes), quizzes (5 min/question), problem sets in `PS/` folders (15 min/question) and empirical projects in `EP/` folders (1 h per instruction page, 2 to 6 h). When a weekly README names the slide decks, only those count (other PDFs are optional readings). For flipped-classroom courses with dated weekly folders, the material of upcoming classes is scheduled *before* the class (top priority from 2 days before), then catch-up, exam prep and previews. Long tasks are split across blocks, short ones share a block. The plan opens with needed vs. free hours per course and flags what doesn't fit or which class can't be fully prepared. Ticking a session credits its minutes to its tasks; a lecture counts as studied once all its tasks are done, and `/progress` shows the hours left per course and lecture.
 *   **📄 Exam Dates From Course Files**: once a day the bot scans your tracked courses' files (syllabus/info sheets, READMEs and slides, PDF/PPTX/HTML, including `Syllabus/` folders; past exam papers are skipped) for exam, retake, midterm, presentation and submission dates. Only passages that mention an exam next to a date (or the exam format) go to the free LLM for extraction, and results are cached per file, so unchanged files are never re-processed. Dates are sanity-checked: if a file names a weekday that doesn't match its year (e.g. an info sheet reused from last year saying "Friday, 12 February 2026" in WS 26/27), or gives no year, the year is corrected and flagged. New or changed dates are announced right away. They also show up in **📚 My Exam Dates** (with a **📄 Scan Course Files Now** button), count towards the weekly study plan's exam priority, and get reminders 7/3/1/0 days before (skipped when StuMS already has a registered sitting that day; retakes only once the main exam has passed). Format-only info ("oral exam at the end of the course", "date set in the first session") is listed as *date not announced yet*.
 *   **📘 Weekly Content-Aware Study Plan & Progress Tracking**: toggle on in `/status` and every Sunday evening (or any time via **`/studyplan`**), the bot scans your **enrolled** courses' lecture files (PDF/PPTX/HTML slides, top level plus one folder down, so weekly dated folders like `20261013/` are included; books, literature, code and problem-set folders are skipped) and tags each with a short topic label (cached, unchanged files are never re-processed). Lectures are put in **teaching order** (dated folders, or `L3`/`Lecture 04`/`03_` numbering), compared against the lectures **already held** according to your calendar (cancelled ones excluded), and against what you've marked as studied. Next week's free time (mornings, afternoons and gaps between classes, 10:00 to 21:00, weekdays only) is then filled in order: first the lectures you're **behind** on, past exam papers for any exam in the next 3 weeks, and only once a course is caught up, a preview of its next lecture. The plan message lists the courses you're behind on and has a ✅ button per session to mark it studied. **`/progress`** shows per-course progress bars (studied vs. held), flags courses you're behind on, and lets you tick off individual lectures. **`/trackcourses`** (or 🎯 Tracked Courses in `/progress`) picks which courses are followed: by default every course with lectures held this semester is tracked automatically; tapping a course switches to a manual selection (only those courses are scanned, shown in `/progress` and scheduled in the plan), and you can switch back to automatic at any time. Off by default.
@@ -162,7 +162,7 @@ chmod +x setup.sh
 
 **What the script does for you:**
 1.  **Environment Isolation**: Creates and activates a Python `.venv`.
-2.  **Dependency Resolution**: Installs all required libraries (`icalendar`, `aiohttp`, etc.).
+2.  **Dependency Resolution**: Installs all required libraries (`aiohttp`, `python-telegram-bot`, `cryptography`, etc.).
 3.  **Engine Selection**: Lets you choose between the Browser-less and Playwright versions.
 4.  **Configuration**: Generates a `.env` template from your input.
 
@@ -177,15 +177,17 @@ PASSWORD=your_password
 TELEGRAM_TOKEN=your_bot_token
 
 # --- Authentication ---
-ALLOWED_USER_IDS=123456,789012  # Comma separated list of authorized users
+ALLOWED_USER_IDS=123456,789012  # Required. Comma separated; left empty, everyone is rejected
 TOTP_SECRET=YOUR_KEY            # Optional: If 2FA/App Authenticator is enabled
+USE_STUDIP_OAUTH=false          # true: JSON:API calls also carry an OAuth2 bearer token
+# SESSION_ENCRYPTION_KEY=...    # Optional: else a random key is created in .vault_key
 
-# --- Calendar Integration ---
-STUDIP_ICAL_URL=https://elearning.uni-oldenburg.de/dispatch.php/ical/index/...
+# --- /login Mini App (see DEPLOY_LOGIN.md) ---
+# CLOUDFLARE_TUNNEL=quick       # or LOGIN_PUBLIC_URL=https://bot.example.com
 
 # --- WhatsApp Integration ---
 # WA_GROUP_ID is set from within the bot (see below), not typed here.
-PORT=3838  # Port for the WhatsApp Microservice
+PORT=3838  # Port for the WhatsApp Microservice (127.0.0.1 only, token-protected)
 
 # --- Voice Command Intent Routing (optional) ---
 OPENROUTER_API_KEY=your_openrouter_key_here   # https://openrouter.ai/keys — omit to disable, tasks-only voice input still works
@@ -214,9 +216,8 @@ CLOUDFLARE_API_TOKEN=your_cloudflare_workers_ai_token_here    # My Profile -> AP
 HF_TOKEN=your_free_huggingface_read_token_here    # huggingface.co/settings/tokens — effectively required for the free fallback, anonymous ZeroGPU quota is too low
 ```
 
-> [!IMPORTANT]
-> To get your **STUDIP_ICAL_URL**, go to Stud.IP:
-> **Planner** -> **Export** -> **iCalendar** -> Copy the link. This link is essential for the schedule and reminders to work!
+> [!NOTE]
+> No iCal link is needed: the schedule, cancellations and topics come from Stud.IP's JSON:API, and rooms are read from each course's details page (cached for a day).
 
 ---
 
@@ -250,7 +251,7 @@ HF_TOKEN=your_free_huggingface_read_token_here    # huggingface.co/settings/toke
 
 The microservice (`whatsapp_service/`) talks to WhatsApp via **[Baileys](https://github.com/WhiskeySockets/Baileys)** — a direct implementation of WhatsApp's multi-device protocol over a WebSocket, not a browser. No Chromium/Puppeteer involved, ~50MB lighter at idle, and no "headless browser internals changed and broke everything" class of bug.
 
-1. **Auto-Start**: When you launch the bot (`python studip_bot.py`), it automatically starts the WhatsApp microservice in the background.
+1. **Auto-Start**: When you launch the bot (`python studip_bot.py`), it automatically starts the WhatsApp microservice in the background. The service only listens on `127.0.0.1` and rejects every request without the shared `X-WA-Service-Token` header; the bot generates that token per run and passes it to the process it starts (set `WA_SERVICE_TOKEN` in `.env` only if you run `server.js` separately).
 2. **First Time Login (QR)**: The bot will generate a WhatsApp QR code and send it to you via Telegram as an image. Scan it with your phone's WhatsApp (Linked Devices) — same scan-a-code flow as linking WhatsApp Web, just without an actual browser behind it.
 3. **Pick the Target Group**: Use the `/status` menu → **"📱 WhatsApp"** → **"🔍 Detect WA Groups"**. Send or receive any message in the target group first (so the service logs its exact ID), then tap it in the list to set it active — the group is always set by the exact ID captured this way, not a typed name, since name-based lookup is fragile (collisions, drift) and could silently fail to find the right group.
 4. **Session Persistence**: Your session is saved to `whatsapp_service/baileys_auth/` (a folder of credential files — gitignored, never commit it). If you need a new QR code (e.g., you logged out), simply tap **"📲 Request WA QR"** in the `/status` menu.

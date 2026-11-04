@@ -2,7 +2,13 @@ import asyncio
 import contextvars
 import logging
 import io
+import os
 import signal
+
+# Every cache/state file below is a relative path; anchor them to the bot's
+# own directory so starting it from another working directory (PM2, cron,
+# a shell elsewhere) never scatters or loses state.
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from dotenv import load_dotenv
@@ -10,7 +16,7 @@ try:
 except ImportError:
     pass
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, InputMediaPhoto, WebAppInfo, MenuButtonWebApp, MenuButtonDefault
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, TypeHandler, ApplicationHandlerStop, filters
 import pyotp
 import uuid
 import random
@@ -27,14 +33,17 @@ import shutil
 import tempfile
 import time
 import aiohttp
-import logging
-import os
 import json
+import secrets
 import psutil
-from datetime import datetime, timedelta, timezone, date, time
+from logging.handlers import RotatingFileHandler
+# `time` stays the stdlib module (time.time(), time.monotonic(), ...);
+# datetime.time is imported as `dtime` so it never shadows it.
+from datetime import datetime, timedelta, timezone, date, time as dtime
 from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo
 from telegram.constants import ChatAction
+from telegram.helpers import escape_markdown
 from asyncio import CancelledError
 from studip_session import StudIPSession
 import studip_oauth
@@ -165,12 +174,29 @@ def _parse_allowed_user_ids(env_value: str) -> set[int]:
 ALLOWED_USER_IDS = _parse_allowed_user_ids(ALLOWED_USER_IDS_ENV)
 
 
-def is_user_allowed(user_id: int) -> bool:
-    # If allowlist is empty, allow everyone (backward compatibility) — but warn
+async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drop every update from users outside ALLOWED_USER_IDS before any handler runs."""
+    user = update.effective_user
+    if user is not None and is_user_allowed(user.id):
+        return
+    logging.warning(f"⛔ Ignored update from unauthorised user {user.id if user else 'unknown'}")
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("⛔ Not authorised.", show_alert=False)
+        elif update.effective_message and update.effective_chat and update.effective_chat.type == "private":
+            await update.effective_message.reply_text("⛔ Not authorised.")
+    except Exception:
+        pass
+    raise ApplicationHandlerStop
+
+
+def is_user_allowed(user_id: Optional[int]) -> bool:
+    # Fail closed: an empty allowlist would hand the Stud.IP account, grades
+    # and messages to anyone who finds the bot, so it locks everyone out.
     if not ALLOWED_USER_IDS:
-        logging.warning("⚠️ ALLOWED_USER_IDS is empty — bot is open to everyone.")
-        return True
-    return user_id in ALLOWED_USER_IDS
+        logging.warning("⚠️ ALLOWED_USER_IDS is empty - every user is rejected. Set it in .env.")
+        return False
+    return user_id is not None and user_id in ALLOWED_USER_IDS
 
 
 # link_cache limits
@@ -360,9 +386,9 @@ def _breadcrumb(user_id: int) -> str:
     if not parts:
         return "📂 *Root*"
     if len(parts) == 1:
-        return f"📂 *{parts[0]}*"
+        return f"📂 *{_md(parts[0])}*"
     else:
-        chain = " › ".join(parts)
+        chain = " › ".join(_md(p) for p in parts)
         return f"📂 *{chain}*"
 
 
@@ -374,6 +400,22 @@ def _status_emoji(status: str) -> str:
 def _safe_loc(loc: str) -> str:
     """Clean and return the location string with a fallback."""
     return (loc or "Unknown").strip()
+
+
+def _md(text) -> str:
+    """Escape free text (course titles, rooms, error messages) for Telegram's
+    legacy Markdown mode, where a stray `_` or `*` makes the whole message fail."""
+    return escape_markdown(str(text or ""), version=1)
+
+
+def _h(text) -> str:
+    """Escape free text for Telegram's HTML parse mode (`&` and `<` break it)."""
+    return html.escape(str(text or ""), quote=False)
+
+
+def _format_hours(minutes: int) -> str:
+    hours = minutes / 60
+    return f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
 
 
 def _get_day_emoji(day_name: str) -> str:
@@ -922,11 +964,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 try:
-    _file_handler = logging.FileHandler(LOG_FILE)
+    _file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
 except (PermissionError, OSError):
-    _temp_log = os.path.join("/tmp", LOG_FILE)
+    _temp_log = os.path.join(tempfile.gettempdir(), LOG_FILE)
     print(f"⚠️ Permission denied for {LOG_FILE}, logging to {_temp_log} instead.")
-    _file_handler = logging.FileHandler(_temp_log)
+    _file_handler = RotatingFileHandler(_temp_log, maxBytes=5 * 1024 * 1024, backupCount=3)
 
 _file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 _console_handler = logging.StreamHandler()
@@ -937,6 +979,17 @@ root_logger.addHandler(_console_handler)
 # httpx logs every request URL at INFO, and Telegram's URLs carry the bot
 # token (api.telegram.org/bot<token>/...), so it would end up in the logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# ── WhatsApp microservice ─────────────────────────────────────────────────────
+# The Node service only listens on 127.0.0.1 and rejects requests without this
+# shared secret. When WA_SERVICE_TOKEN isn't set in .env, a random one is made
+# per run and handed to the service through the environment it inherits when
+# start_whatsapp_microservice() spawns it.
+WA_SERVICE_PORT = int(os.getenv("PORT", "3838"))
+WA_SERVICE_URL = f"http://127.0.0.1:{WA_SERVICE_PORT}"
+WA_SERVICE_TOKEN = os.getenv("WA_SERVICE_TOKEN", "").strip() or secrets.token_urlsafe(32)
+os.environ["WA_SERVICE_TOKEN"] = WA_SERVICE_TOKEN
+WA_HEADERS = {"X-WA-Service-Token": WA_SERVICE_TOKEN}
 
 # ── single-instance lock ───────────────────────────────────────────────────────
 LOCK_FILE = ".bot_instance.lock"
@@ -1100,7 +1153,7 @@ async def _on_proxy_session_authenticated() -> None:
                 studip_cookie = c.value
                 break
 
-    use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+    use_oauth = studip_oauth.oauth_enabled()
     need_oauth = use_oauth and studip_oauth.is_expired(studip_oauth.load_tokens())
     is_new_session = bool(studip_cookie and studip_cookie != _last_notified_studip_cookie)
 
@@ -1226,7 +1279,7 @@ async def _perform_web_login(username: str, password: str, totp: str) -> tuple[b
     global _studip_api_user_id
     _studip_api_user_id = None
 
-    use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+    use_oauth = studip_oauth.oauth_enabled()
     if use_oauth:
         try:
             await studip_oauth.authorize_with_session(session)
@@ -1283,15 +1336,17 @@ async def _perform_logout() -> None:
     _last_notified_studip_cookie = None
     if global_session is not None:
         await global_session.logout()
-    use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
-    if use_oauth:
+    if studip_oauth.oauth_enabled():
         studip_oauth.clear_tokens()
+    # Any Mini App / link session still open must not keep proxying the account
+    if login_server is not None:
+        login_server.revoke_all()
 
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/login - open the Stud.IP login page (Mini App or browser)."""
     user = update.effective_user
-    if ALLOWED_USER_IDS and user.id not in ALLOWED_USER_IDS:
+    if not is_user_allowed(user.id if user else None):
         await update.message.reply_text("⛔ Not authorised.")
         return
     await _send_login_prompt(update.message, user.id)
@@ -1300,7 +1355,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/logout - sign out of Stud.IP and clear stored session cookies & OAuth2 tokens."""
     user = update.effective_user
-    if ALLOWED_USER_IDS and user.id not in ALLOWED_USER_IDS:
+    if not is_user_allowed(user.id if user else None):
         await update.message.reply_text("⛔ Not authorised.")
         return
     await _perform_logout()
@@ -3585,7 +3640,7 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Not a real error, just the same menu content
             try:
                 await query.answer("All current information is already displayed.")
-            except:
+            except Exception:
                 pass
             return
 
@@ -3593,7 +3648,7 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         # If edit fails (e.g. same text), don't crash
         try:
             await query.edit_message_text(error_msg)
-        except:
+        except Exception:
             pass
         logging.error(f"Menu button navigation error: {e}")
 
@@ -3635,7 +3690,7 @@ async def studip_api_get(path: str, params: Optional[dict] = None, _retry: bool 
     async with await session.get(url, params=params) as r:
         status, text = r.status, await r.text()
     if status == 401 and _retry:
-        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        use_oauth = studip_oauth.oauth_enabled()
         if use_oauth and studip_oauth.load_tokens() and await studip_oauth.get_access_token(force_refresh=True):
             return await studip_api_get(path, params, _retry=False)
         # Self-healing silent SSO renewal attempt
@@ -4126,7 +4181,7 @@ def _parse_file_date_v2(modified_text: str | None, modified_iso: str | None):
                 return now - timedelta(hours=val)
             else:
                 return now - timedelta(minutes=val)
-        except:
+        except Exception:
             pass
 
     # "Just now" / "Gerade eben"
@@ -4139,7 +4194,7 @@ def _parse_file_date_v2(modified_text: str | None, modified_iso: str | None):
         try:
             t = datetime.strptime(s, "%H:%M").time()
             return datetime.combine(now.date(), t)
-        except:
+        except Exception:
             pass
 
     # C) Standard Date Formats
@@ -4560,7 +4615,7 @@ async def set_wa_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            await session.post("http://localhost:3838/set_group_id", json={"groupId": group_id}, timeout=10)
+            await session.post(f"{WA_SERVICE_URL}/set_group_id", headers=WA_HEADERS, json={"groupId": group_id}, timeout=10)
     except Exception as e:
         logging.error(f"Failed to notify WhatsApp service of new group ID: {e}")
 
@@ -4974,9 +5029,9 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
             loc_icon = _get_location_emoji(ev.get("location", ""))
 
             block = (
-                f"{course_icon} <b>{display_title}</b>\n"
+                f"{course_icon} <b>{_h(display_title)}</b>\n"
                 f"   🕒 <code>{duration}</code>\n"
-                f"   {loc_icon} {_safe_loc(ev['location'])}"
+                f"   {loc_icon} {_h(_safe_loc(ev['location']))}"
             )
             course_blocks.append(block)
         lines.append("\n\n".join(course_blocks))
@@ -4988,9 +5043,10 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     if study_windows:
         study_lines = ["📚 <b>Good Times to Study:</b>"]
         for g in study_windows:
-            hours = g["duration_minutes"] / 60
-            duration_text = f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
-            study_lines.append(f"🕒 <code>{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}</code> ({duration_text}) - {g['description']}")
+            study_lines.append(
+                f"🕒 <code>{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}</code> "
+                f"({_format_hours(g['duration_minutes'])}) - {_h(g['description'])}"
+            )
         study_text = "\n\n" + "\n".join(study_lines)
 
     # 2b. Today's tasks (reminders due today, regardless of which
@@ -5452,7 +5508,7 @@ async def message_poll_loop(app) -> None:
         await asyncio.sleep(MESSAGE_POLL_SECONDS)
         if global_watcher_paused or global_session is None or admin_id is None:
             continue
-        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        use_oauth = studip_oauth.oauth_enabled()
         has_auth = os.path.exists(global_session.cookie_file) or (use_oauth and studip_oauth.load_tokens() is not None)
         if not has_auth:
             continue
@@ -5759,10 +5815,6 @@ CACHE_FILE = "messages_cache.json"
 MSG_CACHE_FILE = "messages_cache.json"
 MAX_CACHE_SIZE = 200  # upper limit to avoid bloating cache
 
-import re
-from datetime import datetime
-from bs4 import BeautifulSoup
-
 
 def _get_course_icon(title: str) -> str:
     """Emoji based on course type."""
@@ -5826,33 +5878,9 @@ def _get_location_emoji(location: str) -> str:
 
 
 
-async def schedule_reminders(events, chat_id, bot):
-    """Schedule silent reminders 1 hour before each event."""
-    now = datetime.now()
-    for e in events:
-        reminder_time = e["start"] - timedelta(hours=1)
-        delay = (reminder_time - now).total_seconds()
-        if delay <= 0:
-            continue  # skip past events
-
-        async def send_reminder(ev=e):
-            await bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"⏰ Reminder:\n"
-                    f"“{ev['title']}” starts in 1 hour ({ev['start']:%H:%M})\n"
-                    f"📍 {ev['location']}"
-                ),
-                disable_notification=True,
-            )
-
-        asyncio.get_event_loop().call_later(delay, lambda: asyncio.create_task(send_reminder()))
-
-
 # ───────────────────────────────────────────────
 # SHOW LAST 5 MESSAGES (from JSON cache)
 # ───────────────────────────────────────────────
-from datetime import datetime
 
 
 async def show_last_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5945,17 +5973,6 @@ async def show_last_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ──────────────────────────────────────────────────────────────────────────────
 #  TELEGRAM UI + MENU + FOLDER VIEW + INSTANT CHECK
 # ──────────────────────────────────────────────────────────────────────────────
-
-def _breadcrumb(user_id: int) -> str:
-    parts = nav_names.get(user_id, [])
-    if not parts:
-        return "📂 *Root*"
-    if len(parts) == 1:
-        return f"📂 *{parts[0]}*"
-    else:
-        chain = " › ".join(parts)
-        return f"📂 *{chain}*"
-
 
 async def _send_courses_menu(query_or_message, courses, extra_buttons=None):
     """Send main course list as buttons. extra_buttons, if given, is a list of
@@ -6449,7 +6466,7 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         import aiohttp
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post("http://localhost:3838/request_qr") as resp:
+                async with session.post(f"{WA_SERVICE_URL}/request_qr", headers=WA_HEADERS) as resp:
                     data = await resp.json()
                     await query.message.reply_text(f"ℹ️ {data.get('message', 'QR request processed.')}")
         except Exception as e:
@@ -6463,7 +6480,7 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         import aiohttp
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post("http://localhost:3838/force_new_qr") as resp:
+                async with session.post(f"{WA_SERVICE_URL}/force_new_qr", headers=WA_HEADERS) as resp:
                     data = await resp.json()
                     await query.message.reply_text(f"ℹ️ {data.get('message', 'QR request processed.')}")
         except Exception as e:
@@ -6480,7 +6497,7 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         import aiohttp
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.post("http://localhost:3838/send_test", timeout=15) as resp:
+                async with session.post(f"{WA_SERVICE_URL}/send_test", headers=WA_HEADERS, timeout=15) as resp:
                     data = await resp.json()
             if data.get("success"):
                 await query.message.reply_text(f"✅ Test message sent to your own WhatsApp chat ({data.get('to', 'own number')}).")
@@ -6494,7 +6511,7 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         import aiohttp
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get("http://localhost:3838/discovered_groups", timeout=10) as resp:
+                async with session.get(f"{WA_SERVICE_URL}/discovered_groups", headers=WA_HEADERS, timeout=10) as resp:
                     data = await resp.json()
                     groups = data.get("groups", [])
         except Exception as e:
@@ -6519,7 +6536,7 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             async def _resolve(g):
                 try:
                     async with aiohttp.ClientSession() as session:
-                        async with session.get("http://localhost:3838/group_name", params={"groupId": g["groupId"]}, timeout=3) as resp:
+                        async with session.get(f"{WA_SERVICE_URL}/group_name", headers=WA_HEADERS, params={"groupId": g["groupId"]}, timeout=3) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
                                 if data.get("name"):
@@ -6712,7 +6729,7 @@ async def _send_text_to_whatsapp(text: str) -> tuple[bool, str]:
         import aiohttp
         async with aiohttp.ClientSession() as session:
             payload = {"text": text, "groupName": group_id}
-            async with session.post("http://localhost:3838/send", json=payload, timeout=10) as resp:
+            async with session.post(f"{WA_SERVICE_URL}/send", headers=WA_HEADERS, json=payload, timeout=10) as resp:
                 if resp.status == 200:
                     return True, "Sent to WhatsApp successfully!"
                 data = await resp.json()
@@ -7395,7 +7412,7 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception as e:
         logging.error(f"Button handler error: {e}")
         try:
-            await sender.reply_text(f"⚠️ An error occurred:\n`{e}`", parse_mode="Markdown")
+            await sender.reply_text(f"⚠️ An error occurred:\n{e}")
         except Exception:
             pass
 
@@ -7618,27 +7635,87 @@ async def _get_calendar_events_api(week_start, days: int = 7) -> list[dict]:
     return events
 
 
-_COURSE_ROOMS_CACHE: dict[str, tuple[float, dict]] = {}
-_COURSE_ROOMS_LOCK = asyncio.Lock()
+_COURSE_ROOMS_CACHE: dict[str, tuple[float, dict]] = {}  # cid -> (expires_at, rooms_map)
+_COURSE_ROOMS_INFLIGHT: dict[str, asyncio.Task] = {}
+COURSE_ROOMS_CACHE_SECONDS = 86400
+COURSE_ROOMS_FAILURE_CACHE_SECONDS = 1800  # don't refetch a failing page on every view
+
+_WEEKDAY_FULL_NAMES = {
+    "monday": 0, "montag": 0, "tuesday": 1, "dienstag": 1, "wednesday": 2, "mittwoch": 2,
+    "thursday": 3, "donnerstag": 3, "friday": 4, "freitag": 4, "saturday": 5, "samstag": 5,
+    "sunday": 6, "sonntag": 6,
+}
+# German short forms only count written the way Stud.IP prints them ("Do.",
+# "Mo,"), so ordinary words like "do", "so" or "mi" in a note never match.
+_WEEKDAY_SHORT_RE = re.compile(r"\b(mo|di|mi|do|fr|sa|so)[.,]", re.IGNORECASE)
+_WEEKDAY_SHORT = {"mo": 0, "di": 1, "mi": 2, "do": 3, "fr": 4, "sa": 5, "so": 6}
 
 
-async def _fetch_course_rooms_map(session, cid: str) -> dict:
-    """Fetch and parse room assignments for a course from its details page.
+def _parse_weekday(txt: str) -> Optional[int]:
+    lowered = txt.lower()
+    for name, wday in _WEEKDAY_FULL_NAMES.items():
+        if re.search(r"\b" + name + r"\b", lowered):
+            return wday
+    m = _WEEKDAY_SHORT_RE.search(txt)
+    return _WEEKDAY_SHORT[m.group(1).lower()] if m else None
 
-    Returns a dict mapping:
+
+def _parse_course_rooms_page(page_html: str) -> dict:
+    """Room assignments from a course details page:
       ("date", datetime.date, "HH:MM") -> room_name
       ("recurring", weekday_int, "HH:MM") -> room_name
-      ("course_default", None) -> room_name
+      ("course_default", None) -> room_name, only when the course uses a
+        single room (with several, a fallback could confidently show the wrong one)
     """
-    if not cid:
-        return {}
+    soup = BeautifulSoup(page_html, "html.parser")
+    rooms_map: dict = {}
+    all_rooms: set[str] = set()
 
-    now_ts = time.time()
-    async with _COURSE_ROOMS_LOCK:
-        cached = _COURSE_ROOMS_CACHE.get(cid)
-        if cached and (now_ts - cached[0] < 86400):
-            return cached[1]
+    for art in soup.find_all("article"):
+        h1 = art.find("h1")
+        if not h1 or not any(k in h1.get_text().lower() for k in ["room", "raum", "termine", "times"]):
+            continue
 
+        for h4 in art.find_all("h4"):
+            room_a = h4.find("a")
+            room_name = (room_a.get_text(strip=True) if room_a else h4.get_text(strip=True)).strip()
+            if not room_name or room_name.lower() in ("no room", "kein raum"):
+                continue
+            all_rooms.add(room_name)
+
+            ul = h4.find_next_sibling("ul")
+            if not ul:
+                continue
+
+            for li in ul.find_all("li"):
+                txt = li.get_text(" ", strip=True)
+                time_m = re.search(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", txt)
+                if not time_m:
+                    continue
+                start_hm = time_m.group(1).zfill(5)
+
+                date_m = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{2,4})\b", txt)
+                is_from = bool(re.search(r"(from|ab)\s+\d{1,2}\.\d{1,2}\.\d{2,4}", txt, re.IGNORECASE))
+
+                if date_m and not is_from:
+                    d, m, y = map(int, date_m.groups())
+                    if y < 100:
+                        y += 2000
+                    try:
+                        rooms_map[("date", date(y, m, d), start_hm)] = room_name
+                    except ValueError:
+                        pass
+                else:
+                    weekday = _parse_weekday(txt)
+                    if weekday is not None:
+                        rooms_map[("recurring", weekday, start_hm)] = room_name
+
+    if len(all_rooms) == 1:
+        rooms_map[("course_default", None)] = next(iter(all_rooms))
+    return rooms_map
+
+
+async def _download_course_rooms_map(session, cid: str) -> dict:
     s = session or global_session
     if not s:
         try:
@@ -7648,82 +7725,35 @@ async def _fetch_course_rooms_map(session, cid: str) -> dict:
 
     url = f"{BASE_URL}/dispatch.php/course/details?sem_id={cid}"
     rooms_map: dict = {}
-    default_room = None
-
+    ttl = COURSE_ROOMS_CACHE_SECONDS
     try:
         async with await s.get(url) as r:
             if r.status != 200:
-                return {}
-            html = await r.text()
-
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(html, "html.parser")
-
-        weekday_map = {
-            "monday": 0, "montag": 0, "mo": 0,
-            "tuesday": 1, "dienstag": 1, "di": 1,
-            "wednesday": 2, "mittwoch": 2, "mi": 2,
-            "thursday": 3, "donnerstag": 3, "do": 3,
-            "friday": 4, "freitag": 4, "fr": 4,
-            "saturday": 5, "samstag": 5, "sa": 5,
-            "sunday": 6, "sonntag": 6, "so": 6,
-        }
-
-        for art in soup.find_all("article"):
-            h1 = art.find("h1")
-            if not h1 or not any(k in h1.get_text().lower() for k in ["room", "raum", "termine", "times"]):
-                continue
-
-            for h4 in art.find_all("h4"):
-                room_a = h4.find("a")
-                room_name = (room_a.get_text(strip=True) if room_a else h4.get_text(strip=True)).strip()
-                if not room_name or room_name.lower() in ("no room", "kein raum"):
-                    continue
-
-                if not default_room:
-                    default_room = room_name
-
-                ul = h4.find_next_sibling("ul")
-                if not ul:
-                    continue
-
-                for li in ul.find_all("li"):
-                    txt = li.get_text(" ", strip=True)
-                    time_m = re.search(r"(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", txt)
-                    start_hm = time_m.group(1).zfill(5) if time_m else None
-                    if not start_hm:
-                        continue
-
-                    date_m = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{2,4})\b", txt)
-                    is_from = bool(re.search(r"(from|ab)\s+\d{1,2}\.\d{1,2}\.\d{2,4}", txt, re.IGNORECASE))
-
-                    if date_m and not is_from:
-                        d, m, y = map(int, date_m.groups())
-                        if y < 100:
-                            y += 2000
-                        try:
-                            rooms_map[("date", date(y, m, d), start_hm)] = room_name
-                        except ValueError:
-                            pass
-                    else:
-                        weekday = None
-                        for wname, wday in weekday_map.items():
-                            if re.search(r"\b" + wname + r"\b", txt, re.IGNORECASE):
-                                weekday = wday
-                                break
-                        if weekday is not None:
-                            rooms_map[("recurring", weekday, start_hm)] = room_name
-
-        if default_room:
-            rooms_map[("course_default", None)] = default_room
-
-        async with _COURSE_ROOMS_LOCK:
-            _COURSE_ROOMS_CACHE[cid] = (now_ts, rooms_map)
-
-        return rooms_map
+                logging.warning(f"Course rooms page for {cid} returned HTTP {r.status}")
+                ttl = COURSE_ROOMS_FAILURE_CACHE_SECONDS
+            else:
+                rooms_map = _parse_course_rooms_page(await r.text())
     except Exception as exc:
-        logging.debug(f"_fetch_course_rooms_map error for cid {cid}: {exc}")
+        logging.warning(f"_fetch_course_rooms_map error for cid {cid}: {exc}")
+        ttl = COURSE_ROOMS_FAILURE_CACHE_SECONDS
+    _COURSE_ROOMS_CACHE[cid] = (time.time() + ttl, rooms_map)
+    return rooms_map
+
+
+async def _fetch_course_rooms_map(session, cid: str) -> dict:
+    """Cached room assignments of a course (see _parse_course_rooms_page).
+    Concurrent callers for the same course share a single download."""
+    if not cid:
         return {}
+    cached = _COURSE_ROOMS_CACHE.get(cid)
+    if cached and time.time() < cached[0]:
+        return cached[1]
+    task = _COURSE_ROOMS_INFLIGHT.get(cid)
+    if task is None:
+        task = asyncio.create_task(_download_course_rooms_map(session, cid))
+        _COURSE_ROOMS_INFLIGHT[cid] = task
+        task.add_done_callback(lambda _t, c=cid: _COURSE_ROOMS_INFLIGHT.pop(c, None))
+    return await asyncio.shield(task)
 
 
 async def get_calendar_events(session, week_start, days: int = 7) -> list:
@@ -7779,17 +7809,17 @@ def _format_event_markdown_block(ev: dict) -> str:
     cancelled_tag = " *(CANCELLED)*" if is_cancelled else ""
 
     lines = [
-        f"{status} {course_icon} *{display_title}*{cancelled_tag}",
+        f"{status} {course_icon} *{_md(display_title)}*{cancelled_tag}",
         f"   🕒 `{duration}`",
-        f"   {loc_icon} {_safe_loc(ev.get('location', ''))}",
+        f"   {loc_icon} {_md(_safe_loc(ev.get('location', '')))}",
     ]
     topics = ev.get("topics") or []
     if topics:
-        safe_topics = ", ".join(str(t).replace("*", "").replace("_", "").replace("`", "") for t in topics[:2])
+        safe_topics = ", ".join(str(t).replace("*", "").replace("_", "").replace("`", "").replace("[", "(") for t in topics[:2])
         lines.append(f"   📌 _Topic: {safe_topics}_")
     desc = (ev.get("description") or "").strip()
     if desc:
-        safe_desc = desc.replace("*", "").replace("_", "").replace("`", "").replace("\n", " ")[:120]
+        safe_desc = desc.replace("*", "").replace("_", "").replace("`", "").replace("[", "(").replace("\n", " ")[:120]
         lines.append(f"   📝 _{safe_desc}_")
     return "\n".join(lines)
 
@@ -7829,11 +7859,10 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
     if study_windows:
         gap_lines = ["\n📚 *Good Times to Study*", "━━━━━━━━━━━━━━━━━━"]
         for g in study_windows:
-            hours = g["duration_minutes"] / 60
-            duration_text = f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
             rem_tag = " _(available now)_" if g.get("is_remaining") else ""
             gap_lines.append(
-                f"🕒 `{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}` ({duration_text}){rem_tag} - {g['description']}"
+                f"🕒 `{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}` "
+                f"({_format_hours(g['duration_minutes'])}){rem_tag} - {_md(g['description'])}"
             )
         text += "\n" + "\n".join(gap_lines)
 
@@ -7879,16 +7908,22 @@ def _week_tasks_for_range(week_start, week_end) -> list:
     return tasks
 
 
-STUDY_GAP_MIN_MINUTES = 90  # shorter gaps aren't really worth flagging — barely time to settle in before the next class
-STUDY_GAP_MAX_MINUTES = 6 * 60  # an end-of-day/no-more-classes gap isn't "squeezed between commitments", just free time — not what this is for
+STUDY_GAP_MIN_MINUTES = 90  # weekly study plan: shorter free windows aren't worth scheduling a session into
+# "Good Times to Study" hints (daily view, weekly view, morning summary, narration)
+STUDY_WINDOW_DAY_START = dtime(9, 0)
+STUDY_WINDOW_DAY_END = dtime(19, 0)
+STUDY_WINDOW_BETWEEN_MIN_MINUTES = 60  # a gap squeezed between two classes
+STUDY_WINDOW_EDGE_MIN_MINUTES = 90  # before the first / after the last class
+STUDY_WINDOW_REMAINING_MIN_MINUTES = 30  # today: still worth showing a window already under way
 
 
 def find_study_windows_for_day(events: list, target_date: date, reference_now: Optional[datetime] = None) -> list[dict]:
     """Find good study windows for a single day:
       - Full day free (Mon-Fri) if no classes are scheduled.
-      - Free time before the first class (e.g. 09:00 to first class start, if >= 90 mins).
+      - Free time before the first class (09:00 to first class start, if >= 90 mins).
       - Free time between classes (gaps >= 60 mins).
       - Free time after the last class (last class end to 19:00, if >= 90 mins).
+    Bounds are the STUDY_WINDOW_* constants.
     If `reference_now` is provided and target_date == reference_now.date(),
     dynamically excludes expired windows and updates ongoing windows to reflect
     remaining time today.
@@ -7896,10 +7931,11 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
     day_events = [
         ev for ev in events
         if ev.get("date_key") == target_date and not ev.get("is_cancelled")
+        and ev.get("start_dt") and ev.get("end_dt")
     ]
 
-    day_study_start = datetime.combine(target_date, time(9, 0), tzinfo=TZ_BERLIN)
-    day_study_end = datetime.combine(target_date, time(19, 0), tzinfo=TZ_BERLIN)
+    day_study_start = datetime.combine(target_date, STUDY_WINDOW_DAY_START, tzinfo=TZ_BERLIN)
+    day_study_end = datetime.combine(target_date, STUDY_WINDOW_DAY_END, tzinfo=TZ_BERLIN)
 
     windows = []
 
@@ -7908,8 +7944,8 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
             windows.append({
                 "date_key": target_date,
                 "start_dt": day_study_start,
-                "end_dt": datetime.combine(target_date, time(18, 0), tzinfo=TZ_BERLIN),
-                "duration_minutes": 9 * 60,
+                "end_dt": day_study_end,
+                "duration_minutes": int((day_study_end - day_study_start).total_seconds() / 60),
                 "description": "full day free for focused study",
                 "after": "morning",
                 "before": "evening",
@@ -7933,13 +7969,13 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
         # 1. Before first class
         first_busy = busy_intervals[0]
         if first_busy["start"] > day_study_start:
-            mins = (first_busy["start"] - day_study_start).total_seconds() / 60
-            if mins >= 90:
+            mins = (min(first_busy["start"], day_study_end) - day_study_start).total_seconds() / 60
+            if mins >= STUDY_WINDOW_EDGE_MIN_MINUTES:
                 first_title = first_busy["first_title"]
                 windows.append({
                     "date_key": target_date,
                     "start_dt": day_study_start,
-                    "end_dt": first_busy["start"],
+                    "end_dt": min(first_busy["start"], day_study_end),
                     "duration_minutes": int(mins),
                     "description": f"before {first_title}",
                     "after": "morning",
@@ -7952,7 +7988,7 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
             gap_s = busy_intervals[i]["end"]
             gap_e = busy_intervals[i + 1]["start"]
             mins = (gap_e - gap_s).total_seconds() / 60
-            if mins >= 60:
+            if mins >= STUDY_WINDOW_BETWEEN_MIN_MINUTES:
                 prev_title = busy_intervals[i]["last_title"]
                 next_title = busy_intervals[i + 1]["first_title"]
                 windows.append({
@@ -7971,7 +8007,7 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
         if last_busy["end"] < day_study_end:
             study_after_start = max(last_busy["end"], day_study_start)
             mins = (day_study_end - study_after_start).total_seconds() / 60
-            if mins >= 90:
+            if mins >= STUDY_WINDOW_EDGE_MIN_MINUTES:
                 last_title = last_busy["last_title"]
                 windows.append({
                     "date_key": target_date,
@@ -7991,7 +8027,7 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
                 continue
             if w["start_dt"] < reference_now < w["end_dt"]:
                 rem_mins = int((w["end_dt"] - reference_now).total_seconds() / 60)
-                if rem_mins >= 30:
+                if rem_mins >= STUDY_WINDOW_REMAINING_MIN_MINUTES:
                     w_c = dict(w)
                     w_c["start_dt"] = reference_now
                     w_c["duration_minutes"] = rem_mins
@@ -8004,15 +8040,18 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
     return windows
 
 
-def find_weekly_study_gaps(events: list) -> list:
-    """Find all good study windows across the week for backward compatibility and narration."""
-    if not events:
-        return []
-    dates = {ev["date_key"] for ev in events if ev.get("date_key")}
-    if not dates:
-        return []
-    min_date = min(dates)
-    week_start = min_date - timedelta(days=min_date.weekday())
+def find_weekly_study_gaps(events: list, week_start: Optional[date] = None) -> list:
+    """All good study windows Mon-Fri of one week. Shared by the weekly view
+    and the voice narration so both always describe the same week. Without
+    `week_start`, the Monday of the earliest event's week is used."""
+    if week_start is None:
+        dates = {ev["date_key"] for ev in events if ev.get("date_key")}
+        if not dates:
+            return []
+        min_date = min(dates)
+        week_start = min_date - timedelta(days=min_date.weekday())
+    elif isinstance(week_start, datetime):
+        week_start = week_start.date()
     all_windows = []
     for offset in range(5):  # Mon to Fri
         d = week_start + timedelta(days=offset)
@@ -8074,14 +8113,11 @@ async def send_weekly_calendar(sender, events: list, week_start):
         task_lines = ["\n✅ *Tasks This Week*", "━━━━━━━━━━━━━━━━━━"]
         for t in week_tasks:
             due = datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN)
-            course_line = f" [{t['course']}]" if t.get("course") else ""
-            task_lines.append(f"⏰ `{due.strftime('%a %d.%m %H:%M')}` - {t['text']}{course_line}")
+            course_line = f" ({_md(t['course'])})" if t.get("course") else ""
+            task_lines.append(f"⏰ `{due.strftime('%a %d.%m %H:%M')}` - {_md(t['text'])}{course_line}")
         text += "\n" + "\n".join(task_lines)
 
-    all_study_windows = []
-    for offset in range(5):  # Mon-Fri
-        d = week_start + timedelta(days=offset)
-        all_study_windows.extend(find_study_windows_for_day(events, d))
+    all_study_windows = find_weekly_study_gaps(events, week_start)
 
     if all_study_windows:
         gap_lines = ["\n📚 *Good Times to Study*", "━━━━━━━━━━━━━━━━━━"]
@@ -8090,13 +8126,12 @@ async def send_weekly_calendar(sender, events: list, week_start):
             by_day.setdefault(g["date_key"], []).append(g)
 
         for d in sorted(by_day.keys()):
-            day_name = d.strftime("%a")
-            d_lines = []
+            gap_lines.append(f"*{d:%a}*")
             for g in by_day[d]:
-                hours = g["duration_minutes"] / 60
-                duration_text = f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
-                d_lines.append(f"`{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}` ({duration_text}) - {g['description']}")
-            gap_lines.append(f"• *{day_name}*: " + ", ".join(d_lines))
+                gap_lines.append(
+                    f"   `{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}` "
+                    f"({_format_hours(g['duration_minutes'])}) - {_md(g['description'])}"
+                )
         text += "\n" + "\n".join(gap_lines)
 
     # Navigation buttons
@@ -8793,7 +8828,7 @@ async def send_studip_message(recipient_id: str, subject: str, message_body: str
     async with await session.post(url, data=json.dumps(payload), headers=headers) as r:
         status, resp_text = r.status, await r.text()
     if status == 401 and _retry:
-        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        use_oauth = studip_oauth.oauth_enabled()
         if use_oauth and studip_oauth.load_tokens() and await studip_oauth.get_access_token(force_refresh=True):
             return await send_studip_message(recipient_id, subject, message_body, _retry=False)
         # Self-healing silent SSO renewal attempt
@@ -9531,7 +9566,6 @@ async def delete_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-from telegram import ReplyKeyboardMarkup
 
 
 def get_main_keyboard():
@@ -15646,7 +15680,7 @@ async def check_whatsapp_health() -> tuple[bool, str]:
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            async with session.get("http://localhost:3838/status", timeout=5) as resp:
+            async with session.get(f"{WA_SERVICE_URL}/status", headers=WA_HEADERS, timeout=5) as resp:
                 if resp.status != 200:
                     return False, f"Service returned HTTP {resp.status}"
                 data = await resp.json()
@@ -15777,7 +15811,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed bot status"""
     global watcher_controller_running, global_watcher_paused, check_in_progress
 
-    use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+    use_oauth = studip_oauth.oauth_enabled()
     auth_label = "OAuth2 (StudyLoft)" if use_oauth else "Self-Healing Cookie"
     is_active = global_session and await global_session.is_logged_in()
     logged_in = f"✅ Yes ({auth_label})" if is_active else "❌ No"
@@ -15788,8 +15822,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         watcher_status = "🔴 Stopped"
 
-    global_paused = "✅ Yes" if global_watcher_paused else "❌ No"
-    active_check = "✅ Yes" if check_in_progress else "❌ No"
     wa_group_id = os.getenv("WA_GROUP_ID", "").strip()
 
     # Check WA Connection Status, and resolve the active group's display
@@ -15803,7 +15835,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            async with session.get("http://localhost:3838/status", timeout=2) as resp:
+            async with session.get(f"{WA_SERVICE_URL}/status", headers=WA_HEADERS, timeout=2) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     if data.get("isAuthenticated"):
@@ -15819,7 +15851,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if wa_group_id:
                 resolved = False
                 try:
-                    async with session.get("http://localhost:3838/group_name", params={"groupId": wa_group_id}, timeout=3) as resp:
+                    async with session.get(f"{WA_SERVICE_URL}/group_name", headers=WA_HEADERS, params={"groupId": wa_group_id}, timeout=3) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             if data.get("name"):
@@ -15828,7 +15860,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
                 if not resolved:
-                    async with session.get("http://localhost:3838/discovered_groups", timeout=2) as resp:
+                    async with session.get(f"{WA_SERVICE_URL}/discovered_groups", headers=WA_HEADERS, timeout=2) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             for g in data.get("groups", []):
@@ -15851,12 +15883,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 💾 System resource information
     process = psutil.Process()
-    with process.oneshot():
-        mem_mb = process.memory_info().rss / 1024 ** 2
-        cpu_percent = process.cpu_percent(interval=0.3)
-
+    mem_mb = process.memory_info().rss / 1024 ** 2
     total_mem = psutil.virtual_memory()
-    sys_cpu = psutil.cpu_percent(interval=0.3)
+    # cpu_percent(interval=...) sleeps, so sample it off the event loop
+    sys_cpu = await asyncio.to_thread(psutil.cpu_percent, 0.3)
 
     sys_info = (
         f"💾 <b>Bot Memory:</b> {mem_mb:.1f} MB\n"
@@ -15967,7 +15997,7 @@ async def _run_begin_flow(message, user, context: ContextTypes.DEFAULT_TYPE):
         if temp_message:
             try:
                 await temp_message.delete()
-            except:
+            except Exception:
                 pass
         await message.reply_text(f"❌ Error: {str(e)}")
 
@@ -15996,6 +16026,10 @@ async def main():
             logging.warning("⚠️ Not logged in to Stud.IP yet. Starting bot so you can sign in via /login.")
 
         app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        # Runs before every other handler (group -1): one allowlist check for
+        # all commands, buttons, messages and Mini App data, instead of
+        # relying on each handler to remember its own.
+        app.add_handler(TypeHandler(Update, _authorization_gate), group=-1)
 
         # Command & Callback handlers
         app.add_handler(CommandHandler("start", start))
@@ -16225,7 +16259,7 @@ def _cleanup_stale_whatsapp_service(wa_dir: str):
         except Exception as e:
             logging.debug(f"Error reading WhatsApp lock file: {e}")
 
-    port = int(os.environ.get("PORT", "3838"))
+    port = WA_SERVICE_PORT
     try:
         import socket
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:

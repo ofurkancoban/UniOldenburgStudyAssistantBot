@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -56,8 +57,21 @@ TOKEN_FILE = os.getenv("STUDIP_OAUTH_TOKEN_FILE", "studip_oauth_tokens.json")
 
 # Refresh this many seconds before the access token actually expires.
 EXPIRY_LEEWAY = 120
+# After a refresh fails for a transient reason (network, 5xx), wait this long
+# before trying again instead of hitting the token endpoint on every API call.
+REFRESH_RETRY_BACKOFF = 60
 
 _refresh_lock = asyncio.Lock()
+_refresh_blocked_until = 0.0
+
+
+class RefreshRejected(RuntimeError):
+    """The server refused the refresh token itself (revoked, rotated, expired)."""
+
+
+def oauth_enabled() -> bool:
+    """Whether JSON:API calls should carry the OAuth2 bearer token (USE_STUDIP_OAUTH)."""
+    return os.getenv("USE_STUDIP_OAUTH", "false").strip().lower() in ("true", "1", "yes")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -109,19 +123,25 @@ def load_tokens() -> Optional[dict]:
     if tokens is not None:
         logger.warning("Restored OAuth tokens from %s", bak)
         try:
-            save_tokens(tokens)
+            save_tokens(tokens, fresh=False)
         except OSError:
             pass
     return tokens
 
 
-def save_tokens(tokens: dict) -> None:
-    """Write encrypted tokens atomically with 0600 - these are account credentials."""
+def save_tokens(tokens: dict, fresh: bool = True) -> None:
+    """Write encrypted tokens atomically with 0600 - these are account credentials.
+
+    `fresh` marks a token response the server just issued: only then are
+    `expires_at` and `refreshed_at` derived from `expires_in`. Re-saving
+    stored tokens (e.g. restoring the .bak file) keeps their real expiry, so
+    a stale access token never looks valid again."""
     tokens = dict(tokens)
     now = _now()
-    if "expires_at" not in tokens or "expires_in" in tokens:
+    if fresh or "expires_at" not in tokens:
         tokens["expires_at"] = now + int(tokens.get("expires_in", 3600))
-    tokens["refreshed_at"] = now
+    if fresh or "refreshed_at" not in tokens:
+        tokens["refreshed_at"] = now
     from studip_vault import write_vault_file
     for target in (TOKEN_FILE, f"{TOKEN_FILE}.bak"):
         write_vault_file(target, tokens, mode=0o600)
@@ -172,7 +192,7 @@ async def authorize_with_session(session, timeout: int = 30) -> dict:
 
     # Already-authorized clients may skip the consent screen entirely.
     if status in (301, 302, 303, 307) and "code=" in location:
-        return await _exchange_code(session, location, verifier)
+        return await _exchange_code(session, location, verifier, state)
 
     if status != 200:
         raise RuntimeError(f"authorize returned HTTP {status}: {_oauth_error(body)}")
@@ -202,13 +222,16 @@ async def authorize_with_session(session, timeout: int = 30) -> dict:
             f"Consent rejected (HTTP {status}, Location={location or '-'}): "
             f"{_oauth_error(body)}"
         )
-    return await _exchange_code(session, location, verifier)
+    return await _exchange_code(session, location, verifier, state)
 
 
-async def _exchange_code(session, redirect_location: str, verifier: str) -> dict:
+async def _exchange_code(session, redirect_location: str, verifier: str, state: str) -> dict:
     match = re.search(r"[?&]code=([^&]+)", redirect_location)
     if not match:
         raise RuntimeError(f"No authorization code in redirect: {redirect_location}")
+    state_match = re.search(r"[?&]state=([^&]+)", redirect_location)
+    if not state_match or not hmac.compare_digest(state_match.group(1), state):
+        raise RuntimeError("OAuth state mismatch in the authorization redirect; refusing the code.")
     code = match.group(1)
     logger.info("Authorization code received (%s...)", code[:10])
 
@@ -250,6 +273,8 @@ async def refresh(tokens: Optional[dict] = None) -> dict:
             status = resp.status
             text = await resp.text()
 
+    if status == 401 or (status == 400 and "invalid_grant" in text):
+        raise RefreshRejected(f"Refresh token rejected (HTTP {status}): {_oauth_error(text)}")
     if status != 200 or not text.lstrip().startswith("{"):
         raise RuntimeError(f"Refresh failed (HTTP {status}): {_oauth_error(text)}")
 
@@ -273,6 +298,7 @@ async def get_access_token(force_refresh: bool = False) -> Optional[str]:
     if not force_refresh and not is_expired(tokens):
         return tokens.get("access_token")
 
+    global _refresh_blocked_until
     async with _refresh_lock:
         tokens = load_tokens()
         if tokens is None:
@@ -282,10 +308,20 @@ async def get_access_token(force_refresh: bool = False) -> Optional[str]:
         recently_refreshed = (_now() - float(tokens.get("refreshed_at", 0))) < 10
         if not is_expired(tokens) and (not force_refresh or recently_refreshed):
             return tokens.get("access_token")
+        if _now() < _refresh_blocked_until:
+            return None if is_expired(tokens, leeway=0) else tokens.get("access_token")
         try:
             tokens = await refresh(tokens)
+            _refresh_blocked_until = 0.0
+        except RefreshRejected as exc:
+            # A dead refresh token never recovers; drop it so callers fall
+            # back to the cookie session instead of retrying on every request.
+            logger.warning("%s - clearing stored OAuth tokens, a fresh login is needed.", exc)
+            clear_tokens()
+            return None
         except Exception as exc:
-            logger.warning("Token refresh failed: %s", exc)
+            logger.warning("Token refresh failed: %s (retrying in %ss)", exc, REFRESH_RETRY_BACKOFF)
+            _refresh_blocked_until = _now() + REFRESH_RETRY_BACKOFF
             if is_expired(tokens, leeway=0):
                 return None
         return tokens.get("access_token")
@@ -328,7 +364,7 @@ async def _cli_login() -> int:
         print("SSO login failed.")
         return 1
     print("Running the OAuth consent flow...")
-    tokens = await authorize_with_session(session)
+    await authorize_with_session(session)
     await session.close()
     print(f"OK - {describe_tokens()}")
     print(f"Stored in {TOKEN_FILE}")

@@ -9,6 +9,7 @@ import qrcode from 'qrcode';
 import FormData from 'form-data';
 import https from 'https';
 import fs from 'fs';
+import crypto from 'crypto';
 import { useResilientAuthState } from './auth_state.js';
 
 // The libsignal dependency (used internally by Baileys for the Signal
@@ -26,6 +27,29 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3838;
+// Loopback only by default: the bot is the sole client, and nothing else on
+// the network should be able to send messages from this WhatsApp account.
+const HOST = process.env.WA_HOST || '127.0.0.1';
+// Shared secret with the bot (it generates one per run and passes it in the
+// environment when it spawns this service, or WA_SERVICE_TOKEN from .env).
+const SERVICE_TOKEN = (process.env.WA_SERVICE_TOKEN || '').trim();
+
+function tokenMatches(received) {
+    const a = Buffer.from(String(received || ''));
+    const b = Buffer.from(SERVICE_TOKEN);
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+if (!SERVICE_TOKEN) {
+    console.error('WA_SERVICE_TOKEN is not set - every request will be rejected. Start the service from the bot or set it in .env.');
+}
+
+app.use((req, res, next) => {
+    if (!SERVICE_TOKEN || !tokenMatches(req.get('X-WA-Service-Token'))) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+    next();
+});
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ALLOWED_USER_IDS = process.env.ALLOWED_USER_IDS ? process.env.ALLOWED_USER_IDS.split(',') : [];
 const AUTH_DIR = 'baileys_auth';
@@ -597,8 +621,8 @@ process.on('SIGINT', cleanupAndExit);
 process.on('SIGTERM', cleanupAndExit);
 process.on('SIGQUIT', cleanupAndExit);
 
-const server = app.listen(PORT, () => {
-    console.log(`WhatsApp service listening on port ${PORT}`);
+const server = app.listen(PORT, HOST, () => {
+    console.log(`WhatsApp service listening on ${HOST}:${PORT}`);
     // Start WhatsApp connection ONLY after the HTTP port is bound
     connectToWhatsApp();
 });

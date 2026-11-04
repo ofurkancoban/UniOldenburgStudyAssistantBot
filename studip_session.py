@@ -184,7 +184,7 @@ class StudIPSession:
             if await self.heal_session():
                 return True
 
-        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        use_oauth = studip_oauth.oauth_enabled()
         if allow_oauth and use_oauth:
             try:
                 token = await studip_oauth.get_access_token()
@@ -211,7 +211,7 @@ class StudIPSession:
             has_headless_creds = bool(
                 self.username and self.password and (self.totp_secret or self.totp_code)
             )
-            use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+            use_oauth = studip_oauth.oauth_enabled()
             if not has_headless_creds and not os.path.exists(self.cookie_file):
                 if not force and use_oauth:
                     try:
@@ -251,7 +251,7 @@ class StudIPSession:
         """Keep Stud.IP web session and NetIQ IDP cookies warm; heal session if needed."""
         if self.explicitly_logged_out or (time.time() - self.last_interactive_activity < 180):
             return
-        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        use_oauth = studip_oauth.oauth_enabled()
         if not os.path.exists(self.cookie_file) and (not use_oauth or studip_oauth.load_tokens() is None):
             return
         await self.ensure_session()
@@ -514,7 +514,7 @@ class StudIPSession:
         Stud.IP's JSON:API accepts session cookies directly; OAuth tokens are only
         used when USE_STUDIP_OAUTH is explicitly enabled.
         """
-        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        use_oauth = studip_oauth.oauth_enabled()
         if not use_oauth:
             return {}
         if "/jsonapi.php/" not in url:

@@ -260,14 +260,14 @@ class LoginServer:
     """Runs the Stud.IP + Uni Oldenburg SSO reverse proxy on the bot's event loop."""
 
     def __init__(self, on_login: LoginCallback, port: Optional[int] = None,
-                 host: str = "0.0.0.0", bot_token: Optional[str] = None,
+                 host: Optional[str] = None, bot_token: Optional[str] = None,
                  allowed_user_ids: Optional[set[int]] = None,
                  base_url_provider: Optional[Callable[[], str]] = None,
                  session_provider: Optional[Callable[[], object]] = None,
                  on_session_authenticated: Optional[Callable[[], Awaitable[None]]] = None):
         self.on_login = on_login
         self.port = int(port or os.getenv("LOGIN_PORT", "8899"))
-        self.host = host
+        self.host = host or self._default_host()
         self.bot_token = bot_token or os.getenv("TELEGRAM_TOKEN", "")
         self.allowed_user_ids = allowed_user_ids or set()
         self.base_url_provider = base_url_provider
@@ -275,9 +275,34 @@ class LoginServer:
         self.on_session_authenticated = on_session_authenticated
         self._tokens: dict[str, dict] = {}
         self._proxy_sessions: dict[str, dict] = {}
+        # Mixed into the cookie signing key. A fresh one per process and per
+        # revoke_all() invalidates every proxy cookie handed out before.
+        self._cookie_salt = secrets.token_bytes(16)
         self._runner: Optional[web.AppRunner] = None
         self._busy = False
         self._last_auth_notify = 0.0
+
+    @staticmethod
+    def _default_host() -> str:
+        """Loopback when a tunnel or reverse proxy fronts the server (nothing
+        else needs to reach it); all interfaces only for the LAN link mode."""
+        explicit = os.getenv("LOGIN_HOST", "").strip()
+        if explicit:
+            return explicit
+        if os.getenv("LOGIN_PUBLIC_URL", "").strip() or os.getenv("CLOUDFLARE_TUNNEL", "").strip():
+            return "127.0.0.1"
+        return "0.0.0.0"
+
+    def _is_allowed(self, user_id) -> bool:
+        # Fail closed: an empty allowlist must not open the proxy (and with it
+        # the whole Stud.IP account) to every Telegram user.
+        return bool(self.allowed_user_ids) and user_id in self.allowed_user_ids
+
+    def revoke_all(self) -> None:
+        """Invalidate every link token and proxy cookie (called on /logout)."""
+        self._tokens.clear()
+        self._proxy_sessions.clear()
+        self._cookie_salt = secrets.token_bytes(16)
 
     # ── urls / tokens ─────────────────────────────────────────────────────
     def base_url(self) -> str:
@@ -308,8 +333,12 @@ class LoginServer:
 
     def _cookie_key(self) -> bytes:
         return hashlib.sha256(
-            f"studip-proxy-cookie:{self.bot_token or 'local'}".encode("utf-8")
+            b"studip-proxy-cookie:" + self._cookie_salt + (self.bot_token or "local").encode("utf-8")
         ).digest()
+
+    def _csrf_token(self, sid: str) -> str:
+        """Per-session token required by state-changing GET links (Relink)."""
+        return hmac.new(self._cookie_key(), f"csrf:{sid}".encode("utf-8"), hashlib.sha256).hexdigest()[:32]
 
     def _create_proxy_session(self, user_id: int) -> str:
         self._purge()
@@ -328,7 +357,12 @@ class LoginServer:
         sid = request.cookies.get(PROXY_COOKIE, "")
         sess = self._proxy_sessions.get(sid)
         if sess:
-            sess["expires"] = time.time() + PROXY_SESSION_TTL
+            # No sliding expiry: a cookie stops working at its signed expiry
+            # however often it is used.
+            if sess["expires"] < time.time():
+                self._proxy_sessions.pop(sid, None)
+                return None
+            sess["sid"] = sid
             return sess
         parts = sid.split(".")
         if len(parts) == 3:
@@ -344,9 +378,9 @@ class LoginServer:
                 self._cookie_key(), f"{uid}.{exp}".encode("utf-8"), hashlib.sha256
             ).hexdigest()
             if hmac.compare_digest(sig, expected):
-                if self.allowed_user_ids and uid not in self.allowed_user_ids:
+                if not self._is_allowed(uid):
                     return None
-                sess = {"user_id": uid, "expires": float(exp)}
+                sess = {"user_id": uid, "expires": float(exp), "sid": sid}
                 self._proxy_sessions[sid] = sess
                 return sess
         return None
@@ -386,7 +420,7 @@ class LoginServer:
         if not user:
             return web.json_response({"ok": False, "error": "Invalid Telegram data."}, status=401)
         user_id = user.get("id")
-        if self.allowed_user_ids and user_id not in self.allowed_user_ids:
+        if not self._is_allowed(user_id):
             logger.warning("Mini App access from unauthorised user %s", user_id)
             return web.json_response({"ok": False, "error": "Not authorized."}, status=403)
 
@@ -399,7 +433,7 @@ class LoginServer:
         self._purge()
         token = request.match_info["token"]
         info = self._tokens.pop(token, None)
-        if not info:
+        if not info or not self._is_allowed(info.get("user_id")):
             return web.Response(
                 text="<h1>Link expired</h1><p>Please send /login again in Telegram.</p>",
                 status=410,
@@ -412,10 +446,16 @@ class LoginServer:
         raise resp
 
     async def _bot_entry(self, request: web.Request) -> web.Response:
-        if not self._check_proxy_session(request):
-            return web.HTTPFound("/app")
+        proxy_sess = self._check_proxy_session(request)
+        if not proxy_sess:
+            raise web.HTTPFound("/app")
 
-        relogin = request.query.get("relogin") == "1"
+        # Relink logs the bot out of Stud.IP, so it must not be triggerable by
+        # a cross-site GET (the cookie is SameSite=None for the Mini App
+        # iframe): it only counts with this session's CSRF token.
+        relogin = request.query.get("relogin") == "1" and hmac.compare_digest(
+            request.query.get("csrf", ""), self._csrf_token(proxy_sess.get("sid", ""))
+        )
         studip_sess = self.session_provider() if self.session_provider else None
         if studip_sess is not None:
             studip_sess.last_interactive_activity = time.time()
@@ -461,10 +501,12 @@ class LoginServer:
 
     # ── reverse proxy ─────────────────────────────────────────────────────
     async def _proxy(self, request: web.Request) -> web.StreamResponse:
-        if not self._check_proxy_session(request):
+        proxy_sess = self._check_proxy_session(request)
+        if not proxy_sess:
             if request.path in ("/", "/app"):
                 return await self._app_gate(request)
-            return web.HTTPFound("/app")
+            raise web.HTTPFound("/app")
+        relink_href = f"/_bot/entry?relogin=1&csrf={self._csrf_token(proxy_sess.get('sid', ''))}"
 
         studip_sess = self.session_provider() if self.session_provider else None
         if studip_sess is None:
@@ -535,7 +577,10 @@ class LoginServer:
             charset = "utf-8"
             if "charset=" in ctype.lower():
                 charset = ctype.lower().split("charset=")[-1].split(";")[0].strip() or "utf-8"
-            text = raw_body.decode(charset, errors="replace")
+            try:
+                text = raw_body.decode(charset, errors="replace")
+            except LookupError:  # unknown charset label from upstream
+                text = raw_body.decode("utf-8", errors="replace")
             text = _ATTR_ORIGIN_RE.sub(r"\1/", text)
             text = _JS_ORIGIN_RE.sub(r"\1/", text)
 
@@ -560,6 +605,7 @@ class LoginServer:
                     + _STATUS_BAR_SNIPPET.replace("__STATUS_TEXT__", "🔐 Uni Oldenburg Login")
                 )
 
+            bar = bar.replace("/_bot/entry?relogin=1", relink_href)
             if "</body>" in text:
                 text = text.replace("</body>", f"{bar}</body>", 1)
             else:
@@ -585,7 +631,7 @@ class LoginServer:
         if not user:
             return web.json_response({"ok": False, "error": "Invalid Telegram data."}, status=401)
         user_id = user.get("id")
-        if self.allowed_user_ids and user_id not in self.allowed_user_ids:
+        if not self._is_allowed(user_id):
             return web.json_response({"ok": False, "error": "Not authorised."}, status=403)
         try:
             body = await request.json()
