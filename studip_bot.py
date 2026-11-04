@@ -2866,11 +2866,22 @@ def get_menu_navigation_keyboard(prev_path=None, next_path=None, current_path="2
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show daily food menu in the requested format"""
+    query = update.callback_query
+    if query:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+    message = update.effective_message
+    if not message:
+        return
+
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else None
 
     if user_id is None or not is_user_allowed(user_id):
-        await update.message.reply_text("Not authorized to use this bot.")
+        await message.reply_text("Not authorized to use this bot.")
         return
 
     try:
@@ -2885,7 +2896,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Dish photos are opt-in via the "📸 Show Dish Photos" button below,
         # not sent automatically — see handle_menu_photos_button.
-        await update.message.reply_text(
+        await message.reply_text(
             menu_text,
             parse_mode="HTML",
             reply_markup=get_menu_navigation_keyboard(prev, next_)
@@ -2893,7 +2904,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         error_msg = f"❌ Error loading menu:\n{str(e)}"
-        await update.message.reply_text(
+        await message.reply_text(
             error_msg,
             reply_markup=get_main_keyboard()
         )
@@ -15701,7 +15712,7 @@ async def main():
         app.add_handler(CallbackQueryHandler(show_last_announcements, pattern="^show_last_announcements$"))
         app.add_handler(CallbackQueryHandler(show_last_files, pattern="^show_last_files$"))
         app.add_handler(CallbackQueryHandler(show_last_forum_posts, pattern="^show_last_forum_posts$"))
-        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(studip_login|studip_logout|start_watchers|stop_watchers|request_wa_qr|force_wa_qr|detect_wa_groups|wa_test_message|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu)$"))
+        app.add_handler(CallbackQueryHandler(handle_status_buttons, pattern="^(studip_login|studip_logout|start_watchers|stop_watchers|request_wa_qr|force_wa_qr|detect_wa_groups|wa_test_message|change_ical_link|fastenroll_menu|fastenroll_new|fastenroll_list_inline|wa_menu|mensa_food)$"))
         app.add_handler(CallbackQueryHandler(handle_exam_buttons, pattern="^(exam_menu|exam_noop|exam_cancel|exam_ask\\|.*|exam_do\\|.*)$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_wa_ask, pattern="^examopen_wa_ask\\|.*$"))
         app.add_handler(CallbackQueryHandler(handle_examopen_wa_confirm, pattern="^examopen_wa_confirm\\|.*$"))
