@@ -7,7 +7,7 @@ beautifulsoup4>=4.14,<5
 lxml>=6.0,<7
 pyotp>=2.9,<3
 psutil>=7.1,<8
-cryptography>=45,<47       # studip_vault: encrypted cookies / OAuth tokens
+cryptography>=45,<51       # studip_vault: encrypted cookies / OAuth tokens
 
 # Voice, documents and AI providers
 SpeechRecognition>=3.17,<4
