@@ -1100,10 +1100,11 @@ async def _on_proxy_session_authenticated() -> None:
                 studip_cookie = c.value
                 break
 
-    need_oauth = studip_oauth.is_expired(studip_oauth.load_tokens())
+    use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+    need_oauth = use_oauth and studip_oauth.is_expired(studip_oauth.load_tokens())
     is_new_session = bool(studip_cookie and studip_cookie != _last_notified_studip_cookie)
 
-    if is_new_session or need_oauth:
+    if use_oauth and (is_new_session or need_oauth):
         _studip_api_user_id = None
         _studip_user_profile = None
         try:
@@ -1111,15 +1112,21 @@ async def _on_proxy_session_authenticated() -> None:
             await get_studip_user_profile()
         except Exception as exc:
             logging.warning(f"⚠️ OAuth consent after proxy login failed: {exc}")
+    elif is_new_session or _studip_user_profile is None:
+        try:
+            await get_studip_user_profile()
+        except Exception as exc:
+            logging.debug(f"Profile sync after login: {exc}")
 
     if is_new_session:
         _last_notified_studip_cookie = studip_cookie
         if _menu_app is not None:
+            auth_msg = "Your session and OAuth2 token are active" if use_oauth else "Your self-healing session is active"
             for uid in ALLOWED_USER_IDS or []:
                 try:
                     await _menu_app.bot.send_message(
                         chat_id=uid,
-                        text="✅ Signed in to Stud.IP. Your session and OAuth2 token are active and will be kept alive automatically.",
+                        text=f"✅ Signed in to Stud.IP. {auth_msg} and will be kept alive automatically.",
                     )
                 except Exception as exc:
                     logging.warning(f"⚠️ Could not send login confirmation to {uid}: {exc}")
@@ -1220,18 +1227,20 @@ async def _perform_web_login(username: str, password: str, totp: str) -> tuple[b
     global _studip_api_user_id
     _studip_api_user_id = None
 
-    # Mint an OAuth token so API traffic no longer needs the password either.
-    try:
-        await studip_oauth.authorize_with_session(session)
-    except Exception as exc:
-        logging.warning(f"⚠️ OAuth consent failed after web login: {exc}")
+    use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+    if use_oauth:
+        try:
+            await studip_oauth.authorize_with_session(session)
+        except Exception as exc:
+            logging.warning(f"⚠️ OAuth consent failed after web login: {exc}")
 
     if _menu_app is not None:
+        auth_msg = "Your session and OAuth2 token are active" if use_oauth else "Your self-healing session is active"
         for uid in ALLOWED_USER_IDS or []:
             try:
                 await _menu_app.bot.send_message(
                     chat_id=uid,
-                    text="✅ Signed in to Stud.IP. Your session and OAuth2 token are active and will be kept alive automatically.",
+                    text=f"✅ Signed in to Stud.IP. {auth_msg} and will be kept alive automatically.",
                 )
             except Exception as exc:
                 logging.warning(f"⚠️ Could not send login confirmation to {uid}: {exc}")
@@ -1276,7 +1285,8 @@ async def _perform_logout() -> None:
     _last_notified_studip_cookie = None
     if global_session is not None:
         await global_session.logout()
-    else:
+    use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+    if use_oauth:
         studip_oauth.clear_tokens()
 
 
@@ -3408,7 +3418,11 @@ async def studip_api_get(path: str, params: Optional[dict] = None, _retry: bool 
     async with await session.get(url, params=params) as r:
         status, text = r.status, await r.text()
     if status == 401 and _retry:
-        if studip_oauth.load_tokens() and await studip_oauth.get_access_token(force_refresh=True):
+        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        if use_oauth and studip_oauth.load_tokens() and await studip_oauth.get_access_token(force_refresh=True):
+            return await studip_api_get(path, params, _retry=False)
+        # Self-healing silent SSO renewal attempt
+        if await session.heal_session():
             return await studip_api_get(path, params, _retry=False)
         await session.login(force=True)
         return await studip_api_get(path, params, _retry=False)
@@ -5210,11 +5224,9 @@ async def message_poll_loop(app) -> None:
         await asyncio.sleep(MESSAGE_POLL_SECONDS)
         if global_watcher_paused or global_session is None or admin_id is None:
             continue
-        if (
-            global_session.explicitly_logged_out
-            or (time.time() - getattr(global_session, "last_interactive_activity", 0.0) < 180)
-            or (not os.path.exists(global_session.cookie_file) and studip_oauth.load_tokens() is None)
-        ):
+        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        has_auth = os.path.exists(global_session.cookie_file) or (use_oauth and studip_oauth.load_tokens() is not None)
+        if not has_auth:
             continue
         try:
             await check_new_messages(app.bot, admin_id, silent=True)
@@ -8429,7 +8441,11 @@ async def send_studip_message(recipient_id: str, subject: str, message_body: str
     async with await session.post(url, data=json.dumps(payload), headers=headers) as r:
         status, resp_text = r.status, await r.text()
     if status == 401 and _retry:
-        if studip_oauth.load_tokens() and await studip_oauth.get_access_token(force_refresh=True):
+        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        if use_oauth and studip_oauth.load_tokens() and await studip_oauth.get_access_token(force_refresh=True):
+            return await send_studip_message(recipient_id, subject, message_body, _retry=False)
+        # Self-healing silent SSO renewal attempt
+        if await session.heal_session():
             return await send_studip_message(recipient_id, subject, message_body, _retry=False)
         await session.login(force=True)
         return await send_studip_message(recipient_id, subject, message_body, _retry=False)
@@ -15441,7 +15457,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed bot status"""
     global watcher_controller_running, global_watcher_paused, check_in_progress
 
-    logged_in = "✅ Yes" if global_session and await global_session.is_logged_in() else "❌ No"
+    use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+    auth_label = "OAuth2 (StudyLoft)" if use_oauth else "Self-Healing Cookie"
+    is_active = global_session and await global_session.is_logged_in()
+    logged_in = f"✅ Yes ({auth_label})" if is_active else "❌ No"
 
     # Watcher durumu
     if watcher_controller_running:

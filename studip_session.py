@@ -148,11 +148,44 @@ class StudIPSession:
             self.logger.error(f"is_html_logged_in check failed: {e}")
             return False
 
+    async def heal_session(self) -> bool:
+        """Attempt self-healing silent SSO renewal using stored NetIQ SSO cookies."""
+        if self.explicitly_logged_out or (time.time() - self.last_interactive_activity < 180):
+            return False
+        if not os.path.exists(self.cookie_file):
+            return False
+
+        async with self._lock:
+            self.logger.info("🔧 [Self-Healing] Attempting silent SSO renewal using warm NetIQ cookies...")
+            await self.ensure_session()
+            elearn = "https://elearning.uni-oldenburg.de"
+            login_link_cancel = f"{elearn}/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
+            try:
+                await self._run_sso_flow(login_link_cancel, referer=f"{elearn}/dispatch.php/my_courses")
+                if await self.is_html_logged_in():
+                    self.explicitly_logged_out = False
+                    await self.save_cookies()
+                    self.logger.info("✅ [Self-Healing] Session successfully healed and restored!")
+                    return True
+                else:
+                    self.logger.warning("⚠️ [Self-Healing] Silent SSO flow finished but login markers missing.")
+                    return False
+            except Exception as exc:
+                self.logger.warning(f"⚠️ [Self-Healing] Silent SSO flow failed: {exc}")
+                return False
+
     async def is_logged_in(self, allow_oauth: bool = True) -> bool:
-        """Check if the session is authenticated (via HTML cookie or OAuth2 token)."""
+        """Check if authenticated (via HTML cookie, automatic self-healing, or OAuth2)."""
         if await self.is_html_logged_in():
             return True
-        if allow_oauth:
+
+        # Automatic self-healing: if HTML session dropped, silently renew via warm NetIQ cookies
+        if os.path.exists(self.cookie_file):
+            if await self.heal_session():
+                return True
+
+        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        if allow_oauth and use_oauth:
             try:
                 token = await studip_oauth.get_access_token()
                 if token:
@@ -178,8 +211,9 @@ class StudIPSession:
             has_headless_creds = bool(
                 self.username and self.password and (self.totp_secret or self.totp_code)
             )
+            use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
             if not has_headless_creds and not os.path.exists(self.cookie_file):
-                if not force:
+                if not force and use_oauth:
                     try:
                         if await studip_oauth.get_access_token():
                             return True
@@ -204,7 +238,7 @@ class StudIPSession:
                 return True
             except Exception as e:
                 self.logger.warning(f"SSO login flow did not complete: {e}")
-                if not force:
+                if not force and use_oauth:
                     try:
                         if await studip_oauth.get_access_token():
                             self.logger.info("Using active OAuth2 token session.")
@@ -214,16 +248,18 @@ class StudIPSession:
                 return False
 
     async def keep_alive(self) -> None:
-        """Keep OAuth2 tokens, Stud.IP web session, and NetIQ IDP cookies warm."""
+        """Keep Stud.IP web session and NetIQ IDP cookies warm; heal session if needed."""
         if self.explicitly_logged_out or (time.time() - self.last_interactive_activity < 180):
             return
-        if not os.path.exists(self.cookie_file) and studip_oauth.load_tokens() is None:
+        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        if not os.path.exists(self.cookie_file) and (not use_oauth or studip_oauth.load_tokens() is None):
             return
         await self.ensure_session()
-        try:
-            await studip_oauth.get_access_token()
-        except Exception as exc:
-            self.logger.debug(f"OAuth keep-alive skipped: {exc}")
+        if use_oauth:
+            try:
+                await studip_oauth.get_access_token()
+            except Exception as exc:
+                self.logger.debug(f"OAuth keep-alive skipped: {exc}")
 
         for sso_url in (
             "https://login.uni-oldenburg.de/nidp/app",
@@ -238,11 +274,10 @@ class StudIPSession:
 
         try:
             if not await self.is_html_logged_in():
-                # Try silent SSO renewal if NetIQ IDP cookies are still warm
-                elearn = "https://elearning.uni-oldenburg.de"
-                login_link_cancel = f"{elearn}/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
-                await self._run_sso_flow(login_link_cancel, referer=f"{elearn}/dispatch.php/my_courses")
-            await self.save_cookies()
+                # Silently heal session using warm NetIQ cookies
+                await self.heal_session()
+            else:
+                await self.save_cookies()
         except Exception as exc:
             self.logger.debug(f"Web session keep-alive renewal skipped: {exc}")
 
@@ -474,11 +509,14 @@ class StudIPSession:
         raise RuntimeError(f"SSO flow did not complete; stuck at {curr_url}")
 
     async def _bearer_headers(self, url: str) -> dict:
-        """OAuth bearer header for JSON:API requests (empty for anything else).
+        """OAuth bearer header for JSON:API requests (only if USE_STUDIP_OAUTH is enabled).
 
-        Stud.IP's OAuth tokens are accepted by /jsonapi.php/ only; regular
-        dispatch.php pages still authenticate through the cookie jar.
+        Stud.IP's JSON:API accepts session cookies directly; OAuth tokens are only
+        used when USE_STUDIP_OAUTH is explicitly enabled.
         """
+        use_oauth = os.getenv("USE_STUDIP_OAUTH", "false").lower() in ("true", "1", "yes")
+        if not use_oauth:
+            return {}
         if "/jsonapi.php/" not in url:
             return {}
         try:
