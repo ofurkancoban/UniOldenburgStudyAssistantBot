@@ -1121,12 +1121,11 @@ async def _on_proxy_session_authenticated() -> None:
     if is_new_session:
         _last_notified_studip_cookie = studip_cookie
         if _menu_app is not None:
-            auth_msg = "Your session and OAuth2 token are active" if use_oauth else "Your self-healing session is active"
             for uid in ALLOWED_USER_IDS or []:
                 try:
                     await _menu_app.bot.send_message(
                         chat_id=uid,
-                        text=f"✅ Signed in to Stud.IP. {auth_msg} and will be kept alive automatically.",
+                        text="✅ Signed in to Stud.IP.",
                     )
                 except Exception as exc:
                     logging.warning(f"⚠️ Could not send login confirmation to {uid}: {exc}")
@@ -1235,12 +1234,11 @@ async def _perform_web_login(username: str, password: str, totp: str) -> tuple[b
             logging.warning(f"⚠️ OAuth consent failed after web login: {exc}")
 
     if _menu_app is not None:
-        auth_msg = "Your session and OAuth2 token are active" if use_oauth else "Your self-healing session is active"
         for uid in ALLOWED_USER_IDS or []:
             try:
                 await _menu_app.bot.send_message(
                     chat_id=uid,
-                    text=f"✅ Signed in to Stud.IP. {auth_msg} and will be kept alive automatically.",
+                    text="✅ Signed in to Stud.IP.",
                 )
             except Exception as exc:
                 logging.warning(f"⚠️ Could not send login confirmation to {uid}: {exc}")
