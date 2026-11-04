@@ -31,7 +31,7 @@ import logging
 import os
 import json
 import psutil
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date, time
 from typing import Any, Optional, Union
 from zoneinfo import ZoneInfo
 from telegram.constants import ChatAction
@@ -4982,6 +4982,17 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
         lines.append("\n\n".join(course_blocks))
         schedule_text = "\n".join(lines)
 
+    # 2a. Today's study windows
+    study_windows = find_study_windows_for_day(events, today_date)
+    study_text = ""
+    if study_windows:
+        study_lines = ["📚 <b>Good Times to Study:</b>"]
+        for g in study_windows:
+            hours = g["duration_minutes"] / 60
+            duration_text = f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
+            study_lines.append(f"🕒 <code>{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}</code> ({duration_text}) - {g['description']}")
+        study_text = "\n\n" + "\n".join(study_lines)
+
     # 2b. Today's tasks (reminders due today, regardless of which
     # ALLOWED_USER_IDS entry created them — they're the same person's
     # other devices, see get_primary_user_name).
@@ -5049,7 +5060,7 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
         "━━━━━━━━━━━━━━━━━━\n\n"
     )
 
-    final_text = f"{header}{schedule_text}{weather_text}{tasks_text}{food_text}{countdown_text}\n\n━━━━━━━━━━━━━━━━━━"
+    final_text = f"{header}{schedule_text}{study_text}{weather_text}{tasks_text}{food_text}{countdown_text}\n\n━━━━━━━━━━━━━━━━━━"
 
     # 4. Photo of the lunch pick, when one can be matched on the
     # Studierendenwerk's public Speiseplan site — same as the standalone
@@ -7813,6 +7824,19 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
         lines.append("━━━━━━━━━━━━━━━━━━")
         text = "\n".join(lines) + weather_block
 
+    now = datetime.now(TZ_BERLIN)
+    study_windows = find_study_windows_for_day(events, target_date, reference_now=now if target_date == now.date() else None)
+    if study_windows:
+        gap_lines = ["\n📚 *Good Times to Study*", "━━━━━━━━━━━━━━━━━━"]
+        for g in study_windows:
+            hours = g["duration_minutes"] / 60
+            duration_text = f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
+            rem_tag = " _(available now)_" if g.get("is_remaining") else ""
+            gap_lines.append(
+                f"🕒 `{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}` ({duration_text}){rem_tag} - {g['description']}"
+            )
+        text += "\n" + "\n".join(gap_lines)
+
     keyboard = [
         [
             InlineKeyboardButton("📆 Week Plan", callback_data="calendar_weekly"),
@@ -7859,39 +7883,141 @@ STUDY_GAP_MIN_MINUTES = 90  # shorter gaps aren't really worth flagging — bare
 STUDY_GAP_MAX_MINUTES = 6 * 60  # an end-of-day/no-more-classes gap isn't "squeezed between commitments", just free time — not what this is for
 
 
-def find_weekly_study_gaps(events: list) -> list:
-    """Find free windows squeezed *between* two classes on the same day
-    that are long enough to be worth flagging as good study time (at
-    least STUDY_GAP_MIN_MINUTES, capped at STUDY_GAP_MAX_MINUTES so a
-    day's last class doesn't count the rest of the day as a "gap").
-    Returns a list of {"date_key", "start_dt", "end_dt", "duration_minutes",
-    "after", "before"} dicts, sorted chronologically."""
-    events_by_day: dict = {}
-    for ev in events:
-        if not ev.get("start_dt") or not ev.get("end_dt"):
-            continue
-        events_by_day.setdefault(ev["date_key"], []).append(ev)
+def find_study_windows_for_day(events: list, target_date: date, reference_now: Optional[datetime] = None) -> list[dict]:
+    """Find good study windows for a single day:
+      - Full day free (Mon-Fri) if no classes are scheduled.
+      - Free time before the first class (e.g. 09:00 to first class start, if >= 90 mins).
+      - Free time between classes (gaps >= 60 mins).
+      - Free time after the last class (last class end to 19:00, if >= 90 mins).
+    If `reference_now` is provided and target_date == reference_now.date(),
+    dynamically excludes expired windows and updates ongoing windows to reflect
+    remaining time today.
+    """
+    day_events = [
+        ev for ev in events
+        if ev.get("date_key") == target_date and not ev.get("is_cancelled")
+    ]
 
-    gaps = []
-    for dk, day_events in events_by_day.items():
-        day_events = sorted(day_events, key=lambda e: e["start_dt"])
-        for i in range(len(day_events) - 1):
-            gap_start = day_events[i]["end_dt"]
-            gap_end = day_events[i + 1]["start_dt"]
-            minutes = (gap_end - gap_start).total_seconds() / 60
-            if minutes < STUDY_GAP_MIN_MINUTES or minutes > STUDY_GAP_MAX_MINUTES:
-                continue
-            gaps.append({
-                "date_key": dk,
-                "start_dt": gap_start,
-                "end_dt": gap_end,
-                "duration_minutes": int(minutes),
-                "after": clean_course_title(day_events[i].get("title", "")) or "your previous class",
-                "before": clean_course_title(day_events[i + 1].get("title", "")) or "your next class",
+    day_study_start = datetime.combine(target_date, time(9, 0), tzinfo=TZ_BERLIN)
+    day_study_end = datetime.combine(target_date, time(19, 0), tzinfo=TZ_BERLIN)
+
+    windows = []
+
+    if not day_events:
+        if target_date.weekday() < 5:  # Mon to Fri
+            windows.append({
+                "date_key": target_date,
+                "start_dt": day_study_start,
+                "end_dt": datetime.combine(target_date, time(18, 0), tzinfo=TZ_BERLIN),
+                "duration_minutes": 9 * 60,
+                "description": "full day free for focused study",
+                "after": "morning",
+                "before": "evening",
+                "is_remaining": False,
             })
+    else:
+        busy_intervals = []
+        for ev in sorted(day_events, key=lambda e: e["start_dt"]):
+            s, e = ev["start_dt"], ev["end_dt"]
+            title = clean_course_title(ev.get("title", "")) or "class"
+            if not busy_intervals:
+                busy_intervals.append({"start": s, "end": e, "first_title": title, "last_title": title})
+            else:
+                last = busy_intervals[-1]
+                if s <= last["end"]:
+                    last["end"] = max(last["end"], e)
+                    last["last_title"] = title
+                else:
+                    busy_intervals.append({"start": s, "end": e, "first_title": title, "last_title": title})
 
-    gaps.sort(key=lambda g: g["start_dt"])
-    return gaps
+        # 1. Before first class
+        first_busy = busy_intervals[0]
+        if first_busy["start"] > day_study_start:
+            mins = (first_busy["start"] - day_study_start).total_seconds() / 60
+            if mins >= 90:
+                first_title = first_busy["first_title"]
+                windows.append({
+                    "date_key": target_date,
+                    "start_dt": day_study_start,
+                    "end_dt": first_busy["start"],
+                    "duration_minutes": int(mins),
+                    "description": f"before {first_title}",
+                    "after": "morning",
+                    "before": first_title,
+                    "is_remaining": False,
+                })
+
+        # 2. Gaps between classes
+        for i in range(len(busy_intervals) - 1):
+            gap_s = busy_intervals[i]["end"]
+            gap_e = busy_intervals[i + 1]["start"]
+            mins = (gap_e - gap_s).total_seconds() / 60
+            if mins >= 60:
+                prev_title = busy_intervals[i]["last_title"]
+                next_title = busy_intervals[i + 1]["first_title"]
+                windows.append({
+                    "date_key": target_date,
+                    "start_dt": gap_s,
+                    "end_dt": gap_e,
+                    "duration_minutes": int(mins),
+                    "description": f"between {prev_title} and {next_title}",
+                    "after": prev_title,
+                    "before": next_title,
+                    "is_remaining": False,
+                })
+
+        # 3. After last class
+        last_busy = busy_intervals[-1]
+        if last_busy["end"] < day_study_end:
+            study_after_start = max(last_busy["end"], day_study_start)
+            mins = (day_study_end - study_after_start).total_seconds() / 60
+            if mins >= 90:
+                last_title = last_busy["last_title"]
+                windows.append({
+                    "date_key": target_date,
+                    "start_dt": study_after_start,
+                    "end_dt": day_study_end,
+                    "duration_minutes": int(mins),
+                    "description": f"after {last_title}",
+                    "after": last_title,
+                    "before": "evening",
+                    "is_remaining": False,
+                })
+
+    if reference_now and reference_now.date() == target_date:
+        active = []
+        for w in windows:
+            if w["end_dt"] <= reference_now:
+                continue
+            if w["start_dt"] < reference_now < w["end_dt"]:
+                rem_mins = int((w["end_dt"] - reference_now).total_seconds() / 60)
+                if rem_mins >= 30:
+                    w_c = dict(w)
+                    w_c["start_dt"] = reference_now
+                    w_c["duration_minutes"] = rem_mins
+                    w_c["is_remaining"] = True
+                    active.append(w_c)
+            else:
+                active.append(w)
+        return active
+
+    return windows
+
+
+def find_weekly_study_gaps(events: list) -> list:
+    """Find all good study windows across the week for backward compatibility and narration."""
+    if not events:
+        return []
+    dates = {ev["date_key"] for ev in events if ev.get("date_key")}
+    if not dates:
+        return []
+    min_date = min(dates)
+    week_start = min_date - timedelta(days=min_date.weekday())
+    all_windows = []
+    for offset in range(5):  # Mon to Fri
+        d = week_start + timedelta(days=offset)
+        all_windows.extend(find_study_windows_for_day(events, d))
+    return all_windows
 
 
 async def send_weekly_calendar(sender, events: list, week_start):
@@ -7949,18 +8075,28 @@ async def send_weekly_calendar(sender, events: list, week_start):
         for t in week_tasks:
             due = datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN)
             course_line = f" [{t['course']}]" if t.get("course") else ""
-            task_lines.append(f"⏰ `{due.strftime('%a %d.%m %H:%M')}` — {t['text']}{course_line}")
+            task_lines.append(f"⏰ `{due.strftime('%a %d.%m %H:%M')}` - {t['text']}{course_line}")
         text += "\n" + "\n".join(task_lines)
 
-    study_gaps = find_weekly_study_gaps(events)
-    if study_gaps:
+    all_study_windows = []
+    for offset in range(5):  # Mon-Fri
+        d = week_start + timedelta(days=offset)
+        all_study_windows.extend(find_study_windows_for_day(events, d))
+
+    if all_study_windows:
         gap_lines = ["\n📚 *Good Times to Study*", "━━━━━━━━━━━━━━━━━━"]
-        for g in study_gaps:
-            hours = g["duration_minutes"] / 60
-            duration_text = f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
-            gap_lines.append(
-                f"🕒 `{g['start_dt']:%a %H:%M}–{g['end_dt']:%H:%M}` ({duration_text}) — between {g['after']} and {g['before']}"
-            )
+        by_day: dict[date, list] = {}
+        for g in all_study_windows:
+            by_day.setdefault(g["date_key"], []).append(g)
+
+        for d in sorted(by_day.keys()):
+            day_name = d.strftime("%a")
+            d_lines = []
+            for g in by_day[d]:
+                hours = g["duration_minutes"] / 60
+                duration_text = f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
+                d_lines.append(f"`{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}` ({duration_text}) - {g['description']}")
+            gap_lines.append(f"• *{day_name}*: " + ", ".join(d_lines))
         text += "\n" + "\n".join(gap_lines)
 
     # Navigation buttons
