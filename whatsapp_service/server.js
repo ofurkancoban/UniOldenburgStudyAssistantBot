@@ -24,7 +24,6 @@ console.info = () => {};
 console.warn = () => {};
 
 const app = express();
-app.use(express.json());
 
 const PORT = process.env.PORT || 3838;
 // Loopback only by default: the bot is the sole client, and nothing else on
@@ -44,12 +43,15 @@ if (!SERVICE_TOKEN) {
     console.error('WA_SERVICE_TOKEN is not set - every request will be rejected. Start the service from the bot or set it in .env.');
 }
 
+// Auth first, body parsing second: an unauthenticated request is rejected
+// before any of its body is read or parsed.
 app.use((req, res, next) => {
     if (!SERVICE_TOKEN || !tokenMatches(req.get('X-WA-Service-Token'))) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
     next();
 });
+app.use(express.json({ limit: '1mb' }));
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const ALLOWED_USER_IDS = process.env.ALLOWED_USER_IDS ? process.env.ALLOWED_USER_IDS.split(',') : [];
 const AUTH_DIR = 'baileys_auth';

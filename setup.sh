@@ -22,13 +22,7 @@ if ! command -v ffmpeg &> /dev/null; then
   echo "   Install it with: apt install ffmpeg (Linux) or brew install ffmpeg (Mac)."
 fi
 
-# ── 2️⃣ Menu Selection ───────────────────────────────────────────────
-echo "Which version would you like to set up?"
-echo "1) Standard (Browser-less, Recommended) - Fast, low RAM"
-echo "2) Legacy (Playwright) - Original version with browser"
-read -p "Select [1-2]: " VERSION_CHOICE
-
-# ── 3️⃣ Virtual Environment ──────────────────────────────────────────
+# ── 2️⃣ Virtual Environment ──────────────────────────────────────────
 if [ ! -d ".venv" ]; then
   echo "📁 Creating virtual environment (.venv)..."
   python3 -m venv .venv
@@ -36,20 +30,14 @@ fi
 
 source .venv/bin/activate
 
-# ── 4️⃣ Dependencies ────────────────────────────────────────────────
+# ── 3️⃣ Dependencies ────────────────────────────────────────────────
 echo "⬆️  Upgrading pip..."
 pip install --upgrade pip setuptools wheel >/dev/null
 
 echo "📦 Installing Python dependencies..."
 pip install -r requirements.txt
 
-if [ "$VERSION_CHOICE" == "2" ]; then
-  echo "🌐 Installing Playwright & Chromium for Legacy version..."
-  pip install playwright
-  playwright install chromium
-fi
-
-# ── 5️⃣ .env Check ──────────────────────────────────────────────────
+# ── 4️⃣ .env Check ──────────────────────────────────────────────────
 if [ ! -f ".env" ]; then
   echo "⚠️  .env file not found!"
   if [ -f ".env.example" ]; then
@@ -64,11 +52,6 @@ if [ ! -f ".env" ]; then
   fi
 fi
 
-# ── 6️⃣ Launch ─────────────────────────────────────────────────────
-if [ "$VERSION_CHOICE" == "1" ]; then
-  echo "🚀 Starting Stud.IP Telegram Bot (Standard)..."
-  python studip_bot.py
-else
-  echo "🚀 Starting Stud.IP Telegram Bot (Legacy)..."
-  python studip_bot_playwright.py
-fi
+# ── 5️⃣ Launch ─────────────────────────────────────────────────────
+echo "🚀 Starting Stud.IP Telegram Bot..."
+python studip_bot.py

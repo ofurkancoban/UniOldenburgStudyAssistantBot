@@ -10,10 +10,21 @@ import struct
 import base64
 import json
 import re
-from urllib.parse import urljoin, urlparse, parse_qs
+from urllib.parse import urljoin, urlparse
 from yarl import URL
 
 import studip_oauth
+from studip_utils import redact_url
+
+# Wait this long after the 1st, 2nd, 3rd, 4th+ failed password/TOTP login in a
+# row before the next automatic attempt. Without it every button tap and
+# watcher cycle re-sent the password, which can get the account locked by
+# NetIQ after a password change.
+LOGIN_BACKOFF_SECONDS = (60, 300, 900, 3600)
+# A positive HTML login check is trusted for this long, so handlers don't
+# download a whole Stud.IP page before doing any actual work.
+LOGIN_CHECK_CACHE_SECONDS = 60
+
 
 class StudIPSession:
     """
@@ -37,6 +48,25 @@ class StudIPSession:
         self._lock = asyncio.Lock()
         self.last_interactive_activity = 0.0
         self.explicitly_logged_out = False
+        self.login_failures = 0
+        self.login_blocked_until = 0.0
+        self._logged_in_until = 0.0
+
+    def reset_login_backoff(self) -> None:
+        """Forget earlier failed logins (after a successful interactive login)."""
+        self.login_failures = 0
+        self.login_blocked_until = 0.0
+
+    def invalidate_login_cache(self) -> None:
+        self._logged_in_until = 0.0
+
+    def _record_login_failure(self) -> None:
+        self.login_failures += 1
+        delay = LOGIN_BACKOFF_SECONDS[min(self.login_failures, len(LOGIN_BACKOFF_SECONDS)) - 1]
+        self.login_blocked_until = time.time() + delay
+        self.logger.warning(
+            "Automatic login failed %sx in a row - next attempt in %s min", self.login_failures, delay // 60
+        )
 
     async def __aenter__(self):
         await self.ensure_session()
@@ -66,6 +96,7 @@ class StudIPSession:
             h = (struct.unpack(">I", h[o:o+4])[0] & 0x7fffffff) % 1000000
             return "{:06d}".format(h)
         except Exception:
+            logging.warning("TOTP code generation failed (check TOTP_SECRET)", exc_info=True)
             return ""
 
     async def save_cookies(self):
@@ -82,9 +113,9 @@ class StudIPSession:
         try:
             from studip_vault import write_vault_file
             write_vault_file(self.cookie_file, entries, mode=0o600)
-            self.logger.info(f"Encrypted cookies saved to {self.cookie_file} (mode 0600)")
+            self.logger.info("Encrypted cookies saved to %s (mode 0600)", self.cookie_file)
         except Exception as exc:
-            self.logger.error(f"Failed to save encrypted cookies to {self.cookie_file}: {exc}")
+            self.logger.error("Failed to save encrypted cookies to %s: %s", self.cookie_file, exc)
 
     async def load_cookies(self):
         if os.path.exists(self.cookie_file):
@@ -116,14 +147,24 @@ class StudIPSession:
                                 {key: val},
                                 response_url=URL(f"https://{dom}/"),
                             )
-                self.logger.info(f"Encrypted cookies loaded from {self.cookie_file}")
+                self.logger.info("Encrypted cookies loaded from %s", self.cookie_file)
                 return True
             except Exception as e:
-                self.logger.error(f"Failed to load cookies: {e}")
+                self.logger.error("Failed to load cookies: %s", e)
         return False
 
-    async def is_html_logged_in(self) -> bool:
-        """Check if the browser-less HTML cookie session is currently authenticated."""
+    async def is_html_logged_in(self, use_cache: bool = True) -> bool:
+        """Check if the browser-less HTML cookie session is currently authenticated.
+
+        A positive result is cached for LOGIN_CHECK_CACHE_SECONDS; a negative
+        one never is, and logout/login invalidate the cache."""
+        if use_cache and time.time() < self._logged_in_until:
+            return True
+        result = await self._check_html_logged_in()
+        self._logged_in_until = time.time() + LOGIN_CHECK_CACHE_SECONDS if result else 0.0
+        return result
+
+    async def _check_html_logged_in(self) -> bool:
         await self.ensure_session()
         try:
             async with self.session.get("https://elearning.uni-oldenburg.de/dispatch.php/start", allow_redirects=True) as r:
@@ -139,13 +180,13 @@ class StudIPSession:
                 has_user_id = "STUDIP.USER_ID" in text
 
                 if (has_logout or has_sidebar or has_my_courses or has_user_id) and not is_guest and not is_login_page:
-                    self.logger.debug(f"is_html_logged_in: True (markers found at {url})")
+                    self.logger.debug("is_html_logged_in: True (markers found at %s)", redact_url(url))
                     return True
 
-                self.logger.info(f"is_html_logged_in: False (markers missing or Guest state at {url})")
+                self.logger.info("is_html_logged_in: False (markers missing or Guest state at %s)", redact_url(url))
                 return False
         except Exception as e:
-            self.logger.error(f"is_html_logged_in check failed: {e}")
+            self.logger.error("is_html_logged_in check failed: %s", e)
             return False
 
     async def heal_session(self) -> bool:
@@ -162,7 +203,7 @@ class StudIPSession:
             login_link_cancel = f"{elearn}/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
             try:
                 await self._run_sso_flow(login_link_cancel, referer=f"{elearn}/dispatch.php/my_courses")
-                if await self.is_html_logged_in():
+                if await self.is_html_logged_in(use_cache=False):
                     self.explicitly_logged_out = False
                     await self.save_cookies()
                     self.logger.info("✅ [Self-Healing] Session successfully healed and restored!")
@@ -171,7 +212,7 @@ class StudIPSession:
                     self.logger.warning("⚠️ [Self-Healing] Silent SSO flow finished but login markers missing.")
                     return False
             except Exception as exc:
-                self.logger.warning(f"⚠️ [Self-Healing] Silent SSO flow failed: {exc}")
+                self.logger.warning("⚠️ [Self-Healing] Silent SSO flow failed: %s", exc)
                 return False
 
     async def is_logged_in(self, allow_oauth: bool = True) -> bool:
@@ -191,7 +232,7 @@ class StudIPSession:
                 if token:
                     return True
             except Exception as exc:
-                self.logger.warning(f"OAuth check failed: {exc}")
+                self.logger.warning("OAuth check failed: %s", exc)
         return False
 
     async def login(self, force=False):
@@ -218,7 +259,13 @@ class StudIPSession:
                         if await studip_oauth.get_access_token():
                             return True
                     except Exception:
-                        pass
+                        logging.debug("OAuth token not available", exc_info=True)
+                return False
+
+            if not force and time.time() < self.login_blocked_until:
+                self.logger.info(
+                    "Skipping automatic login: backing off after %s failure(s) for another %ss", self.login_failures, int(self.login_blocked_until - time.time())
+                )
                 return False
 
             self.logger.info("Starting fresh async browser-less login (NetIQ optimized)...")
@@ -229,22 +276,25 @@ class StudIPSession:
 
             # 1. Prime the session before triggering the login flow.
             try:
-                async with self.session.get(start_url) as r:
+                async with self.session.get(start_url):
                     pass
                 await self._run_sso_flow(login_link_cancel, referer=start_url)
                 self.explicitly_logged_out = False
+                self.reset_login_backoff()
+                self._logged_in_until = time.time() + LOGIN_CHECK_CACHE_SECONDS
                 await self.save_cookies()
                 self.logger.info("✅ Login successful.")
                 return True
             except Exception as e:
-                self.logger.warning(f"SSO login flow did not complete: {e}")
+                self.logger.warning("SSO login flow did not complete: %s", e)
+                self._record_login_failure()
                 if not force and use_oauth:
                     try:
                         if await studip_oauth.get_access_token():
                             self.logger.info("Using active OAuth2 token session.")
                             return True
                     except Exception:
-                        pass
+                        logging.debug("OAuth token not available", exc_info=True)
                 return False
 
     async def keep_alive(self) -> None:
@@ -259,7 +309,7 @@ class StudIPSession:
             try:
                 await studip_oauth.get_access_token()
             except Exception as exc:
-                self.logger.debug(f"OAuth keep-alive skipped: {exc}")
+                self.logger.debug("OAuth keep-alive skipped: %s", exc)
 
         for sso_url in (
             "https://login.uni-oldenburg.de/nidp/app",
@@ -270,21 +320,24 @@ class StudIPSession:
                 async with self.session.get(sso_url, allow_redirects=True, timeout=15) as _:
                     pass
             except Exception as exc:
-                self.logger.debug(f"SSO keep-alive skipped for {sso_url}: {exc}")
+                self.logger.debug("SSO keep-alive skipped for %s: %s", redact_url(sso_url), exc)
 
         try:
-            if not await self.is_html_logged_in():
+            # keep-alive must really touch Stud.IP, so never answer from cache
+            if not await self.is_html_logged_in(use_cache=False):
                 # Silently heal session using warm NetIQ cookies
                 await self.heal_session()
             else:
                 await self.save_cookies()
         except Exception as exc:
-            self.logger.debug(f"Web session keep-alive renewal skipped: {exc}")
+            self.logger.debug("Web session keep-alive renewal skipped: %s", exc)
 
     async def logout(self) -> None:
         """Terminate Stud.IP + NetIQ SSO sessions, clear cookies and OAuth2 tokens."""
         async with self._lock:
             self.explicitly_logged_out = True
+            self.invalidate_login_cache()
+            self.reset_login_backoff()
             self.username = ""
             self.password = ""
             self.totp_secret = ""
@@ -299,7 +352,7 @@ class StudIPSession:
                         async with self.session.get(url, allow_redirects=True, timeout=10) as _:
                             pass
                     except Exception as exc:
-                        self.logger.debug(f"Upstream logout request skipped for {url}: {exc}")
+                        self.logger.debug("Upstream logout request skipped for %s: %s", redact_url(url), exc)
                 self.session.cookie_jar.clear()
 
             for path in (self.cookie_file, f"{self.cookie_file}.tmp"):
@@ -307,7 +360,7 @@ class StudIPSession:
                     if os.path.exists(path):
                         os.remove(path)
                 except OSError as exc:
-                    self.logger.warning(f"Could not remove {path}: {exc}")
+                    self.logger.warning("Could not remove %s: %s", path, exc)
 
             studip_oauth.clear_tokens()
             self.logger.info("🚪 Stud.IP session, SSO cookies, and OAuth2 tokens cleared.")
@@ -344,7 +397,7 @@ class StudIPSession:
         """
         async def follow_redirects(url, text, tag, depth=0):
                 if depth > 20: 
-                    self.logger.warning(f"[{tag}] Max redirect depth reached at {url}")
+                    self.logger.warning("[%s] Max redirect depth reached at %s", tag, redact_url(url))
                     return url, text
                 
                 soup = BeautifulSoup(text, "html.parser")
@@ -353,7 +406,7 @@ class StudIPSession:
                 js_redirect = re.search(r"window\.location\.(?:href|assign|replace)\s*=\s*['\"]([^'\"]+)['\"]", text)
                 if js_redirect:
                     nxt = urljoin(url, js_redirect.group(1))
-                    self.logger.info(f"[{tag}] Following JS redirect: {nxt}")
+                    self.logger.info("[%s] Following JS redirect: %s", tag, nxt)
                     async with self.session.get(nxt, headers={"Referer": url}) as r:
                          return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
 
@@ -363,7 +416,7 @@ class StudIPSession:
                     content = meta.get("content", "")
                     if "url=" in content.lower():
                         nxt = urljoin(url, content.lower().split("url=")[1].strip().strip("'\""))
-                        self.logger.info(f"[{tag}] Following Meta Refresh: {nxt}")
+                        self.logger.info("[%s] Following Meta Refresh: %s", tag, nxt)
                         async with self.session.get(nxt, headers={"Referer": url}) as r:
                             return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
                 
@@ -371,7 +424,7 @@ class StudIPSession:
                 ajax_load = re.search(r"getToContent\(['\"]([^'\"]+)['\"]\s*,\s*['\"][^'\"]+['\"]\)", text)
                 if ajax_load:
                     ajax_url = urljoin(url, ajax_load.group(1))
-                    self.logger.info(f"[{tag}] Following NetIQ AJAX content load: {ajax_url}")
+                    self.logger.info("[%s] Following NetIQ AJAX content load: %s", tag, redact_url(ajax_url))
                     async with self.session.get(ajax_url, headers={"Referer": url}) as r:
                          return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
                 
@@ -384,7 +437,7 @@ class StudIPSession:
                         inputs = {i.get("name"): (i.get("value") or "") for i in form.find_all("input") if i.get("name")}
                         action = urljoin(url, form.get("action") or "")
                         method = (form.get("method") or "POST").upper()
-                        self.logger.info(f"[{tag}] Script-submitting form '{form_name}' to {action}")
+                        self.logger.info("[%s] Script-submitting form '%s' to %s", tag, form_name, action)
                         if method == "POST":
                             async with self.session.post(action, data=inputs, headers={"Referer": url}) as r:
                                 return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
@@ -399,7 +452,7 @@ class StudIPSession:
                     if keys & {"code", "state", "id_token", "samlresponse", "relaystate", "wa", "wresult"}:
                         action = urljoin(url, form.get("action") or "")
                         method = (form.get("method") or "POST").upper()
-                        self.logger.info(f"[{tag}] Auto-submitting auth handoff form to {action}")
+                        self.logger.info("[%s] Auto-submitting auth handoff form to %s", tag, action)
                         if method == "POST":
                             async with self.session.post(action, data=inputs, headers={"Referer": url}) as r:
                                 return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
@@ -407,7 +460,7 @@ class StudIPSession:
                             async with self.session.get(action, params=inputs, headers={"Referer": url}) as r:
                                 return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
 
-                self.logger.debug(f"[{tag}] No more redirects detected at {url}")
+                self.logger.debug("[%s] No more redirects detected at %s", tag, redact_url(url))
                 return url, text
 
         # Helper for form submission
@@ -428,7 +481,7 @@ class StudIPSession:
         async def check_done(url, text):
             if is_done:
                 return await is_done(url, text)
-            return await self.is_html_logged_in()
+            return await self.is_html_logged_in(use_cache=False)
 
         # 1. Entry
         async with self.session.get(entry_url, headers={"Referer": referer} if referer else None) as r:
@@ -445,7 +498,7 @@ class StudIPSession:
             soup = BeautifulSoup(curr_text, "html.parser")
             page_text = curr_text.lower()
 
-            self.logger.info(f"Step {i}: URL {curr_url}")
+            self.logger.info("Step %s: URL %s", i, redact_url(curr_url))
 
             if await check_done(curr_url, curr_text):
                 return curr_url, curr_text
@@ -456,7 +509,7 @@ class StudIPSession:
             if "ecom_user_id" in page_text and "ecom_password" not in page_text:
                 if not self.username:
                     raise RuntimeError("Interactive login required (no stored username)")
-                self.logger.info(f"Step {i+1}: Username Submission")
+                self.logger.info("Step %s: Username Submission", i+1)
                 action, method, payload = get_payload(soup, {"Ecom_User_ID": self.username, "loginButton2": "true"})
                 action = urljoin(curr_url, action)
                 async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
@@ -466,7 +519,7 @@ class StudIPSession:
             if "ecom_password" in page_text:
                 if not self.password:
                     raise RuntimeError("Interactive login required (no stored password)")
-                self.logger.info(f"Step {i+1}: Password Submission (Legacy)")
+                self.logger.info("Step %s: Password Submission (Legacy)", i+1)
                 action, method, payload = get_payload(soup, {"Ecom_Password": self.password, "loginButton2": "true"})
                 action = urljoin(curr_url, action)
                 async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
@@ -487,12 +540,12 @@ class StudIPSession:
                     token = self._get_totp_token()
                     if not token:
                         raise RuntimeError("Interactive login required (no 2FA token available)")
-                    self.logger.info(f"Step {i+1}: TOTP Submission (Contract)")
+                    self.logger.info("Step %s: TOTP Submission (Contract)", i+1)
                     action, method, payload = get_payload(soup, {"nffc": token, "loginButton2": "Next"})
                 else:
                     if not self.password:
                         raise RuntimeError("Interactive login required (no stored password)")
-                    self.logger.info(f"Step {i+1}: Password Submission (Contract)")
+                    self.logger.info("Step %s: Password Submission (Contract)", i+1)
                     action, method, payload = get_payload(soup, {"nffc": self.password, "loginButton2": "Next"})
 
                 action = urljoin(curr_url, action)
@@ -501,7 +554,7 @@ class StudIPSession:
                 continue
 
             # C. Unhandled
-            self.logger.warning(f"Step {i}: Unhandled state. URL: {curr_url}")
+            self.logger.warning("Step %s: Unhandled state. URL: %s", i, redact_url(curr_url))
             if i > 10: break
 
         if await check_done(curr_url, curr_text):
@@ -522,7 +575,7 @@ class StudIPSession:
         try:
             token = await studip_oauth.get_access_token()
         except Exception as exc:  # never let a token problem break a request
-            self.logger.warning(f"OAuth token unavailable: {exc}")
+            self.logger.warning("OAuth token unavailable: %s", exc)
             return {}
         return {"Authorization": f"Bearer {token}"} if token else {}
 

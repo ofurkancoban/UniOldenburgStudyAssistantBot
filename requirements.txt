@@ -17,7 +17,3 @@ gradio_client>=2.7,<3
 fal-client>=1.0,<2
 pypdf>=6.1,<7
 python-pptx>=1.0,<2
-
-# Legacy Playwright engine only (studip_bot_playwright.py); setup.sh installs
-# playwright itself when that engine is chosen.
-nest_asyncio>=1.6,<2

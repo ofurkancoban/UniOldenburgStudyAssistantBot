@@ -47,6 +47,7 @@ def _pid_alive(pid: int) -> bool:
     except ImportError:
         return True
     except Exception:
+        logging.debug("Could not inspect process", exc_info=True)
         return False
 
 
@@ -171,8 +172,10 @@ class QuickTunnel:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                logging.debug("Tunnel supervisor ended with an error", exc_info=True)
             self._task = None
 
     async def _supervise(self) -> None:
@@ -207,7 +210,7 @@ class QuickTunnel:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logging.error(f"⚠️ cloudflared supervisor error: {exc}")
+                logging.error("⚠️ cloudflared supervisor error: %s", exc)
             if self._stopping:
                 break
             logging.warning("🔄 cloudflared stopped - restarting in 3s")

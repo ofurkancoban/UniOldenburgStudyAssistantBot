@@ -21,9 +21,15 @@ from zoneinfo import ZoneInfo
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+# Keep test output out of the bot's live watch_log.txt (importing unibot
+# attaches its file handler to the root logger).
+os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
+# Tests must never touch the real bot database
+os.environ.setdefault("BOT_DB_FILE", os.path.join(tempfile.mkdtemp(prefix="unibot-tests-"), "bot_data.sqlite3"))
 
 import studip_login_server  # noqa: E402
 import studip_oauth  # noqa: E402
+import studip_utils  # noqa: E402
 import studip_vault  # noqa: E402
 
 TZ = ZoneInfo("Europe/Berlin")
@@ -46,27 +52,35 @@ class BotModuleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cwd = os.getcwd()
-        import studip_bot
-        os.chdir(cwd)  # the module anchors CWD to its folder on import
-        cls.bot = studip_bot
+        # importing the package runs unibot.config, which anchors CWD to the project
+        from unibot import auth, schedule
+        os.chdir(cwd)
+        cls.auth = auth
+        cls.schedule = schedule
 
     def test_time_module_not_shadowed(self):
         # Regression: `from datetime import time` once replaced the stdlib
         # module and broke every time.time()/time.monotonic() call.
-        self.assertTrue(callable(getattr(self.bot.time, "time", None)))
-        self.assertTrue(callable(getattr(self.bot.time, "monotonic", None)))
+        import importlib
+        import unibot
+        for name in unibot.MODULE_ORDER:
+            module = importlib.import_module(f"unibot.{name}")
+            t = getattr(module, "time", None)
+            if t is not None:
+                self.assertTrue(callable(getattr(t, "time", None)), name)
+                self.assertTrue(callable(getattr(t, "monotonic", None)), name)
 
     def test_allowlist_fails_closed(self):
-        with mock.patch.object(self.bot, "ALLOWED_USER_IDS", set()):
-            self.assertFalse(self.bot.is_user_allowed(123))
-        with mock.patch.object(self.bot, "ALLOWED_USER_IDS", {123}):
-            self.assertTrue(self.bot.is_user_allowed(123))
-            self.assertFalse(self.bot.is_user_allowed(456))
-            self.assertFalse(self.bot.is_user_allowed(None))
+        with mock.patch.object(self.auth, "ALLOWED_USER_IDS", set()):
+            self.assertFalse(self.auth.is_user_allowed(123))
+        with mock.patch.object(self.auth, "ALLOWED_USER_IDS", {123}):
+            self.assertTrue(self.auth.is_user_allowed(123))
+            self.assertFalse(self.auth.is_user_allowed(456))
+            self.assertFalse(self.auth.is_user_allowed(None))
 
     def test_escaping_helpers(self):
-        self.assertEqual(self.bot._h("Theory & <Practice>"), "Theory &amp; &lt;Practice&gt;")
-        self.assertEqual(self.bot._md("Info_1 *x*"), "Info\\_1 \\*x\\*")
+        self.assertEqual(studip_utils.html_escape("Theory & <Practice>"), "Theory &amp; &lt;Practice&gt;")
+        self.assertEqual(studip_utils.md_escape("Info_1 *x*"), "Info\\_1 \\*x\\*")
 
     def test_study_windows_regular_day(self):
         day = date(2026, 11, 4)  # Wednesday
@@ -74,18 +88,18 @@ class BotModuleTests(unittest.TestCase):
             _event(day, "12:00", "14:00", "Lecture A"),
             _event(day, "15:30", "17:00", "Lecture B"),
         ]
-        windows = self.bot.find_study_windows_for_day(events, day)
+        windows = self.schedule.find_study_windows_for_day(events, day)
         spans = [(w["start_dt"].strftime("%H:%M"), w["end_dt"].strftime("%H:%M")) for w in windows]
         # before (3h), between (1.5h); after 17:00-19:00 is 2h
         self.assertEqual(spans, [("09:00", "12:00"), ("14:00", "15:30"), ("17:00", "19:00")])
 
     def test_study_windows_free_weekday_and_weekend(self):
         wed = date(2026, 11, 4)
-        free = self.bot.find_study_windows_for_day([], wed)
+        free = self.schedule.find_study_windows_for_day([], wed)
         self.assertEqual(len(free), 1)
         self.assertEqual(free[0]["end_dt"].strftime("%H:%M"), "19:00")
         self.assertEqual(free[0]["duration_minutes"], 600)
-        self.assertEqual(self.bot.find_study_windows_for_day([], date(2026, 11, 7)), [])  # Saturday
+        self.assertEqual(self.schedule.find_study_windows_for_day([], date(2026, 11, 7)), [])  # Saturday
 
     def test_study_windows_ignore_cancelled_and_incomplete(self):
         day = date(2026, 11, 4)
@@ -93,20 +107,20 @@ class BotModuleTests(unittest.TestCase):
             _event(day, "10:00", "12:00", is_cancelled=True),
             {"date_key": day, "start_dt": None, "end_dt": None, "title": "broken"},
         ]
-        windows = self.bot.find_study_windows_for_day(events, day)
+        windows = self.schedule.find_study_windows_for_day(events, day)
         self.assertEqual(len(windows), 1)  # whole day free
 
     def test_study_windows_remaining_today(self):
         day = date(2026, 11, 4)
         events = [_event(day, "12:00", "14:00")]
         now = datetime(2026, 11, 4, 10, 30, tzinfo=TZ)
-        windows = self.bot.find_study_windows_for_day(events, day, reference_now=now)
+        windows = self.schedule.find_study_windows_for_day(events, day, reference_now=now)
         self.assertTrue(windows[0]["is_remaining"])
         self.assertEqual(windows[0]["duration_minutes"], 90)
 
     def test_weekly_windows_use_given_week(self):
         monday = date(2026, 11, 2)
-        windows = self.bot.find_weekly_study_gaps([], monday)
+        windows = self.schedule.find_weekly_study_gaps([], monday)
         self.assertEqual([w["date_key"] for w in windows], [date(2026, 11, d) for d in range(2, 7)])
 
     def test_rooms_parser(self):
@@ -121,7 +135,7 @@ class BotModuleTests(unittest.TestCase):
           <ul><li>Do. 08:00 - 10:00 so we meet here</li></ul>
         </article>
         """
-        rooms = self.bot._parse_course_rooms_page(page)
+        rooms = self.schedule._parse_course_rooms_page(page)
         self.assertEqual(rooms[("recurring", 2, "10:00")], "A14 1-102")
         self.assertEqual(rooms[("date", date(2026, 10, 21), "14:00")], "A14 1-102")
         self.assertEqual(rooms[("recurring", 3, "08:00")], "V03 0-C002")
@@ -129,8 +143,8 @@ class BotModuleTests(unittest.TestCase):
         self.assertNotIn(("course_default", None), rooms)
 
     def test_weekday_short_forms_need_punctuation(self):
-        self.assertEqual(self.bot._parse_weekday("Do. 10:00 - 12:00"), 3)
-        self.assertIsNone(self.bot._parse_weekday("so we do this at 10:00 - 12:00"))
+        self.assertEqual(self.schedule._parse_weekday("Do. 10:00 - 12:00"), 3)
+        self.assertIsNone(self.schedule._parse_weekday("so we do this at 10:00 - 12:00"))
 
 
 class OAuthTests(unittest.TestCase):

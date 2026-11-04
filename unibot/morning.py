@@ -1,0 +1,733 @@
+"""Morning summary, spoken daily/weekly plans and voice delivery.
+
+Part of the unibot package (split out of the former single-file studip_bot.py).
+"""
+
+import asyncio
+import html
+import io
+import logging
+import os
+from datetime import datetime, timedelta
+from typing import Optional
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatAction
+from telegram.ext import ContextTypes
+
+from studip_utils import TZ_BERLIN, berlin_now, format_hours as _format_hours, html_escape as _h
+
+from unibot import state
+from unibot.storage import (
+    get_cached_outfit_today,
+    get_primary_user_name,
+    get_recently_worn_item_ids,
+    get_user_name,
+    get_wardrobe_entry,
+    get_wardrobe_feature_enabled,
+    load_general_cache,
+    load_tasks,
+    record_worn_items,
+    save_cached_outfit_today,
+    save_general_cache,
+    update_general_cache,
+)
+from unibot.formatting import _get_course_icon, _get_location_emoji, _safe_loc, clean_course_title
+from unibot.telegram_ui import _download_telegram_file, _show_typing
+from unibot.auth import is_user_allowed
+from unibot.ai import _ai_patience, _call_openrouter, _pcm_to_ogg_voice, synthesize_speech
+from unibot.weather import build_weather_text_line, get_weather_snapshot
+from unibot.mensa import _friendly_menu_category_label, build_food_recommendation, fetch_dish_photo_url
+from unibot.wardrobe import generate_outfit_tryon_image, outfit_caption, pick_outfit_from_wardrobe
+from unibot.schedule import (
+    _week_tasks_for_range,
+    find_study_windows_for_day,
+    find_weekly_study_gaps,
+    get_calendar_events,
+)
+
+
+MORNING_AI_TIMEOUT_SECONDS = 60
+MORNING_AI_ATTEMPTS = 3
+
+
+async def prepare_morning_summary(bot, user_ids) -> Optional[dict]:
+    """See _prepare_morning_summary. Nobody waits on this (it runs up to
+    MORNING_PREPARE_LEAD_MINUTES before delivery), so every AI call inside
+    gets a longer timeout and retries instead of falling back to a
+    template on the free model's first slow response."""
+    token = _ai_patience.set((MORNING_AI_TIMEOUT_SECONDS, MORNING_AI_ATTEMPTS))
+    try:
+        return await _prepare_morning_summary(bot, user_ids)
+    finally:
+        _ai_patience.reset(token)
+
+
+def _format_schedule_section(today_events: list) -> str:
+    if not today_events:
+        return "📅 <b>No classes today!</b> Enjoy your day. ✨"
+    course_blocks = []
+    for ev in today_events:
+        course_icon = _get_course_icon(ev.get("title", ""))
+        display_title = clean_course_title(ev.get("title", ""))
+        loc_icon = _get_location_emoji(ev.get("location", ""))
+        course_blocks.append(
+            f"{course_icon} <b>{_h(display_title)}</b>\n"
+            f"   🕒 <code>{ev['time']}</code>\n"
+            f"   {loc_icon} {_h(_safe_loc(ev['location']))}"
+        )
+    return "\n".join(["📅 <b>Today's Schedule:</b>", "\n\n".join(course_blocks)])
+
+
+def _format_study_windows_section(events: list, today_date) -> str:
+    study_windows = find_study_windows_for_day(events, today_date)
+    if not study_windows:
+        return ""
+    study_lines = ["📚 <b>Good Times to Study:</b>"]
+    for g in study_windows:
+        study_lines.append(
+            f"🕒 <code>{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}</code> "
+            f"({_format_hours(g['duration_minutes'])}) - {_h(g['description'])}"
+        )
+    return "\n\n" + "\n".join(study_lines)
+
+
+def _load_today_tasks(today_date) -> list:
+    """Reminders due today, regardless of which ALLOWED_USER_IDS entry created
+    them (they're the same person's other devices, see get_primary_user_name)."""
+    try:
+        tasks = [
+            t for t in load_tasks()
+            if t.get("due_time") and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == today_date
+        ]
+        return sorted(tasks, key=lambda t: t["due_time"])
+    except Exception as e:
+        logging.error("Summary tasks fetch error: %s", e)
+        return []
+
+
+def _format_tasks_section(today_tasks: list) -> str:
+    if not today_tasks:
+        return ""
+    task_lines = ["✅ <b>Today's Tasks:</b>"]
+    for t in sorted(today_tasks, key=lambda t: t["due_time"]):
+        due = datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN)
+        course_line = f" [{t['course']}]" if t.get("course") else ""
+        task_lines.append(f"⏰ <code>{due.strftime('%H:%M')}</code> - {t['text']}{course_line}")
+    return "\n\n" + "\n".join(task_lines)
+
+
+def _format_lunch_section(food: Optional[dict]) -> str:
+    if food and food.get("dish") and food.get("category"):
+        return f"\n\n🍽️ <b>Lunch pick:</b> {food['dish']} ({_friendly_menu_category_label(food['category'])})"
+    return ""
+
+
+def _format_exam_countdown(exams: list, today_date) -> str:
+    """Countdown to every still-upcoming registered exam, not just the nearest
+    one. It lives inside the pinned summary, so it updates once a day along
+    with everything else."""
+    if not exams:
+        return ""
+    lines = ["⏳ <b>Upcoming Exams</b>"]
+    for exam_title, exam_dt in exams:
+        days_left = (exam_dt.date() - today_date).days
+        if days_left <= 0:
+            day_label = "today"
+        elif days_left == 1:
+            day_label = "tomorrow"
+        else:
+            day_label = f"in {days_left} days"
+        lines.append(f"• <b>{html.escape(exam_title)}</b> {day_label} ({exam_dt:%d.%m.%Y})")
+    return "\n\n" + "\n".join(lines)
+
+
+def _compose_morning_text(today_date, sections: list) -> str:
+    header = (
+        "☀️ <b>GOOD MORNING!</b> ☀️\n"
+        f"🗓️ <b>Today:</b> {today_date:%d %B %Y, %A}\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    return f"{header}{''.join(sections)}\n\n━━━━━━━━━━━━━━━━━━"
+
+
+async def _fetch_today_events(session, today_date) -> tuple[list, list]:
+    """(this week's events, today's events); both empty if the calendar fails."""
+    try:
+        week_start = today_date - timedelta(days=today_date.weekday())
+        events = await get_calendar_events(session=session, week_start=week_start)
+    except Exception as e:
+        logging.error("Summary schedule fetch error: %s", e)
+        return [], []
+    return events, [ev for ev in events if ev["date_key"] == today_date]
+
+
+async def _fetch_lunch_pick() -> Optional[dict]:
+    """Same AI-judged pick as the "🍽️ What should I eat?" button. A failure
+    just omits the section rather than blocking the rest of the summary."""
+    try:
+        return await build_food_recommendation()
+    except Exception as e:
+        logging.error("Summary food recommendation error: %s", e)
+        return None
+
+
+async def _fetch_exam_countdown(session, today_date) -> str:
+    from unibot.voice import _upcoming_exams
+    try:
+        return _format_exam_countdown(await _upcoming_exams(session), today_date)
+    except Exception as e:
+        logging.error("Summary exam countdown error: %s", e)
+        return ""
+
+
+async def _prepare_lunch_photo(food: Optional[dict]) -> tuple[Optional[str], Optional[str]]:
+    """Photo of the lunch pick when one can be matched on the
+    Studierendenwerk's public Speiseplan site, plus its caption."""
+    if not (food and food.get("dish")):
+        return None, None
+    photo_url = None
+    try:
+        photo_url = await fetch_dish_photo_url(food["dish"])
+    except Exception as e:
+        logging.warning("Summary food photo fetch error: %s", e)
+    place = f" ({_friendly_menu_category_label(food['category'])})" if food.get("category") else ""
+    return photo_url, f"🍽️ <b>Today's lunch pick{html.escape(place)}:</b> {html.escape(food['dish'])}"
+
+
+async def _prepare_outfits(bot, user_ids, weather) -> dict:
+    """Daily outfit suggestion with a virtual try-on image per user. Opt-in
+    (toggle in /status) and skipped for users with an empty wardrobe or no
+    reference photo. Every step is best-effort."""
+    outfits: dict = {}
+    if not get_wardrobe_feature_enabled():
+        return outfits
+    for uid in user_ids:
+        try:
+            # A manual "Suggest Outfit Now" tap may have already run
+            # today; deliver_morning_summary resends that one instead.
+            if get_cached_outfit_today(uid):
+                continue
+            wardrobe_entry = get_wardrobe_entry(uid)
+            items = wardrobe_entry.get("items", [])
+            ref_file_id = wardrobe_entry.get("reference_photo_file_id")
+            if not items or not ref_file_id:
+                continue
+            recent_ids = get_recently_worn_item_ids(uid)
+            outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids)
+            if not outfit:
+                continue
+            reference_bytes = await _download_telegram_file(bot, ref_file_id)
+            image_bytes = await generate_outfit_tryon_image(bot, reference_bytes, outfit["chosen_items"]) if reference_bytes else None
+            outfits[uid] = {"outfit": outfit, "image_bytes": image_bytes}
+        except Exception as e:
+            logging.warning("Outfit suggestion failed for %s: %s", uid, e)
+    return outfits
+
+
+async def _prepare_morning_voice(today_events, today_date, today_tasks, weather, food) -> Optional[str]:
+    """AI-narrated voice message, improvised fresh every morning (see
+    build_ai_daily_plan_narration) and converted to OGG now, so delivery is
+    just an upload. A TTS/ffmpeg hiccup just skips it."""
+    try:
+        narration = await build_ai_daily_plan_narration(
+            today_events, today_date, name=get_primary_user_name(),
+            today_tasks=today_tasks, weather=weather, food=food,
+        ) or build_daily_plan_speech_text(today_events, today_date)
+        voice_path = None
+        result = await synthesize_speech(narration)
+        if result:
+            voice_path = await _pcm_to_ogg_voice(*result)
+        if not voice_path:
+            logging.warning("prepare_morning_summary: voice message unavailable (TTS or ffmpeg failed)")
+        return voice_path
+    except Exception as e:
+        logging.error("Morning voice summary failed: %s", e)
+        return None
+
+
+async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
+    """Build everything the morning summary sends, without sending anything:
+    the text (schedule, weather, tasks, AI lunch pick, exam countdown), the
+    lunch photo URL, each user's outfit (AI pick + try-on image) and the
+    AI-narrated voice message (already synthesized to an OGG file). The
+    slow AI parts run here, ahead of time, so deliver_morning_summary can
+    send everything at once at the scheduled time."""
+    session = state.global_session
+    if not session:
+        return None
+
+    today_date = datetime.now(TZ_BERLIN).date()
+    events, today_events = await _fetch_today_events(session, today_date)
+    # Weather for the morning commute window; omitted (not an empty
+    # section) if Open-Meteo is unreachable.
+    weather = await get_weather_snapshot(today_date)
+    today_tasks = _load_today_tasks(today_date)
+    food = await _fetch_lunch_pick()
+
+    final_text = _compose_morning_text(today_date, [
+        _format_schedule_section(today_events),
+        _format_study_windows_section(events, today_date),
+        f"\n\n{build_weather_text_line(weather)}" if weather else "",
+        _format_tasks_section(today_tasks),
+        _format_lunch_section(food),
+        await _fetch_exam_countdown(session, today_date),
+    ])
+    photo_url, photo_caption = await _prepare_lunch_photo(food)
+
+    return {
+        "text": final_text,
+        "photo_url": photo_url,
+        "photo_caption": photo_caption,
+        "outfits": await _prepare_outfits(bot, user_ids, weather),
+        "voice_path": await _prepare_morning_voice(today_events, today_date, today_tasks, weather, food),
+    }
+
+
+async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
+    """Send a prepare_morning_summary result: text (pinned), lunch photo,
+    outfit, voice message, back to back."""
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🍴 Today's Menu", callback_data="menu_nav|2/|new")]
+    ])
+
+    # Pinning isn't automatic in Telegram - a pinned message stays pinned
+    # forever until explicitly unpinned, so keeping only "today's" summary
+    # pinned means unpinning yesterday's (tracked per-chat in general_cache,
+    # since pin state is per-chat) before pinning the new one. Best-effort:
+    # a pin/unpin failure (e.g. missing chat permission) never blocks the
+    # summary itself from going out.
+    pin_cache = load_general_cache()
+    pinned = pin_cache.get("pinned_morning_summary", {})
+    pin_cache_dirty = False
+
+    for uid in user_ids:
+        try:
+            sent_msg = await bot.send_message(
+                chat_id=uid,
+                text=prepared["text"],
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        except Exception as e:
+            logging.error("Failed to send summary to %s: %s", uid, e)
+            continue
+
+        prev_msg_id = pinned.get(str(uid))
+        if prev_msg_id:
+            try:
+                await bot.unpin_chat_message(chat_id=uid, message_id=prev_msg_id)
+            except Exception as e:
+                logging.warning("Failed to unpin previous morning summary for %s: %s", uid, e)
+        try:
+            await bot.pin_chat_message(chat_id=uid, message_id=sent_msg.message_id, disable_notification=True)
+            pinned[str(uid)] = sent_msg.message_id
+            pin_cache_dirty = True
+        except Exception as e:
+            logging.warning("Failed to pin morning summary for %s: %s", uid, e)
+
+    if pin_cache_dirty:
+        update_general_cache({"pinned_morning_summary": pinned})
+
+    if prepared.get("photo_url"):
+        for uid in user_ids:
+            try:
+                await bot.send_photo(chat_id=uid, photo=prepared["photo_url"], caption=prepared.get("photo_caption"), parse_mode="HTML")
+            except Exception as e:
+                logging.error("Failed to send lunch photo to %s: %s", uid, e)
+
+    if get_wardrobe_feature_enabled():
+        for uid in user_ids:
+            try:
+                # Checked again at delivery: a manual "Suggest Outfit Now"
+                # between preparation and now wins, so the user never gets
+                # two different outfits for the same day.
+                cached = get_cached_outfit_today(uid)
+                if cached:
+                    caption = outfit_caption(cached)
+                    if cached.get("photo_file_id"):
+                        await bot.send_photo(chat_id=uid, photo=cached["photo_file_id"], caption=caption, parse_mode="HTML")
+                    else:
+                        await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
+                    continue
+                entry = prepared["outfits"].get(uid)
+                if not entry:
+                    continue
+                outfit = entry["outfit"]
+                caption = outfit_caption(outfit)
+                photo_file_id = None
+                if entry["image_bytes"]:
+                    sent = await bot.send_photo(chat_id=uid, photo=io.BytesIO(entry["image_bytes"]), caption=caption, parse_mode="HTML")
+                    photo_file_id = sent.photo[-1].file_id if sent.photo else None
+                else:
+                    # Every image provider failed/unavailable - still
+                    # deliver the text-only pick rather than nothing, since
+                    # the weather-aware reasoning is useful on its own.
+                    await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
+                record_worn_items(uid, [it["id"] for it in outfit["chosen_items"]])
+                save_cached_outfit_today(uid, outfit["description"], photo_file_id, outfit.get("color_tip", ""), [it["label"] for it in outfit["chosen_items"]])
+            except Exception as e:
+                logging.warning("Outfit suggestion failed for %s: %s", uid, e)
+
+    voice_path = prepared.get("voice_path")
+    if voice_path:
+        try:
+            for uid in user_ids:
+                try:
+                    with open(voice_path, "rb") as f:
+                        await bot.send_voice(chat_id=uid, voice=f)
+                except Exception as e:
+                    logging.error("Morning voice: failed to send to %s: %s", uid, e)
+        finally:
+            try:
+                os.remove(voice_path)
+            except OSError:
+                pass
+
+
+def _mark_morning_summary_sent(today_str: str) -> None:
+    # Re-load rather than reusing a cache loaded earlier - deliver_morning_summary
+    # does its own separate load/save of general_cache.json (to track which
+    # message is currently pinned), and saving a stale copy would silently
+    # overwrite that, breaking the unpin-before-pin logic every day.
+    cache = load_general_cache()
+    cache["last_morning_summary"] = today_str
+    save_general_cache(cache)
+
+
+async def _deliver_morning_summary_at(bot, user_ids, prepared: dict, send_at: datetime, today_str: str) -> None:
+    """Background task: wait until send_at, then deliver."""
+    try:
+        delay = (send_at - datetime.now(TZ_BERLIN)).total_seconds()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        logging.info("🌞 Delivering prepared morning summary...")
+        await deliver_morning_summary(bot, user_ids, prepared)
+    except Exception as e:
+        logging.error("❌ Morning summary delivery failed: %s", e)
+    finally:
+        # Marked even on failure, like the old inline send: a broken
+        # delivery shouldn't repeat on every watcher cycle all day.
+        _mark_morning_summary_sent(today_str)
+
+
+async def handle_calendar_today_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle calendar_today_voice callback ("🔊 Listen" on the daily
+    schedule) — synthesize today's plan via OpenRouter TTS and send it as a
+    voice message."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    try:
+        today = berlin_now().date()
+        week_start = today - timedelta(days=today.weekday())
+        events = await get_calendar_events(session=state.global_session, week_start=week_start)
+        await send_daily_plan_voice(query.message, events, today, user_id=user_id)
+    except Exception as e:
+        logging.error("Calendar today voice error: %s", e)
+        await query.message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
+
+
+async def handle_calendar_weekly_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle calendar_weekly_voice|YYYY-MM-DD callback ("🔊 Listen" on the
+    weekly schedule) — synthesize that week's plan via OpenRouter TTS and
+    send it as a voice message."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        return
+
+    try:
+        _, date_str = query.data.split("|")
+        week_start = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        today = berlin_now().date()
+        week_start = today - timedelta(days=today.weekday())
+
+    try:
+        events = await get_calendar_events(session=state.global_session, week_start=week_start)
+        await send_weekly_plan_voice(query.message, events, week_start, user_id=user_id)
+    except Exception as e:
+        logging.error("Calendar weekly voice error: %s", e)
+        await query.message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
+
+
+def build_daily_plan_speech_text(events: list, target_date) -> str:
+    """Build a plain-English (no Markdown/HTML) description of one day's
+    schedule, suitable as TTS input — reuses the same event dicts
+    send_daily_calendar renders (title, time, location, status)."""
+    today_events = [ev for ev in events if ev["date_key"] == target_date]
+    if not today_events:
+        return f"You have no events scheduled on {target_date:%A, %B %d}. Enjoy your free day!"
+
+    parts = [f"Here is your schedule for {target_date:%A, %B %d}. You have {len(today_events)} event{'s' if len(today_events) != 1 else ''} today."]
+    for ev in today_events:
+        title = clean_course_title(ev.get("title", "")) or "an event"
+        time_range = ev.get("time", "")
+        location = _safe_loc(ev.get("location", ""))
+        sentence = f"{title} at {time_range}"
+        if location and location not in ("-", "TBA", "N/A"):
+            sentence += f", in {location}"
+        parts.append(sentence + ".")
+    return " ".join(parts)
+
+
+DAILY_PLAN_NARRATION_SYSTEM_PROMPT = """You are recording a short, warm, upbeat spoken morning briefing for a university student — it will be converted to speech and sent as a voice message, so write it exactly as you'd say it out loud, not as a written list.
+
+Structure:
+1. Open with a genuine, encouraging line about the day ahead — invent fresh wording every time, never reuse a stock phrase, make it feel spontaneous rather than a template.
+2. If weather data is given, mention what it'll actually be like stepping outside (dry/rainy/sunny etc — the precise temperature matters far less than that) and suggest what to bring or wear, naturally, as part of the flow — not a separate weather-report segment.
+3. Naturally weave in today's schedule: what's on, roughly when, and where — like a friend casually telling them their day, not reading a bureaucratic agenda.
+4. If any tasks are due today, mention them too, woven into the same conversational flow — not as a separate announcement.
+5. If a lunch pick is given, mention it naturally too — what it is and roughly where to get it — as part of the same flow, not a separate food-review segment.
+6. Close with one short, warm line wishing them well.
+
+Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 130 words (a bit more if there's weather, tasks, and/or a lunch pick to mention too). Vary your phrasing and structure every time you're asked this, even for an identical schedule, since this repeats every single morning and must never sound canned or repetitive."""
+
+
+async def build_ai_daily_plan_narration(today_events: list, target_date, name: Optional[str] = None, today_tasks: Optional[list] = None, weather: Optional[dict] = None, food: Optional[dict] = None) -> Optional[str]:
+    """Ask the chat LLM (OpenRouter) to write a warm, freshly-improvised
+    spoken narration of the day's schedule, weather, any tasks due today,
+    and a lunch pick — deliberately not a fixed template, so the opening
+    line and phrasing differ every time this is called, even for an
+    identical schedule. If `name` is given (see get_user_name/
+    get_primary_user_name), the narration addresses them by it. `weather`
+    is a get_weather_snapshot() dict — what matters for the narration is
+    the condition (dry/rainy/etc), not the exact temperature. `food` is a
+    build_food_recommendation() result. Returns None on any failure;
+    callers should fall back to build_daily_plan_speech_text so the voice
+    message always has content."""
+    if today_events:
+        schedule_summary = "\n".join(
+            f"- {clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')} in {_safe_loc(ev.get('location', ''))}"
+            for ev in today_events
+        )
+    else:
+        schedule_summary = "No events scheduled — a free day."
+
+    user_prompt = f"Today is {target_date:%A, %B %d}.\nSchedule:\n{schedule_summary}"
+
+    if weather:
+        wet_note = "expect it to be wet (rain/drizzle/snow)" if weather["is_wet"] else "it should stay dry"
+        user_prompt += (
+            f"\n\nWeather in {weather['location_name']} around when they'll be heading out (8-11 AM): {weather['description']}, "
+            f"{wet_note}, roughly {weather['temp_min']:.0f}-{weather['temp_max']:.0f}°C. "
+            f"Mention the location name ({weather['location_name']}) naturally along with what to expect, and suggest what to bring/wear."
+        )
+
+    if today_tasks:
+        tasks_summary = "\n".join(
+            f"- {t['text']}" + (f" (due {datetime.fromisoformat(t['due_time']).astimezone(TZ_BERLIN).strftime('%H:%M')})" if t.get("due_time") else "")
+            for t in today_tasks
+        )
+        user_prompt += f"\n\nTasks due today:\n{tasks_summary}\nMention these naturally too, not as a separate rigid list."
+
+    if food and food.get("dish") and food.get("category"):
+        user_prompt += (
+            f"\n\nLunch pick for today: {food['dish']} at {_friendly_menu_category_label(food['category'])}. "
+            "Mention it naturally too, briefly."
+        )
+
+    if name:
+        user_prompt += f"\nAddress the listener by name at least once, naturally (their name is {name})."
+    narration = await _call_openrouter(DAILY_PLAN_NARRATION_SYSTEM_PROMPT, user_prompt, temperature=1.15)
+    return narration.strip() if narration else None
+
+
+def build_weekly_plan_speech_text(events: list, week_start, week_end) -> str:
+    """Build a plain-English (no Markdown/HTML) description of one week's
+    schedule, suitable as TTS input — the deterministic fallback for
+    build_ai_weekly_plan_narration, same role as build_daily_plan_speech_text
+    for the daily version."""
+    if not events:
+        return f"You have no events scheduled for the week of {week_start:%B %d} to {week_end:%B %d}. Enjoy the free week!"
+
+    events_by_day: dict = {}
+    for ev in events:
+        events_by_day.setdefault(ev["date_key"], []).append(ev)
+
+    parts = [f"Here is your schedule for the week of {week_start:%B %d} to {week_end:%B %d}."]
+    for dk in sorted(events_by_day.keys()):
+        day_name = dk.strftime("%A")
+        titles = ", ".join(clean_course_title(ev.get("title", "")) or "an event" for ev in events_by_day[dk])
+        parts.append(f"On {day_name}, you have {titles}.")
+    return " ".join(parts)
+
+
+WEEKLY_PLAN_NARRATION_SYSTEM_PROMPT = """You are recording a short, warm, upbeat spoken weekly briefing for a university student — it will be converted to speech and sent as a voice message, so write it exactly as you'd say it out loud, not as a written list.
+
+Structure:
+1. Open with a genuine, encouraging line about the week ahead — invent fresh wording every time, never reuse a stock phrase, make it feel spontaneous rather than a template.
+2. Naturally walk through the week day by day (or group similar/light days together): what's on, roughly when — like a friend giving them the lay of the week, not reading a bureaucratic agenda. Call out the busiest day(s) and any noticeably free day(s) if that's genuinely useful.
+3. If any tasks are due during the week, mention them too, woven into the same conversational flow — not as a separate announcement.
+4. If any good study windows (free gaps squeezed between two classes) are listed, mention the best one or two naturally, e.g. as a nudge for revision or homework — not a rigid list of every single one.
+5. Close with one short, warm line wishing them a good week.
+
+Rules: plain spoken sentences only — no markdown, no emojis, no bullet points, no headers. Keep it under 160 words. Vary your phrasing and structure every time you're asked this, even for an identical week, since this must never sound canned or repetitive."""
+
+
+async def build_ai_weekly_plan_narration(events: list, week_start, week_end, name: Optional[str] = None, week_tasks: Optional[list] = None) -> Optional[str]:
+    """Ask the chat LLM (OpenRouter) to write a warm, freshly-improvised
+    spoken narration of the week's schedule and any tasks due that week —
+    the weekly counterpart of build_ai_daily_plan_narration. Returns None
+    on any failure; callers should fall back to build_weekly_plan_speech_text
+    so the voice message always has content."""
+    if events:
+        events_by_day: dict = {}
+        for ev in events:
+            events_by_day.setdefault(ev["date_key"], []).append(ev)
+        schedule_lines = []
+        for dk in sorted(events_by_day.keys()):
+            day_events = ", ".join(
+                f"{clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')}"
+                for ev in events_by_day[dk]
+            )
+            schedule_lines.append(f"- {dk.strftime('%A')}: {day_events}")
+        schedule_summary = "\n".join(schedule_lines)
+    else:
+        schedule_summary = "No events scheduled — a free week."
+
+    user_prompt = f"Week of {week_start:%B %d} to {week_end:%B %d}.\nSchedule:\n{schedule_summary}"
+
+    if week_tasks:
+        tasks_summary = "\n".join(
+            f"- {t['text']}" + (f" (due {datetime.fromisoformat(t['due_time']).astimezone(TZ_BERLIN).strftime('%A %H:%M')})" if t.get("due_time") else "")
+            for t in week_tasks
+        )
+        user_prompt += f"\n\nTasks due this week:\n{tasks_summary}\nMention these naturally too, not as a separate rigid list."
+
+    study_gaps = find_weekly_study_gaps(events)
+    if study_gaps:
+        gaps_summary = "\n".join(
+            f"- {g['start_dt']:%A} {g['start_dt']:%H:%M}-{g['end_dt']:%H:%M} ({g['duration_minutes'] // 60}h{g['duration_minutes'] % 60:02d}m), between {g['after']} and {g['before']}"
+            for g in study_gaps
+        )
+        user_prompt += f"\n\nFree windows between classes this week, good for studying:\n{gaps_summary}\nMention the best one or two naturally as a nudge for revision/homework, not all of them, and not as a rigid list."
+
+    if name:
+        user_prompt += f"\nAddress the listener by name at least once, naturally (their name is {name})."
+    narration = await _call_openrouter(WEEKLY_PLAN_NARRATION_SYSTEM_PROMPT, user_prompt, temperature=1.15)
+    return narration.strip() if narration else None
+
+
+async def _send_voice_to_users(bot, user_ids, text: str):
+    """Synthesize `text` once via OpenRouter TTS and send the resulting
+    voice message to every user_id, reusing the same converted file rather
+    than re-synthesizing per recipient. Used for the automatic morning
+    voice summary, which has no single "sender" to reply to and no text
+    fallback of its own to send — the text morning summary already went
+    out separately, so a TTS/ffmpeg failure here just logs and skips."""
+    result = await synthesize_speech(text)
+    if not result:
+        logging.warning("_send_voice_to_users: TTS unavailable, skipping voice message")
+        return
+    pcm_bytes, sample_rate = result
+
+    ogg_path = await _pcm_to_ogg_voice(pcm_bytes, sample_rate)
+    if not ogg_path:
+        logging.warning("_send_voice_to_users: ffmpeg conversion failed, skipping voice message")
+        return
+    try:
+        for uid in user_ids:
+            try:
+                with open(ogg_path, "rb") as f:
+                    await bot.send_voice(chat_id=uid, voice=f)
+            except Exception as e:
+                logging.error("_send_voice_to_users: failed to send to %s: %s", uid, e)
+    finally:
+        try:
+            os.remove(ogg_path)
+        except OSError:
+            pass
+
+
+async def _try_send_voice(sender, text: str) -> bool:
+    """Best-effort: synthesize `text` via OpenRouter TTS, convert to
+    OGG/Opus, and send it as a voice message on `sender`. Returns True on
+    success, False on any failure (TTS unavailable, ffmpeg missing/failed,
+    or the send itself raising) — callers decide what, if anything, to do
+    about a False result (e.g. fall back to sending the text)."""
+    result = await synthesize_speech(text)
+    if not result:
+        return False
+    pcm_bytes, sample_rate = result
+
+    ogg_path = await _pcm_to_ogg_voice(pcm_bytes, sample_rate)
+    if not ogg_path:
+        return False
+
+    try:
+        with open(ogg_path, "rb") as f:
+            await sender.reply_voice(voice=f)
+        return True
+    except Exception as e:
+        logging.error("_try_send_voice: failed to send voice message: %s", e)
+        return False
+    finally:
+        try:
+            os.remove(ogg_path)
+        except OSError:
+            pass
+
+
+async def send_daily_plan_voice(sender, events: list, target_date, user_id=None):
+    """Build today's schedule as a warm, freshly-improvised spoken
+    narration (falling back to a plain deterministic description if the
+    LLM call fails), synthesize it via OpenRouter TTS, and send it as a
+    Telegram voice message. Falls back to sending the text itself (never
+    silently does nothing) if TTS is unavailable, ffmpeg is missing, or
+    synthesis fails for any reason.
+
+    `user_id` personalizes the narration with that user's name (see
+    get_user_name); falls back to get_primary_user_name() if not given or
+    unset, since ALLOWED_USER_IDS is currently the same person on
+    different devices."""
+    today_events = [ev for ev in events if ev["date_key"] == target_date]
+    name = (get_user_name(user_id) if user_id is not None else None) or get_primary_user_name()
+    try:
+        today_tasks = [
+            t for t in load_tasks()
+            if t.get("due_time") and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == target_date
+        ]
+    except Exception as e:
+        logging.warning("send_daily_plan_voice: tasks fetch failed: %s", e)
+        today_tasks = []
+    weather = await get_weather_snapshot(target_date)
+    text = await build_ai_daily_plan_narration(today_events, target_date, name=name, today_tasks=today_tasks, weather=weather) or build_daily_plan_speech_text(events, target_date)
+    await _show_typing(sender, action=ChatAction.RECORD_VOICE)
+
+    if not await _try_send_voice(sender, text):
+        await sender.reply_text("⚠️ Couldn't generate voice right now — here's the schedule as text instead:\n\n" + text)
+
+
+async def send_weekly_plan_voice(sender, events: list, week_start, user_id=None):
+    """Same idea as send_daily_plan_voice, but for the whole week — a warm,
+    freshly-improvised narration of the week's schedule and any tasks due
+    that week, synthesized and sent as a voice message. Falls back to a
+    plain deterministic description, and further to plain text, on any
+    failure."""
+    week_end = week_start + timedelta(days=6)
+    name = (get_user_name(user_id) if user_id is not None else None) or get_primary_user_name()
+    week_tasks = _week_tasks_for_range(week_start, week_end)
+    text = await build_ai_weekly_plan_narration(events, week_start, week_end, name=name, week_tasks=week_tasks) or build_weekly_plan_speech_text(events, week_start, week_end)
+    await _show_typing(sender, action=ChatAction.RECORD_VOICE)
+
+    if not await _try_send_voice(sender, text):
+        await sender.reply_text("⚠️ Couldn't generate voice right now — here's the week as text instead:\n\n" + text)
+
+
+async def send_text_and_voice(sender, text: str):
+    """Send `text` as a normal message, then also synthesize and send it as
+    a voice message via the same free OpenRouter TTS pipeline as 🔊 Listen.
+    Best-effort for the voice half — a TTS/ffmpeg failure just means no
+    voice note follows, since the text has already gone out and callers
+    shouldn't have to handle a second failure mode on top of their own."""
+    await sender.reply_text(text)
+    await _show_typing(sender, action=ChatAction.RECORD_VOICE)
+    await _try_send_voice(sender, text)

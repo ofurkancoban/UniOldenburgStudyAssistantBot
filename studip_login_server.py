@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import html
 import json
 import logging
 import os
@@ -36,6 +35,8 @@ from typing import Awaitable, Callable, Optional
 from urllib.parse import parse_qsl, urlsplit
 
 from aiohttp import web
+
+from studip_utils import redact_url
 
 logger = logging.getLogger("StudIPLoginServer")
 
@@ -463,7 +464,7 @@ class LoginServer:
             if relogin:
                 await studip_sess.logout()
                 studip_sess.last_interactive_activity = time.time()
-            elif await studip_sess.is_html_logged_in():
+            elif await studip_sess.is_html_logged_in(use_cache=False):
                 studip_sess.explicitly_logged_out = False
                 studip_sess.last_interactive_activity = 0.0
                 self._schedule_auth_hook()
@@ -479,7 +480,7 @@ class LoginServer:
                     ) as _:
                         pass
                 except Exception:
-                    pass
+                    logging.debug("Stud.IP login check request failed", exc_info=True)
 
         # Start the real Uni Oldenburg OIDC SSO flow
         raise web.HTTPFound("/dispatch.php/login?again=yes&sso=oidc&cancel_login=1")
@@ -552,7 +553,7 @@ class LoginServer:
                 raw_body = await up_resp.read()
                 up_headers = up_resp.headers
         except Exception as exc:
-            logger.error("Proxy upstream error for %s: %s", target_url, exc)
+            logger.error("Proxy upstream error for %s: %s", redact_url(target_url), exc)
             return web.Response(text=f"Upstream error: {exc}", status=502)
 
         resp_headers = {}

@@ -1,0 +1,46 @@
+{
+  "data": [
+    {
+      "relationships": {
+        "author": {
+          "data": {
+            "id": "u1"
+          }
+        }
+      },
+      "attributes": {
+        "content-html": "<p>The exam is on <b>Friday</b> &amp; room A01.</p>",
+        "mkdate": "2026-11-04T10:00:00+01:00"
+      }
+    },
+    {
+      "relationships": {
+        "author": {
+          "data": {
+            "id": "u2"
+          }
+        }
+      },
+      "attributes": {
+        "content-html": "<p>Thanks!</p>",
+        "mkdate": "2026-11-04T11:30:00+01:00"
+      }
+    }
+  ],
+  "included": [
+    {
+      "type": "forum-members",
+      "id": "u1",
+      "attributes": {
+        "name": "Dr. Müller <TA>"
+      }
+    },
+    {
+      "type": "forum-members",
+      "id": "u2",
+      "attributes": {
+        "name": "Student B"
+      }
+    }
+  ]
+}

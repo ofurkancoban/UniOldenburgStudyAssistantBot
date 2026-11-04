@@ -4,7 +4,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Telegram](https://img.shields.io/badge/Telegram-Bot-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)
-![Architecture](https://img.shields.io/badge/Architecture-Dual--Engine-blue?style=for-the-badge)
+![Architecture](https://img.shields.io/badge/Stud.IP-JSON%3AAPI-blue?style=for-the-badge)
 
 </div>
 
@@ -12,18 +12,7 @@ The ultimate Telegram companion for students at the **University of Oldenburg**.
 
 ---
 
-## 🌗 Choose Your Engine
-
-This project offers two distinct ways to interact with Stud.IP. You can select your preferred engine during the initial setup via `setup.sh`.
-
-| Feature | 🚀 Browser-less (Standard) | 🌐 Playwright (Legacy) |
-| :--- | :--- | :--- |
-| **Logic** | Stud.IP's own JSON:API (HTML pages as fallback) | Simulated Browser (Chromium) |
-| **Speed** | ⚡ Instant Sync | 🐢 Slower (Browser overhead) |
-| **RAM Usage** | ~50MB - 100MB | ~500MB - 1GB+ |
-| **Stability** | High (No browser crashes) | Medium (Requires display/driver) |
-| **Best For** | Production/Cloud Servers | Local Desktop / Debugging |
-| **File** | `studip_bot.py` | `studip_bot_playwright.py` |
+## 🔌 How It Talks to Stud.IP
 
 Courses, files and folders, announcements, messages and forum posts are read from Stud.IP's own JSON:API (`/jsonapi.php/v1`), using the same logged-in session as the web pages, so no API registration is needed. Each of them falls back to reading the HTML page if the API ever fails. Logging in (SSO with TOTP), enrolment and everything from StuMS (exam dates, registration, grades) still go through the web pages, since there is no API for them.
 
@@ -163,8 +152,7 @@ chmod +x setup.sh
 **What the script does for you:**
 1.  **Environment Isolation**: Creates and activates a Python `.venv`.
 2.  **Dependency Resolution**: Installs all required libraries (`aiohttp`, `python-telegram-bot`, `cryptography`, etc.).
-3.  **Engine Selection**: Lets you choose between the Browser-less and Playwright versions.
-4.  **Configuration**: Generates a `.env` template from your input.
+3.  **Configuration**: Creates `.env` from `.env.example` if it is missing, then starts the bot.
 
 ---
 
@@ -268,30 +256,49 @@ The microservice (`whatsapp_service/`) talks to WhatsApp via **[Baileys](https:/
 ```mermaid
 %%{init: {'theme': 'dark'}}%%
 graph TD
-    A[Telegram Bot] --> B{Engine Choice}
-    B -->|Option 1| C[studip_bot.py / Browser-less]
-    B -->|Option 2| D[studip_bot_playwright.py / Legacy]
-    C --> E[aiohttp + BS4]
-    D --> F[Playwright / Chromium]
-    E --> G[Stud.IP JSON/HTML API]
-    F --> G
-    G --> H[(Persistent Cache)]
-    C --> K[exam_reminder.py]
+    A[Telegram] <--> B[unibot package]
+    B --> C[aiohttp + BeautifulSoup]
+    C --> D[Stud.IP JSON:API / HTML pages]
+    B --> K[exam_reminder.py]
     K -->|Shared SSO session| L[StuMS / HISinOne Portal]
-    L --> H
-    C -.->|Forward & Status| I[Node.js WhatsApp Microservice / Baileys]
-    D -.->|Forward & Status| I
+    B --> H[(bot_data.sqlite3)]
+    B -.->|Forward & Status| I[Node.js WhatsApp Microservice / Baileys]
     I --> J[WhatsApp multi-device protocol over WebSocket]
-    C -.->|Voice note| M[Google Web Speech STT]
-    M -.->|Transcript| N[OpenRouter free LLM]
-    N -.->|Classified intent| C
+    B -.->|Voice note| M[GWDG Whisper / Google Web Speech]
+    B -.->|Intents, summaries, plans| N[GWDG / OpenRouter LLMs]
 ```
 
-> **exam_reminder.py** shares the same authenticated session as `studip_bot.py` (Stud.IP's SSO trust extends to the StuMS/HISinOne exam portal) to track registrations, exam dates, and grades — no separate login required.
+`studip_bot.py` is only the entry point (PM2 and the self-restart start it). The bot itself is the `unibot` package, one module per area, layered so that a module only imports modules listed before it in `unibot/__init__.py` (`MODULE_ORDER`):
+
+| Layer | Modules |
+| :--- | :--- |
+| Foundation | `config` (all `.env` settings, checked at startup by `validate_settings()`), `db`, `state`, `storage`, `formatting`, `telegram_ui` |
+| Stud.IP and services | `auth`, `studip_api`, `ai`, `documents`, `weather`, `mensa`, `wardrobe`, `schedule`, `whatsapp` |
+| Features | `monitoring`, `exams`, `study_plan`, `tasks`, `enrollment`, `morning`, `voice`, `system`, `menus` |
+| Runtime | `watcher` (background loop), `app` (startup and handler registration) |
+
+Shared runtime state (the Stud.IP session, the login server, watcher flags) lives in `unibot/state.py` and is always read as `state.<name>`, so every module sees the current value.
+
+**Persistent data** (caches, settings, tasks, wardrobe, study progress) is stored in one SQLite database, `bot_data.sqlite3` (`unibot/db.py`), one row per document, each save a single transaction. Existing JSON files from older versions are imported automatically the first time they are read and then left in place as a backup. Back up `bot_data.sqlite3` (together with `.env` and `.vault_key`) to back up the bot.
+
+> **exam_reminder.py** shares the same authenticated session as the bot (Stud.IP's SSO trust extends to the StuMS/HISinOne exam portal) to track registrations, exam dates, and grades, so no separate login is required.
 >
-> Voice notes go through two free external calls before anything happens: GWDG's Whisper (`whisper-large-v3`, with your course names as a vocabulary hint) for transcription, falling back to Google's Web Speech API, then an OpenRouter `:free` model for intent classification: both optional, both fail gracefully back to plain-text behavior if unavailable.
+> Voice notes go through GWDG's Whisper (`whisper-large-v3`, with your course names as a vocabulary hint), falling back to Google's Web Speech API, then a free LLM classifies the intent. Both steps are optional and fall back to plain-text behavior if unavailable.
 >
-> **WhatsApp Microservice** (`whatsapp_service/`) runs on [Baileys](https://github.com/WhiskeySockets/Baileys), not a browser — it speaks WhatsApp's multi-device protocol directly over a WebSocket (no Puppeteer/Chromium). Session credentials persist to `whatsapp_service/baileys_auth/`.
+> **WhatsApp Microservice** (`whatsapp_service/`) runs on [Baileys](https://github.com/WhiskeySockets/Baileys), not a browser: it speaks WhatsApp's multi-device protocol directly over a WebSocket. Session credentials persist to `whatsapp_service/baileys_auth/`.
+
+---
+
+## 🧪 Development
+
+```bash
+pip install -r requirements-dev.txt
+ruff check .                              # lint (rules in pyproject.toml)
+mypy                                      # type check the annotated core modules
+python -m unittest discover -s tests -v   # tests
+```
+
+The tests never touch the network, Telegram or the real database (`BOT_DB_FILE` points them to a temporary one). Parsers are tested against saved sample pages in `tests/fixtures/`. GitHub Actions (`.github/workflows/ci.yml`) runs the same checks on every push and pull request, plus `npm ci`, a syntax check and `npm audit` for the WhatsApp service.
 
 ---
 

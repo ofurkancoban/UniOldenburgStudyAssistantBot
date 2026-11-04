@@ -20,8 +20,18 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+_TZ_BERLIN = ZoneInfo("Europe/Berlin")
+
+
+def berlin_now() -> datetime:
+    """Berlin wall-clock time, naive (StuMS dates are naive Berlin-local),
+    independent of the server's timezone."""
+    return datetime.now(_TZ_BERLIN).replace(tzinfo=None)
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -78,7 +88,7 @@ def load_exam_cache() -> dict:
             with open(EXAM_CACHE_PATH, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            logging.warning(f"Could not load exam reminder cache: {e}")
+            logging.warning("Could not load exam reminder cache: %s", e)
     return {
         "notified_open": {}, "notified_deadline": {}, "notified_exam_date": {},
         "notified_exam_hours": {}, "known_grades": {},
@@ -92,7 +102,7 @@ def save_exam_cache(data: dict) -> None:
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, EXAM_CACHE_PATH)
     except Exception as e:
-        logging.error(f"Could not save exam reminder cache: {e}")
+        logging.error("Could not save exam reminder cache: %s", e)
 
 
 async def _establish_stums_session(session) -> str:
@@ -111,7 +121,7 @@ async def _establish_stums_session(session) -> str:
     try:
         return await session.sso_handoff(SSO_ENTRY_URL, "stums.uni-oldenburg.de")
     except RuntimeError as e:
-        raise RuntimeError(f"StuMS SSO handoff failed: {e}")
+        raise RuntimeError(f"StuMS SSO handoff failed: {e}") from e
 
 
 def _parse_candidate_units(html_text: str) -> list[dict]:
@@ -434,7 +444,7 @@ async def get_open_exam_registrations(session, failed_codes: Optional[set] = Non
             try:
                 periods = await _fetch_examination_periods(session, referer, unit["unit_id"], unit["period_id"])
             except Exception as e:
-                logging.warning(f"exam_reminder: failed to fetch detail for {unit['code']}: {e}")
+                logging.warning("exam_reminder: failed to fetch detail for %s: %s", unit['code'], e)
                 if failed_codes is not None:
                     failed_codes.add(unit["code"])
                 return
@@ -610,7 +620,7 @@ async def get_all_exam_dates(session) -> list[dict]:
             try:
                 periods = await _fetch_examination_periods(session, referer, unit["unit_id"], unit["period_id"])
             except Exception as e:
-                logging.warning(f"exam_reminder: failed to fetch detail for {unit['code']}: {e}")
+                logging.warning("exam_reminder: failed to fetch detail for %s: %s", unit['code'], e)
                 return
         for period in periods:
             if period.get("exam_date"):
@@ -629,14 +639,14 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
     try:
         exams = await get_registered_exam_schedule(session)
     except Exception as e:
-        logging.error(f"exam_reminder: fetch registered exam schedule failed: {e}")
+        logging.error("exam_reminder: fetch registered exam schedule failed: %s", e)
         return
 
     cache = load_exam_cache()
     notified_days = cache.get("notified_exam_date", {})
     notified_hours = cache.get("notified_exam_hours", {})
 
-    now = datetime.now()
+    now = berlin_now()
     today = now.date()
     still_upcoming_keys = set()
 
@@ -667,9 +677,9 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
                 )
                 try:
                     await broadcast_fn(bot, text, reply_markup=WA_FORWARD_MARKUP)
-                    logging.info(f"🎓 Notified: exam date reminder ({threshold}d) for {key}")
+                    logging.info("🎓 Notified: exam date reminder (%sd) for %s", threshold, key)
                 except Exception as e:
-                    logging.error(f"exam_reminder: failed to send exam-date reminder for {key}: {e}")
+                    logging.error("exam_reminder: failed to send exam-date reminder for %s: %s", key, e)
                 sent_days.add(threshold)
                 notified_days[key] = sorted(sent_days)
                 cache["notified_exam_date"] = notified_days
@@ -692,9 +702,9 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
                 )
                 try:
                     await broadcast_fn(bot, text, reply_markup=WA_FORWARD_MARKUP)
-                    logging.info(f"🎓 Notified: exam starting soon for {key}")
+                    logging.info("🎓 Notified: exam starting soon for %s", key)
                 except Exception as e:
-                    logging.error(f"exam_reminder: failed to send starting-soon reminder for {key}: {e}")
+                    logging.error("exam_reminder: failed to send starting-soon reminder for %s: %s", key, e)
                 notified_hours[key] = True
                 cache["notified_exam_hours"] = notified_hours
                 save_exam_cache(cache)
@@ -854,7 +864,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
     try:
         open_exams = await get_open_exam_registrations(session, failed_codes=failed_codes)
     except Exception as e:
-        logging.error(f"exam_reminder: fetch failed: {e}")
+        logging.error("exam_reminder: fetch failed: %s", e)
         return
 
     cache = load_exam_cache()
@@ -862,7 +872,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
     notified_deadline = cache.get("notified_deadline", {})
     muted_codes = set(cache.get("muted_codes", []))
 
-    now = datetime.now()
+    now = berlin_now()
     still_open_keys = set()
 
     for exam in open_exams:
@@ -913,9 +923,9 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
             )
             try:
                 await broadcast_fn(bot, text, reply_markup=keyboard)
-                logging.info(f"🎓 Notified: exam registration opened for {occurrence_key}")
+                logging.info("🎓 Notified: exam registration opened for %s", occurrence_key)
             except Exception as e:
-                logging.error(f"exam_reminder: failed to send open-notification for {occurrence_key}: {e}")
+                logging.error("exam_reminder: failed to send open-notification for %s: %s", occurrence_key, e)
             notified_open[occurrence_key] = now.isoformat()
             # Persist immediately so a crash while processing a later exam in this
             # same batch can't cause this notification to be resent on restart.
@@ -939,9 +949,9 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
                     )
                     try:
                         await broadcast_fn(bot, text, reply_markup=keyboard)
-                        logging.info(f"🎓 Notified: {days_left} day(s) left for {occurrence_key}")
+                        logging.info("🎓 Notified: %s day(s) left for %s", days_left, occurrence_key)
                     except Exception as e:
-                        logging.error(f"exam_reminder: failed to send deadline-notification for {occurrence_key}: {e}")
+                        logging.error("exam_reminder: failed to send deadline-notification for %s: %s", occurrence_key, e)
                     sent_thresholds.add(threshold)
                     notified_deadline[occurrence_key] = sorted(sent_thresholds)
                     cache["notified_deadline"] = notified_deadline
@@ -1158,7 +1168,7 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
     try:
         grades = await get_grades(session)
     except Exception as e:
-        logging.error(f"exam_reminder: fetch grades failed: {e}")
+        logging.error("exam_reminder: fetch grades failed: %s", e)
         return
 
     cache = load_exam_cache()
@@ -1172,7 +1182,7 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
                 known_grades[entry["number"]] = {"status_title": st, "grade": entry.get("grade")}
         cache["known_grades"] = known_grades
         save_exam_cache(cache)
-        logging.info(f"🎓 Seeded {len(known_grades)} historical grades into baseline cache.")
+        logging.info("🎓 Seeded %s historical grades into baseline cache.", len(known_grades))
         return
 
     for entry in grades:
@@ -1230,9 +1240,9 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
         try:
             await broadcast_fn(bot, personal_text, parse_mode="HTML")
             await broadcast_fn(bot, announcement_text, parse_mode="HTML", reply_markup=WA_FORWARD_MARKUP)
-            logging.info(f"🎓 Notified: grade result for {entry.get('title')} ({number})")
+            logging.info("🎓 Notified: grade result for %s (%s)", entry.get('title'), number)
         except Exception as e:
-            logging.error(f"exam_reminder: failed to send grade notification for {number}: {e}")
+            logging.error("exam_reminder: failed to send grade notification for %s: %s", number, e)
 
         known_grades[number] = fingerprint
         cache["known_grades"] = known_grades
@@ -1242,7 +1252,7 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
 async def check_tuition_reminders(session, bot, broadcast_fn, force: bool = False) -> None:
     """Check tuition fee (Rückmeldung) status on StuMS and send proactive alerts if
     unpaid invoices exist or when payment is received."""
-    now = datetime.now()
+    now = berlin_now()
     today = now.date()
     today_str = today.isoformat()
 
@@ -1251,13 +1261,13 @@ async def check_tuition_reminders(session, bot, broadcast_fn, force: bool = Fals
     last_check_ts = t_state.get("last_check_ts", 0)
 
     # Check at most once every 6 hours unless forced
-    if not force and (now.timestamp() - last_check_ts < 6 * 3600):
+    if not force and (time.time() - last_check_ts < 6 * 3600):
         return
 
     try:
         t_data = await get_tuition_status(session)
     except Exception as exc:
-        logging.debug(f"check_tuition_reminders: fetch failed ({exc})")
+        logging.debug("check_tuition_reminders: fetch failed (%s)", exc)
         return
 
     has_open = bool(t_data.get("has_open_payments", False))
@@ -1265,7 +1275,7 @@ async def check_tuition_reminders(session, bot, broadcast_fn, force: bool = Fals
     was_open = bool(t_state.get("has_open_payments", False))
     last_alert_date = t_state.get("last_alert_date")
 
-    t_state["last_check_ts"] = int(now.timestamp())
+    t_state["last_check_ts"] = int(time.time())
     t_state["has_open_payments"] = has_open
 
     # 1. Payment cleared notification
@@ -1281,7 +1291,7 @@ async def check_tuition_reminders(session, bot, broadcast_fn, force: bool = Fals
             await broadcast_fn(bot, cleared_text, parse_mode="HTML")
             logging.info("💶 Tuition fee cleared notification sent.")
         except Exception as exc:
-            logging.error(f"Failed to send tuition clearance alert: {exc}")
+            logging.error("Failed to send tuition clearance alert: %s", exc)
 
     # 2. Open payment alert
     elif has_open and open_invoices:
@@ -1340,9 +1350,9 @@ async def check_tuition_reminders(session, bot, broadcast_fn, force: bool = Fals
             try:
                 await broadcast_fn(bot, alert_text, parse_mode="HTML")
                 t_state["last_alert_date"] = today_str
-                logging.info(f"💶 Tuition due reminder sent for {period} ({to_pay}).")
+                logging.info("💶 Tuition due reminder sent for %s (%s).", period, to_pay)
             except Exception as exc:
-                logging.error(f"Failed to send tuition due alert: {exc}")
+                logging.error("Failed to send tuition due alert: %s", exc)
 
     cache["tuition_status"] = t_state
     save_exam_cache(cache)

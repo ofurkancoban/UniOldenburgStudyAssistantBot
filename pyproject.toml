@@ -1,0 +1,45 @@
+[project]
+name = "uni-oldenburg-study-assistant"
+version = "1.0.0"
+description = "Telegram study assistant for Stud.IP at the University of Oldenburg"
+readme = "README.md"
+requires-python = ">=3.10"
+# Runtime dependencies are pinned in requirements.txt (the bot is deployed
+# from a checkout, not installed as a package).
+
+[tool.ruff]
+target-version = "py310"
+extend-exclude = ["whatsapp_service"]
+
+[tool.ruff.lint]
+# F: pyflakes (undefined names, unused imports, ...)
+# E9: syntax errors          B: likely bugs (bugbear)
+# G004: f-strings in log calls (use lazy %-formatting)
+# S110/S112, E722: exceptions swallowed without a trace
+select = ["F", "E9", "B", "G004", "S110", "S112", "E722"]
+# zip() over lists built side by side; strict=True would turn a harmless
+# length mismatch into a crash.
+ignore = ["B905"]
+
+[tool.ruff.lint.per-file-ignores]
+# Package __init__ re-exports config on purpose (it must load first).
+"unibot/__init__.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = true
+# Only the listed modules are type checked so far; widen the list as more
+# modules get annotations. Imported modules are analysed but not reported.
+follow_imports = "silent"
+files = [
+    "studip_utils.py",
+    "unibot/__init__.py",
+    "unibot/config.py",
+    "unibot/db.py",
+    "unibot/state.py",
+    "unibot/watcher.py",
+]
+
+[tool.coverage.run]
+source = ["unibot", "studip_utils", "studip_session", "studip_oauth", "studip_vault"]

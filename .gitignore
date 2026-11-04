@@ -13,6 +13,9 @@ yarn-debug.log*
 yarn-error.log*
 
 # Bot Cache & Runtime
+bot_data.sqlite3
+bot_data.sqlite3-wal
+bot_data.sqlite3-shm
 announcement_cache.json
 files_cache.json
 study_plan_cache.json

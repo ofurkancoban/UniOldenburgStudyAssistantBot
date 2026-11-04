@@ -1,0 +1,4 @@
+# Tools for development and CI (not needed on the server)
+-r requirements.txt
+ruff==0.17.3
+mypy==2.4.1
