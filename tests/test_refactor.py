@@ -587,7 +587,7 @@ class StumsHandoffTests(unittest.TestCase):
 
     def test_gives_up_with_clear_message(self):
         s = self.session(["Login notwendig", "Login notwendig"])
-        with self.assertRaisesRegex(RuntimeError, "/login"):
+        with self.assertRaisesRegex(RuntimeError, "still shows you as logged out"):
             asyncio.run(self.er._establish_stums_session(s))
         self.assertEqual(s._stums_verified_at, 0.0)
 
@@ -597,14 +597,36 @@ class StumsHandoffTests(unittest.TestCase):
             asyncio.run(self.er._establish_stums_session(s))
         self.assertFalse(first.exception.quiet)
         self.assertGreater(s.stums_blocked_until, __import__("time").time() + 25 * 60)
-        with self.assertRaises(self.er.StumsLoginUnavailable) as second:
+        with self.er.background_stums(), self.assertRaises(self.er.StumsLoginUnavailable) as second:
             asyncio.run(self.er._establish_stums_session(s))
         self.assertTrue(second.exception.quiet)
-        self.assertEqual(s.sso_handoff.await_count, 2)  # no new attempt during the pause
+        self.assertEqual(s.sso_handoff.await_count, 2)  # background: no new attempt during the pause
         with mock.patch.object(self.er.logging, "error") as err, mock.patch.object(self.er.logging, "debug") as dbg:
             self.er._log_stums_failure("fetch failed", first.exception)
             self.er._log_stums_failure("fetch failed", second.exception)
         self.assertEqual((err.call_count, dbg.call_count), (1, 1))
+
+    def test_user_actions_ignore_the_pause(self):
+        s = self.session(["Login notwendig", "Login notwendig", "<h1>ok</h1>"])
+        with self.assertRaises(self.er.StumsLoginUnavailable):
+            asyncio.run(self.er._establish_stums_session(s))
+        # a button press right after the refusal tries StuMS again at once
+        asyncio.run(self.er._establish_stums_session(s))
+        self.assertEqual(s.sso_handoff.await_count, 3)
+        self.assertEqual(s.stums_blocked_until, 0.0)
+
+    def test_background_checks_are_marked(self):
+        seen = {}
+
+        async def probe(*args, **kwargs):
+            seen["background"] = self.er._stums_background.get()
+
+        for name in ("check_exam_reminders", "check_grade_reminders", "check_tuition_reminders", "check_exam_date_reminders"):
+            fn = getattr(self.er, name)
+            self.assertTrue(hasattr(fn, "__wrapped__"), name)
+            asyncio.run(self.er._background_job(probe)())
+            self.assertTrue(seen.pop("background"))
+        self.assertFalse(self.er._stums_background.get())
 
     def test_new_login_ends_the_pause(self):
         import studip_session

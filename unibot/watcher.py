@@ -11,6 +11,7 @@ from datetime import datetime
 from typing import Optional
 
 from exam_reminder import (
+    background_stums,
     check_exam_date_reminders,
     check_exam_reminders,
     check_grade_reminders,
@@ -158,7 +159,8 @@ async def _run_reminder_checks(bot, session):
 
 async def _check_file_exam_reminders(bot, session):
     try:
-        registered = await get_registered_exam_schedule(session)
+        with background_stums():
+            registered = await get_registered_exam_schedule(session)
     except Exception as e:
         logging.warning("File exam reminders: registered schedule unavailable: %s", e)
         registered = []

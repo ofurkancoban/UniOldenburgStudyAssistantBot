@@ -15,6 +15,9 @@ which uses a tense difference in its wording:
 """
 
 import asyncio
+import contextlib
+import contextvars
+import functools
 import html
 import json
 import logging
@@ -54,6 +57,29 @@ class StumsLoginUnavailable(RuntimeError):
     def __init__(self, message: str, quiet: bool = False):
         super().__init__(message)
         self.quiet = quiet
+
+
+# Background checks (watcher) respect the retry pause; anything the user
+# triggers (a button, a command) always tries StuMS right away.
+_stums_background = contextvars.ContextVar("stums_background", default=False)
+
+
+@contextlib.contextmanager
+def background_stums():
+    """Mark StuMS calls inside this block as background work."""
+    token = _stums_background.set(True)
+    try:
+        yield
+    finally:
+        _stums_background.reset(token)
+
+
+def _background_job(fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        with background_stums():
+            return await fn(*args, **kwargs)
+    return wrapper
 
 
 def _log_stums_failure(context: str, exc: Exception) -> None:
@@ -148,7 +174,7 @@ async def _establish_stums_session(session) -> str:
     if not session.explicitly_logged_out and time.time() - verified_at < STUMS_VERIFIED_SECONDS:
         return session._stums_referer
     blocked_until = getattr(session, "stums_blocked_until", 0.0)
-    if time.time() < blocked_until:
+    if _stums_background.get() and time.time() < blocked_until:
         raise StumsLoginUnavailable(
             f"StuMS login refused earlier; next try at {time.strftime('%H:%M', time.localtime(blocked_until))} "
             "or after /login", quiet=True,
@@ -169,8 +195,9 @@ async def _establish_stums_session(session) -> str:
             session.session.cookie_jar.clear_domain(STUMS_HOST)
     session.stums_blocked_until = time.time() + STUMS_RETRY_SECONDS
     raise StumsLoginUnavailable(
-        "StuMS login could not be restored automatically (the handoff reached StuMS "
-        f"but it still asks for a login). Retrying in {STUMS_RETRY_SECONDS // 60} min or after /login."
+        "StuMS did not sign this account in: the university login succeeded, but the "
+        "StuMS portal still shows you as logged out. Background checks retry in "
+        f"{STUMS_RETRY_SECONDS // 60} min."
     )
 
 
@@ -696,6 +723,7 @@ async def get_all_exam_dates(session) -> list[dict]:
     return results
 
 
+@_background_job
 async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
     """Remind about upcoming exam dates the student is registered for: at 3/1/0 days
     before, plus a same-day heads-up a few hours before start when a start time is
@@ -917,6 +945,7 @@ async def submit_exam_action(session, unit_id: str, action_type: str) -> dict:
     }
 
 
+@_background_job
 async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: dict) -> None:
     """Check for newly-opened exam registrations and closing-soon deadlines.
 
@@ -1229,6 +1258,7 @@ def compute_transcript_summary(grades: list[dict]) -> dict:
     }
 
 
+@_background_job
 async def check_grade_reminders(session, bot, broadcast_fn) -> None:
     """Notify when a module reaches a final grade (passed/failed) for the first
     time, or when that result changes (e.g. a correction)."""
@@ -1316,6 +1346,7 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
         save_exam_cache(cache)
 
 
+@_background_job
 async def check_tuition_reminders(session, bot, broadcast_fn, force: bool = False) -> None:
     """Check tuition fee (Rückmeldung) status on StuMS and send proactive alerts if
     unpaid invoices exist or when payment is received."""
