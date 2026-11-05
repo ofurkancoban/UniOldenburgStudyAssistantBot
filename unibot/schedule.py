@@ -174,6 +174,47 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                 except Exception as e:
                     logging.error("Failed to send reminder for %s: %s", title, e)
 
+        # Study window reminders (30 minutes before, window: 25-35 minutes)
+        today_windows = find_study_windows_for_day(events, now.date())
+        for w in today_windows:
+            start_dt = w.get("start_dt")
+            if not start_dt:
+                continue
+
+            diff = start_dt - now
+            minutes_left = diff.total_seconds() / 60
+            if 25 < minutes_left <= 35:
+                study_key = f"study_remind|{w['date_key']}|{int(start_dt.timestamp())}"
+                if study_key in reminders:
+                    continue
+
+                duration_str = _format_hours(w["duration_minutes"])
+                desc = w.get("description", "focused study window")
+                desc_formatted = desc[0].upper() + desc[1:] if desc else "Focused study window"
+                text = (
+                    "🔔 <b>STUDY TIME REMINDER</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "📚 <b>Good Time to Study</b>\n"
+                    f"🕒 Starting in <b>{int(minutes_left)} minutes</b> ({start_dt:%H:%M} – {w['end_dt']:%H:%M})\n"
+                    f"⏳ Duration: <b>{duration_str}</b>\n"
+                    f"💡 <i>{desc_formatted}</i>\n"
+                    "━━━━━━━━━━━━━━━━━━"
+                )
+                keyboard = [
+                    [
+                        InlineKeyboardButton("📅 Today's Plan", callback_data="calendar_today"),
+                        InlineKeyboardButton("📆 Week Plan", callback_data="calendar_weekly"),
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                try:
+                    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
+                    logging.info("🔔 Sent study session reminder for %s to %s", desc, chat_id)
+                    reminders[study_key] = int(now.timestamp())
+                    updated = True
+                except Exception as e:
+                    logging.error("Failed to send study session reminder: %s", e)
+
         # Cleanup old reminders (older than 24 hours)
         cutoff = now.timestamp() - 86400
         new_cache = {k: v for k, v in reminders.items() if v > cutoff}
@@ -628,12 +669,25 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
     if study_windows:
         gap_lines = ["\n📚 *Good Times to Study*", "━━━━━━━━━━━━━━━━━━"]
         for g in study_windows:
-            rem_tag = " _(available now)_" if g.get("is_remaining") else ""
+            if g.get("is_remaining"):
+                rem_tag = f" 🟢 _({_format_hours(g['duration_minutes'])} left, available now)_"
+            else:
+                rem_tag = f" ({_format_hours(g['duration_minutes'])})"
+            desc = g.get("description", "")
+            desc_formatted = desc[0].upper() + desc[1:] if desc else "Study window"
             gap_lines.append(
-                f"🕒 `{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}` "
-                f"({_format_hours(g['duration_minutes'])}){rem_tag} - {_md(g['description'])}"
+                f"🕒 `{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}`{rem_tag} - {_md(desc_formatted)}"
             )
         text += "\n" + "\n".join(gap_lines)
+    elif target_date == now.date() and target_date.weekday() < 5:
+        all_today_windows = find_study_windows_for_day(events, target_date, reference_now=None)
+        if all_today_windows:
+            gap_lines = [
+                "\n📚 *Good Times to Study*",
+                "━━━━━━━━━━━━━━━━━━",
+                "✅ _All scheduled study windows for today have ended._",
+            ]
+            text += "\n" + "\n".join(gap_lines)
 
     keyboard = [
         [
@@ -679,16 +733,22 @@ def _week_tasks_for_range(week_start, week_end) -> list:
 STUDY_WINDOW_DAY_START = dtime(9, 0)
 STUDY_WINDOW_DAY_END = dtime(19, 0)
 STUDY_WINDOW_BETWEEN_MIN_MINUTES = 60  # a gap squeezed between two classes
-STUDY_WINDOW_EDGE_MIN_MINUTES = 90  # before the first / after the last class
+STUDY_WINDOW_EDGE_MIN_MINUTES = 60  # before the first / after the last class
 STUDY_WINDOW_REMAINING_MIN_MINUTES = 30  # today: still worth showing a window already under way
+
+FREE_DAY_SESSIONS = [
+    (dtime(9, 30), dtime(12, 30), "morning focus session"),
+    (dtime(13, 30), dtime(16, 30), "afternoon focus session"),
+    (dtime(17, 0), dtime(19, 0), "evening review session"),
+]
 
 
 def find_study_windows_for_day(events: list, target_date: date, reference_now: Optional[datetime] = None) -> list[dict]:
     """Find good study windows for a single day:
-      - Full day free (Mon-Fri) if no classes are scheduled.
-      - Free time before the first class (09:00 to first class start, if >= 90 mins).
+      - Divided focus sessions (Mon-Fri) if no classes are scheduled.
+      - Free time before the first class (09:00 to first class start, if >= 60 mins).
       - Free time between classes (gaps >= 60 mins).
-      - Free time after the last class (last class end to 19:00, if >= 90 mins).
+      - Free time after the last class (last class end to 19:00, if >= 60 mins).
     Bounds are the STUDY_WINDOW_* constants.
     If `reference_now` is provided and target_date == reference_now.date(),
     dynamically excludes expired windows and updates ongoing windows to reflect
@@ -707,16 +767,19 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
 
     if not day_events:
         if target_date.weekday() < 5:  # Mon to Fri
-            windows.append({
-                "date_key": target_date,
-                "start_dt": day_study_start,
-                "end_dt": day_study_end,
-                "duration_minutes": int((day_study_end - day_study_start).total_seconds() / 60),
-                "description": "full day free for focused study",
-                "after": "morning",
-                "before": "evening",
-                "is_remaining": False,
-            })
+            for start_t, end_t, desc in FREE_DAY_SESSIONS:
+                s_dt = datetime.combine(target_date, start_t, tzinfo=TZ_BERLIN)
+                e_dt = datetime.combine(target_date, end_t, tzinfo=TZ_BERLIN)
+                windows.append({
+                    "date_key": target_date,
+                    "start_dt": s_dt,
+                    "end_dt": e_dt,
+                    "duration_minutes": int((e_dt - s_dt).total_seconds() / 60),
+                    "description": desc,
+                    "after": "morning" if start_t.hour < 12 else "lunch break",
+                    "before": "evening" if end_t.hour >= 18 else "afternoon break",
+                    "is_remaining": False,
+                })
     else:
         busy_intervals = []
         for ev in sorted(day_events, key=lambda e: e["start_dt"]):
@@ -891,12 +954,18 @@ async def send_weekly_calendar(sender, events: list, week_start):
         for g in all_study_windows:
             by_day.setdefault(g["date_key"], []).append(g)
 
-        for d in sorted(by_day.keys()):
-            gap_lines.append(f"*{d:%a}*")
-            for g in by_day[d]:
+        for offset in range(5):
+            d = week_start + timedelta(days=offset)
+            windows_for_day = by_day.get(d, [])
+            if not windows_for_day:
+                continue
+            gap_lines.append(f"\n🔹 *{d.strftime('%A, %d.%m')}*")
+            for g in windows_for_day:
+                desc = g.get("description", "")
+                desc_formatted = desc[0].upper() + desc[1:] if desc else "Study window"
                 gap_lines.append(
-                    f"   `{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}` "
-                    f"({_format_hours(g['duration_minutes'])}) - {_md(g['description'])}"
+                    f"   🕒 `{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}` "
+                    f"({_format_hours(g['duration_minutes'])}) - {_md(desc_formatted)}"
                 )
         text += "\n" + "\n".join(gap_lines)
 

@@ -85,9 +85,11 @@ def _format_study_windows_section(events: list, today_date) -> str:
         return ""
     study_lines = ["📚 <b>Good Times to Study:</b>"]
     for g in study_windows:
+        desc = g.get("description", "")
+        desc_formatted = desc[0].upper() + desc[1:] if desc else "Study window"
         study_lines.append(
             f"🕒 <code>{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}</code> "
-            f"({_format_hours(g['duration_minutes'])}) - {_h(g['description'])}"
+            f"({_format_hours(g['duration_minutes'])}) - {_h(desc_formatted)}"
         )
     return "\n\n" + "\n".join(study_lines)
 

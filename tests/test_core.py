@@ -96,9 +96,10 @@ class BotModuleTests(unittest.TestCase):
     def test_study_windows_free_weekday_and_weekend(self):
         wed = date(2026, 11, 4)
         free = self.schedule.find_study_windows_for_day([], wed)
-        self.assertEqual(len(free), 1)
-        self.assertEqual(free[0]["end_dt"].strftime("%H:%M"), "19:00")
-        self.assertEqual(free[0]["duration_minutes"], 600)
+        self.assertEqual(len(free), 3)
+        spans = [(w["start_dt"].strftime("%H:%M"), w["end_dt"].strftime("%H:%M")) for w in free]
+        self.assertEqual(spans, [("09:30", "12:30"), ("13:30", "16:30"), ("17:00", "19:00")])
+        self.assertEqual([w["duration_minutes"] for w in free], [180, 180, 120])
         self.assertEqual(self.schedule.find_study_windows_for_day([], date(2026, 11, 7)), [])  # Saturday
 
     def test_study_windows_ignore_cancelled_and_incomplete(self):
@@ -108,7 +109,7 @@ class BotModuleTests(unittest.TestCase):
             {"date_key": day, "start_dt": None, "end_dt": None, "title": "broken"},
         ]
         windows = self.schedule.find_study_windows_for_day(events, day)
-        self.assertEqual(len(windows), 1)  # whole day free
+        self.assertEqual(len(windows), 3)  # whole day free -> 3 sessions
 
     def test_study_windows_remaining_today(self):
         day = date(2026, 11, 4)
@@ -121,7 +122,40 @@ class BotModuleTests(unittest.TestCase):
     def test_weekly_windows_use_given_week(self):
         monday = date(2026, 11, 2)
         windows = self.schedule.find_weekly_study_gaps([], monday)
-        self.assertEqual([w["date_key"] for w in windows], [date(2026, 11, d) for d in range(2, 7)])
+        self.assertEqual(len(windows), 15)  # 5 days * 3 sessions
+        self.assertEqual(sorted(set(w["date_key"] for w in windows)), [date(2026, 11, d) for d in range(2, 7)])
+
+    def test_study_session_reminder_triggered(self):
+        from unittest.mock import AsyncMock, patch
+
+        mock_bot = mock.MagicMock()
+        mock_bot.send_message = AsyncMock()
+
+        # Wednesday Nov 4, 2026 at 09:02 Berlin time (28 mins before 09:30 morning study session)
+        fixed_now = datetime(2026, 11, 4, 9, 2, tzinfo=TZ)
+        cached_reminders = {}
+
+        class MockDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
+        with patch("unibot.schedule.get_calendar_events", new_callable=AsyncMock) as mock_get_events, \
+             patch("unibot.schedule.load_reminders_cache", return_value=cached_reminders), \
+             patch("unibot.schedule.save_reminders_cache") as mock_save, \
+             patch("unibot.schedule.datetime", MockDateTime):
+
+            # 1 dummy event so events is non-empty, but on another day so Wednesday is free
+            mock_get_events.return_value = [_event(date(2026, 11, 2), "10:00", "12:00")]
+
+            asyncio.run(self.schedule.check_calendar_reminders(mock_bot, chat_id=999, silent=True))
+
+            mock_bot.send_message.assert_called_once()
+            kwargs = mock_bot.send_message.call_args[1]
+            self.assertEqual(kwargs["chat_id"], 999)
+            self.assertIn("STUDY TIME REMINDER", kwargs["text"])
+            self.assertIn("Morning focus session", kwargs["text"])
+            self.assertTrue(mock_save.called)
 
     def test_rooms_parser(self):
         page = """
