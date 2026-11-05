@@ -56,7 +56,7 @@ from unibot.telegram_ui import (
     _start_loading_animation,
     _stop_loading_animation,
 )
-from unibot.auth import is_user_allowed
+from unibot.auth import is_user_admin, is_user_allowed
 from unibot.ai import (
     _call_gwdg_chat,
     _call_openrouter,
@@ -356,7 +356,8 @@ async def handle_wardrobe_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if not is_user_allowed(user_id):
+    if not is_user_admin(user_id):
+        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
         return
     text, keyboard = _wardrobe_list_view(user_id)
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
@@ -366,7 +367,8 @@ async def handle_wardrobe_add_item(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if not is_user_allowed(user_id):
+    if not is_user_admin(user_id):
+        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
         return
     context.user_data["pending_step"] = "wardrobe_add_item"
     await query.message.reply_text("📸 Send a photo of one clothing item.")
@@ -376,7 +378,8 @@ async def handle_wardrobe_set_reference(update: Update, context: ContextTypes.DE
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if not is_user_allowed(user_id):
+    if not is_user_admin(user_id):
+        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
         return
     context.user_data["pending_step"] = "wardrobe_set_reference"
     await query.message.reply_text("🖼️ Send one clear full-body photo of yourself — I'll reuse it every morning.")
@@ -386,7 +389,8 @@ async def handle_wardrobe_remove(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if not is_user_allowed(user_id):
+    if not is_user_admin(user_id):
+        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
         return
     item_id = query.data.split("|", 1)[1]
     remove_wardrobe_item(user_id, item_id)
@@ -432,7 +436,8 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
     await query.answer()
 
     user_id = query.from_user.id
-    if not is_user_allowed(user_id):
+    if not is_user_admin(user_id):
+        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
         return
 
     entry = get_wardrobe_entry(user_id)
@@ -516,7 +521,9 @@ async def handle_outfit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     suggestion and redraws the submenu in place."""
     query = update.callback_query
     await query.answer()
-    if not is_user_allowed(query.from_user.id):
+    user_id = query.from_user.id
+    if not is_user_admin(user_id):
+        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
         return
     if query.data == "outfit_menu_toggle":
         set_wardrobe_feature_enabled(not get_wardrobe_feature_enabled())

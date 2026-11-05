@@ -157,6 +157,40 @@ class BotModuleTests(unittest.TestCase):
             self.assertIn("Morning focus session", kwargs["text"])
             self.assertTrue(mock_save.called)
 
+    def test_multi_user_admin_and_invites(self):
+        from unibot import db, auth
+
+        admin_id = 9990001
+        db.bootstrap_admins({admin_id})
+        self.assertTrue(auth.is_user_admin(admin_id))
+        self.assertTrue(auth.is_user_allowed(admin_id))
+
+        # Create invite token
+        code = db.create_invite_token(created_by=admin_id, label="Student Anna")
+        self.assertTrue(code.startswith("UNI-"))
+
+        # Redeem token
+        new_user_id = 9990002
+        ok, msg = db.redeem_invite_token(code, telegram_id=new_user_id, full_name="Anna Schmidt", username="anna_s")
+        self.assertTrue(ok)
+        self.assertTrue(auth.is_user_allowed(new_user_id))
+        self.assertFalse(auth.is_user_admin(new_user_id))
+
+        # Token cannot be re-used
+        ok2, msg2 = db.redeem_invite_token(code, telegram_id=9990003)
+        self.assertFalse(ok2)
+
+        # Save and load encrypted credentials in SQLite
+        fake_cookies = {"PHPSESSID": "secret123456", "session_user": "anna"}
+        db.save_user_credential(new_user_id, "cookies", fake_cookies)
+        loaded = db.load_user_credential(new_user_id, "cookies")
+        self.assertEqual(loaded, fake_cookies)
+
+        # Analytics
+        analytics = db.get_user_analytics()
+        self.assertGreaterEqual(analytics["total_users"], 2)
+        self.assertGreaterEqual(analytics["active_users"], 2)
+
     def test_rooms_parser(self):
         page = """
         <article><h1>Rooms and times</h1>

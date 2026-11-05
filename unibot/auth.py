@@ -4,6 +4,7 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import errno
+import html
 import logging
 import os
 from typing import Optional
@@ -20,6 +21,7 @@ from studip_tunnel import QuickTunnel
 
 from unibot import state
 from unibot.config import (
+    ADMIN_USER_IDS,
     ALLOWED_USER_IDS,
     CLOUDFLARE_TUNNEL,
     LOGIN_PUBLIC_URL,
@@ -35,14 +37,83 @@ TOTP_SECRET = ""
 
 
 async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drop every update from users outside ALLOWED_USER_IDS before any handler runs."""
+    """Drop or onboard updates. Allowed users proceed; new users can redeem invite codes."""
     user = update.effective_user
     if user is not None and is_user_allowed(user.id):
+        action = None
+        if update.callback_query and update.callback_query.data:
+            action = f"cb:{update.callback_query.data[:30]}"
+        elif update.effective_message and update.effective_message.text:
+            txt = update.effective_message.text.strip()
+            if txt.startswith("/"):
+                action = f"cmd:{txt.split()[0][:20]}"
+        try:
+            from unibot.db import update_user_activity
+            update_user_activity(user.id, action=action)
+        except Exception:
+            pass
         return
-    logging.warning("⛔ Ignored update from unauthorised user %s", user.id if user else 'unknown')
+
+    # User is not allowed yet. Check if they are submitting an invite code in private chat.
+    if user is not None and update.effective_message and update.effective_chat and update.effective_chat.type == "private":
+        text = (update.effective_message.text or "").strip()
+        code = None
+        if text.startswith("/start"):
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1:
+                param = parts[1].strip()
+                if param.startswith("inv_"):
+                    code = param[4:]
+                elif param.upper().startswith("UNI-"):
+                    code = param.upper()
+        elif text.upper().startswith("UNI-"):
+            code = text.upper()
+
+        if code:
+            from unibot.db import redeem_invite_token
+            ok, msg = redeem_invite_token(code, user.id, full_name=user.full_name, username=user.username)
+            if ok:
+                login_url = _login_public_url()
+                keyboard = []
+                if login_url:
+                    keyboard.append([InlineKeyboardButton("🔐 Stud.IP Hesabını Bağla", web_app=WebAppInfo(url=login_url))])
+                reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+                welcome_text = (
+                    "🎉 <b>Tebrikler, Erişim Onaylandı!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    f"Hoş geldiniz, <b>{html.escape(user.first_name or 'Öğrenci')}</b>!\n\n"
+                    "UniOldenburg Asistanı hesabınız başarıyla aktive edildi.\n\n"
+                    "Derslerinizi, sınavlarınızı ve notlarınızı senkronize etmek için "
+                    "lütfen Stud.IP hesabınızı bağlayın."
+                )
+                await update.effective_message.reply_text(welcome_text, parse_mode="HTML", reply_markup=reply_markup)
+                raise ApplicationHandlerStop
+            else:
+                await update.effective_message.reply_text(
+                    f"❌ <b>Geçersiz Kod:</b> {msg}\n\nLütfen admin tarafından verilen kodu kontrol edip tekrar deneyin.",
+                    parse_mode="HTML",
+                )
+                raise ApplicationHandlerStop
+
+        # No invite code provided
+        gate_text = (
+            "🔒 <b>UniOldenburg Öğrenci Asistanı</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Bu bot özel davetiyeyle çalışmaktadır.\n\n"
+            "Erişim sağlamak için lütfen yöneticiniz (admin) tarafından size iletilen "
+            "<b>kişiye özel erişim kodunu</b> (örn: <code>UNI-ABC-123</code>) bu sohbete mesaj olarak yazın.\n"
+            "━━━━━━━━━━━━━━━━━━"
+        )
+        try:
+            await update.effective_message.reply_text(gate_text, parse_mode="HTML")
+        except TelegramError:
+            pass
+        raise ApplicationHandlerStop
+
+    logging.warning("⛔ Ignored update from unauthorised user %s", user.id if user else "unknown")
     try:
         if update.callback_query:
-            await update.callback_query.answer("⛔ Not authorised.", show_alert=False)
+            await update.callback_query.answer("⛔ Erişim yetkiniz bulunmuyor.", show_alert=True)
         elif update.effective_message and update.effective_chat and update.effective_chat.type == "private":
             await update.effective_message.reply_text("⛔ Not authorised.")
     except TelegramError:
@@ -51,12 +122,27 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 def is_user_allowed(user_id: Optional[int]) -> bool:
-    # Fail closed: an empty allowlist would hand the Stud.IP account, grades
-    # and messages to anyone who finds the bot, so it locks everyone out.
-    if not ALLOWED_USER_IDS:
-        logging.warning("⚠️ ALLOWED_USER_IDS is empty - every user is rejected. Set it in .env.")
+    if user_id is None:
         return False
-    return user_id is not None and user_id in ALLOWED_USER_IDS
+    if ALLOWED_USER_IDS and user_id in ALLOWED_USER_IDS:
+        return True
+    try:
+        from unibot.db import is_user_allowed_db
+        return is_user_allowed_db(user_id)
+    except Exception:
+        return False
+
+
+def is_user_admin(user_id: Optional[int]) -> bool:
+    if user_id is None:
+        return False
+    if ADMIN_USER_IDS and user_id in ADMIN_USER_IDS:
+        return True
+    try:
+        from unibot.db import is_user_admin_db
+        return is_user_admin_db(user_id)
+    except Exception:
+        return False
 
 # ── single-instance lock ───────────────────────────────────────────────────────
 LOCK_FILE = ".bot_instance.lock"

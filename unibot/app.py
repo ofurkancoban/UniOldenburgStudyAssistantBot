@@ -163,7 +163,14 @@ from unibot.enrollment import (
 )
 from unibot.morning import handle_calendar_today_voice, handle_calendar_weekly_voice
 from unibot.voice import handle_photo_message, handle_voice_clarify, handle_voice_confirm, handle_voice_reject
-from unibot.system import healthcheck_command, restart_command, status_command
+from unibot.system import (
+    admin_command,
+    handle_admin_callbacks,
+    healthcheck_command,
+    invite_command,
+    restart_command,
+    status_command,
+)
 from unibot.menus import (
     _send_courses_menu,
     handle_change_semester,
@@ -267,7 +274,10 @@ def register_handlers(app) -> None:
     app.add_handler(CommandHandler("login", login_command))
     app.add_handler(CommandHandler("logout", logout_command))
     app.add_handler(CommandHandler("restart", restart_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("invite", invite_command))
     
+    app.add_handler(CallbackQueryHandler(handle_admin_callbacks, pattern="^admin_.*$"))
     app.add_handler(CallbackQueryHandler(show_last_messages, pattern="^show_last_messages$"))
     app.add_handler(CallbackQueryHandler(handle_studip_message_reply_start, pattern=r"^msg_reply\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_studip_message_reply_cancel, pattern=r"^msg_reply_cancel$"))
@@ -375,6 +385,27 @@ async def main():
 
     app = None
     try:
+        # Bootstrap admin users and migrate existing credentials to DB vault
+        try:
+            from unibot.config import ADMIN_USER_IDS
+            from unibot import db
+            db.bootstrap_admins(ADMIN_USER_IDS)
+            for aid in ADMIN_USER_IDS:
+                if not db.load_user_credential(aid, "cookies") and os.path.exists("studip_cookies.json"):
+                    from studip_vault import load_vault_json
+                    cookies = load_vault_json("studip_cookies.json")
+                    if cookies:
+                        db.save_user_credential(aid, "cookies", cookies)
+                        logging.info("Migrated studip_cookies.json into DB for admin %s", aid)
+                if not db.load_user_credential(aid, "oauth_tokens") and os.path.exists("studip_oauth_tokens.json"):
+                    from studip_vault import load_vault_json
+                    tokens = load_vault_json("studip_oauth_tokens.json")
+                    if tokens:
+                        db.save_user_credential(aid, "oauth_tokens", tokens)
+                        logging.info("Migrated studip_oauth_tokens.json into DB for admin %s", aid)
+        except Exception as exc:
+            logging.debug("Credentials DB bootstrap skipped: %s", exc)
+
         state.global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
         
         logging.info("🔐 Checking Stud.IP session...")

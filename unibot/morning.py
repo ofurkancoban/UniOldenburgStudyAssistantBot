@@ -34,7 +34,7 @@ from unibot.storage import (
 )
 from unibot.formatting import _get_course_icon, _get_location_emoji, _safe_loc, clean_course_title
 from unibot.telegram_ui import _download_telegram_file, _show_typing
-from unibot.auth import is_user_allowed
+from unibot.auth import is_user_admin, is_user_allowed
 from unibot.ai import _ai_patience, _call_openrouter, _pcm_to_ogg_voice, synthesize_speech
 from unibot.weather import build_weather_text_line, get_weather_snapshot
 from unibot.mensa import _friendly_menu_category_label, build_food_recommendation, fetch_dish_photo_url
@@ -205,6 +205,8 @@ async def _prepare_outfits(bot, user_ids, weather) -> dict:
     if not get_wardrobe_feature_enabled():
         return outfits
     for uid in user_ids:
+        if not is_user_admin(uid):
+            continue
         try:
             # A manual "Suggest Outfit Now" tap may have already run
             # today; deliver_morning_summary resends that one instead.
@@ -340,6 +342,8 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
 
     if get_wardrobe_feature_enabled():
         for uid in user_ids:
+            if not is_user_admin(uid):
+                continue
             try:
                 # Checked again at delivery: a manual "Suggest Outfit Now"
                 # between preparation and now wins, so the user never gets

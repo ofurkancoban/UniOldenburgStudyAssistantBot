@@ -43,6 +43,11 @@ def _parse_allowed_user_ids(env_value: str) -> set[int]:
 
 ALLOWED_USER_IDS = _parse_allowed_user_ids(ALLOWED_USER_IDS_ENV)
 
+ADMIN_USER_IDS_ENV = os.getenv("ADMIN_USER_IDS", "").strip()
+ADMIN_USER_IDS = _parse_allowed_user_ids(ADMIN_USER_IDS_ENV)
+if not ADMIN_USER_IDS and ALLOWED_USER_IDS:
+    ADMIN_USER_IDS = set(ALLOWED_USER_IDS)
+
 
 # ── logging setup ──────────────────────────────────────────────────────────────
 # BOT_LOG_FILE lets tests and one-off scripts keep their output out of the live log
