@@ -456,6 +456,7 @@ class WatcherCycleTests(unittest.TestCase):
             "load_general_cache": lambda: dict(cache),
             "save_general_cache": lambda data: cache.update(data),
             "update_general_cache": lambda data: cache.update(data),
+            "load_exam_cache": lambda: {},
         }
         app = mock.MagicMock()
         from unibot import state
@@ -473,6 +474,39 @@ class WatcherCycleTests(unittest.TestCase):
         self.assertEqual(cache["health_state"], {"studip": False})
         self.assertIn("last_exam_date_check", cache)
         self.assertTrue(any("Health check failed" in t and "down &lt;now&gt;" in t for t in sent))
+
+    def test_stums_checks_are_throttled(self):
+        watcher = _import("watcher")
+        cache, calls, exam_cache = {}, [], {}
+
+        def job(name):
+            async def run(*args, **kwargs):
+                calls.append(name)
+            return run
+
+        patches = dict(
+            load_general_cache=lambda: dict(cache), update_general_cache=lambda d: cache.update(d),
+            load_exam_cache=lambda: exam_cache, ALLOWED_USER_IDS=set(),
+            check_calendar_reminders=job("calendar"), check_course_schedule_changes=job("changes"),
+            check_task_reminders=job("tasks"), check_exam_reminders=job("registrations"),
+            check_grade_reminders=job("grades"), check_tuition_reminders=job("tuition"),
+        )
+        start = datetime(2026, 11, 5, 12, 0, tzinfo=watcher.TZ_BERLIN)
+
+        def cycle(minutes):
+            calls.clear()
+            asyncio.run(watcher._run_reminder_checks(None, object(), start + timedelta(minutes=minutes)))
+            return {c for c in calls if c in ("registrations", "grades", "tuition")}
+
+        with mock.patch.multiple(watcher, **patches):
+            self.assertEqual(cycle(0), {"registrations", "grades", "tuition"})
+            self.assertEqual(cycle(2), set())  # next watcher cycle: nothing due
+            self.assertEqual(cycle(16), {"grades"})  # grades every 15 min
+            self.assertEqual(cycle(31), {"grades"})  # registrations hourly outside a window
+            self.assertEqual(cycle(61), {"registrations", "grades", "tuition"})
+            exam_cache["notified_open"] = {"MOD1:sitting": "2026-11-05"}
+            self.assertEqual(cycle(92), {"registrations", "grades"})  # 30 min while a window is open
+        self.assertIn("tasks", calls)  # local checks still run every cycle
 
     def test_once_per_period(self):
         watcher = _import("watcher")

@@ -47,6 +47,7 @@ STUMS_BASE = "https://stums.uni-oldenburg.de"
 SSO_ENTRY_URL = f"{STUMS_BASE}/qisserver/api/identityprovider/redirect/2/login"
 STUMS_HOST = "stums.uni-oldenburg.de"
 STUMS_VERIFIED_SECONDS = 60  # how long a verified StuMS login is trusted without re-checking
+TUITION_CHECK_SECONDS = 24 * 3600  # fee status changes rarely
 STUMS_RETRY_SECONDS = 30 * 60  # pause after StuMS refused the login (a new /login retries at once)
 
 
@@ -1358,8 +1359,8 @@ async def check_tuition_reminders(session, bot, broadcast_fn, force: bool = Fals
     t_state = cache.get("tuition_status", {})
     last_check_ts = t_state.get("last_check_ts", 0)
 
-    # Check at most once every 6 hours unless forced
-    if not force and (time.time() - last_check_ts < 6 * 3600):
+    # Check at most once a day unless forced
+    if not force and (time.time() - last_check_ts < TUITION_CHECK_SECONDS):
         return
 
     try:

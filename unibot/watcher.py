@@ -12,6 +12,7 @@ from typing import Optional
 
 from exam_reminder import (
     background_stums,
+    load_exam_cache,
     check_exam_date_reminders,
     check_exam_reminders,
     check_grade_reminders,
@@ -64,6 +65,12 @@ FILE_WATCHER_INTERVAL = 2 * 60 * 60
 # stops the others; a failure is logged and retried on the next cycle.
 
 EXAM_DATE_CHECK_INTERVAL_SECONDS = 3 * 3600  # upcoming exam dates change rarely
+# StuMS checks are throttled: every check signs in to StuMS through the SSO,
+# and a student account should not log in hundreds of times a day.
+GRADE_CHECK_INTERVAL_SECONDS = 15 * 60
+EXAM_REGISTRATION_CHECK_INTERVAL_SECONDS = 60 * 60
+EXAM_REGISTRATION_OPEN_INTERVAL_SECONDS = 30 * 60  # while a registration window is open
+TUITION_ATTEMPT_INTERVAL_SECONDS = 60 * 60  # check_tuition_reminders itself runs once a day
 HEALTH_CHECK_INTERVAL_SECONDS = 30 * 60
 
 
@@ -141,20 +148,38 @@ async def _send_calendar_reminders(bot):
         await check_calendar_reminders(bot, uid, silent=True)
 
 
-async def _run_reminder_checks(bot, session):
+def _exam_registration_interval() -> int:
+    """Shorter while StuMS has an open registration we have notified about."""
+    return EXAM_REGISTRATION_OPEN_INTERVAL_SECONDS if load_exam_cache().get("notified_open") \
+        else EXAM_REGISTRATION_CHECK_INTERVAL_SECONDS
+
+
+async def _run_throttled(cache_key: str, now: datetime, interval: int, label: str, job, *args, start_message=None):
+    """Run a job when its interval has passed; the attempt is recorded even
+    when it fails, so a broken StuMS is not retried on every cycle."""
+    if not _is_due(cache_key, now, interval):
+        return
+    await _guarded(label, job, *args, start_message=start_message)
+    update_general_cache({cache_key: now.isoformat()})
+
+
+async def _run_reminder_checks(bot, session, now: datetime):
     """Calendar, schedule change, task, exam, grade and tuition reminders."""
     await _guarded("Calendar reminder check", _send_calendar_reminders, bot)
     # Automatic course cancellation & room change alerts
     await _guarded("Course schedule change check", check_course_schedule_changes, session, bot)
     # Personal task reminders (local JSON, no network calls needed)
     await _guarded("Task reminder check", check_task_reminders, bot)
-    # Exam registrations and grades run every watcher cycle.
-    await _guarded("Exam reminder check", check_exam_reminders, session, bot, broadcast, exam_action_cache,
-                   start_message="🎓 Checking exam registrations...")
-    await _guarded("Grade reminder check", check_grade_reminders, session, bot, broadcast,
-                   start_message="🎓 Checking for new grades...")
-    await _guarded("Tuition reminder check", check_tuition_reminders, session, bot, broadcast,
-                   start_message="💶 Checking tuition / fee status...")
+    # StuMS: exam registrations, grades and fees, each on its own interval
+    await _run_throttled("last_exam_registration_check", now, _exam_registration_interval(), "Exam reminder check",
+                         check_exam_reminders, session, bot, broadcast, exam_action_cache,
+                         start_message="🎓 Checking exam registrations...")
+    await _run_throttled("last_grade_check", now, GRADE_CHECK_INTERVAL_SECONDS, "Grade reminder check",
+                         check_grade_reminders, session, bot, broadcast,
+                         start_message="🎓 Checking for new grades...")
+    await _run_throttled("last_tuition_attempt", now, TUITION_ATTEMPT_INTERVAL_SECONDS, "Tuition reminder check",
+                         check_tuition_reminders, session, bot, broadcast,
+                         start_message="💶 Checking tuition / fee status...")
 
 
 async def _check_file_exam_reminders(bot, session):
@@ -272,7 +297,7 @@ async def unified_watcher_controller(app):
             now = datetime.now(TZ_BERLIN)
 
             await _run_scheduled_jobs(bot, session, now)
-            await _run_reminder_checks(bot, session)
+            await _run_reminder_checks(bot, session, now)
             await _run_exam_date_checks(bot, session, now)
             await _run_health_check(bot, now)
             await _run_content_watchers(bot, admin_id, cycle_count)
