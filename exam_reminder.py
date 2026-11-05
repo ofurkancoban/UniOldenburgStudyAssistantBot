@@ -177,8 +177,8 @@ async def _establish_stums_session(session) -> str:
     blocked_until = getattr(session, "stums_blocked_until", 0.0)
     if _stums_background.get() and time.time() < blocked_until:
         raise StumsLoginUnavailable(
-            f"StuMS login refused earlier; next try at {time.strftime('%H:%M', time.localtime(blocked_until))} "
-            "or after /login", quiet=True,
+            f"StuMS refused the login earlier; background checks retry at "
+            f"{time.strftime('%H:%M', time.localtime(blocked_until))}", quiet=True,
         )
 
     for attempt in (1, 2):
@@ -734,7 +734,7 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
     try:
         exams = await get_registered_exam_schedule(session)
     except Exception as e:
-        logging.error("exam_reminder: fetch registered exam schedule failed: %s", e)
+        _log_stums_failure("fetch registered exam schedule failed", e)
         return
 
     cache = load_exam_cache()

@@ -187,7 +187,8 @@ async def _check_file_exam_reminders(bot, session):
         with background_stums():
             registered = await get_registered_exam_schedule(session)
     except Exception as e:
-        logging.warning("File exam reminders: registered schedule unavailable: %s", e)
+        log = logging.debug if getattr(e, "quiet", False) else logging.warning
+        log("File exam reminders: registered schedule unavailable: %s", e)
         registered = []
     await check_file_exam_reminders(bot, registered)
 
