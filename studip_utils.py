@@ -139,7 +139,7 @@ def route_proxy_url(url: str, extra_headers: dict | None = None) -> tuple[str, d
             if worker_secret:
                 headers["X-Proxy-Secret"] = worker_secret
             if "Accept-Encoding" not in headers:
-                headers["Accept-Encoding"] = "gzip, deflate, br"
+                headers["Accept-Encoding"] = "gzip, deflate"
             return routed, headers
     except Exception:
         pass
