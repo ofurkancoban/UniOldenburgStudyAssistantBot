@@ -115,8 +115,28 @@ def _read_token_file(path: str) -> Optional[dict]:
     return tokens
 
 
-def load_tokens() -> Optional[dict]:
-    """Stored tokens, falling back to the .bak file if the main file is missing/broken."""
+def load_tokens(user_id: Optional[int] = None) -> Optional[dict]:
+    """Stored tokens, checking DB vault first if user_id is provided, falling back to files."""
+    if user_id is not None:
+        try:
+            from unibot import db
+            tokens = db.load_user_credential(user_id, "oauth_tokens")
+            if tokens and isinstance(tokens, dict) and tokens.get("access_token"):
+                return tokens
+        except Exception as exc:
+            logger.warning("Could not load tokens from DB for user %s: %s", user_id, exc)
+
+        # Non-admin users must not inherit the system/admin token file
+        is_admin = False
+        try:
+            from unibot.config import ADMIN_USER_IDS
+            if user_id in ADMIN_USER_IDS:
+                is_admin = True
+        except Exception:
+            pass
+        if not is_admin:
+            return None
+
     tokens = _read_token_file(TOKEN_FILE)
     if tokens is not None:
         return tokens
@@ -125,13 +145,13 @@ def load_tokens() -> Optional[dict]:
     if tokens is not None:
         logger.warning("Restored OAuth tokens from %s", bak)
         try:
-            save_tokens(tokens, fresh=False)
+            save_tokens(tokens, fresh=False, user_id=user_id)
         except OSError:
             pass
     return tokens
 
 
-def save_tokens(tokens: dict, fresh: bool = True) -> None:
+def save_tokens(tokens: dict, fresh: bool = True, user_id: Optional[int] = None) -> None:
     """Write encrypted tokens atomically with 0600 - these are account credentials.
 
     `fresh` marks a token response the server just issued: only then are
@@ -144,20 +164,50 @@ def save_tokens(tokens: dict, fresh: bool = True) -> None:
         tokens["expires_at"] = now + int(tokens.get("expires_in", 3600))
     if fresh or "refreshed_at" not in tokens:
         tokens["refreshed_at"] = now
-    from studip_vault import write_vault_file
-    for target in (TOKEN_FILE, f"{TOKEN_FILE}.bak"):
-        write_vault_file(target, tokens, mode=0o600)
-    logger.info("Tokens encrypted and saved to %s (mode 0600, expires in %ss)", TOKEN_FILE, tokens.get("expires_in", 3600))
 
-
-def clear_tokens() -> None:
-    """Remove stored OAuth2 token files from disk."""
-    for path in (TOKEN_FILE, f"{TOKEN_FILE}.bak", f"{TOKEN_FILE}.tmp", f"{TOKEN_FILE}.bak.tmp"):
+    if user_id is not None:
         try:
-            if os.path.exists(path):
-                os.remove(path)
-        except OSError as exc:
-            logger.warning("Could not remove %s: %s", path, exc)
+            from unibot import db
+            db.save_user_credential(user_id, "oauth_tokens", tokens)
+            logger.info("Tokens encrypted and saved to DB for user %s (expires in %ss)", user_id, tokens.get("expires_in", 3600))
+        except Exception as exc:
+            logger.warning("Could not save tokens to DB for user %s: %s", user_id, exc)
+
+    save_file = False
+    if user_id is None:
+        save_file = True
+    else:
+        try:
+            from unibot.config import ADMIN_USER_IDS
+            if user_id in ADMIN_USER_IDS:
+                save_file = True
+        except Exception:
+            pass
+
+    if save_file:
+        from studip_vault import write_vault_file
+        for target in (TOKEN_FILE, f"{TOKEN_FILE}.bak"):
+            write_vault_file(target, tokens, mode=0o600)
+        logger.info("Tokens encrypted and saved to %s (mode 0600, expires in %ss)", TOKEN_FILE, tokens.get("expires_in", 3600))
+
+
+def clear_tokens(user_id: Optional[int] = None) -> None:
+    """Remove stored OAuth2 token files from disk or DB."""
+    if user_id is not None:
+        try:
+            from unibot.db import _connection, _lock
+            with _lock:
+                _connection().execute("DELETE FROM user_credentials WHERE user_id = ? AND credential_type = 'oauth_tokens'", (user_id,))
+        except Exception as exc:
+            logger.warning("Could not clear tokens from DB for user %s: %s", user_id, exc)
+
+    if user_id is None:
+        for path in (TOKEN_FILE, f"{TOKEN_FILE}.bak", f"{TOKEN_FILE}.tmp", f"{TOKEN_FILE}.bak.tmp"):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as exc:
+                logger.warning("Could not remove %s: %s", path, exc)
 
 
 def is_expired(tokens: Optional[dict], leeway: int = EXPIRY_LEEWAY) -> bool:
@@ -168,12 +218,13 @@ def is_expired(tokens: Optional[dict], leeway: int = EXPIRY_LEEWAY) -> bool:
 
 # ── consent flow (needs a logged-in session) ──────────────────────────────────
 
-async def authorize_with_session(session, timeout: int = 30) -> dict:
+async def authorize_with_session(session, timeout: int = 30, user_id: Optional[int] = None) -> dict:
     """Run the full authorization-code flow against a logged-in StudIPSession.
 
     `session` is a `studip_session.StudIPSession` whose cookie jar already
     carries a valid web session. Returns the token dict.
     """
+    effective_user_id = user_id or getattr(session, "user_id", None)
     verifier = _b64url(os.urandom(32))
     challenge = _b64url(hashlib.sha256(verifier.encode()).digest())
     state = _b64url(os.urandom(16))
@@ -195,7 +246,7 @@ async def authorize_with_session(session, timeout: int = 30) -> dict:
 
     # Already-authorized clients may skip the consent screen entirely.
     if status in (301, 302, 303, 307) and "code=" in location:
-        return await _exchange_code(session, location, verifier, state)
+        return await _exchange_code(session, location, verifier, state, user_id=effective_user_id)
 
     if status != 200:
         raise RuntimeError(f"authorize returned HTTP {status}: {_oauth_error(body)}")
@@ -225,10 +276,10 @@ async def authorize_with_session(session, timeout: int = 30) -> dict:
             f"Consent rejected (HTTP {status}, Location={location or '-'}): "
             f"{_oauth_error(body)}"
         )
-    return await _exchange_code(session, location, verifier, state)
+    return await _exchange_code(session, location, verifier, state, user_id=effective_user_id)
 
 
-async def _exchange_code(session, redirect_location: str, verifier: str, state: str) -> dict:
+async def _exchange_code(session, redirect_location: str, verifier: str, state: str, user_id: Optional[int] = None) -> dict:
     match = re.search(r"[?&]code=([^&]+)", redirect_location)
     if not match:
         raise RuntimeError(f"No authorization code in redirect: {redirect_location}")
@@ -255,15 +306,15 @@ async def _exchange_code(session, redirect_location: str, verifier: str, state: 
         raise RuntimeError(f"Token exchange failed (HTTP {status}): {_oauth_error(text)}")
 
     tokens = json.loads(text)
-    save_tokens(tokens)
+    save_tokens(tokens, user_id=user_id)
     return tokens
 
 
 # ── refresh ───────────────────────────────────────────────────────────────────
 
-async def refresh(tokens: Optional[dict] = None) -> dict:
+async def refresh(tokens: Optional[dict] = None, user_id: Optional[int] = None) -> dict:
     """Trade the refresh token for a new access token (rotates the refresh token)."""
-    tokens = tokens or load_tokens()
+    tokens = tokens or load_tokens(user_id=user_id)
     if not tokens or not tokens.get("refresh_token"):
         raise RuntimeError("No refresh token stored; run a fresh login.")
 
@@ -286,18 +337,18 @@ async def refresh(tokens: Optional[dict] = None) -> dict:
     new_tokens = json.loads(text)
     if not new_tokens.get("refresh_token") and tokens.get("refresh_token"):
         new_tokens["refresh_token"] = tokens["refresh_token"]
-    save_tokens(new_tokens)
+    save_tokens(new_tokens, user_id=user_id)
     return new_tokens
 
 
-async def get_access_token(force_refresh: bool = False) -> Optional[str]:
+async def get_access_token(force_refresh: bool = False, user_id: Optional[int] = None) -> Optional[str]:
     """A currently valid access token, refreshing when needed.
 
     Serialized with an asyncio lock so concurrent API calls never consume the
     same rotating refresh_token twice. Returns None when there is no token
     file at all (caller should fall back to the cookie session).
     """
-    tokens = load_tokens()
+    tokens = load_tokens(user_id=user_id)
     if tokens is None:
         return None
     if not force_refresh and not is_expired(tokens):
@@ -305,7 +356,7 @@ async def get_access_token(force_refresh: bool = False) -> Optional[str]:
 
     global _refresh_blocked_until
     async with _refresh_lock:
-        tokens = load_tokens()
+        tokens = load_tokens(user_id=user_id)
         if tokens is None:
             return None
         # If another coroutine just refreshed the token while we waited for the lock,
@@ -316,13 +367,20 @@ async def get_access_token(force_refresh: bool = False) -> Optional[str]:
         if _now() < _refresh_blocked_until:
             return None if is_expired(tokens, leeway=0) else tokens.get("access_token")
         try:
-            tokens = await refresh(tokens)
+            if user_id is not None:
+                try:
+                    tokens = await refresh(tokens, user_id=user_id)
+                except TypeError:
+                    tokens = await refresh(tokens)
+            else:
+                tokens = await refresh(tokens)
             _refresh_blocked_until = 0.0
+            return tokens.get("access_token")
         except RefreshRejected as exc:
             # A dead refresh token never recovers; drop it so callers fall
             # back to the cookie session instead of retrying on every request.
             logger.warning("%s - clearing stored OAuth tokens, a fresh login is needed.", exc)
-            clear_tokens()
+            clear_tokens(user_id=user_id)
             return None
         except Exception as exc:
             logger.warning("Token refresh failed: %s (retrying in %ss)", exc, REFRESH_RETRY_BACKOFF)

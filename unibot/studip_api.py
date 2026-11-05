@@ -28,7 +28,7 @@ from studip_utils import (
 from unibot import state
 from unibot.storage import get_watch_previous_semester_enabled, load_default_semester, save_studip_user_name
 from unibot.formatting import clean_html_text
-from unibot.auth import login_studip
+from unibot.auth import get_user_session, login_studip
 
 
 BASE_URL = "https://elearning.uni-oldenburg.de"
@@ -305,25 +305,26 @@ class StudipApiError(Exception):
     pass
 
 
-async def studip_api_get(path: str, params: Optional[dict] = None, _retry: bool = True) -> dict:
+async def studip_api_get(path: str, params: Optional[dict] = None, session: Optional[object] = None, user_id: Optional[int] = None, _retry: bool = True) -> dict:
     """GET one JSON:API resource ("/users/me" or a "/jsonapi.php/..." link).
 
     The bearer header is added by StudIPSession, so API traffic uses the
     stored OAuth token when there is one and the cookie session otherwise.
     On a 401 it refreshes the token once, then falls back to a full login."""
-    session = state.global_session or await login_studip()
+    session = session or get_user_session(user_id) or await login_studip(user_id=user_id)
     url = BASE_URL + path if path.startswith("/jsonapi.php") else STUDIP_API_URL + path
     async with await session.get(url, params=params) as r:
         status, text = r.status, await r.text()
     if status == 401 and _retry:
+        eff_user_id = getattr(session, "user_id", None) or user_id
         use_oauth = studip_oauth.oauth_enabled()
-        if use_oauth and studip_oauth.load_tokens() and await studip_oauth.get_access_token(force_refresh=True):
-            return await studip_api_get(path, params, _retry=False)
+        if use_oauth and studip_oauth.load_tokens(user_id=eff_user_id) and await studip_oauth.get_access_token(force_refresh=True, user_id=eff_user_id):
+            return await studip_api_get(path, params, session=session, user_id=user_id, _retry=False)
         # Self-healing silent SSO renewal attempt
         if await session.heal_session():
-            return await studip_api_get(path, params, _retry=False)
+            return await studip_api_get(path, params, session=session, user_id=user_id, _retry=False)
         await session.login(force=True)
-        return await studip_api_get(path, params, _retry=False)
+        return await studip_api_get(path, params, session=session, user_id=user_id, _retry=False)
     if status != 200:
         raise StudipApiError(f"{path}: HTTP {status}")
     try:
@@ -347,34 +348,37 @@ async def studip_api_get_all(path: str, params: Optional[dict] = None) -> tuple[
             return data, included
 
 
-async def get_studip_user_profile() -> dict:
+async def get_studip_user_profile(user_id: Optional[int] = None, session: Optional[object] = None) -> dict:
     """Fetch profile of the currently authenticated user from Stud.IP /users/me."""
-    if state._studip_user_profile:
+    if user_id is None and state._studip_user_profile:
         return state._studip_user_profile
     try:
-        res = await studip_api_get("/users/me")
+        res = await studip_api_get("/users/me", session=session, user_id=user_id)
         user = res.get("data", {})
-        state._studip_api_user_id = user.get("id")
+        studip_id = user.get("id")
         attrs = user.get("attributes", {})
         formatted_name = (attrs.get("formatted-name") or "").strip()
         given_name = (attrs.get("given-name") or "").strip()
         family_name = (attrs.get("family-name") or "").strip()
         username = (attrs.get("username") or "").strip()
         display_name = formatted_name or given_name or username
-        state._studip_user_profile = {
-            "id": state._studip_api_user_id,
+        profile = {
+            "id": studip_id,
             "username": username,
             "formatted_name": formatted_name,
             "given_name": given_name,
             "family_name": family_name,
             "display_name": display_name,
         }
-        if display_name:
-            save_studip_user_name(display_name)
-        return state._studip_user_profile
+        if user_id is None:
+            state._studip_api_user_id = studip_id
+            state._studip_user_profile = profile
+            if display_name:
+                save_studip_user_name(display_name)
+        return profile
     except Exception as exc:
         logging.warning("Could not fetch Stud.IP user profile: %s", exc)
-        return state._studip_user_profile or {}
+        return (state._studip_user_profile or {}) if user_id is None else {}
 
 
 async def studip_api_user_id() -> str:

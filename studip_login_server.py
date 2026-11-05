@@ -277,8 +277,9 @@ class LoginServer:
                  host: Optional[str] = None, bot_token: Optional[str] = None,
                  allowed_user_ids: Optional[set[int]] = None,
                  base_url_provider: Optional[Callable[[], str]] = None,
-                 session_provider: Optional[Callable[[], object]] = None,
-                 on_session_authenticated: Optional[Callable[[], Awaitable[None]]] = None):
+                 session_provider: Optional[Callable[..., object]] = None,
+                 on_session_authenticated: Optional[Callable[..., Awaitable[None]]] = None,
+                 is_allowed_callback: Optional[Callable[[int], bool]] = None):
         self.on_login = on_login
         self.port = int(port or os.getenv("LOGIN_PORT", "8899"))
         self.host = host or self._default_host()
@@ -287,6 +288,7 @@ class LoginServer:
         self.base_url_provider = base_url_provider
         self.session_provider = session_provider
         self.on_session_authenticated = on_session_authenticated
+        self.is_allowed_callback = is_allowed_callback
         self._tokens: dict[str, dict] = {}
         self._proxy_sessions: dict[str, dict] = {}
         # Mixed into the cookie signing key. A fresh one per process and per
@@ -308,9 +310,22 @@ class LoginServer:
         return "0.0.0.0"
 
     def _is_allowed(self, user_id) -> bool:
-        # Fail closed: an empty allowlist must not open the proxy (and with it
-        # the whole Stud.IP account) to every Telegram user.
+        # Check dynamic allowlist/DB callback first, then static allowlist
+        if self.is_allowed_callback is not None:
+            try:
+                if self.is_allowed_callback(user_id):
+                    return True
+            except Exception as exc:
+                logger.warning("is_allowed_callback error: %s", exc)
         return bool(self.allowed_user_ids) and user_id in self.allowed_user_ids
+
+    def _resolve_session(self, user_id: Optional[int] = None):
+        if not self.session_provider:
+            return None
+        try:
+            return self.session_provider(user_id)
+        except TypeError:
+            return self.session_provider()
 
     def revoke_all(self) -> None:
         """Invalidate every link token and proxy cookie (called on /logout)."""
@@ -464,13 +479,14 @@ class LoginServer:
         if not proxy_sess:
             raise web.HTTPFound("/app")
 
+        user_id = proxy_sess.get("user_id")
         # Relink logs the bot out of Stud.IP, so it must not be triggerable by
         # a cross-site GET (the cookie is SameSite=None for the Mini App
         # iframe): it only counts with this session's CSRF token.
         relogin = request.query.get("relogin") == "1" and hmac.compare_digest(
             request.query.get("csrf", ""), self._csrf_token(proxy_sess.get("sid", ""))
         )
-        studip_sess = self.session_provider() if self.session_provider else None
+        studip_sess = self._resolve_session(user_id)
         if studip_sess is not None:
             studip_sess.last_interactive_activity = time.time()
             await studip_sess.ensure_session()
@@ -480,10 +496,18 @@ class LoginServer:
             elif await studip_sess.is_html_logged_in(use_cache=False):
                 studip_sess.explicitly_logged_out = False
                 studip_sess.last_interactive_activity = 0.0
-                self._schedule_auth_hook()
+                self._schedule_auth_hook(user_id)
                 raise web.HTTPFound("/dispatch.php/my_courses")
             else:
-                if studip_sess.explicitly_logged_out or not os.path.exists(studip_sess.cookie_file):
+                has_cookies = False
+                if getattr(studip_sess, "user_id", None):
+                    try:
+                        from unibot import db
+                        has_cookies = bool(db.load_user_credential(studip_sess.user_id, "cookies"))
+                    except Exception:
+                        pass
+                has_file = bool(studip_sess.cookie_file and os.path.exists(studip_sess.cookie_file))
+                if studip_sess.explicitly_logged_out or (not has_cookies and not has_file):
                     studip_sess.session.cookie_jar.clear()
                 try:
                     async with studip_sess.session.get(
@@ -498,18 +522,21 @@ class LoginServer:
         # Start the real Uni Oldenburg OIDC SSO flow
         raise web.HTTPFound("/dispatch.php/login?again=yes&sso=oidc&cancel_login=1")
 
-    def _schedule_auth_hook(self) -> None:
+    def _schedule_auth_hook(self, user_id: Optional[int] = None) -> None:
         now = time.time()
         if now - self._last_auth_notify < 15.0:
             return
         self._last_auth_notify = now
         if self.on_session_authenticated:
-            asyncio.create_task(self._run_auth_hook())
+            asyncio.create_task(self._run_auth_hook(user_id))
 
-    async def _run_auth_hook(self) -> None:
+    async def _run_auth_hook(self, user_id: Optional[int] = None) -> None:
         try:
             if self.on_session_authenticated:
-                await self.on_session_authenticated()
+                try:
+                    await self.on_session_authenticated(user_id)
+                except TypeError:
+                    await self.on_session_authenticated()
         except Exception as exc:
             logger.warning("on_session_authenticated hook failed: %s", exc)
 
@@ -520,9 +547,10 @@ class LoginServer:
             if request.path in ("/", "/app"):
                 return await self._app_gate(request)
             raise web.HTTPFound("/app")
+        user_id = proxy_sess.get("user_id")
         relink_href = f"/_bot/entry?relogin=1&csrf={self._csrf_token(proxy_sess.get('sid', ''))}"
 
-        studip_sess = self.session_provider() if self.session_provider else None
+        studip_sess = self._resolve_session(user_id)
         if studip_sess is None:
             return web.Response(text="Bot session not initialized", status=503)
         await studip_sess.ensure_session()
@@ -608,7 +636,7 @@ class LoginServer:
             if is_studip_auth:
                 studip_sess.explicitly_logged_out = False
                 studip_sess.last_interactive_activity = 0.0
-                self._schedule_auth_hook()
+                self._schedule_auth_hook(user_id)
                 bar = (
                     _CONNECTED_BANNER_SNIPPET
                     + _STATUS_BAR_SNIPPET.replace("__STATUS_TEXT__", "✅ Bot connected")

@@ -21,6 +21,7 @@ from exam_reminder import (
 )
 from studip_utils import TZ_BERLIN, berlin_now
 
+from unibot import db
 from unibot import state
 from unibot.config import (
     ALLOWED_USER_IDS,
@@ -115,17 +116,28 @@ async def _scan_and_announce_file_exams(bot, session):
     await notify_new_file_exam_events(bot, new_events)
 
 
+def _get_active_user_ids() -> list[int]:
+    try:
+        active = [u["telegram_id"] for u in db.get_all_users() if u.get("is_active", 1)]
+        if active:
+            return active
+    except Exception:
+        pass
+    return list(ALLOWED_USER_IDS)
+
+
 async def _run_scheduled_jobs(bot, session, now: datetime):
     """Morning summary plus the weekly and daily background jobs."""
     # Morning summary: prepared ahead of time (AI lunch pick, outfit
     # image, voice), then sent all at once at MORNING_SUMMARY_HOUR.
-    await _guarded("Morning summary", run_morning_summary_schedule, bot, ALLOWED_USER_IDS, now)
+    active_uids = _get_active_user_ids()
+    await _guarded("Morning summary", run_morning_summary_schedule, bot, active_uids, now)
 
     # Weekly content-aware study plan (Sunday evening, opt-in toggle).
     if now.weekday() == 6 and now.hour >= 18 and get_weekly_study_plan_enabled():
         await _run_once_per_period(
             "last_weekly_study_plan", now.strftime("%G-W%V"), "Weekly study plan",
-            "📘 Generating weekly study plan...", run_weekly_study_plan_job, bot, ALLOWED_USER_IDS, session,
+            "📘 Generating weekly study plan...", run_weekly_study_plan_job, bot, active_uids, session,
         )
 
     # Exam dates from course files (syllabus, info sheets, slides): once a day.
@@ -144,7 +156,7 @@ async def _run_scheduled_jobs(bot, session, now: datetime):
 
 
 async def _send_calendar_reminders(bot):
-    for uid in ALLOWED_USER_IDS:
+    for uid in _get_active_user_ids():
         await check_calendar_reminders(bot, uid, silent=True)
 
 
@@ -318,12 +330,15 @@ SESSION_KEEPALIVE_SECONDS = 600  # 10 min keep-alive for OAuth + Stud.IP/NetIQ c
 
 async def session_keepalive_loop():
     """Periodically refresh OAuth2 tokens and touch Stud.IP / NetIQ IDP cookies
-    so a single /login session stays alive indefinitely without re-entering credentials."""
+    so sessions stay alive indefinitely without re-entering credentials."""
     while True:
         await asyncio.sleep(SESSION_KEEPALIVE_SECONDS)
         try:
             if state.global_session is not None:
                 await state.global_session.keep_alive()
+            for uid, sess in list(state.user_sessions.items()):
+                if sess is not None and sess is not state.global_session:
+                    await sess.keep_alive()
         except asyncio.CancelledError:
             raise
         except Exception as exc:

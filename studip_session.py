@@ -32,7 +32,7 @@ class StudIPSession:
     Using aiohttp for high performance and non-blocking operation in bots.
     """
     
-    def __init__(self, username, password, totp_secret, cookie_file="studip_cookies.json", totp_code=None):
+    def __init__(self, username, password, totp_secret, cookie_file="studip_cookies.json", totp_code=None, user_id=None):
         self.username = username
         self.password = password
         self.totp_secret = totp_secret
@@ -40,6 +40,7 @@ class StudIPSession:
         # Used once, then cleared - the secret-based generator takes over.
         self.totp_code = totp_code
         self.cookie_file = cookie_file
+        self.user_id = user_id
         self.session = None
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -138,58 +139,82 @@ class StudIPSession:
                 "domain": dom,
                 "path": cookie["path"] or "/",
             })
-        try:
-            from studip_vault import write_vault_file
-            write_vault_file(self.cookie_file, entries, mode=0o600)
-            self.logger.info("Encrypted cookies saved to %s (mode 0600)", self.cookie_file)
-        except Exception as exc:
-            self.logger.error("Failed to save encrypted cookies to %s: %s", self.cookie_file, exc)
+        if getattr(self, "user_id", None):
+            try:
+                from unibot import db
+                db.save_user_credential(self.user_id, "cookies", entries)
+                self.logger.info("Encrypted cookies saved to DB for user %s", self.user_id)
+            except Exception as exc:
+                self.logger.error("Failed to save cookies to DB for user %s: %s", self.user_id, exc)
+
+        if self.cookie_file:
+            try:
+                from studip_vault import write_vault_file
+                write_vault_file(self.cookie_file, entries, mode=0o600)
+                self.logger.info("Encrypted cookies saved to %s (mode 0600)", self.cookie_file)
+            except Exception as exc:
+                self.logger.error("Failed to save encrypted cookies to %s: %s", self.cookie_file, exc)
 
     async def load_cookies(self):
-        if os.path.exists(self.cookie_file):
+        data = None
+        if getattr(self, "user_id", None):
+            try:
+                from unibot import db
+                data = db.load_user_credential(self.user_id, "cookies")
+                if data:
+                    self.logger.info("Encrypted cookies loaded from DB for user %s", self.user_id)
+            except Exception as exc:
+                self.logger.warning("Failed to load cookies from DB for user %s: %s", self.user_id, exc)
+
+        if data is None and self.cookie_file and os.path.exists(self.cookie_file):
             try:
                 from studip_vault import read_vault_file
                 data = read_vault_file(self.cookie_file, auto_migrate=True)
                 if data is None:
                     with open(self.cookie_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                if self.session and data:
-                    worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
-                    if isinstance(data, list):
-                        for entry in data:
-                            key = entry.get("key")
-                            val = entry.get("value")
-                            dom = (entry.get("domain") or "elearning.uni-oldenburg.de").lstrip(".")
-                            path = entry.get("path") or "/"
-                            if key is not None and val is not None:
-                                self.session.cookie_jar.update_cookies(
-                                    {key: val},
-                                    response_url=URL(f"https://{dom}{path}"),
-                                )
-                                if worker_url:
-                                    self.session.cookie_jar.update_cookies(
-                                        {key: val},
-                                        response_url=URL(worker_url),
-                                    )
-                    elif isinstance(data, dict):
-                        for key, val in data.items():
-                            if key in ("JSESSIONID", "UrnNovellNidpClusterMemberId", "_PA_SDK_SSO_") or key.startswith("x-oidp-"):
-                                dom = "idp.uni-oldenburg.de"
-                            else:
-                                dom = "elearning.uni-oldenburg.de"
+                if data:
+                    self.logger.info("Encrypted cookies loaded from %s", self.cookie_file)
+            except Exception as e:
+                self.logger.error("Failed to load cookies: %s", e)
+
+        if self.session and data:
+            try:
+                worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
+                if isinstance(data, list):
+                    for entry in data:
+                        key = entry.get("key")
+                        val = entry.get("value")
+                        dom = (entry.get("domain") or "elearning.uni-oldenburg.de").lstrip(".")
+                        path = entry.get("path") or "/"
+                        if key is not None and val is not None:
                             self.session.cookie_jar.update_cookies(
                                 {key: val},
-                                response_url=URL(f"https://{dom}/"),
+                                response_url=URL(f"https://{dom}{path}"),
                             )
                             if worker_url:
                                 self.session.cookie_jar.update_cookies(
                                     {key: val},
                                     response_url=URL(worker_url),
                                 )
-                self.logger.info("Encrypted cookies loaded from %s", self.cookie_file)
+                elif isinstance(data, dict):
+                    for key, val in data.items():
+                        if key in ("JSESSIONID", "UrnNovellNidpClusterMemberId", "_PA_SDK_SSO_") or key.startswith("x-oidp-"):
+                            dom = "idp.uni-oldenburg.de"
+                        else:
+                            dom = "elearning.uni-oldenburg.de"
+                        self.session.cookie_jar.update_cookies(
+                            {key: val},
+                            response_url=URL(f"https://{dom}/"),
+                        )
+                        if worker_url:
+                            self.session.cookie_jar.update_cookies(
+                                {key: val},
+                                response_url=URL(worker_url),
+                            )
                 return True
             except Exception as e:
-                self.logger.error("Failed to load cookies: %s", e)
+                self.logger.error("Failed to apply cookies to session: %s", e)
         return False
 
     async def is_html_logged_in(self, use_cache: bool = True) -> bool:
@@ -232,7 +257,14 @@ class StudIPSession:
         """Attempt self-healing silent SSO renewal using stored NetIQ SSO cookies."""
         if self.explicitly_logged_out or (time.time() - self.last_interactive_activity < 180):
             return False
-        if not os.path.exists(self.cookie_file):
+        has_cookies = False
+        if getattr(self, "user_id", None):
+            try:
+                from unibot import db
+                has_cookies = bool(db.load_user_credential(self.user_id, "cookies"))
+            except Exception:
+                pass
+        if not has_cookies and (not self.cookie_file or not os.path.exists(self.cookie_file)):
             return False
 
         async with self._lock:
@@ -260,14 +292,15 @@ class StudIPSession:
             return True
 
         # Automatic self-healing: if HTML session dropped, silently renew via warm NetIQ cookies
-        if os.path.exists(self.cookie_file):
+        has_file = bool(self.cookie_file and os.path.exists(self.cookie_file))
+        if has_file or getattr(self, "user_id", None):
             if await self.heal_session():
                 return True
 
         use_oauth = studip_oauth.oauth_enabled()
         if allow_oauth and use_oauth:
             try:
-                token = await studip_oauth.get_access_token()
+                token = await studip_oauth.get_access_token(user_id=getattr(self, "user_id", None))
                 if token:
                     return True
             except Exception as exc:
@@ -295,7 +328,7 @@ class StudIPSession:
             if not has_headless_creds and not os.path.exists(self.cookie_file):
                 if not force and use_oauth:
                     try:
-                        if await studip_oauth.get_access_token():
+                        if await studip_oauth.get_access_token(user_id=getattr(self, "user_id", None)):
                             return True
                     except Exception:
                         logging.debug("OAuth token not available", exc_info=True)
@@ -329,7 +362,7 @@ class StudIPSession:
                 self._record_login_failure()
                 if not force and use_oauth:
                     try:
-                        if await studip_oauth.get_access_token():
+                        if await studip_oauth.get_access_token(user_id=getattr(self, "user_id", None)):
                             self.logger.info("Using active OAuth2 token session.")
                             return True
                     except Exception:
@@ -341,12 +374,20 @@ class StudIPSession:
         if self.explicitly_logged_out or (time.time() - self.last_interactive_activity < 180):
             return
         use_oauth = studip_oauth.oauth_enabled()
-        if not os.path.exists(self.cookie_file) and (not use_oauth or studip_oauth.load_tokens() is None):
+        has_cookies = False
+        if getattr(self, "user_id", None):
+            try:
+                from unibot import db
+                has_cookies = bool(db.load_user_credential(self.user_id, "cookies"))
+            except Exception:
+                pass
+        has_file = bool(self.cookie_file and os.path.exists(self.cookie_file))
+        if not has_cookies and not has_file and (not use_oauth or studip_oauth.load_tokens(getattr(self, "user_id", None)) is None):
             return
         await self.ensure_session()
         if use_oauth:
             try:
-                await studip_oauth.get_access_token()
+                await studip_oauth.get_access_token(user_id=getattr(self, "user_id", None))
             except Exception as exc:
                 self.logger.debug("OAuth keep-alive skipped: %s", exc)
 
@@ -394,14 +435,22 @@ class StudIPSession:
                         self.logger.debug("Upstream logout request skipped for %s: %s", redact_url(url), exc)
                 self.session.cookie_jar.clear()
 
-            for path in (self.cookie_file, f"{self.cookie_file}.tmp"):
+            if getattr(self, "user_id", None):
                 try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except OSError as exc:
-                    self.logger.warning("Could not remove %s: %s", path, exc)
+                    from unibot import db
+                    db.delete_user_credentials(self.user_id)
+                except Exception as exc:
+                    self.logger.warning("Could not delete credentials for user %s: %s", self.user_id, exc)
 
-            studip_oauth.clear_tokens()
+            if self.cookie_file:
+                for path in (self.cookie_file, f"{self.cookie_file}.tmp"):
+                    try:
+                        if os.path.exists(path):
+                            os.remove(path)
+                    except OSError as exc:
+                        self.logger.warning("Could not remove %s: %s", path, exc)
+
+            studip_oauth.clear_tokens(getattr(self, "user_id", None))
             self.logger.info("🚪 Stud.IP session, SSO cookies, and OAuth2 tokens cleared.")
 
     async def sso_handoff(self, entry_url: str, success_host: str, referer: str = None) -> str:
@@ -612,7 +661,7 @@ class StudIPSession:
         if "/jsonapi.php/" not in url:
             return {}
         try:
-            token = await studip_oauth.get_access_token()
+            token = await studip_oauth.get_access_token(user_id=getattr(self, "user_id", None))
         except Exception as exc:  # never let a token problem break a request
             self.logger.warning("OAuth token unavailable: %s", exc)
             return {}

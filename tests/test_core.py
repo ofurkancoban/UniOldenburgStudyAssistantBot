@@ -389,5 +389,61 @@ class ProxyRoutingTests(unittest.TestCase):
             self.assertNotIn("X-Target-Host", headers)
 
 
+class MultiUserSessionTests(unittest.TestCase):
+    def setUp(self):
+        from unibot import db, state
+        self.db = db
+        self.state = state
+        self.state.user_sessions.clear()
+
+    def test_get_user_session_isolation_and_db_cookies(self):
+        from unibot.auth import get_user_session
+        s1 = get_user_session(1001)
+        s2 = get_user_session(1002)
+        self.assertIsNot(s1, s2)
+        self.assertEqual(s1.user_id, 1001)
+        self.assertEqual(s2.user_id, 1002)
+
+        # Save cookies for user 1001
+        self.db.save_user_credential(1001, "cookies", [{"key": "test_cookie", "value": "val_1001"}])
+        self.assertIsNotNone(self.db.load_user_credential(1001, "cookies"))
+        self.assertIsNone(self.db.load_user_credential(1002, "cookies"))
+
+    def test_oauth_per_user_isolation(self):
+        tok1 = {"access_token": "acc_1", "refresh_token": "ref_1", "expires_in": 3600}
+        tok2 = {"access_token": "acc_2", "refresh_token": "ref_2", "expires_in": 3600}
+        studip_oauth.save_tokens(tok1, user_id=2001)
+        studip_oauth.save_tokens(tok2, user_id=2002)
+
+        loaded1 = studip_oauth.load_tokens(user_id=2001)
+        loaded2 = studip_oauth.load_tokens(user_id=2002)
+        self.assertEqual(loaded1.get("access_token"), "acc_1")
+        self.assertEqual(loaded2.get("access_token"), "acc_2")
+
+        studip_oauth.clear_tokens(user_id=2001)
+        self.assertIsNone(studip_oauth.load_tokens(user_id=2001))
+        self.assertIsNotNone(studip_oauth.load_tokens(user_id=2002))
+
+    def test_login_server_session_resolution_and_callback(self):
+        sessions = {}
+        def provider(uid):
+            if uid not in sessions:
+                sessions[uid] = f"sess_{uid}"
+            return sessions[uid]
+
+        def is_allowed(uid):
+            return uid == 777
+
+        srv = studip_login_server.LoginServer(
+            on_login=None,
+            session_provider=provider,
+            is_allowed_callback=is_allowed,
+        )
+        self.assertEqual(srv._resolve_session(123), "sess_123")
+        self.assertEqual(srv._resolve_session(456), "sess_456")
+        self.assertTrue(srv._is_allowed(777))
+        self.assertFalse(srv._is_allowed(888))
+
+
 if __name__ == "__main__":
     unittest.main()

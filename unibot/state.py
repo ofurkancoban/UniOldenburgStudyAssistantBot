@@ -19,6 +19,7 @@ last_full_check_time: Optional[datetime] = None
 global_scan_count = 0
 # ── global runtime state ───────────────────────────────────────────────────────
 global_session: Optional[StudIPSession] = None
+user_sessions: dict[int, StudIPSession] = {}
 global_watcher_paused = False
 message_poll_task: Optional[asyncio.Task] = None  # see message_poll_loop
 session_keepalive_task: Optional[asyncio.Task] = None  # see session_keepalive_loop

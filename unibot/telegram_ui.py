@@ -18,6 +18,7 @@ from telegram.error import TelegramError
 
 from studip_utils import md_escape as _md, safe_filename as _safe_filename
 
+from unibot import db
 from unibot.config import ALLOWED_USER_IDS
 
 
@@ -55,8 +56,15 @@ async def _send_file_bytes(message, content: bytes, fname: str, sid: str, captio
 # ── helpers ────────────────────────────────────────────────────────────────────
 # ── broadcast helper ──────────────────────────────────────────────────────────
 async def broadcast(bot, text, parse_mode="HTML", disable_notification=True, reply_markup=None):
-    """Send a message to all allowed users with optional reply markup."""
-    for uid in ALLOWED_USER_IDS:
+    """Send a message to all allowed and active users with optional reply markup."""
+    targets = set(ALLOWED_USER_IDS)
+    try:
+        for u in db.get_all_users():
+            if u.get("is_active", 1):
+                targets.add(u["telegram_id"])
+    except Exception:
+        pass
+    for uid in targets:
         try:
             await bot.send_message(
                 chat_id=uid,

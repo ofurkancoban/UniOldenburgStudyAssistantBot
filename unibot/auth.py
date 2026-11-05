@@ -19,6 +19,7 @@ from studip_login_server import LoginServer
 from studip_session import StudIPSession
 from studip_tunnel import QuickTunnel
 
+from unibot import db
 from unibot import state
 from unibot.config import (
     ADMIN_USER_IDS,
@@ -26,6 +27,12 @@ from unibot.config import (
     CLOUDFLARE_TUNNEL,
     LOGIN_PUBLIC_URL,
     TELEGRAM_TOKEN,
+)
+from unibot.db import (
+    is_user_admin_db,
+    is_user_allowed_db,
+    redeem_invite_token,
+    update_user_activity,
 )
 
 
@@ -48,7 +55,6 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
             if txt.startswith("/"):
                 action = f"cmd:{txt.split()[0][:20]}"
         try:
-            from unibot.db import update_user_activity
             update_user_activity(user.id, action=action)
         except Exception:
             pass
@@ -70,7 +76,6 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
             code = text.upper()
 
         if code:
-            from unibot.db import redeem_invite_token
             ok, msg = redeem_invite_token(code, user.id, full_name=user.full_name, username=user.username)
             if ok:
                 login_url = _login_public_url()
@@ -127,7 +132,6 @@ def is_user_allowed(user_id: Optional[int]) -> bool:
     if ALLOWED_USER_IDS and user_id in ALLOWED_USER_IDS:
         return True
     try:
-        from unibot.db import is_user_allowed_db
         return is_user_allowed_db(user_id)
     except Exception:
         return False
@@ -139,7 +143,6 @@ def is_user_admin(user_id: Optional[int]) -> bool:
     if ADMIN_USER_IDS and user_id in ADMIN_USER_IDS:
         return True
     try:
-        from unibot.db import is_user_admin_db
         return is_user_admin_db(user_id)
     except Exception:
         return False
@@ -199,25 +202,52 @@ SELECTORS = {
 
 
 # ── Stud.IP login ──────────────────────────────────────────────────────────────
-async def login_studip(notify=None):
-    
-    if state.global_session is None:
-        state.global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
-    
-    if await state.global_session.is_logged_in():
+def get_user_session(user_id: Optional[int] = None) -> StudIPSession:
+    """Retrieve or initialize the StudIPSession for a specific Telegram user."""
+    if user_id is None:
+        if state.global_session is None:
+            state.global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
         return state.global_session
+
+    if user_id in state.user_sessions:
+        return state.user_sessions[user_id]
+
+    if is_user_admin(user_id) and state.global_session is not None and not state.global_session.user_id:
+        state.global_session.user_id = user_id
+        state.user_sessions[user_id] = state.global_session
+        return state.global_session
+
+    cookie_file = f"studip_cookies_{user_id}.json"
+    if is_user_admin(user_id) and os.path.exists("studip_cookies.json") and not os.path.exists(cookie_file):
+        cookie_file = "studip_cookies.json"
+
+    sess = StudIPSession(
+        USERNAME, PASSWORD, TOTP_SECRET,
+        cookie_file=cookie_file,
+        user_id=user_id,
+    )
+    state.user_sessions[user_id] = sess
+    if state.global_session is None and is_user_admin(user_id):
+        state.global_session = sess
+    return sess
+
+
+async def login_studip(notify=None, user_id: Optional[int] = None):
+    session = get_user_session(user_id)
+    if await session.is_logged_in():
+        return session
 
     if notify:
         await notify("Starting login...")
-    
-    success = await state.global_session.login()
-    
+
+    success = await session.login()
+
     if success:
         state._login_failure_notified = False
         if notify:
             await notify("Login successful.")
         logging.info("Logged in successfully (browser-less session).")
-        return state.global_session
+        return session
     else:
         if notify:
             await notify("Login failed.")
@@ -256,15 +286,14 @@ def _login_public_url() -> str:
 
 
 def _get_or_init_session() -> StudIPSession:
-    if state.global_session is None:
-        state.global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
-    return state.global_session
+    return get_user_session(None)
 
 
-async def _on_proxy_session_authenticated() -> None:
+async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None:
     """Called when the user completes login in the proxied Stud.IP Mini App."""
     from unibot.studip_api import get_studip_user_profile
-    session = _get_or_init_session()
+
+    session = get_user_session(user_id)
     session.explicitly_logged_out = False
     session.last_interactive_activity = 0.0
     session.reset_login_backoff()
@@ -279,34 +308,44 @@ async def _on_proxy_session_authenticated() -> None:
                 break
 
     use_oauth = studip_oauth.oauth_enabled()
-    need_oauth = use_oauth and studip_oauth.is_expired(studip_oauth.load_tokens())
+    need_oauth = use_oauth and studip_oauth.is_expired(studip_oauth.load_tokens(user_id=user_id))
     is_new_session = bool(studip_cookie and studip_cookie != state._last_notified_studip_cookie)
 
+    profile = {}
     if use_oauth and (is_new_session or need_oauth):
-        state._studip_api_user_id = None
-        state._studip_user_profile = None
+        if user_id is None or is_user_admin(user_id):
+            state._studip_api_user_id = None
+            state._studip_user_profile = None
         try:
-            await studip_oauth.authorize_with_session(session)
-            await get_studip_user_profile()
+            await studip_oauth.authorize_with_session(session, user_id=user_id)
+            profile = await get_studip_user_profile(user_id=user_id, session=session)
         except Exception as exc:
-            logging.warning("⚠️ OAuth consent after proxy login failed: %s", exc)
+            logging.warning("⚠️ OAuth consent after proxy login failed for user %s: %s", user_id, exc)
     elif is_new_session or state._studip_user_profile is None:
         try:
-            await get_studip_user_profile()
+            profile = await get_studip_user_profile(user_id=user_id, session=session)
         except Exception as exc:
-            logging.debug("Profile sync after login: %s", exc)
+            logging.debug("Profile sync after login for user %s: %s", user_id, exc)
 
-    if is_new_session:
+    if profile and user_id is not None:
+        studip_user = profile.get("username")
+        display_name = profile.get("display_name")
+        if studip_user or display_name:
+            db.upsert_user(telegram_id=user_id, studip_username=studip_user)
+
+    if is_new_session and (user_id is None or is_user_admin(user_id)):
         state._last_notified_studip_cookie = studip_cookie
-        if state._menu_app is not None:
-            for uid in ALLOWED_USER_IDS or []:
-                try:
-                    await state._menu_app.bot.send_message(
-                        chat_id=uid,
-                        text="✅ Signed in to Stud.IP.",
-                    )
-                except Exception as exc:
-                    logging.warning("⚠️ Could not send login confirmation to %s: %s", uid, exc)
+
+    if state._menu_app is not None:
+        target_uids = [user_id] if user_id else (ALLOWED_USER_IDS or [])
+        for uid in target_uids:
+            try:
+                await state._menu_app.bot.send_message(
+                    chat_id=uid,
+                    text="✅ Signed in to Stud.IP.",
+                )
+            except Exception as exc:
+                logging.warning("⚠️ Could not send login confirmation to %s: %s", uid, exc)
 
 
 def _get_login_server() -> LoginServer:
@@ -316,8 +355,9 @@ def _get_login_server() -> LoginServer:
             bot_token=TELEGRAM_TOKEN,
             allowed_user_ids=set(ALLOWED_USER_IDS),
             base_url_provider=_login_public_url,
-            session_provider=_get_or_init_session,
+            session_provider=get_user_session,
             on_session_authenticated=_on_proxy_session_authenticated,
+            is_allowed_callback=is_user_allowed,
         )
     return state.login_server
 

@@ -125,7 +125,7 @@ async def send_task_list(message, user_id: int):
         due = datetime.fromisoformat(t["due_time"])
         course_line = f" [{t['course']}]" if t.get("course") else ""
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"task_delete|{t['id']}")]])
-        await message.reply_text(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} — {t['text']}{course_line}", reply_markup=keyboard)
+        await message.reply_text(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} - {t['text']}{course_line}", reply_markup=keyboard)
 
     for t in plain:
         course_line = f" [{t['course']}]" if t.get("course") else ""
