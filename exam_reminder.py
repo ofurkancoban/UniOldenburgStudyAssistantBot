@@ -44,6 +44,21 @@ STUMS_BASE = "https://stums.uni-oldenburg.de"
 SSO_ENTRY_URL = f"{STUMS_BASE}/qisserver/api/identityprovider/redirect/2/login"
 STUMS_HOST = "stums.uni-oldenburg.de"
 STUMS_VERIFIED_SECONDS = 60  # how long a verified StuMS login is trusted without re-checking
+STUMS_RETRY_SECONDS = 30 * 60  # pause after StuMS refused the login (a new /login retries at once)
+
+
+class StumsLoginUnavailable(RuntimeError):
+    """StuMS did not accept the login. `quiet` is set while the retry pause
+    is running, so callers log the failure once instead of every cycle."""
+
+    def __init__(self, message: str, quiet: bool = False):
+        super().__init__(message)
+        self.quiet = quiet
+
+
+def _log_stums_failure(context: str, exc: Exception) -> None:
+    log = logging.debug if getattr(exc, "quiet", False) else logging.error
+    log("exam_reminder: %s: %s", context, exc)
 STUDY_PLANNER_URL = (
     f"{STUMS_BASE}/qisserver/pages/startFlow.xhtml?_flowId=studyPlanner-flow"
     "&navigationPosition=hisinoneMeinStudium%2ChisinoneStudyPlanner&recordRequest=true"
@@ -132,6 +147,12 @@ async def _establish_stums_session(session) -> str:
     verified_at = getattr(session, "_stums_verified_at", 0.0)
     if not session.explicitly_logged_out and time.time() - verified_at < STUMS_VERIFIED_SECONDS:
         return session._stums_referer
+    blocked_until = getattr(session, "stums_blocked_until", 0.0)
+    if time.time() < blocked_until:
+        raise StumsLoginUnavailable(
+            f"StuMS login refused earlier; next try at {time.strftime('%H:%M', time.localtime(blocked_until))} "
+            "or after /login", quiet=True,
+        )
 
     for attempt in (1, 2):
         try:
@@ -141,13 +162,15 @@ async def _establish_stums_session(session) -> str:
         if await _stums_logged_in(session, referer):
             session._stums_verified_at = time.time()
             session._stums_referer = referer
+            session.stums_blocked_until = 0.0
             return referer
         if attempt == 1:
             logging.info("exam_reminder: StuMS session expired; dropping StuMS cookies and signing in again")
             session.session.cookie_jar.clear_domain(STUMS_HOST)
-    raise RuntimeError(
+    session.stums_blocked_until = time.time() + STUMS_RETRY_SECONDS
+    raise StumsLoginUnavailable(
         "StuMS login could not be restored automatically (the handoff reached StuMS "
-        "but it still asks for a login). Sign in again with /login."
+        f"but it still asks for a login). Retrying in {STUMS_RETRY_SECONDS // 60} min or after /login."
     )
 
 
@@ -907,7 +930,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
     try:
         open_exams = await get_open_exam_registrations(session, failed_codes=failed_codes)
     except Exception as e:
-        logging.error("exam_reminder: fetch failed: %s", e)
+        _log_stums_failure("fetch failed", e)
         return
 
     cache = load_exam_cache()
@@ -1212,7 +1235,7 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
     try:
         grades = await get_grades(session)
     except Exception as e:
-        logging.error("exam_reminder: fetch grades failed: %s", e)
+        _log_stums_failure("fetch grades failed", e)
         return
 
     cache = load_exam_cache()

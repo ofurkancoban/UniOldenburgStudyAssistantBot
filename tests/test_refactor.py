@@ -562,6 +562,7 @@ class StumsHandoffTests(unittest.TestCase):
         s = mock.MagicMock()
         s.explicitly_logged_out = False
         s._stums_verified_at = 0.0
+        s.stums_blocked_until = 0.0
         s.sso_handoff = mock.AsyncMock(return_value="https://stums.uni-oldenburg.de/start")
         pages = iter(planner_pages)
 
@@ -590,6 +591,28 @@ class StumsHandoffTests(unittest.TestCase):
             asyncio.run(self.er._establish_stums_session(s))
         self.assertEqual(s._stums_verified_at, 0.0)
 
+    def test_pauses_after_refusal_and_logs_once(self):
+        s = self.session(["Login notwendig", "Login notwendig"])
+        with self.assertRaises(self.er.StumsLoginUnavailable) as first:
+            asyncio.run(self.er._establish_stums_session(s))
+        self.assertFalse(first.exception.quiet)
+        self.assertGreater(s.stums_blocked_until, __import__("time").time() + 25 * 60)
+        with self.assertRaises(self.er.StumsLoginUnavailable) as second:
+            asyncio.run(self.er._establish_stums_session(s))
+        self.assertTrue(second.exception.quiet)
+        self.assertEqual(s.sso_handoff.await_count, 2)  # no new attempt during the pause
+        with mock.patch.object(self.er.logging, "error") as err, mock.patch.object(self.er.logging, "debug") as dbg:
+            self.er._log_stums_failure("fetch failed", first.exception)
+            self.er._log_stums_failure("fetch failed", second.exception)
+        self.assertEqual((err.call_count, dbg.call_count), (1, 1))
+
+    def test_new_login_ends_the_pause(self):
+        import studip_session
+        sess = studip_session.StudIPSession("u", "p", "JBSWY3DPEHPK3PXP", cookie_file="/nonexistent")
+        sess.stums_blocked_until = __import__("time").time() + 600
+        sess.reset_login_backoff()
+        self.assertEqual(sess.stums_blocked_until, 0.0)
+
     def test_forget_forces_a_new_check(self):
         s = self.session(["ok", "ok"])
         asyncio.run(self.er._establish_stums_session(s))
@@ -602,6 +625,23 @@ class StumsHandoffTests(unittest.TestCase):
         s.sso_handoff.side_effect = RuntimeError("Interactive login required (no stored password)")
         with self.assertRaisesRegex(RuntimeError, "StuMS SSO handoff failed"):
             asyncio.run(self.er._establish_stums_session(s))
+
+
+class LoginProxyAccessLogTests(unittest.TestCase):
+    def test_query_strings_are_not_logged(self):
+        import logging as logging_mod
+        import studip_login_server
+        logger = logging_mod.getLogger("test.access")
+        access = studip_login_server._RedactedAccessLogger(logger, "")
+        request = mock.MagicMock(remote="127.0.0.1", method="GET", path="/sso.php/oidc",
+                                 path_qs="/sso.php/oidc?code=SECRET&state=abc")
+        response = mock.MagicMock(status=302, body_length=0)
+        with self.assertLogs("test.access", level="INFO") as logs:
+            access.log(request, response, 0.01)
+        line = logs.output[0]
+        self.assertIn("/sso.php/oidc", line)
+        self.assertNotIn("SECRET", line)
+        self.assertNotIn("state", line)
 
 
 if __name__ == "__main__":

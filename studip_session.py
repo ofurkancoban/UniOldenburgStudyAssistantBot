@@ -51,11 +51,15 @@ class StudIPSession:
         self.login_failures = 0
         self.login_blocked_until = 0.0
         self._logged_in_until = 0.0
+        # Set by exam_reminder when StuMS refuses the login; background StuMS
+        # checks pause until then (a new interactive login clears it).
+        self.stums_blocked_until = 0.0
 
     def reset_login_backoff(self) -> None:
         """Forget earlier failed logins (after a successful interactive login)."""
         self.login_failures = 0
         self.login_blocked_until = 0.0
+        self.stums_blocked_until = 0.0
 
     def invalidate_login_cache(self) -> None:
         self._logged_in_until = 0.0

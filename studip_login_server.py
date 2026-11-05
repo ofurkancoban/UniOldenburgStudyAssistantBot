@@ -35,6 +35,7 @@ from typing import Awaitable, Callable, Optional
 from urllib.parse import parse_qsl, urlsplit
 
 from aiohttp import web
+from aiohttp.abc import AbstractAccessLogger
 
 from studip_utils import redact_url
 
@@ -255,6 +256,18 @@ function _botCloseApp() {
 })();
 </script>
 """
+
+
+class _RedactedAccessLogger(AbstractAccessLogger):
+    """Access log line without the query string, Referer or User-Agent.
+
+    aiohttp's default format logs the full request line, and the SSO redirects
+    through this proxy carry one-time OAuth codes and state values in the
+    query string (and in the Referer of the next request)."""
+
+    def log(self, request, response, time):
+        self.logger.info('%s "%s %s" %s %s %.3fs', request.remote, request.method,
+                         request.path, response.status, response.body_length, time)
 
 
 class LoginServer:
@@ -665,7 +678,7 @@ class LoginServer:
         app.router.add_post("/api/login", self._api_login)
         app.router.add_get("/health", lambda _r: web.Response(text="ok"))
         app.router.add_route("*", "/{tail:.*}", self._proxy)
-        self._runner = web.AppRunner(app)
+        self._runner = web.AppRunner(app, access_log_class=_RedactedAccessLogger)
         await self._runner.setup()
         await web.TCPSite(self._runner, self.host, self.port).start()
         logger.info("Login server on :%s (public base: %s)", self.port, self.base_url())
