@@ -54,6 +54,11 @@ whatsapp_service/*.lock
 
 # Debug / Temp
 *.html
+# ...except the saved sample pages the tests parse
+!tests/fixtures/*.html
+# Browser network captures contain cookies, tokens and form data
+*.har
+*.devtools
 whatsapp_service/baileys_auth.broken-*/
 
 # Secrets / runtime state added with the vault and tunnel
