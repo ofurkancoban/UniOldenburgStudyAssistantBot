@@ -42,6 +42,8 @@ WA_FORWARD_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to
 
 STUMS_BASE = "https://stums.uni-oldenburg.de"
 SSO_ENTRY_URL = f"{STUMS_BASE}/qisserver/api/identityprovider/redirect/2/login"
+STUMS_HOST = "stums.uni-oldenburg.de"
+STUMS_VERIFIED_SECONDS = 60  # how long a verified StuMS login is trusted without re-checking
 STUDY_PLANNER_URL = (
     f"{STUMS_BASE}/qisserver/pages/startFlow.xhtml?_flowId=studyPlanner-flow"
     "&navigationPosition=hisinoneMeinStudium%2ChisinoneStudyPlanner&recordRequest=true"
@@ -117,11 +119,48 @@ async def _establish_stums_session(session) -> str:
     reuses the session's shared NetIQ state machine (`sso_handoff`), which
     transparently falls through to the same credential-entry steps `login()` uses
     (Ecom fields, TOTP/contract page) whenever that happens.
+
+    Reaching the StuMS host is not proof of a StuMS login: once the StuMS
+    session has expired, the entry URL lands on the portal start page as an
+    anonymous visitor, and every page then says "Login notwendig". So the
+    login is verified on a protected page; if it is missing, the stale StuMS
+    cookies are dropped and the handoff runs once more, which sends the
+    browser through the identity provider again. A verified login is
+    remembered for STUMS_VERIFIED_SECONDS so one watcher cycle (registrations,
+    grades, tuition) checks it only once.
     """
-    try:
-        return await session.sso_handoff(SSO_ENTRY_URL, "stums.uni-oldenburg.de")
-    except RuntimeError as e:
-        raise RuntimeError(f"StuMS SSO handoff failed: {e}") from e
+    verified_at = getattr(session, "_stums_verified_at", 0.0)
+    if not session.explicitly_logged_out and time.time() - verified_at < STUMS_VERIFIED_SECONDS:
+        return session._stums_referer
+
+    for attempt in (1, 2):
+        try:
+            referer = await session.sso_handoff(SSO_ENTRY_URL, STUMS_HOST)
+        except RuntimeError as e:
+            raise RuntimeError(f"StuMS SSO handoff failed: {e}") from e
+        if await _stums_logged_in(session, referer):
+            session._stums_verified_at = time.time()
+            session._stums_referer = referer
+            return referer
+        if attempt == 1:
+            logging.info("exam_reminder: StuMS session expired; dropping StuMS cookies and signing in again")
+            session.session.cookie_jar.clear_domain(STUMS_HOST)
+    raise RuntimeError(
+        "StuMS login could not be restored automatically (the handoff reached StuMS "
+        "but it still asks for a login). Sign in again with /login."
+    )
+
+
+async def _stums_logged_in(session, referer: str) -> bool:
+    """Whether StuMS treats this session as signed in (checked on the study planner)."""
+    async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
+        html_text = await r.text()
+    return "Login notwendig" not in html_text
+
+
+def forget_stums_login(session) -> None:
+    """Drop the remembered StuMS verification, e.g. after a page reported "Login notwendig"."""
+    session._stums_verified_at = 0.0
 
 
 def _parse_candidate_units(html_text: str) -> list[dict]:
@@ -430,6 +469,7 @@ async def get_open_exam_registrations(session, failed_codes: Optional[set] = Non
     async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
         html_text = await r.text()
     if "Login notwendig" in html_text:
+        forget_stums_login(session)
         raise RuntimeError("StuMS session expired while fetching study planner")
 
     candidates = _parse_candidate_units(html_text)
@@ -464,6 +504,7 @@ async def get_registered_exams(session) -> list[dict]:
     async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
         html_text = await r.text()
     if "Login notwendig" in html_text:
+        forget_stums_login(session)
         raise RuntimeError("StuMS session expired while fetching study planner")
 
     units = _parse_registration_status(html_text)
@@ -510,6 +551,7 @@ async def get_registered_exam_schedule(session) -> list[dict]:
     async with await session.get(ENROLLMENT_INFO_URL, allow_redirects=True, headers={"Referer": referer}) as r:
         html_text = await r.text()
     if "Login notwendig" in html_text:
+        forget_stums_login(session)
         raise RuntimeError("StuMS session expired while fetching registered exam schedule")
 
     soup = BeautifulSoup(html_text, "html.parser")
@@ -606,6 +648,7 @@ async def get_all_exam_dates(session) -> list[dict]:
     async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
         html_text = await r.text()
     if "Login notwendig" in html_text:
+        forget_stums_login(session)
         raise RuntimeError("StuMS session expired while fetching study planner")
 
     units = _parse_registration_status(html_text)
@@ -1070,6 +1113,7 @@ async def get_grades(session) -> list[dict]:
         html_text = await r.text()
         page_url = str(r.url)
     if "Login notwendig" in html_text:
+        forget_stums_login(session)
         raise RuntimeError("StuMS session expired while fetching grades")
 
     soup = BeautifulSoup(html_text, "html.parser")
@@ -1468,6 +1512,7 @@ async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
             html_text = await r.text()
             page_url = str(r.url)
         if "Login notwendig" in html_text:
+            forget_stums_login(session)
             raise RuntimeError("StuMS session expired while opening My Achievements.")
 
         soup = BeautifulSoup(html_text, "html.parser")
@@ -1486,6 +1531,7 @@ async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
             html_text = await r.text()
             page_url = str(r.url)
         if "Login notwendig" in html_text:
+            forget_stums_login(session)
             raise RuntimeError("StuMS session expired while opening Student Service.")
 
         soup = BeautifulSoup(html_text, "html.parser")
@@ -1561,6 +1607,7 @@ async def get_tuition_status(session) -> dict:
         html_text = await r.text()
         page_url = str(r.url)
     if "Login notwendig" in html_text:
+        forget_stums_login(session)
         raise RuntimeError("StuMS session expired while opening Student Service.")
 
     soup = BeautifulSoup(html_text, "html.parser")

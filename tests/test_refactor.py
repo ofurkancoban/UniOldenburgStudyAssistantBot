@@ -548,5 +548,61 @@ class DispatchTableTests(unittest.TestCase):
             self.assertTrue(hasattr(fn, "__wrapped__"), fn.__name__)
 
 
+# ── StuMS login handoff ──────────────────────────────────────────────────────
+class StumsHandoffTests(unittest.TestCase):
+    """The handoff used to count any page on the StuMS host as a login, so an
+    expired StuMS session failed on every watcher cycle without ever signing in
+    again."""
+
+    def setUp(self):
+        import exam_reminder
+        self.er = exam_reminder
+
+    def session(self, planner_pages):
+        s = mock.MagicMock()
+        s.explicitly_logged_out = False
+        s._stums_verified_at = 0.0
+        s.sso_handoff = mock.AsyncMock(return_value="https://stums.uni-oldenburg.de/start")
+        pages = iter(planner_pages)
+
+        async def get(url, **kwargs):
+            return FakeResponse(body=next(pages))
+
+        s.get = get
+        return s
+
+    def test_valid_login_is_used_and_remembered(self):
+        s = self.session(["<h1>Studienplaner</h1>"])
+        self.assertEqual(asyncio.run(self.er._establish_stums_session(s)), "https://stums.uni-oldenburg.de/start")
+        asyncio.run(self.er._establish_stums_session(s))  # within 60 s: no second handoff or check
+        self.assertEqual(s.sso_handoff.await_count, 1)
+        s.session.cookie_jar.clear_domain.assert_not_called()
+
+    def test_expired_session_signs_in_again(self):
+        s = self.session(["Login notwendig", "<h1>Studienplaner</h1>"])
+        asyncio.run(self.er._establish_stums_session(s))
+        self.assertEqual(s.sso_handoff.await_count, 2)
+        s.session.cookie_jar.clear_domain.assert_called_once_with("stums.uni-oldenburg.de")
+
+    def test_gives_up_with_clear_message(self):
+        s = self.session(["Login notwendig", "Login notwendig"])
+        with self.assertRaisesRegex(RuntimeError, "/login"):
+            asyncio.run(self.er._establish_stums_session(s))
+        self.assertEqual(s._stums_verified_at, 0.0)
+
+    def test_forget_forces_a_new_check(self):
+        s = self.session(["ok", "ok"])
+        asyncio.run(self.er._establish_stums_session(s))
+        self.er.forget_stums_login(s)
+        asyncio.run(self.er._establish_stums_session(s))
+        self.assertEqual(s.sso_handoff.await_count, 2)
+
+    def test_handoff_errors_are_wrapped(self):
+        s = self.session([])
+        s.sso_handoff.side_effect = RuntimeError("Interactive login required (no stored password)")
+        with self.assertRaisesRegex(RuntimeError, "StuMS SSO handoff failed"):
+            asyncio.run(self.er._establish_stums_session(s))
+
+
 if __name__ == "__main__":
     unittest.main()
