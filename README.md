@@ -16,6 +16,8 @@ The ultimate Telegram companion for students at the **University of Oldenburg**.
 
 Courses, files and folders, announcements, messages and forum posts are read from Stud.IP's own JSON:API (`/jsonapi.php/v1`), using the same logged-in session as the web pages, so no API registration is needed. Each of them falls back to reading the HTML page if the API ever fails. Logging in (SSO with TOTP), enrolment and everything from StuMS (exam dates, registration, grades) still go through the web pages, since there is no API for them.
 
+All outgoing requests to Stud.IP, StuMS, and NetIQ SSO can optionally be routed through a **Cloudflare Worker reverse proxy** (`CLOUDFLARE_WORKER_URL`). This routes bot requests through Cloudflare's rotating edge IPs to preserve privacy, avoid rate-limiting, and mask the VPS host IP, while preserving session cookies and redirects. If unset, the bot falls back directly to transparent native requests.
+
 ---
 
 ## ✨ Power Features
@@ -256,16 +258,20 @@ The microservice (`whatsapp_service/`) talks to WhatsApp via **[Baileys](https:/
 ```mermaid
 %%{init: {'theme': 'dark'}}%%
 graph TD
-    A[Telegram] <--> B[unibot package]
-    B --> C[aiohttp + BeautifulSoup]
-    C --> D[Stud.IP JSON:API / HTML pages]
-    B --> K[exam_reminder.py]
-    K -->|Shared SSO session| L[StuMS / HISinOne Portal]
-    B --> H[(bot_data.sqlite3)]
-    B -.->|Forward & Status| I[Node.js WhatsApp Microservice / Baileys]
-    I --> J[WhatsApp multi-device protocol over WebSocket]
-    B -.->|Voice note| M[GWDG Whisper / Google Web Speech]
-    B -.->|Intents, summaries, plans| N[GWDG / OpenRouter LLMs]
+    A["Telegram"] <--> B["unibot package"]
+    B --> C["studip_session (aiohttp)"]
+    B --> K["exam_reminder.py"]
+    K -->|Shared SSO session| C
+    C -->|CLOUDFLARE_WORKER_URL| W["Cloudflare Worker (Rotating Edge IPs)"]
+    W --> D["Stud.IP (JSON:API / HTML pages)"]
+    W --> L["StuMS / HISinOne Portal"]
+    C -.->|Direct fallback| D
+    C -.->|Direct fallback| L
+    B --> H[("bot_data.sqlite3")]
+    B -.->|Forward & Status| I["Node.js WhatsApp Microservice (Baileys)"]
+    I --> J["WhatsApp multi-device protocol (WebSocket)"]
+    B -.->|Voice note| M["GWDG Whisper / Google Web Speech"]
+    B -.->|Intents, summaries, plans| N["GWDG / OpenRouter LLMs"]
 ```
 
 `studip_bot.py` is only the entry point (PM2 and the self-restart start it). The bot itself is the `unibot` package, one module per area, layered so that a module only imports modules listed before it in `unibot/__init__.py` (`MODULE_ORDER`):
