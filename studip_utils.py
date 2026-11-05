@@ -138,6 +138,8 @@ def route_proxy_url(url: str, extra_headers: dict | None = None) -> tuple[str, d
             headers["X-Target-Host"] = parts.netloc
             if worker_secret:
                 headers["X-Proxy-Secret"] = worker_secret
+            if "Accept-Encoding" not in headers:
+                headers["Accept-Encoding"] = "gzip, deflate, br"
             return routed, headers
     except Exception:
         pass
