@@ -283,5 +283,43 @@ class LoginServerTests(unittest.TestCase):
         self.assertNotEqual(server._csrf_token(a), server._csrf_token(b))
 
 
+class ProxyRoutingTests(unittest.TestCase):
+    def test_passthrough_when_unset(self):
+        with mock.patch.dict(os.environ, {"CLOUDFLARE_WORKER_URL": "", "CLOUDFLARE_WORKER_SECRET": ""}):
+            url = "https://elearning.uni-oldenburg.de/dispatch.php/start"
+            routed, headers = studip_utils.route_proxy_url(url, {"X-Custom": "val"})
+            self.assertEqual(routed, url)
+            self.assertEqual(headers, {"X-Custom": "val"})
+            self.assertEqual(studip_utils.unroute_proxy_url(url), url)
+
+    def test_routes_university_hosts_with_secret(self):
+        worker = "https://my-uni-worker.subdomain.workers.dev"
+        env = {
+            "CLOUDFLARE_WORKER_URL": worker,
+            "CLOUDFLARE_WORKER_SECRET": "test-super-secret",
+        }
+        with mock.patch.dict(os.environ, env):
+            url = "https://elearning.uni-oldenburg.de/dispatch.php/start?foo=bar"
+            routed, headers = studip_utils.route_proxy_url(url)
+            self.assertEqual(
+                routed,
+                f"{worker}/elearning.uni-oldenburg.de/dispatch.php/start?foo=bar",
+            )
+            self.assertEqual(headers.get("X-Proxy-Secret"), "test-super-secret")
+            self.assertEqual(headers.get("X-Target-Host"), "elearning.uni-oldenburg.de")
+
+            unrouted = studip_utils.unroute_proxy_url(routed)
+            self.assertEqual(unrouted, url)
+
+    def test_ignores_non_university_hosts(self):
+        worker = "https://my-uni-worker.subdomain.workers.dev"
+        with mock.patch.dict(os.environ, {"CLOUDFLARE_WORKER_URL": worker}):
+            telegram_url = "https://api.telegram.org/bot123/getMe"
+            routed, headers = studip_utils.route_proxy_url(telegram_url)
+            self.assertEqual(routed, telegram_url)
+            self.assertNotIn("X-Proxy-Secret", headers)
+            self.assertNotIn("X-Target-Host", headers)
+
+
 if __name__ == "__main__":
     unittest.main()

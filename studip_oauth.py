@@ -47,6 +47,8 @@ from typing import Optional
 import aiohttp
 from bs4 import BeautifulSoup
 
+from studip_utils import route_proxy_url
+
 logger = logging.getLogger("StudIPOAuth")
 
 BASE_URL = "https://elearning.uni-oldenburg.de"
@@ -184,7 +186,8 @@ async def authorize_with_session(session, timeout: int = 30) -> dict:
         "state": state,
     }
     logger.info("Requesting consent page...")
-    async with session.session.get(AUTHORIZE_URL, params=params, allow_redirects=False,
+    routed_auth, auth_headers = route_proxy_url(AUTHORIZE_URL)
+    async with session.session.get(routed_auth, params=params, headers=auth_headers or None, allow_redirects=False,
                                    timeout=timeout) as resp:
         status = resp.status
         body = await resp.text()
@@ -211,7 +214,7 @@ async def authorize_with_session(session, timeout: int = 30) -> dict:
     payload["allow"] = ""  # empty value == approve; "1" is read as a rejection
 
     logger.info("Submitting consent...")
-    async with session.session.post(AUTHORIZE_URL, data=payload, allow_redirects=False,
+    async with session.session.post(routed_auth, data=payload, headers=auth_headers or None, allow_redirects=False,
                                     timeout=timeout) as resp:
         status = resp.status
         location = resp.headers.get("Location", "")
@@ -242,7 +245,8 @@ async def _exchange_code(session, redirect_location: str, verifier: str, state: 
         "client_id": CLIENT_ID,
         "code_verifier": verifier,
     }
-    async with session.session.post(TOKEN_URL, data=data, allow_redirects=False,
+    routed_tok, tok_headers = route_proxy_url(TOKEN_URL)
+    async with session.session.post(routed_tok, data=data, headers=tok_headers or None, allow_redirects=False,
                                     timeout=30) as resp:
         status = resp.status
         text = await resp.text()
@@ -268,8 +272,9 @@ async def refresh(tokens: Optional[dict] = None) -> dict:
         "refresh_token": tokens["refresh_token"],
         "client_id": CLIENT_ID,
     }
+    routed_tok, tok_headers = route_proxy_url(TOKEN_URL)
     async with aiohttp.ClientSession() as http:
-        async with http.post(TOKEN_URL, data=data, allow_redirects=False, timeout=30) as resp:
+        async with http.post(routed_tok, data=data, headers=tok_headers or None, allow_redirects=False, timeout=30) as resp:
             status = resp.status
             text = await resp.text()
 

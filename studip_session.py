@@ -14,7 +14,7 @@ from urllib.parse import urljoin, urlparse
 from yarl import URL
 
 import studip_oauth
-from studip_utils import redact_url
+from studip_utils import redact_url, route_proxy_url, unroute_proxy_url
 
 # Wait this long after the 1st, 2nd, 3rd, 4th+ failed password/TOTP login in a
 # row before the next automatic attempt. Without it every button tap and
@@ -103,15 +103,38 @@ class StudIPSession:
             logging.warning("TOTP code generation failed (check TOTP_SECRET)", exc_info=True)
             return ""
 
+    def _s_get(self, url, **kwargs):
+        routed_url, headers = route_proxy_url(url, kwargs.pop("headers", None))
+        if headers:
+            kwargs["headers"] = headers
+        return self.session.get(routed_url, **kwargs)
+
+    def _s_post(self, url, **kwargs):
+        routed_url, headers = route_proxy_url(url, kwargs.pop("headers", None))
+        if headers:
+            kwargs["headers"] = headers
+        return self.session.post(routed_url, **kwargs)
+
     async def save_cookies(self):
         if not self.session:
             return
+        worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
+        worker_host = urlparse(worker_url).netloc.lower() if worker_url else ""
+
         entries = []
+        seen = set()
         for cookie in self.session.cookie_jar:
+            dom = cookie["domain"] or "elearning.uni-oldenburg.de"
+            if worker_host and (dom.lower() == worker_host or dom.lower() == f".{worker_host}"):
+                dom = "elearning.uni-oldenburg.de"
+            item_key = (cookie.key, dom, cookie["path"] or "/")
+            if item_key in seen:
+                continue
+            seen.add(item_key)
             entries.append({
                 "key": cookie.key,
                 "value": cookie.value,
-                "domain": cookie["domain"] or "elearning.uni-oldenburg.de",
+                "domain": dom,
                 "path": cookie["path"] or "/",
             })
         try:
@@ -130,6 +153,7 @@ class StudIPSession:
                     with open(self.cookie_file, "r", encoding="utf-8") as f:
                         data = json.load(f)
                 if self.session and data:
+                    worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
                     if isinstance(data, list):
                         for entry in data:
                             key = entry.get("key")
@@ -141,6 +165,11 @@ class StudIPSession:
                                     {key: val},
                                     response_url=URL(f"https://{dom}{path}"),
                                 )
+                                if worker_url:
+                                    self.session.cookie_jar.update_cookies(
+                                        {key: val},
+                                        response_url=URL(worker_url),
+                                    )
                     elif isinstance(data, dict):
                         for key, val in data.items():
                             if key in ("JSESSIONID", "UrnNovellNidpClusterMemberId", "_PA_SDK_SSO_") or key.startswith("x-oidp-"):
@@ -151,6 +180,11 @@ class StudIPSession:
                                 {key: val},
                                 response_url=URL(f"https://{dom}/"),
                             )
+                            if worker_url:
+                                self.session.cookie_jar.update_cookies(
+                                    {key: val},
+                                    response_url=URL(worker_url),
+                                )
                 self.logger.info("Encrypted cookies loaded from %s", self.cookie_file)
                 return True
             except Exception as e:
@@ -171,7 +205,7 @@ class StudIPSession:
     async def _check_html_logged_in(self) -> bool:
         await self.ensure_session()
         try:
-            async with self.session.get("https://elearning.uni-oldenburg.de/dispatch.php/start", allow_redirects=True) as r:
+            async with self._s_get("https://elearning.uni-oldenburg.de/dispatch.php/start", allow_redirects=True) as r:
                 text = await r.text()
                 url = str(r.url)
 
@@ -280,7 +314,7 @@ class StudIPSession:
 
             # 1. Prime the session before triggering the login flow.
             try:
-                async with self.session.get(start_url):
+                async with self._s_get(start_url):
                     pass
                 await self._run_sso_flow(login_link_cancel, referer=start_url)
                 self.explicitly_logged_out = False
@@ -321,7 +355,7 @@ class StudIPSession:
             "https://stums.uni-oldenburg.de/qisserver/api/identityprovider/redirect/2/login",
         ):
             try:
-                async with self.session.get(sso_url, allow_redirects=True, timeout=15) as _:
+                async with self._s_get(sso_url, allow_redirects=True, timeout=15) as _:
                     pass
             except Exception as exc:
                 self.logger.debug("SSO keep-alive skipped for %s: %s", redact_url(sso_url), exc)
@@ -353,7 +387,7 @@ class StudIPSession:
                     "https://login.uni-oldenburg.de/nidp/app/logout",
                 ):
                     try:
-                        async with self.session.get(url, allow_redirects=True, timeout=10) as _:
+                        async with self._s_get(url, allow_redirects=True, timeout=10) as _:
                             pass
                     except Exception as exc:
                         self.logger.debug("Upstream logout request skipped for %s: %s", redact_url(url), exc)
@@ -410,9 +444,9 @@ class StudIPSession:
                 js_redirect = re.search(r"window\.location\.(?:href|assign|replace)\s*=\s*['\"]([^'\"]+)['\"]", text)
                 if js_redirect:
                     nxt = urljoin(url, js_redirect.group(1))
-                    self.logger.info("[%s] Following JS redirect: %s", tag, nxt)
-                    async with self.session.get(nxt, headers={"Referer": url}) as r:
-                         return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
+                    self.logger.info("[%s] Following JS redirect: %s", tag, redact_url(nxt))
+                    async with self._s_get(nxt, headers={"Referer": url}) as r:
+                         return await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), tag, depth + 1)
 
                 # 2. Meta Refresh
                 meta = soup.find("meta", attrs={"http-equiv": lambda x: x and x.lower() == "refresh"})
@@ -420,17 +454,17 @@ class StudIPSession:
                     content = meta.get("content", "")
                     if "url=" in content.lower():
                         nxt = urljoin(url, content.lower().split("url=")[1].strip().strip("'\""))
-                        self.logger.info("[%s] Following Meta Refresh: %s", tag, nxt)
-                        async with self.session.get(nxt, headers={"Referer": url}) as r:
-                            return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
+                        self.logger.info("[%s] Following Meta Refresh: %s", tag, redact_url(nxt))
+                        async with self._s_get(nxt, headers={"Referer": url}) as r:
+                            return await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), tag, depth + 1)
                 
                 # 3. AJAX Content Load (NetIQ specific)
                 ajax_load = re.search(r"getToContent\(['\"]([^'\"]+)['\"]\s*,\s*['\"][^'\"]+['\"]\)", text)
                 if ajax_load:
                     ajax_url = urljoin(url, ajax_load.group(1))
                     self.logger.info("[%s] Following NetIQ AJAX content load: %s", tag, redact_url(ajax_url))
-                    async with self.session.get(ajax_url, headers={"Referer": url}) as r:
-                         return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
+                    async with self._s_get(ajax_url, headers={"Referer": url}) as r:
+                         return await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), tag, depth + 1)
                 
                 # 4. Script-based form auto-submit (e.g., NetIQ authCodeForm)
                 form_submit = re.search(r"document\.forms\[['\"]([^'\"]+)['\"]\]\.submit\(\)", text)
@@ -441,13 +475,13 @@ class StudIPSession:
                         inputs = {i.get("name"): (i.get("value") or "") for i in form.find_all("input") if i.get("name")}
                         action = urljoin(url, form.get("action") or "")
                         method = (form.get("method") or "POST").upper()
-                        self.logger.info("[%s] Script-submitting form '%s' to %s", tag, form_name, action)
+                        self.logger.info("[%s] Script-submitting form '%s' to %s", tag, form_name, redact_url(action))
                         if method == "POST":
-                            async with self.session.post(action, data=inputs, headers={"Referer": url}) as r:
-                                return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
+                            async with self._s_post(action, data=inputs, headers={"Referer": url}) as r:
+                                return await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), tag, depth + 1)
                         else:
-                            async with self.session.get(action, params=inputs, headers={"Referer": url}) as r:
-                                return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
+                            async with self._s_get(action, params=inputs, headers={"Referer": url}) as r:
+                                return await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), tag, depth + 1)
 
                 # 5. OAuth/SAML Auth Handoff Forms (Auto-submit via presence of sensitive keys)
                 for form in soup.find_all("form"):
@@ -456,13 +490,13 @@ class StudIPSession:
                     if keys & {"code", "state", "id_token", "samlresponse", "relaystate", "wa", "wresult"}:
                         action = urljoin(url, form.get("action") or "")
                         method = (form.get("method") or "POST").upper()
-                        self.logger.info("[%s] Auto-submitting auth handoff form to %s", tag, action)
+                        self.logger.info("[%s] Auto-submitting auth handoff form to %s", tag, redact_url(action))
                         if method == "POST":
-                            async with self.session.post(action, data=inputs, headers={"Referer": url}) as r:
-                                return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
+                            async with self._s_post(action, data=inputs, headers={"Referer": url}) as r:
+                                return await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), tag, depth + 1)
                         else:
-                            async with self.session.get(action, params=inputs, headers={"Referer": url}) as r:
-                                return await follow_redirects(str(r.url), await r.text(), tag, depth + 1)
+                            async with self._s_get(action, params=inputs, headers={"Referer": url}) as r:
+                                return await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), tag, depth + 1)
 
                 self.logger.debug("[%s] No more redirects detected at %s", tag, redact_url(url))
                 return url, text
@@ -488,8 +522,8 @@ class StudIPSession:
             return await self.is_html_logged_in(use_cache=False)
 
         # 1. Entry
-        async with self.session.get(entry_url, headers={"Referer": referer} if referer else None) as r:
-            curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "entry")
+        async with self._s_get(entry_url, headers={"Referer": referer} if referer else None) as r:
+            curr_url, curr_text = await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), "entry")
 
         # 2. Main state-machine loop
         prev_text = ""
@@ -516,8 +550,8 @@ class StudIPSession:
                 self.logger.info("Step %s: Username Submission", i+1)
                 action, method, payload = get_payload(soup, {"Ecom_User_ID": self.username, "loginButton2": "true"})
                 action = urljoin(curr_url, action)
-                async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
-                    curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "user")
+                async with self._s_post(action, data=payload, headers={"Referer": curr_url}) as r:
+                    curr_url, curr_text = await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), "user")
                 continue
 
             if "ecom_password" in page_text:
@@ -526,8 +560,8 @@ class StudIPSession:
                 self.logger.info("Step %s: Password Submission (Legacy)", i+1)
                 action, method, payload = get_payload(soup, {"Ecom_Password": self.password, "loginButton2": "true"})
                 action = urljoin(curr_url, action)
-                async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
-                    curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "pass")
+                async with self._s_post(action, data=payload, headers={"Referer": curr_url}) as r:
+                    curr_url, curr_text = await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), "pass")
                 continue
 
             # B. contract Page (Unified)
@@ -553,8 +587,8 @@ class StudIPSession:
                     action, method, payload = get_payload(soup, {"nffc": self.password, "loginButton2": "Next"})
 
                 action = urljoin(curr_url, action)
-                async with self.session.post(action, data=payload, headers={"Referer": curr_url}) as r:
-                    curr_url, curr_text = await follow_redirects(str(r.url), await r.text(), "contract")
+                async with self._s_post(action, data=payload, headers={"Referer": curr_url}) as r:
+                    curr_url, curr_text = await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), "contract")
                 continue
 
             # C. Unhandled
@@ -590,13 +624,19 @@ class StudIPSession:
 
     async def get(self, url, **kwargs):
         await self.ensure_session()
-        kwargs["headers"] = await self._merged_headers(url, kwargs.get("headers"))
-        return self.session.get(url, **kwargs)
+        merged = await self._merged_headers(url, kwargs.pop("headers", None))
+        routed_url, headers = route_proxy_url(url, merged)
+        if headers:
+            kwargs["headers"] = headers
+        return self.session.get(routed_url, **kwargs)
 
     async def post(self, url, **kwargs):
         await self.ensure_session()
-        kwargs["headers"] = await self._merged_headers(url, kwargs.get("headers"))
-        return self.session.post(url, **kwargs)
+        merged = await self._merged_headers(url, kwargs.pop("headers", None))
+        routed_url, headers = route_proxy_url(url, merged)
+        if headers:
+            kwargs["headers"] = headers
+        return self.session.post(routed_url, **kwargs)
 
     async def close(self):
         if self.session and not self.session.closed:

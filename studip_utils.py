@@ -105,3 +105,63 @@ def redact_url(url) -> str:
         return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
     except ValueError:
         return "<url>"
+
+
+def route_proxy_url(url: str, extra_headers: dict | None = None) -> tuple[str, dict]:
+    """Route outgoing University of Oldenburg requests through a Cloudflare Worker proxy.
+
+    If CLOUDFLARE_WORKER_URL is set in environment, transparently rewrites target
+    URLs for Stud.IP, StuMS, and NetIQ SSO to point to the Cloudflare Worker, attaching
+    X-Target-Host and X-Proxy-Secret.
+    """
+    worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
+    worker_secret = os.getenv("CLOUDFLARE_WORKER_SECRET", "").strip()
+    headers = dict(extra_headers or {})
+
+    if not worker_url:
+        return url, headers
+
+    try:
+        parts = urlsplit(str(url))
+        target_hosts = {
+            "studip.uni-oldenburg.de",
+            "elearning.uni-oldenburg.de",
+            "stums.uni-oldenburg.de",
+            "idp.uni-oldenburg.de",
+            "login.uni-oldenburg.de",
+        }
+        if parts.netloc.lower() in target_hosts:
+            worker_parts = urlsplit(worker_url)
+            base_worker_path = worker_parts.path.rstrip("/")
+            routed_path = f"{base_worker_path}/{parts.netloc.lower()}{parts.path}"
+            routed = urlunsplit((worker_parts.scheme, worker_parts.netloc, routed_path, parts.query, ""))
+            headers["X-Target-Host"] = parts.netloc
+            if worker_secret:
+                headers["X-Proxy-Secret"] = worker_secret
+            return routed, headers
+    except Exception:
+        pass
+
+    return url, headers
+
+
+def unroute_proxy_url(url: str) -> str:
+    """If url points to Cloudflare Worker proxy, reconstruct original uni url."""
+    worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
+    if not worker_url:
+        return str(url)
+
+    try:
+        parts = urlsplit(str(url))
+        worker_parts = urlsplit(worker_url)
+        if parts.netloc.lower() == worker_parts.netloc.lower():
+            # Check if path starts with target host
+            path_segments = [s for s in parts.path.split("/") if s]
+            if path_segments and "uni-oldenburg.de" in path_segments[0].lower():
+                target_host = path_segments[0].lower()
+                rest_path = "/" + "/".join(path_segments[1:])
+                return urlunsplit((parts.scheme, target_host, rest_path, parts.query, parts.fragment))
+    except Exception:
+        pass
+
+    return str(url)
