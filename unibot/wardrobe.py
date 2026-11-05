@@ -357,7 +357,7 @@ async def handle_wardrobe_menu(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     user_id = query.from_user.id
     if not is_user_admin(user_id):
-        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     text, keyboard = _wardrobe_list_view(user_id)
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
@@ -368,7 +368,7 @@ async def handle_wardrobe_add_item(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     user_id = query.from_user.id
     if not is_user_admin(user_id):
-        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     context.user_data["pending_step"] = "wardrobe_add_item"
     await query.message.reply_text("📸 Send a photo of one clothing item.")
@@ -379,7 +379,7 @@ async def handle_wardrobe_set_reference(update: Update, context: ContextTypes.DE
     await query.answer()
     user_id = query.from_user.id
     if not is_user_admin(user_id):
-        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     context.user_data["pending_step"] = "wardrobe_set_reference"
     await query.message.reply_text("🖼️ Send one clear full-body photo of yourself — I'll reuse it every morning.")
@@ -390,7 +390,7 @@ async def handle_wardrobe_remove(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     user_id = query.from_user.id
     if not is_user_admin(user_id):
-        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     item_id = query.data.split("|", 1)[1]
     remove_wardrobe_item(user_id, item_id)
@@ -437,7 +437,7 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
 
     user_id = query.from_user.id
     if not is_user_admin(user_id):
-        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
 
     entry = get_wardrobe_entry(user_id)
@@ -523,7 +523,7 @@ async def handle_outfit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
     user_id = query.from_user.id
     if not is_user_admin(user_id):
-        await query.answer("⛔ Bu özellik yalnızca yöneticiye özeldir.", show_alert=True)
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     if query.data == "outfit_menu_toggle":
         set_wardrobe_feature_enabled(not get_wardrobe_feature_enabled())

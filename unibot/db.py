@@ -305,11 +305,11 @@ def redeem_invite_token(code: str, telegram_id: int, full_name: Optional[str] = 
             (clean_code,),
         ).fetchone()
         if not row:
-            return False, "Geçersiz davet kodu."
+            return False, "Invalid invite code."
         if row[4]:  # is_used
-            return False, "Bu davet kodu daha önce kullanılmış."
+            return False, "This invite code has already been used."
         if now > row[3]:  # expires_at
-            return False, "Bu davet kodunun geçerlilik süresi dolmuş."
+            return False, "This invite code has expired."
 
         _connection().execute(
             "UPDATE invite_tokens SET is_used = 1, used_by = ?, used_at = ? WHERE code = ?",
@@ -322,7 +322,7 @@ def redeem_invite_token(code: str, telegram_id: int, full_name: Optional[str] = 
             full_name=full_name,
             is_active=1,
         )
-        return True, "Davet kodu başarıyla onaylandı. Hoş geldiniz!"
+        return True, "Invite code verified successfully. Welcome!"
 
 
 def list_invite_tokens(active_only: bool = False) -> list[dict]:

@@ -76,32 +76,32 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
                 login_url = _login_public_url()
                 keyboard = []
                 if login_url:
-                    keyboard.append([InlineKeyboardButton("🔐 Stud.IP Hesabını Bağla", web_app=WebAppInfo(url=login_url))])
+                    keyboard.append([InlineKeyboardButton("🔐 Connect Stud.IP Account", web_app=WebAppInfo(url=login_url))])
                 reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
                 welcome_text = (
-                    "🎉 <b>Tebrikler, Erişim Onaylandı!</b>\n"
+                    "🎉 <b>Access Granted!</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    f"Hoş geldiniz, <b>{html.escape(user.first_name or 'Öğrenci')}</b>!\n\n"
-                    "UniOldenburg Asistanı hesabınız başarıyla aktive edildi.\n\n"
-                    "Derslerinizi, sınavlarınızı ve notlarınızı senkronize etmek için "
-                    "lütfen Stud.IP hesabınızı bağlayın."
+                    f"Welcome, <b>{html.escape(user.first_name or 'Student')}</b>!\n\n"
+                    "Your UniOldenburg Assistant account has been activated.\n\n"
+                    "To synchronize your courses, exams, and grades, "
+                    "please connect your Stud.IP account below."
                 )
                 await update.effective_message.reply_text(welcome_text, parse_mode="HTML", reply_markup=reply_markup)
                 raise ApplicationHandlerStop
             else:
                 await update.effective_message.reply_text(
-                    f"❌ <b>Geçersiz Kod:</b> {msg}\n\nLütfen admin tarafından verilen kodu kontrol edip tekrar deneyin.",
+                    f"❌ <b>Invalid Code:</b> {msg}\n\nPlease check the invite code from your administrator and try again.",
                     parse_mode="HTML",
                 )
                 raise ApplicationHandlerStop
 
         # No invite code provided
         gate_text = (
-            "🔒 <b>UniOldenburg Öğrenci Asistanı</b>\n"
+            "🔒 <b>UniOldenburg Student Assistant</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "Bu bot özel davetiyeyle çalışmaktadır.\n\n"
-            "Erişim sağlamak için lütfen yöneticiniz (admin) tarafından size iletilen "
-            "<b>kişiye özel erişim kodunu</b> (örn: <code>UNI-ABC-123</code>) bu sohbete mesaj olarak yazın.\n"
+            "This bot is currently private and invite-only.\n\n"
+            "To gain access, please send your <b>personalized invite code</b> "
+            "(e.g., <code>UNI-ABC-123</code>) provided by your administrator.\n"
             "━━━━━━━━━━━━━━━━━━"
         )
         try:
@@ -113,9 +113,9 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     logging.warning("⛔ Ignored update from unauthorised user %s", user.id if user else "unknown")
     try:
         if update.callback_query:
-            await update.callback_query.answer("⛔ Erişim yetkiniz bulunmuyor.", show_alert=True)
+            await update.callback_query.answer("⛔ Access denied. Not authorized.", show_alert=True)
         elif update.effective_message and update.effective_chat and update.effective_chat.type == "private":
-            await update.effective_message.reply_text("⛔ Not authorised.")
+            await update.effective_message.reply_text("⛔ Not authorized.")
     except TelegramError:
         pass
     raise ApplicationHandlerStop

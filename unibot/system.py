@@ -52,7 +52,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Restart the bot process itself (and cleanly shut down the WhatsApp microservice first)."""
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None or not is_user_admin(user_id):
-        await update.message.reply_text("⛔ Bu komut yalnızca yöneticilere özeldir.")
+        await update.message.reply_text("⛔ This command is restricted to administrators.")
         return
 
     await update.message.reply_text("♻️ Restarting bot...")
@@ -353,20 +353,20 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _format_time_ago(ts: float) -> str:
     diff = time.time() - ts
     if diff < 60:
-        return "şimdi"
+        return "just now"
     elif diff < 3600:
-        return f"{int(diff // 60)} dk önce"
+        return f"{int(diff // 60)}m ago"
     elif diff < 86400:
-        return f"{int(diff // 3600)} sa önce"
+        return f"{int(diff // 3600)}h ago"
     else:
-        return f"{int(diff // 86400)} gün önce"
+        return f"{int(diff // 86400)}d ago"
 
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin dashboard command."""
     user = update.effective_user
     if not user or not is_user_admin(user.id):
-        await update.message.reply_text("⛔ Bu komut yalnızca yöneticilere özeldir.")
+        await update.message.reply_text("⛔ This command is restricted to administrators.")
         return
     text, reply_markup = _build_admin_overview_view()
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
@@ -375,45 +375,45 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _build_admin_overview_view() -> tuple[str, InlineKeyboardMarkup]:
     stats = db.get_user_analytics()
     text = (
-        "👑 <b>UniOldenburg Yönetim Paneli</b>\n"
+        "👑 <b>UniOldenburg Admin Dashboard</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"👥 <b>Toplam Kayıtlı:</b> <code>{stats['total_users']}</code> öğrenci\n"
-        f"🟢 <b>Aktif Hesaplar:</b> <code>{stats['active_users']}</code>\n"
-        f"📅 <b>Bugün Aktif (DAU):</b> <code>{stats['dau']}</code>\n"
-        f"📆 <b>Bu Hafta Aktif (WAU):</b> <code>{stats['wau']}</code>\n"
-        f"🎫 <b>Bekleyen Davet Kodları:</b> <code>{stats['pending_invites']}</code>\n"
+        f"👥 <b>Total Registered:</b> <code>{stats['total_users']}</code> students\n"
+        f"🟢 <b>Active Accounts:</b> <code>{stats['active_users']}</code>\n"
+        f"📅 <b>Daily Active (DAU):</b> <code>{stats['dau']}</code>\n"
+        f"📆 <b>Weekly Active (WAU):</b> <code>{stats['wau']}</code>\n"
+        f"🎫 <b>Pending Invite Codes:</b> <code>{stats['pending_invites']}</code>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "🔥 <b>En Aktif Öğrenciler:</b>\n"
+        "🔥 <b>Most Active Students:</b>\n"
     )
     if stats["top_users"]:
         for idx, u in enumerate(stats["top_users"], 1):
             name = u["username"] or u["full_name"] or str(u["telegram_id"])
             ago = _format_time_ago(u["last_active_at"])
-            text += f"{idx}. <b>@{name}</b> - {u['interactions']} işlem ({ago})\n"
+            text += f"{idx}. <b>@{name}</b> - {u['interactions']} actions ({ago})\n"
     else:
-        text += "<i>Henüz aktivite kaydı yok.</i>\n"
+        text += "<i>No activity records yet.</i>\n"
 
-    text += "\n⚡ <b>Son Aktiviteler:</b>\n"
+    text += "\n⚡ <b>Recent Activities:</b>\n"
     if stats["recent_activities"]:
         for a in stats["recent_activities"]:
             name = a["username"] or a["full_name"] or str(a["telegram_id"])
             ago = _format_time_ago(a["created_at"])
             text += f"• <b>@{name}:</b> <code>{a['action']}</code> ({ago})\n"
     else:
-        text += "<i>Son aktivite bulunmuyor.</i>\n"
+        text += "<i>No recent activity.</i>\n"
 
     keyboard = [
         [
-            InlineKeyboardButton("👥 Kullanıcı Listesi", callback_data="admin_users"),
-            InlineKeyboardButton("🔑 Davet Kodları", callback_data="admin_invites"),
+            InlineKeyboardButton("👥 User Directory", callback_data="admin_users"),
+            InlineKeyboardButton("🔑 Invite Codes", callback_data="admin_invites"),
         ],
         [
-            InlineKeyboardButton("➕ Yeni Davet Kodu", callback_data="admin_new_invite"),
-            InlineKeyboardButton("⚡ Sistem Sağlığı", callback_data="admin_system_health"),
+            InlineKeyboardButton("➕ New Invite Code", callback_data="admin_new_invite"),
+            InlineKeyboardButton("⚡ System Health", callback_data="admin_system_health"),
         ],
         [
-            InlineKeyboardButton("🔄 Yenile", callback_data="admin_menu"),
-            InlineKeyboardButton("♻️ Botu Yeniden Başlat", callback_data="admin_restart_prompt"),
+            InlineKeyboardButton("🔄 Refresh", callback_data="admin_menu"),
+            InlineKeyboardButton("♻️ Restart Bot", callback_data="admin_restart_prompt"),
         ],
     ]
     return text, InlineKeyboardMarkup(keyboard)
@@ -423,7 +423,7 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Generate a new personalized invite code."""
     user = update.effective_user
     if not user or not is_user_admin(user.id):
-        await update.message.reply_text("⛔ Bu komut yalnızca yöneticilere özeldir.")
+        await update.message.reply_text("⛔ This command is restricted to administrators.")
         return
 
     label = " ".join(context.args).strip() if context.args else None
@@ -432,15 +432,15 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     deep_link = f"https://t.me/{bot_me.username}?start=inv_{code.replace('-', '').lower()}"
 
     text = (
-        "🔑 <b>Yeni Kişiye Özel Davet Kodu</b>\n"
+        "🔑 <b>New Personalized Invite Code</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        f"🎫 <b>Erişim Kodu:</b> <code>{code}</code>\n"
-        f"👤 <b>Etiket:</b> <code>{label or 'İsimsiz'}</code>\n"
-        "⏳ <b>Geçerlilik Süresi:</b> 7 gün (Tek kullanımlık)\n\n"
-        "🔗 <b>Tek Tıkla Doğrudan Katılma Linki:</b>\n"
+        f"🎫 <b>Access Code:</b> <code>{code}</code>\n"
+        f"👤 <b>Label:</b> <code>{label or 'Unlabeled'}</code>\n"
+        "⏳ <b>Validity:</b> 7 days (Single-use)\n\n"
+        "🔗 <b>One-Tap Invite Link:</b>\n"
         f"{deep_link}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "<i>Bu linki veya kodu öğrenciye iletebilirsiniz.</i>"
+        "<i>Share this code or link with the student.</i>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -451,7 +451,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     user = query.from_user
     if not user or not is_user_admin(user.id):
-        await query.answer("⛔ Bu panel yalnızca yöneticilere özeldir.", show_alert=True)
+        await query.answer("⛔ Access denied. Admin-only feature.", show_alert=True)
         return
 
     data = query.data
@@ -464,25 +464,25 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
     if data == "admin_users":
         users = db.get_all_users()
         lines = [
-            "👥 <b>Kayıtlı Öğrenciler & Kullanıcılar</b>",
+            "👥 <b>Registered Students & Users</b>",
             "━━━━━━━━━━━━━━━━━━",
         ]
         keyboard = []
         for u in users:
             name = u["username"] or u["full_name"] or str(u["telegram_id"])
-            role_badge = "👑 Admin" if u["role"] == "admin" else "🎓 Öğrenci"
-            status_badge = "🟢 Aktif" if u["is_active"] else "🔴 Engelli"
+            role_badge = "👑 Admin" if u["role"] == "admin" else "🎓 Student"
+            status_badge = "🟢 Active" if u["is_active"] else "🔴 Blocked"
             ago = _format_time_ago(u["last_active_at"])
             lines.append(
                 f"• <b>@{name}</b> (<code>{u['telegram_id']}</code>)\n"
-                f"   Rol: {role_badge} | Durum: {status_badge}\n"
-                f"   İşlem: {u['interaction_count']} | Son: {ago}"
+                f"   Role: {role_badge} | Status: {status_badge}\n"
+                f"   Actions: {u['interaction_count']} | Last: {ago}"
             )
             if u["role"] != "admin":
-                toggle_btn_text = "🚫 Engelle" if u["is_active"] else "✅ Aktif Et"
+                toggle_btn_text = "🚫 Block" if u["is_active"] else "✅ Activate"
                 keyboard.append([InlineKeyboardButton(f"{toggle_btn_text} (@{name})", callback_data=f"admin_toggle_user|{u['telegram_id']}")])
 
-        keyboard.append([InlineKeyboardButton("⬅️ Admin Paneline Dön", callback_data="admin_menu")])
+        keyboard.append([InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="admin_menu")])
         await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -492,63 +492,63 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         if target and target["role"] != "admin":
             new_state = not target["is_active"]
             db.set_user_active(target_id, new_state)
-            await query.answer(f"Kullanıcı {'aktif edildi' if new_state else 'engellendi'}.", show_alert=True)
+            await query.answer(f"User {'activated' if new_state else 'blocked'}.", show_alert=True)
 
         users = db.get_all_users()
-        lines = ["👥 <b>Kayıtlı Öğrenciler & Kullanıcılar</b>", "━━━━━━━━━━━━━━━━━━"]
+        lines = ["👥 <b>Registered Students & Users</b>", "━━━━━━━━━━━━━━━━━━"]
         keyboard = []
         for u in users:
             name = u["username"] or u["full_name"] or str(u["telegram_id"])
-            role_badge = "👑 Admin" if u["role"] == "admin" else "🎓 Öğrenci"
-            status_badge = "🟢 Aktif" if u["is_active"] else "🔴 Engelli"
+            role_badge = "👑 Admin" if u["role"] == "admin" else "🎓 Student"
+            status_badge = "🟢 Active" if u["is_active"] else "🔴 Blocked"
             ago = _format_time_ago(u["last_active_at"])
             lines.append(
                 f"• <b>@{name}</b> (<code>{u['telegram_id']}</code>)\n"
-                f"   Rol: {role_badge} | Durum: {status_badge}\n"
-                f"   İşlem: {u['interaction_count']} | Son: {ago}"
+                f"   Role: {role_badge} | Status: {status_badge}\n"
+                f"   Actions: {u['interaction_count']} | Last: {ago}"
             )
             if u["role"] != "admin":
-                toggle_btn_text = "🚫 Engelle" if u["is_active"] else "✅ Aktif Et"
+                toggle_btn_text = "🚫 Block" if u["is_active"] else "✅ Activate"
                 keyboard.append([InlineKeyboardButton(f"{toggle_btn_text} (@{name})", callback_data=f"admin_toggle_user|{u['telegram_id']}")])
-        keyboard.append([InlineKeyboardButton("⬅️ Admin Paneline Dön", callback_data="admin_menu")])
+        keyboard.append([InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="admin_menu")])
         await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if data == "admin_invites":
         invites = db.list_invite_tokens(active_only=False)[:10]
         lines = [
-            "🔑 <b>Davet Kodları (Son 10)</b>",
+            "🔑 <b>Invite Codes (Last 10)</b>",
             "━━━━━━━━━━━━━━━━━━",
         ]
         if invites:
             for inv in invites:
-                status = "✅ Kullanıldı" if inv["is_used"] else ("⏳ Bekliyor" if inv["expires_at"] > time.time() else "⌛ Süresi Doldu")
+                status = "✅ Used" if inv["is_used"] else ("⏳ Pending" if inv["expires_at"] > time.time() else "⌛ Expired")
                 lbl = f" ({inv['label']})" if inv['label'] else ""
                 lines.append(f"🎫 <code>{inv['code']}</code>{lbl} - {status}")
         else:
-            lines.append("<i>Henüz üretilmiş davet kodu yok.</i>")
+            lines.append("<i>No invite codes generated yet.</i>")
 
         keyboard = [
-            [InlineKeyboardButton("➕ Yeni Kod Üret", callback_data="admin_new_invite")],
-            [InlineKeyboardButton("⬅️ Admin Paneline Dön", callback_data="admin_menu")],
+            [InlineKeyboardButton("➕ Generate New Code", callback_data="admin_new_invite")],
+            [InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="admin_menu")],
         ]
         await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if data == "admin_new_invite":
-        code = db.create_invite_token(created_by=user.id, label="Panelden Üretildi", expires_days=7.0)
+        code = db.create_invite_token(created_by=user.id, label="Dashboard Generated", expires_days=7.0)
         bot_me = await context.bot.get_me()
         deep_link = f"https://t.me/{bot_me.username}?start=inv_{code.replace('-', '').lower()}"
         text = (
-            "✅ <b>Yeni Davet Kodu Üretildi</b>\n"
+            "✅ <b>New Invite Code Generated</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            f"🎫 <b>Kod:</b> <code>{code}</code>\n"
-            f"🔗 <b>Hızlı Link:</b>\n{deep_link}\n"
+            f"🎫 <b>Code:</b> <code>{code}</code>\n"
+            f"🔗 <b>Quick Link:</b>\n{deep_link}\n"
             "━━━━━━━━━━━━━━━━━━"
         )
         keyboard = [
-            [InlineKeyboardButton("🔑 Tüm Kodlar", callback_data="admin_invites")],
-            [InlineKeyboardButton("⬅️ Admin Paneline Dön", callback_data="admin_menu")],
+            [InlineKeyboardButton("🔑 All Codes", callback_data="admin_invites")],
+            [InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="admin_menu")],
         ]
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return
@@ -558,28 +558,28 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         cpu = psutil.cpu_percent(interval=None)
         disk = shutil.disk_usage("/")
         text = (
-            "⚡ <b>Sistem & Sunucu Sağlığı</b>\n"
+            "⚡ <b>System & Server Health</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            f"💻 <b>CPU Kullanımı:</b> <code>%{cpu}</code>\n"
+            f"💻 <b>CPU Usage:</b> <code>%{cpu}</code>\n"
             f"🧠 <b>RAM:</b> <code>{mem.used // (1024*1024)}MB / {mem.total // (1024*1024)}MB</code> (%{mem.percent})\n"
             f"💾 <b>Disk:</b> <code>{disk.used // (1024**3)}GB / {disk.total // (1024**3)}GB</code>\n"
             f"🌐 <b>Cloudflare Tunnel:</b> <code>{'Online' if state.quick_tunnel else 'Direct / Off'}</code>\n"
-            f"🔄 <b>Watcher Görevi:</b> <code>{'Çalışıyor' if state.unified_watcher_task and not state.unified_watcher_task.done() else 'Durdu'}</code>\n"
+            f"🔄 <b>Watcher Task:</b> <code>{'Running' if state.unified_watcher_task and not state.unified_watcher_task.done() else 'Stopped'}</code>\n"
             "━━━━━━━━━━━━━━━━━━"
         )
-        keyboard = [[InlineKeyboardButton("⬅️ Admin Paneline Dön", callback_data="admin_menu")]]
+        keyboard = [[InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="admin_menu")]]
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if data == "admin_restart_prompt":
         keyboard = [
-            [InlineKeyboardButton("✅ Evet, Yeniden Başlat", callback_data="admin_restart_confirm")],
-            [InlineKeyboardButton("❌ İptal", callback_data="admin_menu")],
+            [InlineKeyboardButton("✅ Yes, Restart Now", callback_data="admin_restart_confirm")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="admin_menu")],
         ]
-        await query.edit_message_text("⚠️ <b>Bot yeniden başlatılsın mı?</b>\nBu işlem ~2-3 saniye sürer.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        await query.edit_message_text("⚠️ <b>Restart the bot service?</b>\nThis takes ~2-3 seconds.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     if data == "admin_restart_confirm":
-        await query.edit_message_text("♻️ <b>Bot yeniden başlatılıyor...</b>", parse_mode="HTML")
+        await query.edit_message_text("♻️ <b>Restarting bot...</b>", parse_mode="HTML")
         asyncio.create_task(_restart_process())
         return
