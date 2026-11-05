@@ -16,11 +16,13 @@ import psutil
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import ContextTypes
 
+from datetime import datetime
 import studip_oauth
-from studip_utils import berlin_now
+from studip_utils import TZ_BERLIN, berlin_now
 
 from unibot import db, state
 from unibot.config import (
+    ALLOWED_USER_IDS,
     PROJECT_ROOT,
     WA_HEADERS,
     WA_SERVICE_URL,
@@ -38,6 +40,8 @@ from unibot.storage import (
 from unibot.auth import (
     _get_login_server,
     _login_public_url,
+    _perform_logout,
+    get_user_session,
     is_user_admin,
     is_user_allowed,
     login_studip,
@@ -99,7 +103,7 @@ DISK_MIN_FREE_GB = 5
 
 
 async def check_studip_health() -> tuple[bool, str]:
-    """(ok, detail) — logs in (or confirms the cached session still works)
+    """(ok, detail) - logs in (or confirms the cached session still works)
     and fetches the course list as a cheap end-to-end check that Stud.IP
     access actually works, not just that credentials are configured."""
     try:
@@ -113,7 +117,7 @@ async def check_studip_health() -> tuple[bool, str]:
 
 
 async def check_whatsapp_health() -> tuple[bool, str]:
-    """(ok, detail) — asks the local WhatsApp microservice for its own
+    """(ok, detail) - asks the local WhatsApp microservice for its own
     connection state (same /status endpoint the 📱 WhatsApp status line
     in /status uses)."""
     try:
@@ -148,7 +152,7 @@ def check_disk_health() -> tuple[bool, str]:
 async def run_health_checks(live_openrouter: bool = False) -> dict:
     """Run every subsystem check and return {key: (ok, detail)} for
     "studip", "whatsapp", "weather", "openrouter", "gwdg", "disk" (see HEALTH_CHECK_LABELS
-    for display names). Each check is independently best-effort — one
+    for display names). Each check is independently best-effort - one
     failing never blocks or skews the others."""
     studip = await check_studip_health()
     whatsapp = await check_whatsapp_health()
@@ -160,7 +164,7 @@ async def run_health_checks(live_openrouter: bool = False) -> dict:
 
 
 async def healthcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /healthcheck — an on-demand, full (live OpenRouter call
+    """Handle /healthcheck - an on-demand, full (live OpenRouter call
     included) check of every subsystem the bot depends on, plus the
     currently-running git commit, so "is everything actually working
     right now" is a single command instead of SSHing into the server."""
@@ -193,13 +197,80 @@ async def healthcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed bot status"""
     user_id = update.effective_user.id if update.effective_user else None
+    is_admin = is_user_admin(user_id)
 
     use_oauth = studip_oauth.oauth_enabled()
     auth_label = "OAuth2 (StudyLoft)" if use_oauth else "Self-Healing Cookie"
+
+    public_login = _login_public_url()
+    if public_login.startswith("https://"):
+        login_btn = InlineKeyboardButton(
+            "🔐 Login Stud.IP",
+            web_app=WebAppInfo(url=_get_login_server().app_url()),
+        )
+    else:
+        login_btn = InlineKeyboardButton("🔐 Login Stud.IP", callback_data="studip_login")
+
+    # ── Non-admin student dashboard ───────────────────────────────────────────
+    if not is_admin:
+        sess = get_user_session(user_id)
+        user_logged_in = await sess.is_logged_in()
+        studip_status = f"✅ Connected ({auth_label})" if user_logged_in else "❌ Not connected"
+
+        user_info = db.get_user(user_id) if user_id else None
+        db_studip = (user_info.get("studip_username") if user_info else "") or ""
+        profile_name = db_studip
+        if user_logged_in:
+            try:
+                prof = await get_studip_user_profile(user_id=user_id, session=sess)
+                profile_name = prof.get("formatted_name") or prof.get("given_name") or prof.get("username") or db_studip
+            except Exception:
+                pass
+
+        default_semester = load_default_semester()
+        default_semester_label = default_semester.get("label") or "Not set"
+        weather_location = load_weather_location()
+        weather_location_label = f"{weather_location['name']}, {weather_location['country']}" if weather_location else "Uni Oldenburg (default)"
+        study_plan_enabled = get_weekly_study_plan_enabled()
+
+        text = (
+            "━━━━━━━━━━━━━━━━━\n"
+            "🎓 <b>Student Account Status</b>\n"
+            "━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>Stud.IP Account:</b> {profile_name or 'Not linked'}\n"
+            f"🔑 <b>Connection:</b> {studip_status}\n"
+            f"📆 <b>Current Semester:</b> {default_semester_label}\n"
+            f"📍 <b>Campus / Weather:</b> {weather_location_label}\n"
+            f"📘 <b>Weekly Study Plan:</b> {'✅ Enabled' if study_plan_enabled else '🔲 Disabled'}\n"
+        )
+        if not user_logged_in:
+            text += "\n💡 <i>Connect your Stud.IP account below to access your personal courses, files, and deadlines.</i>"
+
+        keyboard = []
+        if user_logged_in:
+            keyboard.append([
+                login_btn,
+                InlineKeyboardButton("🚪 Disconnect Stud.IP", callback_data="studip_logout"),
+            ])
+        else:
+            keyboard.append([login_btn])
+
+        keyboard.append([
+            InlineKeyboardButton("🎯 Tracked Courses", callback_data="sp_track_menu"),
+            InlineKeyboardButton("📆 Semester & Calendar", callback_data="status_group|semester"),
+        ])
+        keyboard.append([
+            InlineKeyboardButton("📄 Documents & Tuition", callback_data="status_group|docs_tuition"),
+            InlineKeyboardButton("🌤️ Weather & Location", callback_data="status_group|weather"),
+        ])
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    # ── Administrator full system status ──────────────────────────────────────
     is_active = state.global_session and await state.global_session.is_logged_in()
     logged_in = f"✅ Yes ({auth_label})" if is_active else "❌ No"
 
-    # Watcher durumu
+    # Watcher status
     if state.watcher_controller_running:
         watcher_status = "🟢 Running"
     else:
@@ -207,14 +278,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     wa_group_id = get_wa_group_id()
 
-    # Check WA Connection Status, and resolve the active group's display
-    # name (the group is always set by exact ID via "🔍 Detect WA Groups"
-    # now — this is just a friendlier label for it here). Tries /group_name
-    # first (asks WhatsApp directly by ID via getChatById, so it works even
-    # right after a service restart), falling back to the discovered-groups
-    # log (names seen via message_create) if that's unreachable.
     wa_status = "🔴 Disconnected (service unreachable)"
-    wa_group_label = "⚠️ Not set — use 📱 WhatsApp → 🔍 Detect WA Groups" if not wa_group_id else wa_group_id
+    wa_group_label = "⚠️ Not set - use 📱 WhatsApp -> 🔍 Detect WA Groups" if not wa_group_id else wa_group_id
     try:
         async with shared_http() as session:
             async with session.get(f"{WA_SERVICE_URL}/status", headers=WA_HEADERS, timeout=2) as resp:
@@ -223,10 +288,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if data.get("isAuthenticated"):
                         wa_status = "🟢 Connected"
                     elif data.get("hasEverConnected") or data.get("isReconnecting"):
-                        # Was connected before (or is mid-reconnect) - a real
-                        # session drop, not first-time setup. See the
-                        # proactive 🔴/🟢 Telegram alerts in server.js for
-                        # when this actually changed.
                         wa_status = "🔴 Disconnected (session dropped, reconnecting...)"
                     else:
                         wa_status = "🟡 Waiting for first QR scan"
@@ -267,7 +328,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     process = psutil.Process()
     mem_mb = process.memory_info().rss / 1024 ** 2
     total_mem = psutil.virtual_memory()
-    # cpu_percent(interval=...) sleeps, so sample it off the event loop
     sys_cpu = await asyncio.to_thread(psutil.cpu_percent, 0.3)
 
     sys_info = (
@@ -276,9 +336,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🧠 <b>System CPU:</b> {sys_cpu:.1f}%"
     )
 
-    # High RAM warning
     if mem_mb > 500:
-        sys_info += "\n\n⚠️ <b>High memory usage detected — bot restart recommended.</b>"
+        sys_info += "\n\n⚠️ <b>High memory usage detected - bot restart recommended.</b>"
 
     # Last full check time
     if state.last_full_check_time:
@@ -287,7 +346,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         minutes = remainder // 60
         text += f"\n\n🕓 Last Full Check: {state.last_full_check_time.strftime('%d %b %Y %H:%M')} ({hours}h {minutes}m ago)"
     else:
-        text += "\n\n🕓 Last Full Check: —"
+        text += "\n\n🕓 Last Full Check: -"
 
     text += f"\n\n{sys_info}"
 
@@ -313,41 +372,27 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n📍 Weather Location: {weather_location_label}"
 
     wardrobe_enabled = get_wardrobe_feature_enabled()
-    is_admin = is_user_admin(user_id)
-    if is_admin:
-        text += f"\n👔 Daily Outfit Suggestion: {'✅ On' if wardrobe_enabled else '🔲 Off'}"
+    text += f"\n👔 Daily Outfit Suggestion: {'✅ On' if wardrobe_enabled else '🔲 Off'}"
 
     study_plan_enabled = get_weekly_study_plan_enabled()
     text += f"\n📘 Weekly Study Plan: {'✅ On' if study_plan_enabled else '🔲 Off'}"
 
-    public_login = _login_public_url()
-    if public_login.startswith("https://"):
-        login_btn = InlineKeyboardButton(
-            "🔐 Login",
-            web_app=WebAppInfo(url=_get_login_server().app_url()),
-        )
-    else:
-        login_btn = InlineKeyboardButton("🔐 Login", callback_data="studip_login")
-
-    row_tools = []
-    if is_admin:
-        row_tools.append(InlineKeyboardButton("👔 Wardrobe & Weather", callback_data="outfit_menu"))
-        row_tools.append(InlineKeyboardButton("📱 WhatsApp Gateway", callback_data="wa_menu"))
-    else:
-        row_tools.append(InlineKeyboardButton("🌤️ Weather & Location", callback_data="status_group|weather"))
+    row_tools = [
+        InlineKeyboardButton("👔 Wardrobe & Weather", callback_data="outfit_menu"),
+        InlineKeyboardButton("📱 WhatsApp Gateway", callback_data="wa_menu"),
+    ]
 
     keyboard = [
         [login_btn, InlineKeyboardButton("🚪 Logout", callback_data="studip_logout")],
         [InlineKeyboardButton("📄 Documents & Tuition", callback_data="status_group|docs_tuition"), InlineKeyboardButton("📆 Semester & Calendar", callback_data="status_group|semester")],
         row_tools,
         [InlineKeyboardButton("🎯 Tracked Courses", callback_data="sp_track_menu"), InlineKeyboardButton("👤 Profile", callback_data="status_group|profile")],
+        [InlineKeyboardButton("⚙️ Admin Dashboard", callback_data="admin_menu")],
     ]
-    if is_admin:
-        keyboard.append([InlineKeyboardButton("⚙️ Admin Dashboard", callback_data="admin_menu")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
+
 
 
 def _format_time_ago(ts: float) -> str:
@@ -466,52 +511,111 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         lines = [
             "👥 <b>Registered Students & Users</b>",
             "━━━━━━━━━━━━━━━━━━",
+            "Tap a student to view details, toggle status, change role, or revoke session:\n",
         ]
         keyboard = []
         for u in users:
             name = u["username"] or u["full_name"] or str(u["telegram_id"])
             role_badge = "👑 Admin" if u["role"] == "admin" else "🎓 Student"
-            status_badge = "🟢 Active" if u["is_active"] else "🔴 Blocked"
+            status_icon = "🟢" if u["is_active"] else "🔴"
             ago = _format_time_ago(u["last_active_at"])
             lines.append(
-                f"• <b>@{name}</b> (<code>{u['telegram_id']}</code>)\n"
-                f"   Role: {role_badge} | Status: {status_badge}\n"
-                f"   Actions: {u['interaction_count']} | Last: {ago}"
+                f"{status_icon} <b>@{name}</b> (<code>{u['telegram_id']}</code>)\n"
+                f"   Role: {role_badge} | Actions: {u['interaction_count']} | Last: {ago}"
             )
-            if u["role"] != "admin":
-                toggle_btn_text = "🚫 Block" if u["is_active"] else "✅ Activate"
-                keyboard.append([InlineKeyboardButton(f"{toggle_btn_text} (@{name})", callback_data=f"admin_toggle_user|{u['telegram_id']}")])
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"{status_icon} @{name} ({role_badge})",
+                    callback_data=f"admin_user_detail|{u['telegram_id']}",
+                )
+            ])
 
         keyboard.append([InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="admin_menu")])
         await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
-    if data.startswith("admin_toggle_user|"):
+    if data.startswith("admin_user_detail|"):
         target_id = int(data.split("|")[1])
         target = db.get_user(target_id)
-        if target and target["role"] != "admin":
+        if not target:
+            await query.answer("User not found.", show_alert=True)
+            return
+
+        name = target["username"] or target["full_name"] or str(target_id)
+        role = target.get("role", "user")
+        is_active = target.get("is_active", True)
+        studip_user = target.get("studip_username") or "Not linked"
+        reg_time = datetime.fromtimestamp(target.get("created_at", time.time()), TZ_BERLIN).strftime("%d.%m.%Y %H:%M")
+        last_active = _format_time_ago(target.get("last_active_at", time.time()))
+
+        has_active_session = target_id in state.user_sessions
+        session_badge = "🟢 In-memory Session Active" if has_active_session else "⚪ No active memory session"
+
+        text = (
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>Student Profile: @{name}</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"🆔 <b>Telegram ID:</b> <code>{target_id}</code>\n"
+            f"📛 <b>Full Name:</b> {target.get('full_name') or 'N/A'}\n"
+            f"🎓 <b>Stud.IP Account:</b> <code>{studip_user}</code>\n"
+            f"👑 <b>Role:</b> {'👑 Administrator' if role == 'admin' else '🎓 Student'}\n"
+            f"📶 <b>Account Status:</b> {'🟢 Active' if is_active else '🔴 Blocked'}\n"
+            f"⚡ <b>Session State:</b> {session_badge}\n"
+            f"📊 <b>Interactions:</b> {target.get('interaction_count', 0)} commands\n"
+            f"🕓 <b>Last Active:</b> {last_active}\n"
+            f"📅 <b>Registered:</b> {reg_time}\n"
+            "━━━━━━━━━━━━━━━━━━"
+        )
+
+        keyboard = []
+        is_primary_admin = target_id in (ALLOWED_USER_IDS or [])
+        if not is_primary_admin and target_id != user.id:
+            block_label = "🚫 Block Account" if is_active else "✅ Activate Account"
+            keyboard.append([InlineKeyboardButton(block_label, callback_data=f"admin_toggle_user|{target_id}")])
+
+            role_label = "🎓 Demote to Student" if role == "admin" else "👑 Promote to Admin"
+            keyboard.append([InlineKeyboardButton(role_label, callback_data=f"admin_role_user|{target_id}")])
+
+        keyboard.append([InlineKeyboardButton("🚪 Revoke Stud.IP Session", callback_data=f"admin_revoke_user|{target_id}")])
+        keyboard.append([InlineKeyboardButton("⬅️ Back to Users", callback_data="admin_users")])
+
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data.startswith("admin_toggle_user|"):
+        target_id = int(data.split("|")[1])
+        if target_id in (ALLOWED_USER_IDS or []) or target_id == user.id:
+            await query.answer("Cannot modify primary administrator.", show_alert=True)
+            return
+        target = db.get_user(target_id)
+        if target:
             new_state = not target["is_active"]
             db.set_user_active(target_id, new_state)
             await query.answer(f"User {'activated' if new_state else 'blocked'}.", show_alert=True)
+        query.data = f"admin_user_detail|{target_id}"
+        await handle_admin_callbacks(update, context)
+        return
 
-        users = db.get_all_users()
-        lines = ["👥 <b>Registered Students & Users</b>", "━━━━━━━━━━━━━━━━━━"]
-        keyboard = []
-        for u in users:
-            name = u["username"] or u["full_name"] or str(u["telegram_id"])
-            role_badge = "👑 Admin" if u["role"] == "admin" else "🎓 Student"
-            status_badge = "🟢 Active" if u["is_active"] else "🔴 Blocked"
-            ago = _format_time_ago(u["last_active_at"])
-            lines.append(
-                f"• <b>@{name}</b> (<code>{u['telegram_id']}</code>)\n"
-                f"   Role: {role_badge} | Status: {status_badge}\n"
-                f"   Actions: {u['interaction_count']} | Last: {ago}"
-            )
-            if u["role"] != "admin":
-                toggle_btn_text = "🚫 Block" if u["is_active"] else "✅ Activate"
-                keyboard.append([InlineKeyboardButton(f"{toggle_btn_text} (@{name})", callback_data=f"admin_toggle_user|{u['telegram_id']}")])
-        keyboard.append([InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="admin_menu")])
-        await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+    if data.startswith("admin_role_user|"):
+        target_id = int(data.split("|")[1])
+        if target_id in (ALLOWED_USER_IDS or []) or target_id == user.id:
+            await query.answer("Cannot modify primary administrator role.", show_alert=True)
+            return
+        target = db.get_user(target_id)
+        if target:
+            new_role = "student" if target["role"] == "admin" else "admin"
+            db.set_user_role(target_id, new_role)
+            await query.answer(f"Role updated to {new_role}.", show_alert=True)
+        query.data = f"admin_user_detail|{target_id}"
+        await handle_admin_callbacks(update, context)
+        return
+
+    if data.startswith("admin_revoke_user|"):
+        target_id = int(data.split("|")[1])
+        await _perform_logout(user_id=target_id)
+        await query.answer("Stud.IP session revoked and credentials cleared.", show_alert=True)
+        query.data = f"admin_user_detail|{target_id}"
+        await handle_admin_callbacks(update, context)
         return
 
     if data == "admin_invites":

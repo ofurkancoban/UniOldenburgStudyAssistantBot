@@ -28,7 +28,7 @@ from studip_utils import (
 from unibot import state
 from unibot.storage import get_watch_previous_semester_enabled, load_default_semester, save_studip_user_name
 from unibot.formatting import clean_html_text
-from unibot.auth import get_user_session, login_studip
+from unibot.auth import get_user_session, is_user_admin, login_studip
 
 
 BASE_URL = "https://elearning.uni-oldenburg.de"
@@ -58,24 +58,41 @@ def _normalize_url(u: str | None) -> str | None:
     return u
 
 
+def _record_course(cid: str, name: str, user_id: Optional[int] = None) -> None:
+    if user_id is not None:
+        if user_id not in state.user_courses_map:
+            state.user_courses_map[user_id] = {}
+        state.user_courses_map[user_id][cid] = name
+    if user_id is None or is_user_admin(user_id):
+        state.courses_map[cid] = name
+
+
 # ── course listing ────────────────────────────────────────────────────────────
-async def list_courses(semester_id: str = None):
+async def list_courses(
+    semester_id: Optional[str] = None,
+    session: Optional[object] = None,
+    user_id: Optional[int] = None,
+):
     """[(name, cid), ...] of the user's courses in semester_id (the current
     semester when None), via the JSON:API with the my_courses page as
-    fallback. Also records every course in courses_map."""
+    fallback. Also records courses in user_courses_map and courses_map."""
     try:
-        courses = await _list_courses_api(semester_id)
+        courses = await _list_courses_api(semester_id, session=session, user_id=user_id)
         if courses:
             for name, cid in courses:
-                state.courses_map[cid] = name
+                _record_course(cid, name, user_id=user_id)
             logging.info("✅ %s courses from the Stud.IP API.", len(courses))
             return courses
     except Exception as e:
         logging.warning("list_courses: API failed (%s), falling back to the my_courses page", e)
-    return await _list_courses_html(semester_id)
+    return await _list_courses_html(semester_id, session=session, user_id=user_id)
 
 
-async def _list_courses_html(semester_id: str = None):
+async def _list_courses_html(
+    semester_id: Optional[str] = None,
+    session: Optional[object] = None,
+    user_id: Optional[int] = None,
+):
     """
     Extract courses from the 'my_courses' page.
     Uses multi-method strategy: Vuex Store analysis (modern) and DOM Scrapy (legacy).
@@ -86,7 +103,8 @@ async def _list_courses_html(semester_id: str = None):
     listing that follows is scoped to it, instead of whatever the account's
     filter happened to be left on last.
     """
-    session = await login_studip()
+    if session is None:
+        session = await login_studip(user_id=user_id)
     if session is None:
         logging.error("❌ Failed to get session for list_courses")
         return []
@@ -153,7 +171,7 @@ async def _list_courses_html(semester_id: str = None):
                                 name = info.get("name", "").strip()
                                 if name:
                                     all_courses_dict[cid] = name
-                                    state.courses_map[cid] = name
+                                    _record_course(cid, name, user_id=user_id)
                                     
                     # Fallback: Recursive search in this specific JSON block
                     if not courses_payload:
@@ -184,7 +202,7 @@ async def _list_courses_html(semester_id: str = None):
             name = row.get("title") or row.get_text(" ", strip=True)
             if cid and name and len(name) > 3:
                 all_courses_dict[cid] = name
-                state.courses_map[cid] = name
+                _record_course(cid, name, user_id=user_id)
 
         # Pattern 2: Any link containing a course ID pattern
         course_links = soup.find_all("a", href=re.compile(r"(?:course_id=|to=|details\.php\?id=)([a-f0-9]{32})"))
@@ -197,7 +215,7 @@ async def _list_courses_html(semester_id: str = None):
                 if name and len(name) > 3:
                     if cid not in all_courses_dict:
                         all_courses_dict[cid] = name
-                        state.courses_map[cid] = name
+                        _record_course(cid, name, user_id=user_id)
         
         # If we found courses on the first URL, we might still want to try the second 
         # to ensure we get "all" if the first was restricted to one semester.
@@ -206,7 +224,7 @@ async def _list_courses_html(semester_id: str = None):
         logging.info("✅ Extracted %s unique courses.", len(all_courses_dict))
         # Ensure the map is updated for other functions
         for cid, name in all_courses_dict.items():
-            state.courses_map[cid] = name
+            _record_course(cid, name, user_id=user_id)
         # The bot expects (name, cid) tuples
         return [(name, cid) for cid, name in all_courses_dict.items()]
 
@@ -214,9 +232,10 @@ async def _list_courses_html(semester_id: str = None):
     return []
 
 
+
 async def _switch_semester_filter(session, semester_id: str) -> None:
     """Explicitly switch Stud.IP's own session-level "my_courses" semester
-    filter — the exact same request list_courses(semester_id=...) makes as
+    filter - the exact same request list_courses(semester_id=...) makes as
     a side effect. Used to restore the filter back to a known semester
     after a temporary switch to fetch a *different* semester's data (e.g.
     the previous one, for the previous-semester enrolment/watch features),
@@ -234,16 +253,16 @@ async def _switch_semester_filter(session, semester_id: str) -> None:
 
 
 async def _ensure_watched_courses_map(session) -> None:
-    """(Re)builds the shared `courses_map` global — used by all three
+    """(Re)builds the shared `courses_map` global - used by all three
     background watchers (announcements, new files, forum posts) to decide
-    which courses to check — to include the previous semester's courses
+    which courses to check - to include the previous semester's courses
     too when that's enabled (see get_watch_previous_semester_enabled /
     /status's toggle). Only rebuilds when the map is empty or the toggle's
     state has changed since the last build, not on every watcher cycle.
 
     Deliberately resolves "current semester" explicitly (default_semester,
     falling back to the newest entry in get_semester_options) rather than
-    relying on a no-arg list_courses() call reflecting "current" — that
+    relying on a no-arg list_courses() call reflecting "current" - that
     depends on whatever semester some unrelated browsing interaction
     (Files/Enroll/Sign Out's own semester pickers) last left the shared
     session's filter pointed at, which isn't reliable here."""
@@ -333,13 +352,18 @@ async def studip_api_get(path: str, params: Optional[dict] = None, session: Opti
         raise StudipApiError(f"{path}: response is not JSON") from e
 
 
-async def studip_api_get_all(path: str, params: Optional[dict] = None) -> tuple[list, list]:
+async def studip_api_get_all(
+    path: str,
+    params: Optional[dict] = None,
+    session: Optional[object] = None,
+    user_id: Optional[int] = None,
+) -> tuple[list, list]:
     """Every page of a JSON:API collection, as (data, included)."""
     params = dict(params or {}, **{"page[limit]": STUDIP_API_PAGE_LIMIT})
     data, included, offset = [], [], 0
     while True:
         params["page[offset]"] = offset
-        page = await studip_api_get(path, params)
+        page = await studip_api_get(path, params, session=session, user_id=user_id)
         data += page.get("data", [])
         included += page.get("included", [])
         offset += STUDIP_API_PAGE_LIMIT
@@ -381,7 +405,10 @@ async def get_studip_user_profile(user_id: Optional[int] = None, session: Option
         return (state._studip_user_profile or {}) if user_id is None else {}
 
 
-async def studip_api_user_id() -> str:
+async def studip_api_user_id(session: Optional[object] = None, user_id: Optional[int] = None) -> str:
+    if user_id is not None:
+        profile = await get_studip_user_profile(user_id=user_id, session=session)
+        return profile.get("id") or ""
     if not state._studip_api_user_id:
         profile = await get_studip_user_profile()
         state._studip_api_user_id = profile.get("id")
@@ -410,18 +437,23 @@ def _api_berlin(iso: Optional[str]) -> Optional[datetime]:
         return None
 
 
-async def _list_courses_api(semester_id: Optional[str] = None) -> list:
+async def _list_courses_api(
+    semester_id: Optional[str] = None,
+    session: Optional[object] = None,
+    user_id: Optional[int] = None,
+) -> list:
     """(name, cid) for the user's courses in semester_id (the current
     semester when None, which is what every no-argument caller means), like
     the my_courses page: study groups are left out, and a course without an
     end semester runs unlimited, is listed in every semester and gets
     " (unrestricted)" appended, exactly as that page names it."""
     if state._studip_api_semester_starts is None:
-        semesters, _ = await studip_api_get_all("/semesters")
+        semesters, _ = await studip_api_get_all("/semesters", session=session, user_id=user_id)
         state._studip_api_semester_starts = {x["id"]: datetime.fromisoformat(x["attributes"]["start"]) for x in semesters}
         state._studip_api_current_semester = next((x["id"] for x in semesters if x["attributes"].get("is-current")), None)
     starts = state._studip_api_semester_starts
-    courses, _ = await studip_api_get_all(f"/users/{await studip_api_user_id()}/courses")
+    uid_str = await studip_api_user_id(session=session, user_id=user_id)
+    courses, _ = await studip_api_get_all(f"/users/{uid_str}/courses", session=session, user_id=user_id)
     target = starts.get(semester_id or state._studip_api_current_semester)
     result = []
     for c in courses:
@@ -434,6 +466,7 @@ async def _list_courses_api(semester_id: Optional[str] = None) -> list:
         name = (c["attributes"].get("title") or "").strip()
         if name:
             result.append((name if end_id else f"{name} (unrestricted)", c["id"]))
+    return result
     return result
 
 

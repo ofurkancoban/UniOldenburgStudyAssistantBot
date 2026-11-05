@@ -444,6 +444,102 @@ class MultiUserSessionTests(unittest.TestCase):
         self.assertTrue(srv._is_allowed(777))
         self.assertFalse(srv._is_allowed(888))
 
+    def test_set_user_role_and_user_logout_isolation(self):
+        from unibot.auth import _perform_logout, get_user_session
+        from studip_session import StudIPSession
+
+        # Test role modification
+        self.db.upsert_user(3001, role="student")
+        self.db.set_user_role(3001, "admin")
+        self.assertEqual(self.db.get_user(3001)["role"], "admin")
+        self.db.set_user_role(3001, "student")
+        self.assertEqual(self.db.get_user(3001)["role"], "student")
+
+        # Setup mock user sessions and credentials
+        sess1 = get_user_session(3001)
+        sess2 = get_user_session(3002)
+        self.state.user_courses_map[3001] = {"c1": "Math"}
+        self.state.user_courses_map[3002] = {"c2": "Physics"}
+        self.db.save_user_credential(3001, "cookies", [{"key": "c1", "value": "v1"}])
+        self.db.save_user_credential(3002, "cookies", [{"key": "c2", "value": "v2"}])
+
+        # Logout user 3001
+        asyncio.run(_perform_logout(user_id=3001))
+
+        # User 3001 is cleaned up
+        self.assertNotIn(3001, self.state.user_sessions)
+        self.assertNotIn(3001, self.state.user_courses_map)
+        self.assertIsNone(self.db.load_user_credential(3001, "cookies"))
+
+        # User 3002 is completely untouched
+        self.assertIn(3002, self.state.user_sessions)
+        self.assertIn(3002, self.state.user_courses_map)
+        self.assertIsNotNone(self.db.load_user_credential(3002, "cookies"))
+
+    def test_list_courses_records_in_user_courses_map(self):
+        from unibot.studip_api import list_courses
+
+        with mock.patch("unibot.studip_api._list_courses_api", new=mock.AsyncMock(return_value=[("Distributed Systems", "cid_dist_sys")])):
+            courses = asyncio.run(list_courses(user_id=4001))
+            self.assertEqual(courses, [("Distributed Systems", "cid_dist_sys")])
+            self.assertIn(4001, self.state.user_courses_map)
+            self.assertEqual(self.state.user_courses_map[4001]["cid_dist_sys"], "Distributed Systems")
+
+    def test_status_command_student_and_admin(self):
+        from unibot.system import status_command
+
+        student_update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=5001),
+            message=mock.AsyncMock(),
+        )
+        with mock.patch("unibot.system.is_user_admin", return_value=False), \
+             mock.patch("unibot.auth.is_user_admin", return_value=False):
+            asyncio.run(status_command(student_update, None))
+            sent_text = student_update.message.reply_text.call_args[0][0]
+            self.assertIn("Student Account Status", sent_text)
+            self.assertNotIn("Bot Memory", sent_text)
+            self.assertNotIn("WA Group", sent_text)
+
+        admin_update = types.SimpleNamespace(
+            effective_user=types.SimpleNamespace(id=9999),
+            message=mock.AsyncMock(),
+        )
+        with mock.patch("unibot.system.is_user_admin", return_value=True), \
+             mock.patch("unibot.auth.is_user_admin", return_value=True):
+            asyncio.run(status_command(admin_update, None))
+            sent_text = admin_update.message.reply_text.call_args[0][0]
+            self.assertIn("Bot Status", sent_text)
+            self.assertIn("Bot Memory", sent_text)
+            self.assertIn("Unified Watcher", sent_text)
+
+    def test_admin_drill_down_callbacks(self):
+        from unibot.system import handle_admin_callbacks
+
+        self.db.upsert_user(6001, role="student", username="stud1", full_name="Student One", is_active=1)
+
+        query = mock.AsyncMock()
+        query.data = "admin_user_detail|6001"
+        query.from_user = types.SimpleNamespace(id=9999)
+        update = types.SimpleNamespace(callback_query=query)
+        with mock.patch("unibot.system.is_user_admin", return_value=True):
+            asyncio.run(handle_admin_callbacks(update, None))
+            detail_text = query.edit_message_text.call_args[0][0]
+            self.assertIn("Student Profile: @stud1", detail_text)
+            self.assertIn("Student", detail_text)
+
+            query.data = "admin_toggle_user|6001"
+            asyncio.run(handle_admin_callbacks(update, None))
+            self.assertEqual(self.db.get_user(6001)["is_active"], 0)
+
+            query.data = "admin_role_user|6001"
+            asyncio.run(handle_admin_callbacks(update, None))
+            self.assertEqual(self.db.get_user(6001)["role"], "admin")
+
+            self.state.user_sessions[6001] = mock.AsyncMock()
+            query.data = "admin_revoke_user|6001"
+            asyncio.run(handle_admin_callbacks(update, None))
+            self.assertNotIn(6001, self.state.user_sessions)
+
 
 if __name__ == "__main__":
     unittest.main()

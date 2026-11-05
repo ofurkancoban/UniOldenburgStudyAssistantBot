@@ -26,6 +26,7 @@ session_keepalive_task: Optional[asyncio.Task] = None  # see session_keepalive_l
 unified_watcher_task: Optional[asyncio.Task] = None
 watcher_controller_running = False
 courses_map: dict[str, str] = {}  # cid -> course_name
+user_courses_map: dict[int, dict[str, str]] = {}  # user_id -> {cid: course_name}
 
 
 _shared_http_session: Optional[aiohttp.ClientSession] = None

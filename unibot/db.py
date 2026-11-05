@@ -271,6 +271,22 @@ def set_user_active(telegram_id: int, is_active: bool) -> None:
         )
 
 
+def set_user_role(telegram_id: int, role: str) -> None:
+    with _lock:
+        _connection().execute(
+            "UPDATE users SET role = ? WHERE telegram_id = ?",
+            (role, telegram_id),
+        )
+
+
+def update_user_studip(telegram_id: int, studip_username: str) -> None:
+    with _lock:
+        _connection().execute(
+            "UPDATE users SET studip_username = ? WHERE telegram_id = ?",
+            (studip_username, telegram_id),
+        )
+
+
 def is_user_admin_db(telegram_id: int) -> bool:
     user = get_user(telegram_id)
     return bool(user and user.get("role") == "admin" and user.get("is_active"))

@@ -489,8 +489,24 @@ async def _send_login_prompt(reply_target, user_id: int) -> None:
         )
 
 
-async def _perform_logout() -> None:
-    """Log out of Stud.IP + NetIQ SSO and wipe stored cookies and OAuth2 tokens."""
+async def _perform_logout(user_id: Optional[int] = None) -> None:
+    """Log out of Stud.IP and clear stored session cookies and OAuth2 tokens."""
+    if user_id is not None:
+        sess = state.user_sessions.pop(user_id, None)
+        if sess is not None:
+            await sess.logout()
+        db.delete_user_credentials(user_id)
+        if studip_oauth.oauth_enabled():
+            studip_oauth.clear_tokens(user_id=user_id)
+        db.update_user_studip(user_id, "")
+        state.user_courses_map.pop(user_id, None)
+        if is_user_admin(user_id) and state.global_session is sess:
+            state.global_session = None
+            state._studip_api_user_id = None
+            state._studip_user_profile = None
+            state._last_notified_studip_cookie = None
+        return
+
     state._studip_api_user_id = None
     state._studip_user_profile = None
     state._last_notified_studip_cookie = None
@@ -515,10 +531,11 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/logout - sign out of Stud.IP and clear stored session cookies & OAuth2 tokens."""
     user = update.effective_user
-    if not is_user_allowed(user.id if user else None):
+    uid = user.id if user else None
+    if not is_user_allowed(uid):
         await update.message.reply_text("⛔ Not authorised.")
         return
-    await _perform_logout()
+    await _perform_logout(user_id=uid)
     await update.message.reply_text(
         "🚪 Logged out from Stud.IP. Saved session cookies and OAuth2 tokens have been cleared.\n"
         "Use /login or the 🔐 Login button under ℹ️ Status whenever you want to sign in again."

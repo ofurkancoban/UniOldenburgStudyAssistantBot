@@ -293,8 +293,13 @@ async def _render_files_courses_for_semester(sender, semester_id: str):
     """List a given semester's courses so the student can pick one to browse
     its files. Shared by handle_files_semester_pick (explicit picker) and
     handle_files_browse (when a default semester is set, skipping the picker)."""
+    uid = None
+    if hasattr(sender, "from_user") and sender.from_user:
+        uid = sender.from_user.id
+    elif hasattr(sender, "effective_user") and sender.effective_user:
+        uid = sender.effective_user.id
     try:
-        courses = await list_courses(semester_id=semester_id)
+        courses = await list_courses(semester_id=semester_id, user_id=uid)
     except Exception as e:
         logging.error("_render_files_courses_for_semester: failed to fetch courses: %s", e)
         await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
@@ -324,7 +329,7 @@ async def handle_files_browse(sender):
 
 
 async def handle_files_semester_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle files_sem|<id> callback — list that semester's courses so the
+    """Handle files_sem|<id> callback - list that semester's courses so the
     student can pick one to browse its files."""
     query = update.callback_query
     await query.answer()
@@ -446,10 +451,14 @@ async def _status_button_studip_logout(update, context, query):
     if user_id is None or not is_user_allowed(user_id):
         await query.message.reply_text("Not authorized to use this bot.")
         return
-    await _perform_logout()
+    await _perform_logout(user_id=user_id)
     try:
-        if query.message and query.message.text and "Logged in:" in query.message.text:
-            updated_html = query.message.text_html.replace("🔑 Logged in: ✅ Yes", "🔑 Logged in: ❌ No")
+        if query.message and query.message.text:
+            updated_html = query.message.text_html
+            if "🔑 Logged in: ✅ Yes" in updated_html:
+                updated_html = updated_html.replace("🔑 Logged in: ✅ Yes", "🔑 Logged in: ❌ No")
+            if "🔑 <b>Connection:</b> ✅ Connected" in updated_html:
+                updated_html = updated_html.replace("✅ Connected", "❌ Not connected")
             await query.edit_message_text(
                 updated_html,
                 parse_mode="HTML",
@@ -821,7 +830,7 @@ async def _selection_nav(update, context, query, data, user_id):
         await send_folder(query, files, cid, user_id, current_url=root_url)
 
     elif action == "courses":
-        courses = await list_courses()
+        courses = await list_courses(user_id=user_id)
         await _send_courses_menu(query, courses)
 
     elif action == "zip":
@@ -937,7 +946,7 @@ async def _selection_message(update, context, query, data, user_id):
             async with await state.global_session.get(msg_url) as resp:
                 html = await resp.text()
 
-            # lxml, not html.parser — see the comment in check_new_announcements_parallel
+            # lxml, not html.parser - see the comment in check_new_announcements_parallel
             # on the same inline-SVG-icon parse-tree corruption bug.
             soup = BeautifulSoup(html, "lxml")
 
@@ -1057,9 +1066,9 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = text_override if text_override is not None else (update.message.text or "").strip()
 
     if step in ("wardrobe_add_item", "wardrobe_set_reference"):
-        # These two steps only consume a photo (handle_photo_message) — a
+        # These two steps only consume a photo (handle_photo_message) - a
         # text reply here means the user typed instead of sending one.
-        await update.effective_message.reply_text("📸 I'm waiting for a photo, not text — send one, or /status to cancel.")
+        await update.effective_message.reply_text("📸 I'm waiting for a photo, not text - send one, or /status to cancel.")
         return True
 
     if step in ("fastenroll_date", "fastenroll_time", "fastenroll_link"):
@@ -1072,27 +1081,27 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data.pop("pending_step", None)
         name = text.strip()[:50]
         if not name:
-            await update.effective_message.reply_text("🤷 That didn't look like a name — try again from /status.")
+            await update.effective_message.reply_text("🤷 That didn't look like a name - try again from /status.")
             return True
         user_id = update.effective_user.id if update.effective_user else None
         if user_id is not None:
             save_user_name(user_id, name)
-        await update.effective_message.reply_text(f"👤 Got it — I'll call you {name}.", reply_markup=get_main_keyboard())
+        await update.effective_message.reply_text(f"👤 Got it - I'll call you {name}.", reply_markup=get_main_keyboard())
         return True
 
     if step == "weather_location":
         context.user_data.pop("pending_step", None)
         query_text = text.strip()[:100]
         if not query_text:
-            await update.effective_message.reply_text("🤷 That didn't look like a place name — try again from /status.")
+            await update.effective_message.reply_text("🤷 That didn't look like a place name - try again from /status.")
             return True
         resolved = await geocode_location(query_text)
         if not resolved:
-            await update.effective_message.reply_text(f"🤷 Couldn't find \"{query_text}\" — try a more specific city name, or check the spelling.")
+            await update.effective_message.reply_text(f"🤷 Couldn't find \"{query_text}\" - try a more specific city name, or check the spelling.")
             return True
         save_weather_location(resolved["name"], resolved["country"], resolved["latitude"], resolved["longitude"])
         await update.effective_message.reply_text(
-            f"📍 Got it — checking weather for {resolved['name']}, {resolved['country']} from now on.",
+            f"📍 Got it - checking weather for {resolved['name']}, {resolved['country']} from now on.",
             reply_markup=get_main_keyboard(),
         )
         return True
@@ -1122,7 +1131,7 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
             await status_msg.edit_text(f"❌ Failed to send reply on Stud.IP:\n<code>{html.escape(str(exc)[:200])}</code>", parse_mode="HTML")
         return True
 
-    # Unknown/stale step — clear it so the user isn't stuck.
+    # Unknown/stale step - clear it so the user isn't stuck.
     context.user_data.pop("pending_step", None)
     return False
 
@@ -1262,8 +1271,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_course_picker(message, context: ContextTypes.DEFAULT_TYPE):
     """List the student's currently-enrolled Stud.IP courses so they can pick one
     for the combined tasks+exam-info view."""
+    uid = None
+    if hasattr(message, "from_user") and message.from_user:
+        uid = message.from_user.id
+    elif hasattr(message, "effective_user") and message.effective_user:
+        uid = message.effective_user.id
     try:
-        courses = await list_courses()
+        courses = await list_courses(user_id=uid)
     except Exception as e:
         logging.error("send_course_picker: failed to fetch courses: %s", e)
         await message.reply_text("❌ Could not load your courses right now.")
@@ -1293,7 +1307,7 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
     options = context.user_data.get("course_view_options", [])
     idx = int(query.data.split("|", 1)[1])
     if not (0 <= idx < len(options)):
-        await query.message.reply_text("⚠️ This course list has expired — tap 📘 By Course again.")
+        await query.message.reply_text("⚠️ This course list has expired - tap 📘 By Course again.")
         return
     course_name, course_cid = options[idx]
 
@@ -1309,7 +1323,7 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for t in sorted(course_tasks, key=lambda t: t.get("due_time") or ""):
             if t.get("due_time"):
                 due = datetime.fromisoformat(t["due_time"])
-                lines.append(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} — {t['text']}")
+                lines.append(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} - {t['text']}")
             else:
                 lines.append(f"• {t['text']}")
         lines.append("━━━━━━━━━━━━━━━━━")
@@ -1341,7 +1355,7 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
             title = e["title"]
             if e.get("group_label"):
                 title += f" ({e['group_label']})"
-            lines.append(f"{title} — {e['exam_date_display']}")
+            lines.append(f"{title} - {e['exam_date_display']}")
 
     await query.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -1383,7 +1397,7 @@ CHANGE_SEM_CONFIG = {
 
 
 async def handle_change_semester(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle change_sem|<files|enroll|deenroll> callback — the "📆 Change
+    """Handle change_sem|<files|enroll|deenroll> callback - the "📆 Change
     Semester" button at the bottom of the Files/Enroll/Sign Out course lists.
     Always shows the full semester picker for that list (ignoring any default
     semester set in /status), so the student can view a different semester
