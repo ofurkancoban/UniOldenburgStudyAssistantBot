@@ -139,7 +139,7 @@ STUDY_PLAN_CACHE_PATH = "study_plan_cache.json"
 
 def load_study_plan_cache() -> dict:
     """Per-course, per-file topic-label cache for the weekly study plan
-    feature — {cid: {filename: {"summary", "size", "modified_ts"}}}. Only
+    feature - {cid: {filename: {"summary", "size", "modified_ts"}}}. Only
     files that were successfully summarized ever get an entry, so a failed
     summarization just means that file is retried cheaply next run rather
     than cached as a placeholder (see collect_course_topics)."""
@@ -158,18 +158,20 @@ def save_study_plan_cache(data: dict) -> None:
         logging.error("Failed to save study plan cache: %s", e)
 
 
-def load_reminders_cache():
-    if db.exists(REMINDERS_CACHE_PATH):
+def load_reminders_cache(user_id: Optional[int] = None):
+    path = f"reminders_cache_{user_id}.json" if user_id else REMINDERS_CACHE_PATH
+    if db.exists(path):
         try:
-            return db.load(REMINDERS_CACHE_PATH)
+            return db.load(path)
         except Exception as e:
             logging.warning("Could not load reminders cache: %s", e)
     return {}
 
 
-def save_reminders_cache(data):
+def save_reminders_cache(data, user_id: Optional[int] = None):
+    path = f"reminders_cache_{user_id}.json" if user_id else REMINDERS_CACHE_PATH
     try:
-        db.save(REMINDERS_CACHE_PATH, data)
+        db.save(path, data)
     except Exception as e:
         logging.error("Could not save reminders cache: %s", e)
 
@@ -267,7 +269,7 @@ DEFAULT_SEMESTER_CACHE_PATH = "default_semester.json"
 
 def load_default_semester() -> dict:
     """Return {"id": ..., "label": ...} for the semester picked via /status's
-    "Set Default Semester" button, or {} if none has been set — in which case
+    "Set Default Semester" button, or {} if none has been set - in which case
     Files/Browse Courses/Sign Out each fall back to showing their own semester
     picker as before."""
     if db.exists(DEFAULT_SEMESTER_CACHE_PATH):
@@ -295,7 +297,7 @@ def clear_default_semester() -> None:
 def get_scan_previous_semester_enabled() -> bool:
     """Whether "📚 Enroll Course" should also include the semester right
     before the one being browsed (a module can still show open enrolment
-    for a prior term's course instance, e.g. a retake slot) — off by
+    for a prior term's course instance, e.g. a retake slot) - off by
     default, toggled via a button on the open-courses view itself (see
     handle_toggle_prev_sem_scan)."""
     return bool(load_general_cache().get("scan_previous_semester"))
@@ -310,7 +312,7 @@ def set_scan_previous_semester_enabled(enabled: bool) -> None:
 def get_watch_previous_semester_enabled() -> bool:
     """Whether the background watchers (announcements, forum posts, new
     files) should also monitor the previous semester's courses, not just
-    the current one — off by default, toggled via /status (see
+    the current one - off by default, toggled via /status (see
     handle_toggle_watch_prev_sem). Distinct from
     get_scan_previous_semester_enabled, which only affects the "➕ Enroll
     Course" browsing list, not what's being actively watched for new
@@ -387,7 +389,7 @@ WARDROBE_CACHE_PATH = "wardrobe.json"
 def load_wardrobe() -> dict:
     """Return {"<user_id>": {"items": [...], "reference_photo_file_id": ...}}
     for the "👔 My Wardrobe" feature. Stores Telegram file_ids, not local image
-    copies — they're free to re-resolve via bot.get_file() whenever an item or
+    copies - they're free to re-resolve via bot.get_file() whenever an item or
     the reference photo needs to be downloaded transiently for a tagging/
     try-on API call, so this cache never needs its own media directory."""
     if db.exists(WARDROBE_CACHE_PATH):
@@ -413,7 +415,7 @@ def add_wardrobe_item(user_id, tags: dict, file_id: Optional[str] = None, image_
     """Catalog one wardrobe item, backed by either a Telegram file_id (the
     normal photo-upload flow, see handle_photo_message) or a direct
     image_url (used for bulk-importing items from an external source,
-    e.g. an order history page) — exactly one of the two should be set.
+    e.g. an order history page) - exactly one of the two should be set.
     See _fetch_wardrobe_item_bytes for how either is resolved back to
     bytes when the item is actually needed for tagging/try-on."""
     wardrobe = load_wardrobe()
@@ -495,8 +497,8 @@ WARDROBE_RECENT_WORN_DAYS = 2  # how far back get_recently_worn_item_ids looks w
 def get_cached_outfit_today(user_id) -> Optional[dict]:
     """Return today's already-generated outfit result for this user, if
     "Suggest Outfit Now" or the morning summary already produced one
-    earlier today — {"description", "photo_file_id" (None if the image
-    step failed and only text went out)} — so a second trigger the same
+    earlier today - {"description", "photo_file_id" (None if the image
+    step failed and only text went out)} - so a second trigger the same
     day resends it instantly instead of burning another round of (quota-
     limited, free-tier) image-generation calls. None if nothing cached
     yet today."""
@@ -521,7 +523,7 @@ def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[
 
 def get_recently_worn_item_ids(user_id) -> set:
     """Item ids chosen in the last WARDROBE_RECENT_WORN_DAYS days, used to
-    deprioritize (not hard-exclude — the wardrobe may simply have only one
+    deprioritize (not hard-exclude - the wardrobe may simply have only one
     t-shirt) repeating the exact same outfit back-to-back."""
     history = load_general_cache().get("outfit_history", {}).get(str(user_id), {})
     cutoff = datetime.now(TZ_BERLIN).date() - timedelta(days=WARDROBE_RECENT_WORN_DAYS)

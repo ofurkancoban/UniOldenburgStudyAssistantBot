@@ -34,7 +34,7 @@ from unibot.storage import (
     update_general_cache,
 )
 from unibot.telegram_ui import broadcast
-from unibot.auth import login_studip
+from unibot.auth import get_user_session, login_studip
 from unibot.schedule import (
     check_calendar_reminders,
     check_course_schedule_changes,
@@ -126,6 +126,15 @@ def _get_active_user_ids() -> list[int]:
     return list(ALLOWED_USER_IDS)
 
 
+async def _run_weekly_study_plan_all_users(bot, active_uids, session):
+    for uid in active_uids:
+        try:
+            user_session = get_user_session(uid) or session
+            await run_weekly_study_plan_job(bot, [uid], user_session, user_id=uid)
+        except Exception as e:
+            logging.warning("Weekly study plan failed for %s: %s", uid, e)
+
+
 async def _run_scheduled_jobs(bot, session, now: datetime):
     """Morning summary plus the weekly and daily background jobs."""
     # Morning summary: prepared ahead of time (AI lunch pick, outfit
@@ -137,7 +146,7 @@ async def _run_scheduled_jobs(bot, session, now: datetime):
     if now.weekday() == 6 and now.hour >= 18 and get_weekly_study_plan_enabled():
         await _run_once_per_period(
             "last_weekly_study_plan", now.strftime("%G-W%V"), "Weekly study plan",
-            "📘 Generating weekly study plan...", run_weekly_study_plan_job, bot, active_uids, session,
+            "📘 Generating weekly study plan...", _run_weekly_study_plan_all_users, bot, active_uids, session,
         )
 
     # Exam dates from course files (syllabus, info sheets, slides): once a day.

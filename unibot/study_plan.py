@@ -48,7 +48,7 @@ from unibot.telegram_ui import (
     _start_loading_animation,
     _stop_loading_animation,
 )
-from unibot.auth import is_user_allowed, login_studip
+from unibot.auth import get_user_session, is_user_admin, is_user_allowed, login_studip
 from unibot.studip_api import (
     _ensure_watched_courses_map,
     _parse_file_date_v2,
@@ -89,7 +89,7 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
 
     If "include previous semester" is toggled on (get_scan_previous_semester_enabled,
     see handle_toggle_prev_sem_scan), the semester right before this one is
-    scanned too and merged in — a module can still have an open retake slot
+    scanned too and merged in - a module can still have an open retake slot
     on a prior term's course instance. Off by default, since most of the
     time it's just doubling the fetch time for nothing."""
     # Explicitly clear the keyboard here: editing text alone leaves whatever
@@ -110,7 +110,7 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
 
         open_courses = await get_open_courses(session, semester_id=semester_id)
         # get_open_courses() only reads each component's own "unrestricted
-        # access" badge on the module listing page — it doesn't know which of
+        # access" badge on the module listing page - it doesn't know which of
         # those the student is already enrolled in, so that's cross-checked
         # here against the student's own course list before displaying.
         enrolled_cids = {cid for _, cid in await list_courses(semester_id=semester_id)}
@@ -149,7 +149,7 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
                     await _switch_semester_filter(session, semester_id)
     except Exception as e:
         # Stop the animation before this edits the same status_msg with the
-        # error — otherwise a late animation tick can race with (or land
+        # error - otherwise a late animation tick can race with (or land
         # after) this edit and clobber it back to a loading frame.
         await _stop_loading_animation(stop_evt, anim_task)
         logging.error("_render_open_courses_for_semester: failed to fetch open courses: %s", e)
@@ -170,7 +170,7 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
         )
         return
 
-    # Group by (semester label, module) rather than just module — when the
+    # Group by (semester label, module) rather than just module - when the
     # previous semester is merged in, a module can share a name across both
     # terms, and these need to stay visually/functionally separate (distinct
     # headers) even though the course details underneath differ. _sem_label
@@ -181,7 +181,7 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
         grouped.setdefault((c.get("_sem_label"), c["module"]), []).append(c)
 
     # Circles first, then squares once a semester has more modules than
-    # circle colors — same color on a module's header and every one of its
+    # circle colors - same color on a module's header and every one of its
     # components ties them together at a glance.
     color_palette = ["🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "⚫️", "⚪️", "🟤",
                       "🟥", "🟧", "🟨", "🟩", "🟦", "🟪", "⬛", "⬜", "🟫"]
@@ -212,7 +212,7 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
     await _reply_or_edit(
         sender,
         f"{count_text}\n"
-        "A module can require both a Lecture and a separate Seminar/Exercise — each is enrolled in individually. Tap one to enroll:",
+        "A module can require both a Lecture and a separate Seminar/Exercise - each is enrolled in individually. Tap one to enroll:",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
@@ -233,7 +233,7 @@ async def _render_enrolled_courses_for_semester(sender, semester_id: str):
     try:
         courses = await list_courses(semester_id=semester_id)
     except Exception as e:
-        # Stop before this edits the same status_msg with the error — see
+        # Stop before this edits the same status_msg with the error - see
         # the identical note in _render_open_courses_for_semester.
         await _stop_loading_animation(stop_evt, anim_task)
         logging.error("_render_enrolled_courses_for_semester: failed to fetch courses: %s", e)
@@ -254,7 +254,7 @@ async def _render_enrolled_courses_for_semester(sender, semester_id: str):
 
     # Best-effort: label each course by Lecture/Exercise/Seminar/etc. using the
     # same module scrape browse-courses uses. Only covers courses that belong
-    # to one of the student's own degree-programme modules for that semester —
+    # to one of the student's own degree-programme modules for that semester -
     # older/other courses (e.g. a language course) just show without a type
     # prefix rather than failing the whole list.
     type_map = {}
@@ -496,7 +496,7 @@ async def search_course_material(question: str, top_k: int = COURSE_SEARCH_TOP_K
 
 
 @single_flight
-async def collect_course_topics(session) -> dict:
+async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
     """Scan every ENROLLED course's files (top level plus one folder level
     down, since many courses keep each week's slides in a dated folder
     like "20261013"), summarize any new/changed lecture file into a
@@ -510,14 +510,18 @@ async def collect_course_topics(session) -> dict:
     exercise material (README, syllabus, quizzes) are never downloaded,
     since the planner doesn't schedule them. When the student picked
     which courses to track, only those are scanned."""
-    await _ensure_watched_courses_map(session)
-    tracked = load_study_progress().get("tracked")
-    courses = [(name, cid) for cid, name in state.courses_map.items() if tracked is None or cid in tracked]
+    if user_id is None or is_user_admin(user_id):
+        await _ensure_watched_courses_map(session)
+    tracked = load_study_progress(user_id=user_id).get("tracked")
+    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses = [(name, cid) for cid, name in courses_dict.items() if tracked is None or cid in tracked]
     if not courses:
         return {}
 
     cache = load_study_plan_cache()
     semaphore = asyncio.Semaphore(3)
+
+    active_session = session or state.global_session
 
     async def process_course(course_name, cid):
         async with semaphore:
@@ -557,7 +561,7 @@ async def collect_course_topics(session) -> dict:
                     continue
 
                 try:
-                    async with await state.global_session.get(url) as resp:
+                    async with await active_session.get(url) as resp:
                         if resp.status != 200:
                             continue
                         content = await resp.read()
@@ -578,6 +582,7 @@ async def collect_course_topics(session) -> dict:
 
     enrolled_cids = {cid for _, cid in courses}
     return {cid: files for cid, files in cache.items() if cid in enrolled_cids}
+
 
 
 # A lecture's position in the course is read from its folder/filename
@@ -967,12 +972,26 @@ def _apply_unit_progress(unit: dict, studied: set, task_minutes: dict) -> None:
 STUDY_PROGRESS_PATH = "study_progress.json"
 
 
-def load_study_progress() -> dict:
+def load_study_progress(user_id: Optional[int] = None) -> dict:
     """{"studied": {cid: [unit_key, ...]}, "last_plan": [session, ...],
     "held": {cid: n}, "held_date": "YYYY-MM-DD", "tracked": [cid, ...]}.
     A unit_key is the lecture file's name, or "session-N" for a held
     lecture with no slides. "tracked" is absent while course selection is
     automatic (see compute_course_progress)."""
+    if user_id is not None:
+        user_key = f"study_progress_{user_id}.json"
+        if db.exists(user_key):
+            try:
+                return db.load(user_key)
+            except Exception as e:
+                logging.warning("Could not load study progress for user %s: %s", user_id, e)
+        if is_user_admin(user_id) and db.exists(STUDY_PROGRESS_PATH):
+            try:
+                return db.load(STUDY_PROGRESS_PATH)
+            except Exception:
+                pass
+        return {}
+
     if db.exists(STUDY_PROGRESS_PATH):
         try:
             return db.load(STUDY_PROGRESS_PATH)
@@ -981,7 +1000,20 @@ def load_study_progress() -> dict:
     return {}
 
 
-def save_study_progress(data: dict) -> None:
+def save_study_progress(data: dict, user_id: Optional[int] = None) -> None:
+    if user_id is not None:
+        user_key = f"study_progress_{user_id}.json"
+        try:
+            db.save(user_key, data)
+        except Exception as e:
+            logging.error("Failed to save study progress for user %s: %s", user_id, e)
+        if is_user_admin(user_id):
+            try:
+                db.save(STUDY_PROGRESS_PATH, data)
+            except Exception:
+                pass
+        return
+
     try:
         db.save(STUDY_PROGRESS_PATH, data)
     except Exception as e:
@@ -1026,18 +1058,19 @@ async def count_lectures_held(session, course_candidates: list) -> dict:
     return held
 
 
-async def _get_lectures_held(session, progress: dict, refresh: bool = False) -> dict:
+async def _get_lectures_held(session, progress: dict, refresh: bool = False, user_id: Optional[int] = None) -> dict:
     """Held-lecture counts, recomputed at most once a day unless refresh
     is set (the progress menu's buttons would otherwise refetch the whole
     semester's calendar on every tap)."""
     today_iso = datetime.now(TZ_BERLIN).date().isoformat()
     if not refresh and progress.get("held_date") == today_iso and "held" in progress:
         return progress["held"]
-    course_candidates = [(name, cid) for cid, name in state.courses_map.items()]
+    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    course_candidates = [(name, cid) for cid, name in courses_dict.items()]
     held = await count_lectures_held(session, course_candidates)
     progress["held"] = held
     progress["held_date"] = today_iso
-    save_study_progress(progress)
+    save_study_progress(progress, user_id=user_id)
     return held
 
 
@@ -1155,7 +1188,7 @@ def find_free_study_windows(events: list, week_start) -> list:
     return windows
 
 
-async def gather_weekly_study_inputs(session) -> dict:
+async def gather_weekly_study_inputs(session, user_id: Optional[int] = None) -> dict:
     """Collect this run's inputs: next week's free study windows, the
     student's own upcoming registered exams (closest first, next 3 weeks;
     the same get_registered_exam_schedule source _upcoming_exams uses, not
@@ -1173,8 +1206,9 @@ async def gather_weekly_study_inputs(session) -> dict:
         logging.warning("gather_weekly_study_inputs: get_registered_exam_schedule failed: %s", e)
         raw_exams = []
 
-    course_files = await collect_course_topics(session)
-    course_candidates = [(name, cid) for cid, name in state.courses_map.items()]
+    course_files = await collect_course_topics(session, user_id=user_id)
+    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    course_candidates = [(name, cid) for cid, name in courses_dict.items()]
     exams = []
     for exam in raw_exams:
         date_str = exam.get("date")
@@ -1201,13 +1235,13 @@ async def gather_weekly_study_inputs(session) -> dict:
             exams.append({"title": f"{fe['course']} ({fe['kind']})", "date": fe["date"], "days_until": days_until, "matched_cid": fe["cid"]})
     exams.sort(key=lambda e: e["days_until"])
 
-    progress = load_study_progress()
-    held = await _get_lectures_held(session, progress, refresh=True)
+    progress = load_study_progress(user_id=user_id)
+    held = await _get_lectures_held(session, progress, refresh=True, user_id=user_id)
     tracked = progress.get("tracked")
     if tracked is None:
-        tracked = _auto_tracked_cids(progress)
-    workload = await collect_course_workload(session, [cid for cid in tracked if cid in state.courses_map])
-    rows = compute_course_progress(course_files, held, progress, dict(state.courses_map), workload)
+        tracked = _auto_tracked_cids(progress, user_id=user_id)
+    workload = await collect_course_workload(session, [cid for cid in tracked if cid in courses_dict])
+    rows = compute_course_progress(course_files, held, progress, dict(courses_dict), workload)
     return {"gaps": gaps, "exams": exams, "rows": rows, "week_start": next_monday}
 
 
@@ -1250,7 +1284,7 @@ def build_study_plan_keyboard(plan: list, done_sessions: list) -> InlineKeyboard
     return InlineKeyboardMarkup(keyboard)
 
 
-async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None) -> str:
+async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None, user_id: Optional[int] = None) -> str:
     """End-to-end weekly study plan: gather inputs, schedule, render, send
     to every user_id. Returns the rendered message text. status_msg, if
     given, is edited through the stages (used by the manual /studyplan
@@ -1258,7 +1292,9 @@ async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None) -> 
     # status_msg (from study_plan_command) already reads "Scanning course
     # files..."; editing it to the same text makes Telegram raise "Message
     # is not modified", so the first stage needs no edit.
-    inputs = await gather_weekly_study_inputs(session)
+    if user_id is None and user_ids and len(user_ids) == 1:
+        user_id = user_ids[0]
+    inputs = await gather_weekly_study_inputs(session, user_id=user_id)
 
     if not inputs["gaps"]:
         text = "\n".join(
@@ -1275,10 +1311,10 @@ async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None) -> 
     if status_msg:
         await status_msg.edit_text("📘 Building your weekly study plan...\n\n🧠 Scheduling sessions...")
     plan = schedule_study_sessions(inputs["gaps"], inputs["rows"], inputs["exams"], inputs["week_start"])
-    progress = load_study_progress()
+    progress = load_study_progress(user_id=user_id)
     progress["last_plan"] = plan["sessions"]
     progress["last_plan_done"] = []
-    save_study_progress(progress)
+    save_study_progress(progress, user_id=user_id)
 
     text = render_weekly_study_plan_message(plan, inputs["gaps"], inputs["exams"], inputs["rows"])
     reply_markup = build_study_plan_keyboard(plan["sessions"], []) if plan["sessions"] else None
@@ -1312,7 +1348,8 @@ async def handle_study_plan_toggle(update: Update, context: ContextTypes.DEFAULT
     """A session button on the weekly plan message: credit (or take back)
     that session's minutes to its tasks and refresh the checkmarks."""
     query = update.callback_query
-    progress = load_study_progress()
+    user_id = update.effective_user.id if update.effective_user else None
+    progress = load_study_progress(user_id=user_id)
     plan = progress.get("last_plan", [])
     try:
         idx = int(query.data.split("|", 1)[1])
@@ -1331,7 +1368,7 @@ async def handle_study_plan_toggle(update: Update, context: ContextTypes.DEFAULT
         done.append(idx)
     else:
         done.remove(idx)
-    save_study_progress(progress)
+    save_study_progress(progress, user_id=user_id)
     await query.answer("Session done ✅" if now_done else "Session unmarked")
     try:
         await query.edit_message_reply_markup(reply_markup=build_study_plan_keyboard(plan, done))
@@ -1339,28 +1376,37 @@ async def handle_study_plan_toggle(update: Update, context: ContextTypes.DEFAULT
         logging.debug("handle_study_plan_toggle: keyboard refresh skipped: %s", e)
 
 
-async def _load_progress_rows(refresh: bool = False) -> tuple:
+async def _load_progress_rows(refresh: bool = False, user_id: Optional[int] = None) -> tuple:
     """(rows, progress). With refresh, the tracked courses' files are
     rescanned first (only new/changed files are summarized/measured, so
     this is mostly listing requests) and held-lecture counts are
     recomputed; without it, cached data is used so per-lecture toggle
     buttons stay instant."""
-    if not state.global_session or not await state.global_session.is_logged_in():
+    user_session = get_user_session(user_id) if user_id else None
+    active_session = user_session or state.global_session
+    if not active_session or not await active_session.is_logged_in():
         await login_studip()
-    await _ensure_watched_courses_map(state.global_session)
+        active_session = state.global_session
+    await _ensure_watched_courses_map(active_session)
+    if user_id and user_id not in state.user_courses_map:
+        try:
+            await list_courses(session=active_session, user_id=user_id)
+        except Exception as e:
+            logging.warning("_load_progress_rows: failed to fetch courses for user %s: %s", user_id, e)
+    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
     if refresh:
-        await collect_course_topics(state.global_session)
-    progress = load_study_progress()
-    held = await _get_lectures_held(state.global_session, progress, refresh=refresh)
-    enrolled = set(state.courses_map)
+        await collect_course_topics(active_session, user_id=user_id)
+    progress = load_study_progress(user_id=user_id)
+    held = await _get_lectures_held(active_session, progress, refresh=refresh, user_id=user_id)
+    enrolled = set(courses_dict)
     tracked = progress.get("tracked")
     if tracked is None:
-        tracked = _auto_tracked_cids(progress)
+        tracked = _auto_tracked_cids(progress, user_id=user_id)
     if refresh:
-        await collect_course_workload(state.global_session, [cid for cid in tracked if cid in enrolled])
+        await collect_course_workload(active_session, [cid for cid in tracked if cid in enrolled])
     course_files = {cid: files for cid, files in load_study_plan_cache().items() if cid in enrolled}
     workload = {cid: entries for cid, entries in load_workload_cache().items() if cid in enrolled}
-    rows = compute_course_progress(course_files, held, progress, dict(state.courses_map), workload)
+    rows = compute_course_progress(course_files, held, progress, dict(courses_dict), workload)
     return rows, progress
 
 
@@ -1389,17 +1435,18 @@ def render_progress_overview(rows: list) -> tuple:
     return "\n".join(lines).rstrip(), InlineKeyboardMarkup(keyboard)
 
 
-def _auto_tracked_cids(progress: dict) -> list:
+def _auto_tracked_cids(progress: dict, user_id: Optional[int] = None) -> list:
     """What automatic mode tracks: courses with lectures held this
     semester or with progress already logged."""
     held = progress.get("held", {})
     studied = progress.get("studied", {})
-    return [cid for cid in state.courses_map if held.get(cid, 0) > 0 or studied.get(cid)]
+    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    return [cid for cid in courses_dict if held.get(cid, 0) > 0 or studied.get(cid)]
 
 
-def render_track_menu(progress: dict) -> tuple:
+def render_track_menu(progress: dict, user_id: Optional[int] = None) -> tuple:
     tracked = progress.get("tracked")
-    selected = set(tracked if tracked is not None else _auto_tracked_cids(progress))
+    selected = set(tracked if tracked is not None else _auto_tracked_cids(progress, user_id=user_id))
     held = progress.get("held", {})
     mode = "manual selection" if tracked is not None else "automatic (courses with lectures held this semester)"
     lines = [
@@ -1410,7 +1457,8 @@ def render_track_menu(progress: dict) -> tuple:
         "Tap a course to add or remove it.",
     ]
     keyboard = []
-    for cid, name in sorted(state.courses_map.items(), key=lambda kv: (kv[0] not in selected, kv[1].lower())):
+    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    for cid, name in sorted(courses_dict.items(), key=lambda kv: (kv[0] not in selected, kv[1].lower())):
         mark = "✅" if cid in selected else "⬜"
         n = held.get(cid, 0)
         suffix = f" · {n} held" if n else ""
@@ -1421,12 +1469,20 @@ def render_track_menu(progress: dict) -> tuple:
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
 
-async def _load_track_menu_progress() -> dict:
-    if not state.global_session or not await state.global_session.is_logged_in():
+async def _load_track_menu_progress(user_id: Optional[int] = None) -> dict:
+    user_session = get_user_session(user_id) if user_id else None
+    active_session = user_session or state.global_session
+    if not active_session or not await active_session.is_logged_in():
         await login_studip()
-    await _ensure_watched_courses_map(state.global_session)
-    progress = load_study_progress()
-    await _get_lectures_held(state.global_session, progress)
+        active_session = state.global_session
+    await _ensure_watched_courses_map(active_session)
+    if user_id and user_id not in state.user_courses_map:
+        try:
+            await list_courses(session=active_session, user_id=user_id)
+        except Exception as e:
+            logging.warning("_load_track_menu_progress: failed to fetch courses for user %s: %s", user_id, e)
+    progress = load_study_progress(user_id=user_id)
+    await _get_lectures_held(active_session, progress, user_id=user_id)
     return progress
 
 
@@ -1436,7 +1492,7 @@ async def track_courses_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     status_msg = await update.message.reply_text("🎯 Loading your courses...", disable_notification=True)
     try:
-        text, markup = render_track_menu(await _load_track_menu_progress())
+        text, markup = render_track_menu(await _load_track_menu_progress(user_id=user_id), user_id=user_id)
         await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
 
     except Exception as e:
@@ -1450,23 +1506,24 @@ async def handle_study_track_menu(update: Update, context: ContextTypes.DEFAULT_
     currently shows, so tapping one course doesn't wipe all the others."""
     query = update.callback_query
     await query.answer()
-    progress = await _load_track_menu_progress()
+    user_id = update.effective_user.id if update.effective_user else None
+    progress = await _load_track_menu_progress(user_id=user_id)
     data = query.data
     if data == "sp_track_auto":
         progress.pop("tracked", None)
-        save_study_progress(progress)
+        save_study_progress(progress, user_id=user_id)
     elif data.startswith("sp_track|"):
         cid = data.split("|", 1)[1]
         tracked = progress.get("tracked")
         if tracked is None:
-            tracked = _auto_tracked_cids(progress)
+            tracked = _auto_tracked_cids(progress, user_id=user_id)
         if cid in tracked:
             tracked.remove(cid)
         else:
             tracked.append(cid)
         progress["tracked"] = tracked
-        save_study_progress(progress)
-    text, markup = render_track_menu(progress)
+        save_study_progress(progress, user_id=user_id)
+    text, markup = render_track_menu(progress, user_id=user_id)
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 
 
@@ -1511,7 +1568,7 @@ async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     status_msg = await update.message.reply_text("📊 Loading study progress...\n\n📚 Scanning course files...", disable_notification=True)
     try:
-        rows, _ = await _load_progress_rows(refresh=True)
+        rows, _ = await _load_progress_rows(refresh=True, user_id=user_id)
         text, markup = render_progress_overview(rows)
         await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
 
@@ -1524,8 +1581,9 @@ async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAU
     """sp_progress / sp_progress_refresh / sp_course|cid / sp_unit|cid|i."""
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id if update.effective_user else None
     data = query.data
-    rows, progress = await _load_progress_rows(refresh=(data == "sp_progress_refresh"))
+    rows, progress = await _load_progress_rows(refresh=(data == "sp_progress_refresh"), user_id=user_id)
 
     if data in ("sp_progress", "sp_progress_refresh"):
         text, markup = render_progress_overview(rows)
@@ -1540,7 +1598,7 @@ async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAU
                 # 🔄 Refresh with nothing changed: Telegram rejects an identical edit.
                 if "not modified" not in str(e).lower():
                     raise
-        return
+            return
 
     parts = data.split("|")
     row = next((r for r in rows if r["cid"] == parts[1]), None)
@@ -1555,7 +1613,8 @@ async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAU
         except (ValueError, IndexError):
             return
         _toggle_studied(progress, unit, row["cid"])
-        save_study_progress(progress)
+        save_study_progress(progress, user_id=user_id)
+        courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
         rows = compute_course_progress(
             {row["cid"]: load_study_plan_cache().get(row["cid"], {})},
             progress.get("held", {}),
@@ -1573,7 +1632,7 @@ study_plan_in_progress: set = set()
 
 
 async def study_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manual on-demand "/studyplan" trigger — same progress-message
+    """Manual on-demand "/studyplan" trigger - same progress-message
     pattern as _run_check_now: one status message edited through stages,
     then the plan itself is delivered as its own message by
     run_weekly_study_plan_job (shared with the automatic weekly trigger)."""
@@ -1591,10 +1650,13 @@ async def study_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "📘 Building your weekly study plan...\n\n📚 Scanning course files...",
             disable_notification=True,
         )
-        if not state.global_session or not await state.global_session.is_logged_in():
+        user_session = get_user_session(user_id) if user_id else None
+        active_session = user_session or state.global_session
+        if not active_session or not await active_session.is_logged_in():
             await status_msg.edit_text("🔄 Session expired, re-logging...")
             await login_studip()
-        await run_weekly_study_plan_job(context.bot, [user_id], state.global_session, status_msg=status_msg)
+            active_session = state.global_session
+        await run_weekly_study_plan_job(context.bot, [user_id], active_session, status_msg=status_msg, user_id=user_id)
         await status_msg.edit_text("✅ Study plan ready, see below 👇")
     except Exception as e:
         await update.message.reply_text(f"❌ Fatal error: {e}")

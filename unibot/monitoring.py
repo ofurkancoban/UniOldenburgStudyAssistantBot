@@ -58,7 +58,7 @@ from unibot.ai import transcribe_voice_message
 global_message_watcher = None
 global_announcement_watcher = None
 task_suggestion_cache = {}  # short_id -> { text, due_time (ISO or None), course }
-announcement_task_cache = {}  # short_id -> { course, subject, body } — raw announcement, converted to a task on demand when "📝 Add as Task" is tapped
+announcement_task_cache = {}  # short_id -> { course, subject, body } - raw announcement, converted to a task on demand when "📝 Add as Task" is tapped
 watch_tasks = {}  # chat_id -> asyncio.Task
 check_in_progress: set[int] = set()  # chat_id set to prevent concurrent checks
 
@@ -350,7 +350,7 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
                     [InlineKeyboardButton("📝 Add as Task", callback_data=f"ann_to_task|{sid}")],
                 ]
                 markup = InlineKeyboardMarkup(buttons)
-                await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup)
+                await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup, cid=ann.get("cid"))
         elif not silent:
             await bot.send_message(chat_id=chat_id, text="☑️ No new announcements found.", disable_notification=True)
 
@@ -376,7 +376,7 @@ async def fetch_message_body(session, message_url):
                 return f"[HTTP Error: {resp.status}]"
             html = await resp.text()
 
-        # lxml, not html.parser — see the comment in check_new_announcements_parallel
+        # lxml, not html.parser - see the comment in check_new_announcements_parallel
         # on the same inline-SVG-icon parse-tree corruption bug.
         soup = BeautifulSoup(html, "lxml")
 
@@ -657,7 +657,7 @@ async def _send_file_alerts(bot, events: list) -> None:
                 "user_id": next(iter(ALLOWED_USER_IDS), None),
             }
             text, keyboard = _file_alert(it, sid)
-            await broadcast(bot, text, parse_mode="HTML", reply_markup=keyboard)
+            await broadcast(bot, text, parse_mode="HTML", reply_markup=keyboard, cid=it.get("cid"))
             await asyncio.sleep(0.3)  # Rate limiting
         except Exception as e:
             logging.error("Error sending notification for file %s: %s", it.get('name'), e)
@@ -1034,7 +1034,7 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False):
 
         for p in new_posts_found:
             markup = await _forum_alert_markup(p)
-            await broadcast(bot, _forum_alert_text(p)[:4000], parse_mode="HTML", reply_markup=markup)
+            await broadcast(bot, _forum_alert_text(p)[:4000], parse_mode="HTML", reply_markup=markup, cid=p.get("cid"))
 
         # Always save cache to bootstrap the "Last 5" feature
         db.save(FORUM_CACHE_PATH, cache)
@@ -1432,8 +1432,8 @@ def render_weekly_study_plan_message(plan: dict, gaps: list, exams: list, rows: 
 async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Transcribe an incoming voice note. If a wizard step is already pending
     (e.g. waiting for a task's due time), the
-    transcription answers that step; otherwise — a fresh, unprompted voice
-    note — it's routed by spoken intent (see classify_voice_intent /
+    transcription answers that step; otherwise - a fresh, unprompted voice
+    note - it's routed by spoken intent (see classify_voice_intent /
     _route_voice_intent) instead of always assuming a new task."""
     from unibot.voice import _route_voice_intent, classify_voice_intent
     user_id = update.effective_user.id if update.effective_user else None
@@ -1453,7 +1453,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     # Google's free STT can mishear things, so confirm before it's actually used
-    # to answer the wizard step (or classified as a fresh command) — nothing is
+    # to answer the wizard step (or classified as a fresh command) - nothing is
     # committed yet. `step` is None when there's no wizard waiting, which is
     # what tells handle_voice_confirm to run intent classification instead of
     # feeding straight into handle_pending_step.
@@ -1461,7 +1461,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     # For read-only, instantly-answerable intents (currently just "what
     # should I eat"), classify right away and skip the "Heard...Is this
-    # correct?" / "Understanding..." confirmation entirely — there's no
+    # correct?" / "Understanding..." confirmation entirely - there's no
     # destructive action or wizard step to protect here, and it reads
     # oddly to interrupt a direct answer with an extra confirm step.
     intent_result = None

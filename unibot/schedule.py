@@ -39,7 +39,7 @@ from unibot.formatting import (
     clean_course_title,
 )
 from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, broadcast
-from unibot.auth import is_user_allowed, login_studip
+from unibot.auth import get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import (
     BASE_URL,
     _api_berlin,
@@ -96,24 +96,25 @@ async def run_morning_summary_schedule(bot, user_ids, now: datetime) -> None:
 @single_flight
 async def check_calendar_reminders(bot, chat_id, silent: bool = False):
     """Check for upcoming classes and send reminders 30 minutes before."""
-    session = state.global_session
+    user_session = get_user_session(chat_id)
+    session = user_session or state.global_session
     try:
         if not silent:
-            logging.info("⏰ Checking calendar reminders...")
+            logging.info("⏰ Checking calendar reminders for %s...", chat_id)
 
-        reminders = load_reminders_cache()
+        reminders = load_reminders_cache(user_id=chat_id)
         updated = False
 
         today = datetime.now(TZ_BERLIN).date()
         week_start = today - timedelta(days=today.weekday())
-        events = await get_calendar_events(session=session, week_start=week_start)
+        events = await get_calendar_events(session=session, week_start=week_start, user_id=chat_id)
         if not events:
             return
 
         now = datetime.now(TZ_BERLIN)
 
         # Only the day's *first* class gets the weather-based earlier
-        # heads-up — that's the actual leaving-home commute; later classes
+        # heads-up -- that's the actual leaving-home commute; later classes
         # are typically just a walk across campus, where weather matters
         # far less than a wet trip from home.
         today_starts = [e["start_dt"] for e in events if e.get("start_dt") and e["start_dt"].date() == now.date()]
@@ -154,7 +155,7 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                 weather_line = ""
                 if is_first_of_day and first_class_weather:
                     if first_class_weather["is_wet"]:
-                        weather_line = f"\n{first_class_weather['emoji']} {first_class_weather['description'].capitalize()} expected — grab an umbrella and leave a bit early!"
+                        weather_line = f"\n{first_class_weather['emoji']} {first_class_weather['description'].capitalize()} expected – grab an umbrella and leave a bit early!"
                     else:
                         weather_line = f"\n{first_class_weather['emoji']} {first_class_weather['description'].capitalize()} out there, should be a fine walk over."
                 text = (
@@ -221,20 +222,20 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
         if len(new_cache) != len(reminders):
             updated = True
         if updated:
-            save_reminders_cache(new_cache)
+            save_reminders_cache(new_cache, user_id=chat_id)
     except Exception as e:
         logging.error("❌ Error in check_calendar_reminders: %s", e)
 
 
 # ── Calendar, Schedule & Activity Stream helpers ──────────────────────────────
 
-async def fetch_user_schedule_api(timestamp: Optional[int] = None) -> list[dict]:
+async def fetch_user_schedule_api(timestamp: Optional[int] = None, user_id: Optional[int] = None, session: Optional[object] = None) -> list[dict]:
     """Fetch the user's weekly semester timetable (`/users/{id}/schedule`) via JSON:API.
     Note: `/schedule` does not accept `page[limit]`, so we call `studip_api_get` directly.
     """
-    uid = await studip_api_user_id()
+    uid = await studip_api_user_id(session=session, user_id=user_id)
     params = {"filter[timestamp]": int(timestamp)} if timestamp else None
-    payload = await studip_api_get(f"/users/{uid}/schedule", params=params)
+    payload = await studip_api_get(f"/users/{uid}/schedule", params=params, session=session, user_id=user_id)
     slots = []
     for item in payload.get("data", []):
         attr = item.get("attributes", {})
@@ -258,19 +259,19 @@ async def fetch_user_schedule_api(timestamp: Optional[int] = None) -> list[dict]
     return slots
 
 
-async def _get_calendar_events_api(week_start, days: int = 7) -> list[dict]:
+async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[int] = None, session: Optional[object] = None) -> list[dict]:
     """Fetch and merge calendar events for `[week_start, week_start + days)` from:
       1. `/users/{id}/schedule` (recurring `seminar-cycle-dates` + schedule entries)
       2. `/courses/{cid}/events` (concrete `course-events` with `is-cancelled`, `location`, `topics`)
       3. `/users/{id}/events` (personal user calendar events)
     """
-    uid = await studip_api_user_id()
+    uid = await studip_api_user_id(session=session, user_id=user_id)
     week_end = week_start + timedelta(days=days)
     mid_dt = datetime.combine(week_start + timedelta(days=max(0, days // 2)), datetime.min.time(), tzinfo=TZ_BERLIN)
     mid_ts = int(mid_dt.timestamp())
     now = datetime.now(TZ_BERLIN)
 
-    schedule_slots = await fetch_user_schedule_api(timestamp=mid_ts)
+    schedule_slots = await fetch_user_schedule_api(timestamp=mid_ts, user_id=user_id, session=session)
 
     # Map (course_id, weekday, start_hm) -> cycle location & recurrence info
     cycle_locs: dict[tuple, str] = {}
@@ -297,7 +298,7 @@ async def _get_calendar_events_api(week_start, days: int = 7) -> list[dict]:
     # 1. Fetch concrete course-events for all schedule courses in parallel
     async def _fetch_course_evs(cid: str) -> tuple[str, list]:
         try:
-            data, _ = await studip_api_get_all(f"/courses/{cid}/events")
+            data, _ = await studip_api_get_all(f"/courses/{cid}/events", session=session, user_id=user_id)
             return cid, data
         except Exception as exc:
             logging.debug("_get_calendar_events_api: /courses/%s/events failed: %s", cid, exc)
@@ -405,7 +406,7 @@ async def _get_calendar_events_api(week_start, days: int = 7) -> list[dict]:
 
     # 3. Personal user events (`/users/{id}/events`)
     try:
-        user_evs, _ = await studip_api_get_all(f"/users/{uid}/events", {"filter[timestamp]": mid_ts})
+        user_evs, _ = await studip_api_get_all(f"/users/{uid}/events", {"filter[timestamp]": mid_ts}, session=session, user_id=user_id)
         for uev in user_evs:
             attr = uev.get("attributes", {})
             start_dt = _api_berlin(attr.get("start"))
@@ -566,13 +567,13 @@ async def _fetch_course_rooms_map(session, cid: str) -> dict:
     return await asyncio.shield(task)
 
 
-async def get_calendar_events(session, week_start, days: int = 7) -> list:
+async def get_calendar_events(session, week_start, days: int = 7, user_id: Optional[int] = None) -> list:
     """Fetch calendar events for `days` days starting at `week_start` natively from Stud.IP.
 
     Retrieves events and cancellations via JSON:API, and enriches room allocations
     from course details. Fully eliminates dependency on external iCal URLs.
     """
-    events = await _get_calendar_events_api(week_start, days=days)
+    events = await _get_calendar_events_api(week_start, days=days, user_id=user_id, session=session)
     if not events:
         return []
 
@@ -716,7 +717,7 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
 
 def _week_tasks_for_range(week_start, week_end) -> list:
     """Return personal tasks due within [week_start, week_end] (inclusive),
-    sorted by due time — regardless of which ALLOWED_USER_IDS entry created
+    sorted by due time -- regardless of which ALLOWED_USER_IDS entry created
     them, same reasoning as prepare_morning_summary's today_tasks (they're the
     same person's other devices)."""
     try:
@@ -1013,12 +1014,14 @@ async def handle_calendar_week(update: Update, context: ContextTypes.DEFAULT_TYP
         week_start = today - timedelta(days=today.weekday())
 
     try:
+        user_id = query.from_user.id
         status_msg = await query.edit_message_text("⏳ Loading schedule...")
         await _show_typing(query)
         stop_evt, anim_task = _start_loading_animation(status_msg, "Loading schedule...")
-        session = state.global_session
+        user_session = get_user_session(user_id)
+        session = user_session or state.global_session
         try:
-            events = await get_calendar_events(session=session, week_start=week_start)
+            events = await get_calendar_events(session=session, week_start=week_start, user_id=user_id)
         finally:
             await _stop_loading_animation(stop_evt, anim_task)
         await send_weekly_calendar(query, events, week_start)
@@ -1028,7 +1031,7 @@ async def handle_calendar_week(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_calendar_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle calendar_today callback — shows the current day's events."""
+    """Handle calendar_today callback -- shows the current day's events."""
     query = update.callback_query
     await query.answer()
 
@@ -1040,11 +1043,12 @@ async def handle_calendar_today(update: Update, context: ContextTypes.DEFAULT_TY
         status_msg = await query.edit_message_text("📅 Fetching today's events...")
         await _show_typing(query)
         stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching today's events...")
-        session = state.global_session
+        user_session = get_user_session(user_id)
+        session = user_session or state.global_session
         today = berlin_now().date()
         week_start = today - timedelta(days=today.weekday())
         try:
-            events = await get_calendar_events(session=session, week_start=week_start)
+            events = await get_calendar_events(session=session, week_start=week_start, user_id=user_id)
         finally:
             await _stop_loading_animation(stop_evt, anim_task)
         await send_daily_calendar(query, events, today, week_start)
@@ -1054,7 +1058,7 @@ async def handle_calendar_today(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_calendar_weekly(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle calendar_weekly callback — shows full week."""
+    """Handle calendar_weekly callback -- shows full week."""
     query = update.callback_query
     await query.answer()
 
@@ -1066,11 +1070,12 @@ async def handle_calendar_weekly(update: Update, context: ContextTypes.DEFAULT_T
         status_msg = await query.edit_message_text("🗓️ Fetching weekly schedule...")
         await _show_typing(query)
         stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching weekly schedule...")
-        session = state.global_session
+        user_session = get_user_session(user_id)
+        session = user_session or state.global_session
         today = berlin_now().date()
         week_start = today - timedelta(days=today.weekday())
         try:
-            events = await get_calendar_events(session=session, week_start=week_start)
+            events = await get_calendar_events(session=session, week_start=week_start, user_id=user_id)
         finally:
             await _stop_loading_animation(stop_evt, anim_task)
         await send_weekly_calendar(query, events, week_start)
@@ -1090,11 +1095,11 @@ _ISO_WEEKDAY_LABELS = {
 }
 
 
-async def build_timetable_text(session=None) -> str:
+async def build_timetable_text(session=None, user_id: Optional[int] = None) -> str:
     """Build a formatted HTML string for the user's recurring semester timetable
     (`/users/{id}/schedule`), enriched with room locations from the current week's
     calendar events when Stud.IP's `/schedule` leaves a room blank."""
-    slots = await fetch_user_schedule_api()
+    slots = await fetch_user_schedule_api(user_id=user_id, session=session)
     if not slots:
         return "🗓️ <b>Semester Timetable (Stundenplan)</b>\n━━━━━━━━━━━━━━━━━\nℹ️ No recurring timetable slots found for the current semester."
 
@@ -1103,7 +1108,7 @@ async def build_timetable_text(session=None) -> str:
     try:
         today = datetime.now(TZ_BERLIN).date()
         week_start = today - timedelta(days=today.weekday())
-        week_evs = await get_calendar_events(session=session or state.global_session, week_start=week_start, days=14)
+        week_evs = await get_calendar_events(session=session or state.global_session, week_start=week_start, days=14, user_id=user_id)
         for ev in week_evs:
             loc = (ev.get("location") or "").strip()
             if not loc:
@@ -1144,7 +1149,7 @@ async def build_timetable_text(session=None) -> str:
 
 
 async def handle_calendar_timetable(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle `calendar_timetable` callback — shows the semester timetable from `/users/{id}/schedule`."""
+    """Handle `calendar_timetable` callback -- shows the semester timetable from `/users/{id}/schedule`."""
     query = update.callback_query
     await query.answer()
 
@@ -1156,8 +1161,10 @@ async def handle_calendar_timetable(update: Update, context: ContextTypes.DEFAUL
         status_msg = await query.edit_message_text("🗓️ Loading semester timetable...")
         await _show_typing(query)
         stop_evt, anim_task = _start_loading_animation(status_msg, "Loading semester timetable...")
+        user_session = get_user_session(user_id)
+        session = user_session or state.global_session
         try:
-            text = await build_timetable_text(session=state.global_session)
+            text = await build_timetable_text(session=session, user_id=user_id)
         finally:
             await _stop_loading_animation(stop_evt, anim_task)
 
@@ -1183,8 +1190,10 @@ async def timetable_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     status_msg = await update.message.reply_text("🗓️ Loading semester timetable...", disable_notification=True)
     stop_evt, anim_task = _start_loading_animation(status_msg, "Loading semester timetable...")
+    user_session = get_user_session(user.id)
+    session = user_session or state.global_session
     try:
-        text = await build_timetable_text(session=state.global_session)
+        text = await build_timetable_text(session=session, user_id=user.id)
     except Exception as e:
         logging.error("timetable_command error: %s", e)
         await status_msg.edit_text(f"❌ Error loading timetable: {str(e)[:200]}")
@@ -1217,13 +1226,15 @@ _ACTIVITY_TYPE_ICONS = {
 }
 
 
-async def fetch_activity_stream_api(limit: int = 20, activity_filter: Optional[str] = None) -> list[dict]:
+async def fetch_activity_stream_api(limit: int = 20, activity_filter: Optional[str] = None, user_id: Optional[int] = None, session: Optional[object] = None) -> list[dict]:
     """Fetch recent activities across all courses via `/users/{id}/activitystream`."""
-    uid = await studip_api_user_id()
+    uid = await studip_api_user_id(session=session, user_id=user_id)
     fetch_limit = max(limit * 3, 40) if activity_filter else limit
     page = await studip_api_get(
         f"/users/{uid}/activitystream",
         params={"page[limit]": min(fetch_limit, 100), "include": "actor,object,context"},
+        session=session,
+        user_id=user_id,
     )
     included_index = {
         (inc.get("type"), inc.get("id")): inc
@@ -1252,8 +1263,9 @@ async def fetch_activity_stream_api(limit: int = 20, activity_filter: Optional[s
 
         actor_name = (actor_inc.get("attributes") or {}).get("formatted-name") or ""
         ctx_title = (ctx_inc.get("attributes") or {}).get("title") or ""
-        if not ctx_title and ctx_ref.get("type") == "courses" and ctx_ref.get("id") in state.courses_map:
-            ctx_title = state.courses_map[ctx_ref["id"]]
+        courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+        if not ctx_title and ctx_ref.get("type") == "courses" and ctx_ref.get("id") in courses_dict:
+            ctx_title = courses_dict[ctx_ref["id"]]
 
         obj_attrs = obj_inc.get("attributes") or {}
         obj_title = (obj_attrs.get("title") or obj_attrs.get("name") or "").strip()
@@ -1282,9 +1294,9 @@ async def fetch_activity_stream_api(limit: int = 20, activity_filter: Optional[s
     return results
 
 
-async def build_activity_stream_text(activity_filter: Optional[str] = None, limit: int = 10) -> tuple[str, InlineKeyboardMarkup]:
+async def build_activity_stream_text(activity_filter: Optional[str] = None, limit: int = 10, user_id: Optional[int] = None, session: Optional[object] = None) -> tuple[str, InlineKeyboardMarkup]:
     """Render the Stud.IP activity stream (`/users/{id}/activitystream`) as HTML + filter buttons."""
-    items = await fetch_activity_stream_api(limit=limit, activity_filter=activity_filter)
+    items = await fetch_activity_stream_api(limit=limit, activity_filter=activity_filter, user_id=user_id, session=session)
     filter_labels = {
         None: "All Activities",
         "documents": "Files & Documents",
@@ -1346,7 +1358,9 @@ async def handle_activity_stream(update: Update, context: ContextTypes.DEFAULT_T
     activity_filter = parts[1].strip() if len(parts) > 1 and parts[1].strip() else None
 
     try:
-        text, markup = await build_activity_stream_text(activity_filter=activity_filter, limit=10)
+        user_session = get_user_session(user_id)
+        session = user_session or state.global_session
+        text, markup = await build_activity_stream_text(activity_filter=activity_filter, limit=10, user_id=user_id, session=session)
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     except Exception as e:
         if "Message is not modified" in str(e):
@@ -1362,8 +1376,10 @@ async def activity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     status_msg = await update.message.reply_text("⚡ Loading Stud.IP activity stream...", disable_notification=True)
     stop_evt, anim_task = _start_loading_animation(status_msg, "Loading Stud.IP activity stream...")
+    user_session = get_user_session(user.id)
+    session = user_session or state.global_session
     try:
-        text, markup = await build_activity_stream_text(activity_filter=None, limit=10)
+        text, markup = await build_activity_stream_text(activity_filter=None, limit=10, user_id=user.id, session=session)
     except Exception as e:
         logging.error("activity_command error: %s", e)
         await status_msg.edit_text(f"❌ Error loading activity stream: {str(e)[:200]}")
@@ -1595,7 +1611,7 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
             end_dt = datetime.fromisoformat(e["end_date"])
             if end_dt.tzinfo is None:
                 end_dt = end_dt.replace(tzinfo=TZ_BERLIN)
-            items.append((end_dt, f"🔴 <b>Registration closes:</b> {e['title']} — {_format_relative(end_dt, now, show_time=False)}"))
+            items.append((end_dt, f"🔴 <b>Registration closes:</b> {e['title']} – {_format_relative(end_dt, now, show_time=False)}"))
     except Exception as e:
         logging.warning("Upcoming dashboard: exam registration fetch failed: %s", e)
 
@@ -1612,7 +1628,7 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
                     dt = dt.replace(tzinfo=TZ_BERLIN)
             else:
                 dt = datetime(exam_date.year, exam_date.month, exam_date.day, tzinfo=TZ_BERLIN)
-            items.append((dt, f"📚 <b>Exam:</b> {e['title']} — {_format_relative(dt, now)}"))
+            items.append((dt, f"📚 <b>Exam:</b> {e['title']} – {_format_relative(dt, now)}"))
     except Exception as e:
         logging.warning("Upcoming dashboard: exam date fetch failed: %s", e)
 
@@ -1623,7 +1639,7 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
         course_suffix = f" [{t['course']}]" if t.get("course") else ""
         if t.get("due_time"):
             dt = datetime.fromisoformat(t["due_time"])
-            items.append((dt, f"✅ <b>Task:</b> {t['text']}{course_suffix} — {_format_relative(dt, now)}"))
+            items.append((dt, f"✅ <b>Task:</b> {t['text']}{course_suffix} – {_format_relative(dt, now)}"))
         else:
             todos.append(f"{t['text']}{course_suffix}")
 
@@ -1644,7 +1660,7 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
 
 
 async def handle_upcoming_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle upcoming_dashboard callback — one combined, chronologically-sorted
+    """Handle upcoming_dashboard callback -- one combined, chronologically-sorted
     view of exam registration deadlines, exam dates, and personal task reminders."""
     query = update.callback_query
     await query.answer()
@@ -1684,7 +1700,7 @@ async def schedule_fastenroll_job(chat_id: int, sem_id: str, target_time_str: st
 
     # The bot logs into a single shared Stud.IP account regardless of which
     # Telegram chat is talking to it, so the same course must not be scheduled
-    # twice from two different chats — that would fire two redundant enrollment
+    # twice from two different chats -- that would fire two redundant enrollment
     # attempts at the same instant.
     all_pending = load_pending()
     for other_chat_id_str, other_jobs in all_pending.items():

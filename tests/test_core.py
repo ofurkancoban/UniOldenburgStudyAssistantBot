@@ -540,6 +540,61 @@ class MultiUserSessionTests(unittest.TestCase):
             asyncio.run(handle_admin_callbacks(update, None))
             self.assertNotIn(6001, self.state.user_sessions)
 
+    def test_per_user_study_progress_and_tracked_isolation(self):
+        from unibot.study_plan import load_study_progress, save_study_progress, _auto_tracked_cids
+
+        p1 = load_study_progress(user_id=7001)
+        p1["tracked"] = ["course_algo"]
+        p1["studied"] = {"course_algo": ["lecture1.pdf"]}
+        save_study_progress(p1, user_id=7001)
+
+        p2 = load_study_progress(user_id=7002)
+        p2["tracked"] = ["course_os"]
+        p2["studied"] = {"course_os": ["slide1.pdf", "slide2.pdf"]}
+        save_study_progress(p2, user_id=7002)
+
+        loaded_p1 = load_study_progress(user_id=7001)
+        loaded_p2 = load_study_progress(user_id=7002)
+
+        self.assertEqual(loaded_p1["tracked"], ["course_algo"])
+        self.assertEqual(loaded_p2["tracked"], ["course_os"])
+        self.assertEqual(loaded_p1["studied"]["course_algo"], ["lecture1.pdf"])
+        self.assertEqual(loaded_p2["studied"]["course_os"], ["slide1.pdf", "slide2.pdf"])
+        self.assertNotIn("course_os", loaded_p1["studied"])
+
+    def test_broadcast_cid_filtering(self):
+        from unibot.telegram_ui import broadcast
+        from unibot import state
+
+        bot = mock.AsyncMock()
+        self.db.upsert_user(8001, role="student", username="math_student", is_active=1)
+        self.db.upsert_user(8002, role="student", username="cs_student", is_active=1)
+
+        state.user_courses_map[8001] = {"math_101": "Mathematics"}
+        state.user_courses_map[8002] = {"cs_101": "Computer Science"}
+
+        with mock.patch("unibot.telegram_ui.ALLOWED_USER_IDS", [9999]):
+            asyncio.run(broadcast(bot, "New Announcement in Math", cid="math_101"))
+
+            sent_to = [call.kwargs.get("chat_id") or call.args[0] if call.args else call.kwargs.get("chat_id") for call in bot.send_message.call_args_list]
+            self.assertIn(9999, sent_to)  # Admin always gets alerts
+            self.assertIn(8001, sent_to)  # Math student gets alert
+            self.assertNotIn(8002, sent_to)  # CS student does not
+
+    def test_per_user_reminders_cache_isolation(self):
+        from unibot.storage import load_reminders_cache, save_reminders_cache
+
+        save_reminders_cache({"Math|12345": 1700000000}, user_id=8001)
+        save_reminders_cache({"CS|67890": 1700000000}, user_id=8002)
+
+        r1 = load_reminders_cache(user_id=8001)
+        r2 = load_reminders_cache(user_id=8002)
+
+        self.assertIn("Math|12345", r1)
+        self.assertNotIn("Math|12345", r2)
+        self.assertIn("CS|67890", r2)
+        self.assertNotIn("CS|67890", r1)
+
 
 if __name__ == "__main__":
     unittest.main()

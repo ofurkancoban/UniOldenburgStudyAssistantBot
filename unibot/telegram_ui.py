@@ -18,7 +18,7 @@ from telegram.error import TelegramError
 
 from studip_utils import md_escape as _md, safe_filename as _safe_filename
 
-from unibot import db
+from unibot import db, state
 from unibot.config import ALLOWED_USER_IDS
 
 
@@ -55,13 +55,40 @@ async def _send_file_bytes(message, content: bytes, fname: str, sid: str, captio
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 # ── broadcast helper ──────────────────────────────────────────────────────────
-async def broadcast(bot, text, parse_mode="HTML", disable_notification=True, reply_markup=None):
-    """Send a message to all allowed and active users with optional reply markup."""
+async def broadcast(
+    bot,
+    text,
+    parse_mode="HTML",
+    disable_notification=True,
+    reply_markup=None,
+    cid: Optional[str] = None,
+):
+    """Send a message to allowed and active users with optional reply markup.
+    If cid is provided, filters recipients to students enrolled in or tracking that course,
+    plus primary administrators.
+    """
     targets = set(ALLOWED_USER_IDS)
     try:
         for u in db.get_all_users():
-            if u.get("is_active", 1):
-                targets.add(u["telegram_id"])
+            if not u.get("is_active", 1):
+                continue
+            uid = u["telegram_id"]
+            if uid in ALLOWED_USER_IDS:
+                targets.add(uid)
+                continue
+            if cid is not None:
+                user_courses = state.user_courses_map.get(uid, {})
+                if cid in user_courses:
+                    targets.add(uid)
+                    continue
+                progress_key = f"study_progress_{uid}.json"
+                if db.exists(progress_key):
+                    prog = db.load(progress_key)
+                    if cid in (prog.get("tracked") or []):
+                        targets.add(uid)
+                        continue
+                continue
+            targets.add(uid)
     except Exception:
         pass
     for uid in targets:
@@ -80,11 +107,11 @@ async def broadcast(bot, text, parse_mode="HTML", disable_notification=True, rep
 
 async def _show_typing(sender, action=ChatAction.TYPING):
     """Show one of Telegram's native chat-action animations in the relevant
-    chat before a slow operation — "typing..." by default (a network fetch,
+    chat before a slow operation - "typing..." by default (a network fetch,
     a page scrape, ...), or a more specific one like ChatAction.UPLOAD_DOCUMENT
     where that's what's actually about to happen (a file/ZIP is being sent).
-    Works with either a Message or a CallbackQuery — both expose get_bot()
-    and a way to reach the chat (.chat / .message.chat) — so callers don't
+    Works with either a Message or a CallbackQuery - both expose get_bot()
+    and a way to reach the chat (.chat / .message.chat) - so callers don't
     need to know which one they were handed. Best-effort: never raises,
     since this is a cosmetic nicety and must not block the actual
     operation."""
@@ -107,7 +134,7 @@ def _start_loading_animation(status_message, base_text: str, frames=LOADING_ANIM
 
     Returns (stop_event, task). MUST be paired with a matching
     `await _stop_loading_animation(stop_event, task)` in a `finally` block
-    BEFORE the caller sends/edits that message with the real result —
+    BEFORE the caller sends/edits that message with the real result -
     otherwise a late animation tick can overwrite real content with a
     stale loading frame. Keep the wrapped span to just the actual slow
     call(s); don't wrap unrelated code after the result is already decided.
@@ -126,7 +153,7 @@ def _start_loading_animation(status_message, base_text: str, frames=LOADING_ANIM
             try:
                 await status_message.edit_text(f"{frames[i % len(frames)]} {base_text}")
             except TelegramError:
-                # Message deleted/unchanged/whatever — stop rather than spam retries.
+                # Message deleted/unchanged/whatever - stop rather than spam retries.
                 break
 
     return stop_event, asyncio.create_task(_loop())
@@ -144,7 +171,7 @@ async def _reply_or_edit(sender, text, reply_markup=None, parse_mode=None):
     """Send text as a new message, or edit sender's message in place when
     sender is a CallbackQuery (has edit_message_text). Stepping through a
     semester picker and its resulting list this way reuses one message
-    instead of stacking new ones — stacked messages made it easy to mis-tap a
+    instead of stacking new ones - stacked messages made it easy to mis-tap a
     stale button left over from an earlier list (e.g. picking a new semester
     while the old course list's "Enroll" buttons were still live underneath,
     accidentally enrolling from the old list instead).
@@ -198,7 +225,7 @@ def get_main_keyboard():
 
 async def _download_telegram_file(bot, file_id: str) -> Optional[bytes]:
     """Download a Telegram-hosted file (photo) to a transient temp path, read
-    it into memory, then remove the temp file — same disposable-temp-file
+    it into memory, then remove the temp file - same disposable-temp-file
     convention as _pcm_to_ogg_voice's PCM intermediate. Returns None on any
     failure (expired file_id, network error) so callers degrade gracefully."""
     path = os.path.join(tempfile.gettempdir(), f"wardrobe_{uuid.uuid4().hex}.jpg")
