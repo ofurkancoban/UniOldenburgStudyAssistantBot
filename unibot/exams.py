@@ -39,7 +39,7 @@ from unibot import db
 from unibot import state
 from unibot.storage import load_default_semester, single_flight
 from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, broadcast
-from unibot.auth import is_user_allowed, login_studip
+from unibot.auth import get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import BASE_URL, _ensure_watched_courses_map, _parse_file_date_v2, list_courses
 from unibot.ai import _call_openrouter, _extract_json_object
 from unibot.documents import extract_text_from_file_async
@@ -50,10 +50,11 @@ from unibot.monitoring import _format_exam_dates_message
 exam_action_cache = {}  # short_id -> { unit_id, action_type ("anmelden"|"abmelden"), title, ts }
 
 
-async def send_exam_registration_menu(message):
+async def send_exam_registration_menu(message, user_id=None):
     """Show currently open-for-registration and currently-registered exams on
     the StuMS/HISinOne portal, each with a Register/Deregister button."""
-    session = await login_studip()
+    user_sess = get_user_session(user_id) if user_id else None
+    session = user_sess or state.global_session or await login_studip()
 
     try:
         open_exams = await get_open_exam_registrations(session)
@@ -185,7 +186,7 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_examopen_wa_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """First tap on an exam-registration notification's "Forward to WA" button
-    — ask for confirmation with a new message rather than touching the
+    - ask for confirmation with a new message rather than touching the
     notification's own row, so its other two buttons (Register / Don't
     remind me again) stay usable no matter what's tapped first."""
     query = update.callback_query
@@ -238,7 +239,7 @@ async def handle_examopen_wa_confirm(update: Update, context: ContextTypes.DEFAU
 
 async def handle_examopen_mute_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """First tap on an exam-registration notification's "Don't remind me
-    again" button — ask for confirmation with a new message, same reasoning
+    again" button - ask for confirmation with a new message, same reasoning
     as handle_examopen_wa_ask."""
     query = update.callback_query
     await query.answer()
@@ -260,7 +261,7 @@ async def handle_examopen_mute_ask(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_examopen_mute_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add this exam's module code to exam_reminder_cache.json's muted_codes
-    list — check_exam_reminders skips building/sending both the "open" and
+    list - check_exam_reminders skips building/sending both the "open" and
     "closing soon" notifications for any code in that list, but keeps
     tracking it internally so it isn't mistaken for closed."""
     query = update.callback_query
@@ -325,7 +326,8 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
     """Handle `stums_doc|<doc_key>` callback: fetch official PDF from StuMS and send to Telegram."""
     query = update.callback_query
     await query.answer("Fetching document from StuMS...")
-    if not is_user_allowed(query.from_user.id):
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
         return
 
     parts = (query.data or "").split("|", 1)
@@ -341,13 +343,15 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
     )
     stop_evt, anim_task = _start_loading_animation(status_msg, f"Generating {spec['label']}...")
     try:
-        session = state.global_session or await login_studip()
+        user_sess = get_user_session(user_id)
+        session = user_sess or state.global_session or await login_studip()
         pdf_bytes, filename = await download_stums_document(session, doc_key)
     except Exception as exc:
         logging.error("StuMS document download failed for %s: %s", doc_key, exc)
         await _stop_loading_animation(stop_evt, anim_task)
         await status_msg.edit_text(
-            f"❌ Failed to download <b>{html.escape(spec['label'])}</b>:\n<code>{html.escape(str(exc)[:220])}</code>",
+            f"❌ Unable to download <b>{html.escape(spec['label'])}</b> via StuMS:\n"
+            "<i>Official documents require an active StuMS student session. Please check your credentials or access StuMS directly.</i>",
             parse_mode="HTML",
         )
         return
@@ -367,10 +371,22 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
     )
 
 
-async def build_tuition_status_text(session=None) -> tuple[str, InlineKeyboardMarkup]:
+async def build_tuition_status_text(session=None, user_id=None) -> tuple[str, InlineKeyboardMarkup]:
     """Fetch and format the StuMS tuition / semester fee (*Rückmeldung*) status."""
-    sess = session or state.global_session or await login_studip()
-    info = await get_tuition_status(sess)
+    user_sess = get_user_session(user_id) if user_id else None
+    sess = session or user_sess or state.global_session or await login_studip()
+    try:
+        info = await get_tuition_status(sess)
+    except Exception as exc:
+        logging.warning("StuMS tuition status fetch failed: %s", exc)
+        lines = [
+            "💶 <b>Tuition &amp; Semester Fees (Rückmeldung)</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━",
+            "ℹ️ <i>Tuition data could not be retrieved from StuMS at this time.</i>\n"
+            "Please check the official <a href='https://stums.uni-oldenburg.de'>StuMS Portal</a> directly.",
+        ]
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data="tuition_status")]])
+        return "\n".join(lines), kb
 
     lines = [
         "💶 <b>Tuition &amp; Semester Fees (Rückmeldung)</b>",
@@ -412,13 +428,15 @@ async def handle_tuition_status(update: Update, context: ContextTypes.DEFAULT_TY
     """Handle `tuition_status` callback."""
     query = update.callback_query
     await query.answer()
-    if not is_user_allowed(query.from_user.id):
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
         return
 
     status_msg = await query.message.reply_text("💶 Checking StuMS tuition & fee account...")
     stop_evt, anim_task = _start_loading_animation(status_msg, "Checking StuMS tuition & fee account...")
     try:
-        text, kb = await build_tuition_status_text(session=state.global_session)
+        user_sess = get_user_session(user_id)
+        text, kb = await build_tuition_status_text(session=user_sess, user_id=user_id)
     except Exception as exc:
         logging.error("Tuition status error: %s", exc)
         await _stop_loading_animation(stop_evt, anim_task)
@@ -438,7 +456,7 @@ async def tuition_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("💶 Checking StuMS tuition & fee account...", disable_notification=True)
     stop_evt, anim_task = _start_loading_animation(status_msg, "Checking StuMS tuition & fee account...")
     try:
-        text, kb = await build_tuition_status_text(session=state.global_session)
+        text, kb = await build_tuition_status_text(session=get_user_session(user.id), user_id=user.id)
     except Exception as exc:
         logging.error("tuition_command error: %s", exc)
         await status_msg.edit_text(f"❌ Error checking tuition status:\n<code>{html.escape(str(exc)[:220])}</code>", parse_mode="HTML")
@@ -533,7 +551,7 @@ async def get_course_module_codes(session, cids: list) -> dict:
 
 
 async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle exam_dates_list callback — shows upcoming exam dates for the courses
+    """Handle exam_dates_list callback - shows upcoming exam dates for the courses
     the student is currently enrolled in on Stud.IP, with each exam's registration
     status, skipping any dates that have already passed."""
     query = update.callback_query
@@ -548,8 +566,9 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
     stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching your exam dates... this may take a moment.")
 
     try:
-        session = await login_studip()
-        courses = await list_courses()
+        user_sess = get_user_session(user_id)
+        session = user_sess or state.global_session or await login_studip()
+        courses = await list_courses(user_id=user_id)
         module_codes = await get_my_module_codes(session, courses)
         exams = await get_all_exam_dates(session)
     except Exception as e:
@@ -598,7 +617,7 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle exam_dates_all callback — shows every upcoming exam date across the
+    """Handle exam_dates_all callback - shows every upcoming exam date across the
     whole curriculum (registered or not), with each exam's registration status,
     skipping any dates that have already passed."""
     query = update.callback_query
@@ -613,7 +632,8 @@ async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TY
     stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching all exam dates... this may take a moment.")
 
     try:
-        session = await login_studip()
+        user_sess = get_user_session(user_id)
+        session = user_sess or state.global_session or await login_studip()
         exams = await get_all_exam_dates(session)
     except Exception as e:
         logging.error("All exam dates error: %s", e)
@@ -636,7 +656,7 @@ async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle transcript_summary callback — shows a weighted-average grade and
+    """Handle transcript_summary callback - shows a weighted-average grade and
     credit total computed from "My achievements" (Notenspiegel). No WA-forward
     button: this is personal grade data."""
     query = update.callback_query
@@ -651,11 +671,15 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
     stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching your transcript...")
 
     try:
-        session = await login_studip()
+        user_sess = get_user_session(user_id)
+        session = user_sess or state.global_session or await login_studip()
         grades = await get_grades(session)
     except Exception as e:
         logging.error("Transcript summary error: %s", e)
-        await query.message.reply_text(f"❌ Error loading transcript: {str(e)[:200]}")
+        await query.message.reply_text(
+            "❌ Unable to load transcript from StuMS.\n"
+            "<i>Your account session may need to be refreshed or StuMS may be temporarily unreachable.</i>"
+        )
         return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
@@ -663,7 +687,7 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
     summary = compute_transcript_summary(grades)
 
     lines = ["📜 <b>Transcript Summary</b>", "━━━━━━━━━━━━━━━━━"]
-    gpa_text = summary["gpa"] if summary["gpa"] is not None else "—"
+    gpa_text = summary["gpa"] if summary["gpa"] is not None else "-"
     lines.append(f"📊 <b>Weighted Average Grade:</b> {gpa_text}")
     lines.append(f"🎓 <b>Total Credits Earned:</b> {summary['total_credits']}")
     lines.append(f"✅ <b>Passed:</b> {len(summary['passed'])} module(s)")
@@ -671,16 +695,16 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
     lines.append("━━━━━━━━━━━━━━━━━")
 
     for item in summary["passed"]:
-        lines.append(f"✅ {item['title']} — {item['grade']} ({item['credits']} ECTS)")
+        lines.append(f"✅ {item['title']} - {item['grade']} ({item['credits']} ECTS)")
     for item in summary["failed"]:
-        grade_part = f" — {item['grade']}" if item.get("grade") else ""
+        grade_part = f" - {item['grade']}" if item.get("grade") else ""
         lines.append(f"❌ {item['title']}{grade_part}")
 
     if not summary["passed"] and not summary["failed"]:
         lines.append("ℹ️ No finalized results yet.")
 
     lines.append("━━━━━━━━━━━━━━━━━")
-    lines.append("<i>Approximate — not an official transcript.</i>")
+    lines.append("<i>Approximate - not an official transcript.</i>")
 
     await _send_exam_dates_chunks(query.message, lines)
 
@@ -699,7 +723,7 @@ async def exams_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _show_typing(message)
     stop_evt, anim_task = _start_loading_animation(status_msg, "Loading exams...")
     try:
-        await send_exam_registration_menu(message)
+        await send_exam_registration_menu(message, user_id=user_id)
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
     try:

@@ -21,6 +21,7 @@ import studip_oauth
 from studip_utils import TZ_BERLIN, berlin_now
 
 from unibot import db, state
+from unibot.telegram_ui import broadcast
 from unibot.config import (
     ALLOWED_USER_IDS,
     PROJECT_ROOT,
@@ -454,14 +455,45 @@ def _build_admin_overview_view() -> tuple[str, InlineKeyboardMarkup]:
         ],
         [
             InlineKeyboardButton("➕ New Invite Code", callback_data="admin_new_invite"),
-            InlineKeyboardButton("⚡ System Health", callback_data="admin_system_health"),
+            InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast_prompt"),
         ],
         [
+            InlineKeyboardButton("⚡ System Health", callback_data="admin_system_health"),
             InlineKeyboardButton("🔄 Refresh", callback_data="admin_menu"),
+        ],
+        [
             InlineKeyboardButton("♻️ Restart Bot", callback_data="admin_restart_prompt"),
         ],
     ]
     return text, InlineKeyboardMarkup(keyboard)
+
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Broadcast an announcement to all registered students (Admin only)."""
+    user = update.effective_user
+    if not user or not is_user_admin(user.id):
+        await update.message.reply_text("⛔ This command is restricted to administrators.")
+        return
+
+    text = " ".join(context.args).strip() if context.args else ""
+    if text:
+        announcement = (
+            "📢 <b>Announcement from Administrator</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"{html.escape(text)}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "<i>Sent to all registered students.</i>"
+        )
+        await broadcast(context.bot, announcement, parse_mode="HTML", disable_notification=False)
+        await update.message.reply_text("✅ Announcement broadcasted to all active students.", parse_mode="HTML")
+    else:
+        context.user_data["pending_step"] = "admin_broadcast_text"
+        await update.message.reply_text(
+            "📢 <b>Broadcast Announcement</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Please send the message you wish to broadcast to all registered students (or send /cancel):",
+            parse_mode="HTML",
+        )
 
 
 async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -655,6 +687,19 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             [InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="admin_menu")],
         ]
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    if data == "admin_broadcast_prompt":
+        context.user_data["pending_step"] = "admin_broadcast_text"
+        keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="admin_menu")]]
+        await query.edit_message_text(
+            "📢 <b>Broadcast Announcement</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "Please send the message you wish to broadcast to all registered students:\n\n"
+            "<i>Type your announcement in chat or tap Cancel below.</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
         return
 
     if data == "admin_system_health":

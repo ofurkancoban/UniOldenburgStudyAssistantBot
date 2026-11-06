@@ -20,14 +20,14 @@ from studip_utils import TZ_BERLIN
 
 from unibot.storage import load_tasks, save_tasks
 from unibot.telegram_ui import get_main_keyboard
-from unibot.auth import is_user_allowed, login_studip
+from unibot.auth import get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import list_courses
 from unibot.ai import _call_openrouter, _extract_json_object
 from unibot.schedule import fastenroll_tasks
 from unibot.monitoring import announcement_task_cache, task_suggestion_cache
 
 
-task_reminder_cache = {}  # task_id -> full task dict — a fired reminder, kept around so its Done/Snooze buttons still work after the task's removed from tasks_cache.json
+task_reminder_cache = {}  # task_id -> full task dict -- a fired reminder, kept around so its Done/Snooze buttons still work after the task's removed from tasks_cache.json
 
 
 async def _run_fastenroll_task(chat_id: int, sem_id: str, target_time_str: str, target_date_str: str, context: ContextTypes.DEFAULT_TYPE):
@@ -182,6 +182,7 @@ async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAUL
             logging.warning("extract_task_from_text failed: %s", e)
             extracted = None
 
+        user_id = update.effective_user.id if update.effective_user else None
         if extracted and extracted.get("due_time"):
             # A date/time was already stated in the same message (e.g.
             # "yarın rapor teslim et saat 15:00'te") - skip the separate
@@ -189,7 +190,7 @@ async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAUL
             state["text"] = extracted["text"]
             state["due_time"] = extracted["due_time"]
             context.user_data.pop("pending_step", None)
-            await _send_task_course_picker(update.effective_message, context)
+            await _send_task_course_picker(update.effective_message, context, user_id=user_id)
             return True
 
         # No date found (or extraction unavailable) - fall back to the
@@ -200,6 +201,7 @@ async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAUL
         return True
 
     if step == "task_time":
+        user_id = update.effective_user.id if update.effective_user else None
         task_text = state.get("text")
         if not task_text:
             context.user_data.pop("task_wizard", None)
@@ -210,23 +212,24 @@ async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAUL
         except ValueError as e:
             await update.effective_message.reply_text(f"⚠️ {e}")
             await update.effective_message.reply_text(TASK_ASK_TIME, reply_markup=get_main_keyboard())
-            return True  # pending_step stays "task_time" — ask again
+            return True  # pending_step stays "task_time" - ask again
 
         # Text and time are set; course tagging is button-driven from here, so
         # the free-text wizard step ends and pending_step is cleared.
         state["due_time"] = due_dt.isoformat() if due_dt else None
         context.user_data.pop("pending_step", None)
-        await _send_task_course_picker(update.effective_message, context)
+        await _send_task_course_picker(update.effective_message, context, user_id=user_id)
         return True
 
     return False
 
 
-async def _send_task_course_picker(message, context: ContextTypes.DEFAULT_TYPE):
+async def _send_task_course_picker(message, context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None):
     """Ask which of the student's currently-enrolled Stud.IP courses (if any)
     this task belongs to, before finally saving it."""
     try:
-        courses = await list_courses()
+        user_sess = get_user_session(user_id) if user_id else None
+        courses = await list_courses(session=user_sess, user_id=user_id)
     except Exception as e:
         logging.warning("Task course picker: failed to fetch courses: %s", e)
         courses = []
@@ -253,7 +256,7 @@ async def handle_task_course_pick(update: Update, context: ContextTypes.DEFAULT_
 
     state = context.user_data.get("task_wizard")
     if not state or "text" not in state:
-        await query.edit_message_text("⚠️ This task setup has expired — please start again with ➕ Add Task.")
+        await query.edit_message_text("⚠️ This task setup has expired -- please start again with ➕ Add Task.")
         return
 
     course_name = None
@@ -280,7 +283,7 @@ async def handle_task_course_pick(update: Update, context: ContextTypes.DEFAULT_
     course_line = f" [{course_name}]" if course_name else ""
     if task["due_time"]:
         due_dt = datetime.fromisoformat(task["due_time"])
-        await query.edit_message_text(f"✅ Reminder set: {due_dt.strftime('%d.%m.%Y %H:%M')} — {task['text']}{course_line}")
+        await query.edit_message_text(f"✅ Reminder set: {due_dt.strftime('%d.%m.%Y %H:%M')} – {task['text']}{course_line}")
     else:
         await query.edit_message_text(f"✅ Task added: {task['text']}{course_line}")
 
@@ -305,12 +308,12 @@ def _save_task_and_confirmation_text(user_id: int, text: str, due_time: Optional
     course_line = f" [{course}]" if course else ""
     if due_time:
         due_dt = datetime.fromisoformat(due_time)
-        return f"✅ Reminder set: {due_dt.strftime('%d.%m.%Y %H:%M')} — {text}{course_line}"
+        return f"✅ Reminder set: {due_dt.strftime('%d.%m.%Y %H:%M')} – {text}{course_line}"
     return f"✅ Task added: {text}{course_line}"
 
 
 async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle tasksug_add|<sid> — save the task the "📝 Add as task?" button
+    """Handle tasksug_add|<sid> -- save the task the "📝 Add as task?" button
     on a new forum notification suggested (see extract_task_suggestion /
     task_suggestion_cache). The course is already known from the source
     post, so this saves directly with no course-picker step, unlike the
@@ -337,7 +340,7 @@ async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAU
 
 
 async def handle_announcement_to_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle ann_to_task|<sid> — the always-present "📝 Add as Task" button
+    """Handle ann_to_task|<sid> - the always-present "📝 Add as Task" button
     on announcement notifications. Unlike the forum suggestion button (pre-
     computed, only shown when a deadline was already detected), this button
     is always there and the LLM conversion (convert_announcement_to_task)
@@ -363,7 +366,7 @@ async def handle_announcement_to_task(update: Update, context: ContextTypes.DEFA
         result = None
 
     if not result:
-        await query.message.reply_text("⚠️ Couldn't convert this to a task right now — try again in a bit, or add it manually via ➕ Add Task.")
+        await query.message.reply_text("⚠️ Couldn't convert this to a task right now - try again in a bit, or add it manually via ➕ Add Task.")
         return
 
     confirmation = _save_task_and_confirmation_text(user_id, result["text"], result.get("due_time"), info["course"])
@@ -418,7 +421,7 @@ def _snooze_offset(code: str) -> timedelta:
 
 async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle task_reminder_done|<id> and task_reminder_snooze|<id>|<code>
-    — the buttons on a fired reminder (see check_task_reminders /
+    - the buttons on a fired reminder (see check_task_reminders /
     task_reminder_cache). Snoozing re-saves the task with a new due_time;
     "Done" just acknowledges, since the task is already gone from the list."""
     query = update.callback_query
@@ -450,10 +453,10 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
     tasks = load_tasks()
     tasks.append(task)
     save_tasks(tasks)
-    await query.message.reply_text(f"⏰ Snoozed — reminding you again at {new_due.strftime('%d.%m.%Y %H:%M')}: {task['text']}")
+    await query.message.reply_text(f"⏰ Snoozed - reminding you again at {new_due.strftime('%d.%m.%Y %H:%M')}: {task['text']}")
 
 
-TASK_SUGGESTION_SYSTEM_PROMPT = """You read one announcement or forum post from a university course and decide whether it mentions a concrete task or deadline the student should be reminded about — a submission deadline, an exam/quiz date, something they need to bring/do/upload by a specific day. Ignore anything with no actionable date (general course info, a topic being "covered later in the semester", opinions, small talk, a reply that doesn't add a new date).
+TASK_SUGGESTION_SYSTEM_PROMPT = """You read one announcement or forum post from a university course and decide whether it mentions a concrete task or deadline the student should be reminded about - a submission deadline, an exam/quiz date, something they need to bring/do/upload by a specific day. Ignore anything with no actionable date (general course info, a topic being "covered later in the semester", opinions, small talk, a reply that doesn't add a new date).
 
 Respond with strict JSON only, no other text: {"has_task": true/false, "task_text": "<short actionable summary in English, e.g. 'Submit problem set 3' or 'Upload presentation slides'>" or null, "due_date": "<YYYY-MM-DD>" or null, "due_time": "<HH:MM 24h>" or null}.
 
@@ -480,7 +483,7 @@ async def extract_task_suggestion(course_name: str, thread_title: Optional[str],
     actionable deadline/task, for the "📝 Add as task?" suggestion button
     on new forum notifications. Returns {"text", "due_time"} (due_time is
     an ISO string or None) on a detected task, or None if no task was
-    found or the call/parse failed — callers should just skip the
+    found or the call/parse failed - callers should just skip the
     suggestion button in that case, never treat it as an error."""
     today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
     user_text = f"Today is {today_str}.\nCourse: {course_name}\n" + (f"Thread: {thread_title}\n" if thread_title else "") + f"\n{body_text}"
@@ -491,9 +494,9 @@ async def extract_task_suggestion(course_name: str, thread_title: Optional[str],
     return {"text": str(parsed["task_text"])[:200], "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
 
 
-ANNOUNCEMENT_TO_TASK_SYSTEM_PROMPT = """You convert a university course announcement into a short, actionable personal to-do for the student reading it — rephrase it in task language ("Review ...", "Submit ...", "Prepare ...", "Read ...", "Bring ...") rather than restating the announcement. Always produce a task_text, even for a purely informational announcement with no deadline (e.g. "Review posted lecture slides for <course>") — this button is tapped deliberately by the student, so there's always something reasonable to turn it into.
+ANNOUNCEMENT_TO_TASK_SYSTEM_PROMPT = """You convert a university course announcement into a short, actionable personal to-do for the student reading it - rephrase it in task language ("Review ...", "Submit ...", "Prepare ...", "Read ...", "Bring ...") rather than restating the announcement. Always produce a task_text, even for a purely informational announcement with no deadline (e.g. "Review posted lecture slides for <course>") - this button is tapped deliberately by the student, so there's always something reasonable to turn it into.
 
-If the announcement clearly mentions a concrete date/deadline (a submission date, an exam date, a specific day something is due), extract it; otherwise leave due_date/due_time null — not every announcement has one, and that's fine, it just becomes a plain to-do with no reminder time.
+If the announcement clearly mentions a concrete date/deadline (a submission date, an exam date, a specific day something is due), extract it; otherwise leave due_date/due_time null - not every announcement has one, and that's fine, it just becomes a plain to-do with no reminder time.
 
 Respond with strict JSON only, no other text: {"task_text": "<short actionable task>", "due_date": "<YYYY-MM-DD>" or null, "due_time": "<HH:MM 24h>" or null}. Resolve relative dates ("by Friday", "next Monday") against today's date, which you're given in the prompt."""
 
@@ -502,7 +505,7 @@ async def convert_announcement_to_task(course_name: str, subject: Optional[str],
     """Ask the LLM to rephrase an announcement as a task, for the always-
     present "📝 Add as Task" button on announcement notifications (unlike
     extract_task_suggestion, this doesn't gate on whether a deadline was
-    found — it's only called when the student deliberately taps the
+    found - it's only called when the student deliberately taps the
     button, so it always tries to produce something). Returns
     {"text", "due_time"}, or None if the call/parse failed."""
     today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
@@ -514,22 +517,22 @@ async def convert_announcement_to_task(course_name: str, subject: Optional[str],
     return {"text": str(parsed["task_text"])[:200], "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
 
 
-TASK_FROM_TEXT_SYSTEM_PROMPT = """You read a person's own task/to-do request (typed or spoken, Turkish or English) for a university assistant bot's task list, and extract a clean task description plus a due date/time — but only if they actually stated one in the same sentence.
+TASK_FROM_TEXT_SYSTEM_PROMPT = """You read a person's own task/to-do request (typed or spoken, Turkish or English) for a university assistant bot's task list, and extract a clean task description plus a due date/time - but only if they actually stated one in the same sentence.
 
-Respond with strict JSON only, no other text: {"task_text": "<short, clean task description, same language as the request, just tidied up — e.g. 'yarın rapor teslim et' -> 'Rapor teslim et', 'add a task submit the report tomorrow' -> 'Submit the report'>", "due_date": "<YYYY-MM-DD>" or null, "due_time": "<HH:MM 24h>" or null}.
+Respond with strict JSON only, no other text: {"task_text": "<short, clean task description, same language as the request, just tidied up - e.g. 'yarın rapor teslim et' -> 'Rapor teslim et', 'add a task submit the report tomorrow' -> 'Submit the report'>", "due_date": "<YYYY-MM-DD>" or null, "due_time": "<HH:MM 24h>" or null}.
 
-due_date/due_time are ONLY set if the person stated an actual date/time themselves (e.g. "tomorrow", "yarın 15:00", "next Friday", "20 Ekim", "in 3 days"); if they only described the task with no date at all, both must be null — never invent one. Resolve relative dates against today's date, given in the prompt."""
+due_date/due_time are ONLY set if the person stated an actual date/time themselves (e.g. "tomorrow", "yarın 15:00", "next Friday", "20 Ekim", "in 3 days"); if they only described the task with no date at all, both must be null - never invent one. Resolve relative dates against today's date, given in the prompt."""
 
 
 async def extract_task_from_text(text: str) -> Optional[dict]:
     """Ask the LLM to clean up a task description and pull out a due
     date/time if one was actually stated in the same sentence (e.g. "yarın
-    rapor teslim et saat 15:00'te") — lets task creation (voice or typed,
+    rapor teslim et saat 15:00'te") - lets task creation (voice or typed,
     see _handle_task_wizard_reply's "task_text" step) skip the separate
     "when is this due?" question when the date was already given upfront,
     the same way create_exam_reminder_task already resolves an exam's date
     in one shot instead of asking a follow-up. Returns {"text", "due_time"}
-    (due_time ISO or None), or None on any failure — callers should fall
+    (due_time ISO or None), or None on any failure - callers should fall
     back to the existing explicit ask-for-time step in that case."""
     today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
     raw = await _call_openrouter(TASK_FROM_TEXT_SYSTEM_PROMPT, f"Today is {today_str}.\n\n{text}")
@@ -559,7 +562,7 @@ Respond with strict JSON only, no other text: {"course_query": "<name or null>",
 async def extract_exam_reminder_task(transcript: str) -> dict:
     """Extract {"course_query", "offset_value", "offset_unit"} from a spoken
     "remind me about <exam> N days/hours before" request. Falls back to all
-    None/"days" on any failure — the caller must treat missing course_query or
+    None/"days" on any failure - the caller must treat missing course_query or
     offset_value as "couldn't understand" rather than guessing."""
     raw = await _call_openrouter(EXAM_REMINDER_TASK_SYSTEM_PROMPT, transcript)
     parsed = _extract_json_object(raw)

@@ -165,6 +165,7 @@ from unibot.morning import handle_calendar_today_voice, handle_calendar_weekly_v
 from unibot.voice import handle_photo_message, handle_voice_clarify, handle_voice_confirm, handle_voice_reject
 from unibot.system import (
     admin_command,
+    broadcast_command,
     handle_admin_callbacks,
     healthcheck_command,
     invite_command,
@@ -276,6 +277,7 @@ def register_handlers(app) -> None:
     app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("invite", invite_command))
+    app.add_handler(CommandHandler("broadcast", broadcast_command))
     
     app.add_handler(CallbackQueryHandler(handle_admin_callbacks, pattern="^admin_.*$"))
     app.add_handler(CallbackQueryHandler(show_last_messages, pattern="^show_last_messages$"))

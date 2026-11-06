@@ -46,10 +46,11 @@ from unibot.telegram_ui import (
     _show_typing,
     _start_loading_animation,
     _stop_loading_animation,
+    broadcast,
     get_main_keyboard,
     nav_names,
 )
-from unibot.auth import _perform_logout, _send_login_prompt, is_user_allowed, login_studip
+from unibot.auth import _perform_logout, _send_login_prompt, get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import (
     _api_message,
     _api_names,
@@ -273,8 +274,16 @@ async def _show_semester_picker(sender, callback_prefix: str, prompt: str):
     "<callback_prefix>|<semester_id>". Shared by the three "browse" entry
     points (Files/Enroll/Sign Out) for their initial pick, and by the
     "📆 Change Semester" button they each offer afterwards to override it."""
+    uid = None
+    if hasattr(sender, "from_user") and sender.from_user:
+        uid = sender.from_user.id
+    elif hasattr(sender, "effective_user") and sender.effective_user:
+        uid = sender.effective_user.id
     try:
-        session = await login_studip()
+        user_sess = get_user_session(uid) if uid else None
+        session = user_sess or state.global_session
+        if not session or not await session.is_logged_in():
+            session = await login_studip(user_id=uid)
         semesters = await get_semester_options(session)
     except Exception as e:
         logging.error("_show_semester_picker: failed to fetch semesters: %s", e)
@@ -299,7 +308,8 @@ async def _render_files_courses_for_semester(sender, semester_id: str):
     elif hasattr(sender, "effective_user") and sender.effective_user:
         uid = sender.effective_user.id
     try:
-        courses = await list_courses(semester_id=semester_id, user_id=uid)
+        user_sess = get_user_session(uid) if uid else None
+        courses = await list_courses(semester_id=semester_id, session=user_sess, user_id=uid)
     except Exception as e:
         logging.error("_render_files_courses_for_semester: failed to fetch courses: %s", e)
         await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
@@ -674,7 +684,8 @@ async def _selection_course(update, context, query, data, user_id):
     root_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
     nav_stack[user_id] = [root_url]
     nav_names[user_id] = [course_name]
-    files = await list_files(cid, root_url)
+    user_sess = get_user_session(user_id)
+    files = await list_files(cid, root_url, session=user_sess, user_id=user_id)
     await send_folder(query, files, cid, user_id, current_url=root_url)
 
 
@@ -691,21 +702,22 @@ async def _selection_folder(update, context, query, data, user_id):
         await query.message.reply_text("⚠️ Folder link not found or expired.")
         return
 
-    # URL'yi normalize et
+    # Normalize URL
     folder_url = _normalize_url(folder_url)
 
     # Update cache (refresh TTL)
     link_cache[sid] = {
         **info,
         "ts": time.time(),
-        "url": folder_url  # normalized URL'yi kaydet
+        "url": folder_url
     }
     cleanup_link_cache()
 
     nav_stack.setdefault(user_id, []).append(folder_url)
     nav_names.setdefault(user_id, []).append(folder_name)
 
-    files = await list_files(cid, folder_url)
+    user_sess = get_user_session(user_id)
+    files = await list_files(cid, folder_url, session=user_sess, user_id=user_id)
     await send_folder(query, files, cid, user_id, current_url=folder_url)
 
 
@@ -724,16 +736,18 @@ async def _selection_file(update, context, query, data, user_id):
         logging.error("❌ Invalid file reference: cid=%s, fname=%s", cid, fname)
         return
 
-    # Mevcut URL'yi kontrol et (watch fonksiyonundan geliyorsa)
+    # Check cached or current URL
     temp_url = info.get("url")
     current_url = info.get("current_url")
+    user_sess = get_user_session(user_id)
+    active_session = user_sess or state.global_session
 
     # Try cached URL first
     if temp_url:
         logging.info("🔄 Trying cached URL: %s", redact_url(temp_url))
         await _show_typing(query, action=ChatAction.UPLOAD_DOCUMENT)
         try:
-            async with await state.global_session.get(temp_url) as resp:
+            async with await active_session.get(temp_url) as resp:
                 if resp.status == 200:
                     content = await resp.read()
                     if len(content) > 48 * 1024 * 1024:
@@ -760,7 +774,7 @@ async def _selection_file(update, context, query, data, user_id):
     stop_evt, anim_task = _start_loading_animation(status_msg, f"Getting fresh download link for:\n📄 {fname}")
 
     try:
-        url = await get_fresh_file_url(cid, fname, current_url)
+        url = await get_fresh_file_url(cid, fname, current_url, session=user_sess, user_id=user_id)
         if not url:
             await query.message.reply_text(f"⚠️ Could not get download link for:\n{fname}")
             logging.error("❌ No download URL found for: %s", fname)
@@ -776,7 +790,7 @@ async def _selection_file(update, context, query, data, user_id):
         cleanup_link_cache()
 
         try:
-            async with await state.global_session.get(url) as resp:
+            async with await active_session.get(url) as resp:
                 if resp.status != 200:
                     await query.message.reply_text(f"⚠️ Download failed (HTTP {resp.status}).")
                     logging.error("❌ Download failed: HTTP %s for %s", resp.status, redact_url(url))
@@ -819,18 +833,21 @@ async def _selection_nav(update, context, query, data, user_id):
             root_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
             nav_stack[user_id] = [root_url]
             nav_names[user_id] = [state.courses_map.get(cid, f"Course {cid[:6]}")]
-            files = await list_files(cid, root_url)
+            user_sess = get_user_session(user_id)
+            files = await list_files(cid, root_url, session=user_sess, user_id=user_id)
             await send_folder(query, files, cid, user_id, current_url=root_url)
 
     elif action == "home":
         root_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
         nav_stack[user_id] = [root_url]
         nav_names[user_id] = [state.courses_map.get(cid, f"Course {cid[:6]}")]
-        files = await list_files(cid, root_url)
+        user_sess = get_user_session(user_id)
+        files = await list_files(cid, root_url, session=user_sess, user_id=user_id)
         await send_folder(query, files, cid, user_id, current_url=root_url)
 
     elif action == "courses":
-        courses = await list_courses(user_id=user_id)
+        user_sess = get_user_session(user_id)
+        courses = await list_courses(session=user_sess, user_id=user_id)
         await _send_courses_menu(query, courses)
 
     elif action == "zip":
@@ -852,8 +869,10 @@ async def _selection_nav(update, context, query, data, user_id):
             except TelegramError:
                 pass
 
+        user_sess = get_user_session(user_id)
         buf, total, folder_name, success_count, total_size = await create_recursive_zip(
-            cid, current_url, root_name=root_name, progress_callback=progress
+            cid, current_url, root_name=root_name, progress_callback=progress,
+            session=user_sess, user_id=user_id,
         )
 
         if total == 0:
@@ -936,14 +955,16 @@ async def _selection_message(update, context, query, data, user_id):
     try:
         logging.info("📨 Opening message ID %s via direct URL...", msg_id)
 
+        user_sess = get_user_session(user_id)
         try:
-            page = await studip_api_get(f"/messages/{msg_id}", {"include": "sender"})
+            page = await studip_api_get(f"/messages/{msg_id}", {"include": "sender"}, session=user_sess, user_id=user_id)
             msg = _api_message(page["data"], _api_names(page.get("included", [])))
             subject, sender_name, date_str, content = msg["title"], msg["sender"], msg["date"], msg["body"]
         except Exception as api_err:
             logging.warning("Message %s: API failed (%s), reading the HTML page", msg_id, api_err)
             msg_url = f"https://elearning.uni-oldenburg.de/dispatch.php/messages/read/{msg_id}/rec"
-            async with await state.global_session.get(msg_url) as resp:
+            active_session = user_sess or state.global_session
+            async with await active_session.get(msg_url) as resp:
                 html = await resp.text()
 
             # lxml, not html.parser - see the comment in check_new_announcements_parallel
@@ -1131,6 +1152,27 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
             await status_msg.edit_text(f"❌ Failed to send reply on Stud.IP:\n<code>{html.escape(str(exc)[:200])}</code>", parse_mode="HTML")
         return True
 
+    if step == "admin_broadcast_text":
+        context.user_data.pop("pending_step", None)
+        msg_text = text.strip()
+        if not msg_text or msg_text.lower() in ("/cancel", "cancel"):
+            await update.effective_message.reply_text("📢 Broadcast cancelled.", reply_markup=get_main_keyboard())
+            return True
+        announcement = (
+            "📢 <b>Announcement from Administrator</b>\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            f"{html.escape(msg_text)}\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "<i>Sent to all registered students.</i>"
+        )
+        await broadcast(context.bot, announcement, parse_mode="HTML", disable_notification=False)
+        await update.effective_message.reply_text(
+            "✅ <b>Broadcast sent successfully!</b>\nAll active students have received your announcement.",
+            parse_mode="HTML",
+            reply_markup=get_main_keyboard(),
+        )
+        return True
+
     # Unknown/stale step - clear it so the user isn't stuck.
     context.user_data.pop("pending_step", None)
     return False
@@ -1207,7 +1249,9 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
                 logging.info("📅 Fetching today's schedule...")
                 today = berlin_now().date()
                 week_start = today - timedelta(days=today.weekday())
-                events = await get_calendar_events(session=state.global_session, week_start=week_start)
+                user_sess = get_user_session(user_id)
+                session = user_sess or state.global_session
+                events = await get_calendar_events(session=session, week_start=week_start, user_id=user_id)
                 await send_daily_calendar(sender, events, today, week_start)
             elif data[0] == "tasks":
                 await send_tasks_menu(sender)

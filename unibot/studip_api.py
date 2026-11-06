@@ -470,7 +470,7 @@ async def _list_courses_api(
     return result
 
 
-async def _list_files_api(cid, folder_url=None) -> list:
+async def _list_files_api(cid, folder_url=None, session=None, user_id=None) -> list:
     """One folder level of a course in list_files' format: the course's root
     folder, or the folder a list_files folder "url" points to."""
     m = _FOLDER_ID_RE.search(folder_url) if folder_url else None
@@ -479,7 +479,7 @@ async def _list_files_api(cid, folder_url=None) -> list:
     elif folder_url and "dispatch.php/course/files" not in folder_url:
         raise StudipApiError(f"no folder id in {folder_url}")
     else:
-        folders, _ = await studip_api_get_all(f"/courses/{cid}/folders")
+        folders, _ = await studip_api_get_all(f"/courses/{cid}/folders", session=session, user_id=user_id)
         root = next((f for f in folders if f["attributes"].get("folder-type") == "RootFolder"), None) \
             or next((f for f in folders if not _api_rel_id(f, "parent")), None)
         if not root:
@@ -491,7 +491,7 @@ async def _list_files_api(cid, folder_url=None) -> list:
         return (dt.strftime("%d.%m.%Y %H:%M"), dt.isoformat()) if dt else ("-", None)
 
     items = []
-    subfolders, _ = await studip_api_get_all(f"/folders/{folder_id}/folders")
+    subfolders, _ = await studip_api_get_all(f"/folders/{folder_id}/folders", session=session, user_id=user_id)
     for f in subfolders:
         modified, modified_iso = stamps(f)
         items.append({
@@ -499,7 +499,7 @@ async def _list_files_api(cid, folder_url=None) -> list:
             "url": f"{BASE_URL}/dispatch.php/course/files/index/{f['id']}?cid={cid}",
             "size": "-", "modified": modified, "modified_iso": modified_iso,
         })
-    file_refs, _ = await studip_api_get_all(f"/folders/{folder_id}/file-refs")
+    file_refs, _ = await studip_api_get_all(f"/folders/{folder_id}/file-refs", session=session, user_id=user_id)
     for f in file_refs:
         modified, modified_iso = stamps(f)
         rs = f["attributes"].get("filesize")
@@ -519,24 +519,25 @@ async def _list_files_api(cid, folder_url=None) -> list:
     return items
 
 
-async def list_files(cid, folder_url=None):
+async def list_files(cid, folder_url=None, session=None, user_id=None):
     """Files and folders of one course folder level (the root folder when
     folder_url is None), via the JSON:API with the HTML file table as
     fallback."""
     try:
-        return await _list_files_api(cid, folder_url)
+        return await _list_files_api(cid, folder_url, session=session, user_id=user_id)
     except Exception as e:
         logging.warning("list_files: API failed for %s (%s), falling back to the HTML page", cid, e)
-    return await _list_files_html(cid, folder_url)
+    return await _list_files_html(cid, folder_url, session=session, user_id=user_id)
 
 
-async def _list_files_html(cid, folder_url=None):
+async def _list_files_html(cid, folder_url=None, session=None, user_id=None):
     """Extract files/folders from Stud.IP file table browser-less."""
     url = _normalize_url(folder_url) if folder_url else f"{BASE_URL}/dispatch.php/course/files?cid={cid}"
     logging.info(">>> list_files called with cid=%s, folder_url=%s => %s", cid, redact_url(folder_url), redact_url(url))
     
+    active_session = session or get_user_session(user_id) or state.global_session
     try:
-        async with await state.global_session.get(url) as resp:
+        async with await active_session.get(url) as resp:
             html_text = await resp.text()
     except Exception as e:
         logging.error("Failed to fetch files: %s", e)
@@ -683,21 +684,20 @@ async def _list_files_html(cid, folder_url=None):
     return items
 
 
-async def get_fresh_file_url(cid, filename, current_url=None):
+async def get_fresh_file_url(cid, filename, current_url=None, session=None, user_id=None):
     """Return a fresh, valid download URL for a given file name browser-less."""
     try:
         logging.info("🔄 Getting fresh URL for: %s in course %s", filename, cid)
         if not current_url:
             current_url = f"{BASE_URL}/dispatch.php/course/files?cid={cid}"
 
-        files = await list_files(cid, current_url)
+        files = await list_files(cid, current_url, session=session, user_id=user_id)
 
         # Find file with exact match
         for f in files:
             if f["type"] == "file" and f["name"] == filename:
                 url = f["url"]
                 if url:
-                    # URL'yi normalize et
                     normalized_url = _normalize_url(url)
                     logging.info("✅ Found URL for %s: %s", filename, redact_url(normalized_url))
                     return normalized_url
@@ -706,7 +706,7 @@ async def get_fresh_file_url(cid, filename, current_url=None):
         logging.info("🔍 File not found in current location, checking root...")
         root_url = f"{BASE_URL}/dispatch.php/course/files?cid={cid}"
         if current_url != root_url:
-            files = await list_files(cid, root_url)
+            files = await list_files(cid, root_url, session=session, user_id=user_id)
 
             for f in files:
                 if f["type"] == "file" and f["name"] == filename:
@@ -725,12 +725,13 @@ async def get_fresh_file_url(cid, filename, current_url=None):
 
 
 # ── recursive ZIP (downloads all files + subfolders) ───────────────────────────
-async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=None):
+async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=None, session=None, user_id=None):
     """Download all files (including subfolders) recursively browser-less."""
+    active_session = session or get_user_session(user_id) or state.global_session
 
     async def _crawl(url, path_prefix, collected, empty_folders):
         try:
-            items = await list_files(cid, url)
+            items = await list_files(cid, url, session=active_session, user_id=user_id)
         except Exception as e:
             logging.warning("Failed to list %s: %s", path_prefix, e)
             return
@@ -776,9 +777,8 @@ async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=
                 continue
 
             try:
-                # Normalize URL just in case
                 file_url = _normalize_url(file_url)
-                async with await state.global_session.get(file_url) as resp:
+                async with await active_session.get(file_url) as resp:
                     if resp.status == 200:
                         content = await resp.read()
                         total_size += len(content)

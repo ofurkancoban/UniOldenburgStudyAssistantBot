@@ -78,20 +78,19 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         if code:
             ok, msg = redeem_invite_token(code, user.id, full_name=user.full_name, username=user.username)
             if ok:
-                login_url = _login_public_url()
-                keyboard = []
-                if login_url:
-                    keyboard.append([InlineKeyboardButton("🔐 Connect Stud.IP Account", web_app=WebAppInfo(url=login_url))])
-                reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
                 welcome_text = (
-                    "🎉 <b>Access Granted!</b>\n"
+                    "🎉 <b>Welcome to UniOldenburg Assistant!</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    f"Welcome, <b>{html.escape(user.first_name or 'Student')}</b>!\n\n"
-                    "Your UniOldenburg Assistant account has been activated.\n\n"
-                    "To synchronize your courses, exams, and grades, "
-                    "please connect your Stud.IP account below."
+                    f"Hello, <b>{html.escape(user.first_name or 'Student')}</b>! Your account has been activated.\n\n"
+                    "Here is what you can do right away:\n"
+                    "• <b>Sync Courses & Files:</b> Browse lecture slides, course files, and updates.\n"
+                    "• <b>Timetable & Deadlines:</b> Check your upcoming schedule and room locations.\n"
+                    "• <b>Mensa Menu & Tasks:</b> View daily meals and manage assignment deadlines.\n\n"
+                    "━━━━━━━━━━━━━━━━━━\n"
+                    "👉 <i>Please sign in to Stud.IP to link your student profile:</i>"
                 )
-                await update.effective_message.reply_text(welcome_text, parse_mode="HTML", reply_markup=reply_markup)
+                await update.effective_message.reply_text(welcome_text, parse_mode="HTML")
+                await _send_login_prompt(update.effective_message, user.id)
                 raise ApplicationHandlerStop
             else:
                 await update.effective_message.reply_text(
