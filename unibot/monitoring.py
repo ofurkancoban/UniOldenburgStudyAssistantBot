@@ -677,11 +677,13 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False):
         if not courses:
             return
 
-        semaphore = asyncio.Semaphore(3)
+        semaphore = asyncio.Semaphore(1)
 
         async def scan(course_name, cid):
             async with semaphore:
-                return await _scan_course_files(course_name, cid, cache)
+                res = await _scan_course_files(course_name, cid, cache)
+                await asyncio.sleep(0.5)  # Pace queries politely
+                return res
 
         results = await asyncio.gather(*(scan(name, cid) for name, cid in courses), return_exceptions=True)
         all_events = []

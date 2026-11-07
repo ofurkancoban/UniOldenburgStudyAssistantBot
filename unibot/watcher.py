@@ -57,7 +57,7 @@ from unibot.tasks import check_task_reminders
 from unibot.system import HEALTH_CHECK_LABELS, run_health_checks
 
 
-FILE_WATCHER_INTERVAL = 2 * 60 * 60
+FILE_WATCHER_INTERVAL = 30 * 60
 
 
 # ── unified watcher controller ─────────────────────────────────────────────────
@@ -252,17 +252,19 @@ async def _run_health_check(bot, now: datetime):
     update_general_cache({"last_health_check": now.isoformat()})
 
 
-async def _run_content_watchers(bot, admin_id, cycle_count: int):
+async def _run_content_watchers(bot, admin_id, cycle_count: int, now: datetime):
     """Announcements, files and forum posts. Messages are polled separately
     every MESSAGE_POLL_SECONDS by message_poll_loop, not once per cycle."""
     await _guarded("Announcement check", check_new_announcements_parallel, bot, admin_id, silent=True,
                    start_message="📢 Checking announcements...")
-    await asyncio.sleep(30)
-    if cycle_count % 2 == 0:
-        await _guarded("File check", check_new_files_parallel, bot, admin_id, silent=True,
-                       start_message="📁 Checking files...")
+    await asyncio.sleep(15)
     await _guarded("Forum check", check_new_forum_posts_parallel, bot, admin_id, silent=True,
                    start_message="💬 Checking forum posts...")
+    await asyncio.sleep(15)
+    # File checks recursively query folder hierarchies; throttle to once every 30 minutes.
+    await _run_throttled("last_file_check", now, FILE_WATCHER_INTERVAL, "File check",
+                         check_new_files_parallel, bot, admin_id, silent=True,
+                         start_message="📁 Checking files...")
 
 
 def _should_skip_cycle() -> bool:
@@ -322,7 +324,7 @@ async def unified_watcher_controller(app):
             await _run_reminder_checks(bot, session, now)
             await _run_exam_date_checks(bot, session, now)
             await _run_health_check(bot, now)
-            await _run_content_watchers(bot, admin_id, cycle_count)
+            await _run_content_watchers(bot, admin_id, cycle_count, now)
 
             logging.info("✅ Watcher cycle #%s completed", cycle_count)
             state.global_scan_count += 1
