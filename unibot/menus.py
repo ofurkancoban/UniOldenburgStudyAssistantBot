@@ -287,6 +287,17 @@ async def _show_semester_picker(sender, callback_prefix: str, prompt: str):
         semesters = await get_semester_options(session)
     except Exception as e:
         logging.error("_show_semester_picker: failed to fetch semesters: %s", e)
+        err_msg = str(e).lower()
+        if uid and ("login" in err_msg or "auth" in err_msg or "session" in err_msg):
+            target = sender.message if hasattr(sender, "message") else sender
+            await _reply_or_edit(
+                sender,
+                "🔐 <b>Stud.IP Login Required</b>\n━━━━━━━━━━━━━━━━━━\n"
+                "Your session is not active or has expired. Please sign in to browse semesters and files:",
+                reply_markup=None,
+            )
+            await _send_login_prompt(target, uid)
+            return
         await _reply_or_edit(sender, f"❌ Could not load semesters: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
         return
 
@@ -307,13 +318,37 @@ async def _render_files_courses_for_semester(sender, semester_id: str):
         uid = sender.from_user.id
     elif hasattr(sender, "effective_user") and sender.effective_user:
         uid = sender.effective_user.id
+
+    user_sess = get_user_session(uid) if uid else None
+    target = sender.message if hasattr(sender, "message") else sender
     try:
-        user_sess = get_user_session(uid) if uid else None
         courses = await list_courses(semester_id=semester_id, session=user_sess, user_id=uid)
     except Exception as e:
         logging.error("_render_files_courses_for_semester: failed to fetch courses: %s", e)
+        err_msg = str(e).lower()
+        if uid and ("login" in err_msg or "auth" in err_msg or "session" in err_msg):
+            await _reply_or_edit(
+                sender,
+                "🔐 <b>Stud.IP Login Required</b>\n━━━━━━━━━━━━━━━━━━\n"
+                "Your session is not active or has expired. Please sign in to access your course files:",
+                reply_markup=None,
+            )
+            await _send_login_prompt(target, uid)
+            return
         await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
         return
+
+    if not courses and uid:
+        is_logged = await user_sess.is_logged_in() if user_sess else False
+        if not is_logged:
+            await _reply_or_edit(
+                sender,
+                "🔐 <b>Stud.IP Login Required</b>\n━━━━━━━━━━━━━━━━━━\n"
+                "You are not currently logged in to Stud.IP.\nPlease sign in below to view your enrolled courses and files:",
+                reply_markup=None,
+            )
+            await _send_login_prompt(target, uid)
+            return
 
     extra_buttons = [
         [

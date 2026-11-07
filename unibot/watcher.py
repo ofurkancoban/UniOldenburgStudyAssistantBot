@@ -327,7 +327,7 @@ async def unified_watcher_controller(app):
             logging.info("✅ Watcher cycle #%s completed", cycle_count)
             state.global_scan_count += 1
             state.last_full_check_time = berlin_now()
-            await asyncio.sleep(90)
+            await asyncio.sleep(180)
 
         except Exception as e:
             logging.error("❌ Watcher controller error: %s", e)

@@ -325,7 +325,9 @@ class StudIPSession:
                 self.username and self.password and (self.totp_secret or self.totp_code)
             )
             use_oauth = studip_oauth.oauth_enabled()
-            if not has_headless_creds and not os.path.exists(self.cookie_file):
+            if not has_headless_creds:
+                if await self.heal_session():
+                    return True
                 if not force and use_oauth:
                     try:
                         if await studip_oauth.get_access_token(user_id=getattr(self, "user_id", None)):

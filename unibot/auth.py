@@ -262,6 +262,11 @@ async def _notify_repeated_login_failure() -> None:
     failing, typically after a password change, so they can sign in again."""
     if state._login_failure_notified or state.global_session is None or state._menu_app is None:
         return
+    # Only alert if headless credentials were configured. Interactive web logins
+    # expire normally and should prompt for interactive sign-in instead of spamming alerts.
+    has_headless = bool(state.global_session.username and state.global_session.password)
+    if not has_headless:
+        return
     if state.global_session.login_failures < LOGIN_FAILURE_NOTIFY_AFTER:
         return
     state._login_failure_notified = True

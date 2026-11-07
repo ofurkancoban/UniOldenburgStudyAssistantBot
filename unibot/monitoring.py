@@ -716,7 +716,7 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False):
 MESSAGE_CHECK_LIMIT = 20
 # The inbox is one small API request, so it's polled on its own short loop
 # (see message_poll_loop) instead of once per multi-minute watcher cycle.
-MESSAGE_POLL_SECONDS = 30
+MESSAGE_POLL_SECONDS = 60
 
 
 async def _fetch_messages_api(limit: int = MESSAGE_CHECK_LIMIT) -> list:
