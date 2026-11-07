@@ -127,31 +127,46 @@ def route_proxy_url(
 
     try:
         parts = urlsplit(str(url))
+        host = (parts.hostname or "").lower()
+        worker_parts = urlsplit(worker_url)
+        worker_host = (worker_parts.hostname or "").lower()
+
         target_hosts = {
             "studip.uni-oldenburg.de",
             "elearning.uni-oldenburg.de",
             "stums.uni-oldenburg.de",
             "idp.uni-oldenburg.de",
             "login.uni-oldenburg.de",
+            "auth.uni-oldenburg.de",
         }
-        if parts.netloc.lower() in target_hosts:
-            worker_parts = urlsplit(worker_url)
+
+        routed = str(url)
+        target_host = None
+
+        if host in target_hosts:
+            target_host = host
             base_worker_path = worker_parts.path.rstrip("/")
-            routed_path = f"{base_worker_path}/{parts.netloc.lower()}{parts.path}"
+            routed_path = f"{base_worker_path}/{target_host}{parts.path}"
             routed = urlunsplit((worker_parts.scheme, worker_parts.netloc, routed_path, parts.query, ""))
-            headers["X-Target-Host"] = parts.netloc
+        elif host == worker_host:
+            path_segments = [s for s in parts.path.split("/") if s]
+            if path_segments and path_segments[0].lower() in target_hosts:
+                target_host = path_segments[0].lower()
+
+        if target_host:
+            headers["X-Target-Host"] = target_host
             if worker_secret:
                 headers["X-Proxy-Secret"] = worker_secret
             if "Accept-Encoding" not in headers:
                 headers["Accept-Encoding"] = "gzip, deflate"
 
-            # Critical: aiohttp CookieJar does not automatically send elearning.uni-oldenburg.de cookies
+            # Critical: aiohttp CookieJar does not automatically send target domain cookies
             # to worker_url (a different host). When routing through Cloudflare Worker proxy,
             # explicitly inject matching cookies for the target university domain into the Cookie header.
             if cookie_jar is not None:
                 try:
                     from yarl import URL as YarlURL
-                    matching_cookies = cookie_jar.filter_cookies(YarlURL(str(url)))
+                    matching_cookies = cookie_jar.filter_cookies(YarlURL(f"https://{target_host}/"))
                     if matching_cookies:
                         cookie_parts = []
                         for k, morsel in matching_cookies.items():

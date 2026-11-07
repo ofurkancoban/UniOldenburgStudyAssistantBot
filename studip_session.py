@@ -118,6 +118,7 @@ class StudIPSession:
                 "elearning.uni-oldenburg.de",
                 "idp.uni-oldenburg.de",
                 "login.uni-oldenburg.de",
+                "auth.uni-oldenburg.de",
                 "stums.uni-oldenburg.de",
                 "studip.uni-oldenburg.de",
             )
@@ -129,19 +130,66 @@ class StudIPSession:
         except Exception as exc:
             self.logger.debug("Worker cookie sync skipped: %s", exc)
 
+    def _capture_response_cookies(self, resp, target_host: str):
+        """Extract Set-Cookie headers from proxy responses and map them back to university host."""
+        if not self.session or not target_host:
+            return
+        try:
+            worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
+            set_cookies = resp.headers.getall("Set-Cookie", [])
+            if not set_cookies:
+                return
+
+            from http.cookies import SimpleCookie
+            for sc in set_cookies:
+                c = SimpleCookie()
+                try:
+                    c.load(sc)
+                except Exception:
+                    continue
+                for key, morsel in c.items():
+                    val = morsel.value
+                    if val is not None:
+                        host_clean = target_host.split(":")[0].lower()
+                        self.session.cookie_jar.update_cookies(
+                            {key: val},
+                            response_url=URL(f"https://{host_clean}/"),
+                        )
+                        if worker_url:
+                            self.session.cookie_jar.update_cookies(
+                                {key: val},
+                                response_url=URL(worker_url),
+                            )
+        except Exception as exc:
+            self.logger.debug("Failed capturing response cookies for %s: %s", target_host, exc)
+
+    class _SRequestContext:
+        def __init__(self, session_obj, method: str, url: str, **kwargs):
+            self.session_obj = session_obj
+            self.method = method
+            self.url = str(url)
+            self.kwargs = kwargs
+            self._resp = None
+
+        async def __aenter__(self):
+            cookie_jar = self.session_obj.session.cookie_jar if self.session_obj.session else None
+            routed_url, headers = route_proxy_url(self.url, self.kwargs.pop("headers", None), cookie_jar=cookie_jar)
+            if headers:
+                self.kwargs["headers"] = headers
+            target_host = (urlsplit(self.url).hostname or "").lower()
+            self._resp = await self.session_obj.session.request(self.method, routed_url, **self.kwargs)
+            self.session_obj._capture_response_cookies(self._resp, target_host)
+            return self._resp
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            if self._resp:
+                await self._resp.__aexit__(exc_type, exc_val, exc_tb)
+
     def _s_get(self, url, **kwargs):
-        cookie_jar = self.session.cookie_jar if self.session else None
-        routed_url, headers = route_proxy_url(url, kwargs.pop("headers", None), cookie_jar=cookie_jar)
-        if headers:
-            kwargs["headers"] = headers
-        return self.session.get(routed_url, **kwargs)
+        return self._SRequestContext(self, "GET", url, **kwargs)
 
     def _s_post(self, url, **kwargs):
-        cookie_jar = self.session.cookie_jar if self.session else None
-        routed_url, headers = route_proxy_url(url, kwargs.pop("headers", None), cookie_jar=cookie_jar)
-        if headers:
-            kwargs["headers"] = headers
-        return self.session.post(routed_url, **kwargs)
+        return self._SRequestContext(self, "POST", url, **kwargs)
 
     async def save_cookies(self):
         if not self.session:
@@ -154,7 +202,8 @@ class StudIPSession:
         for cookie in self.session.cookie_jar:
             dom = cookie["domain"] or "elearning.uni-oldenburg.de"
             if worker_host and (dom.lower() == worker_host or dom.lower() == f".{worker_host}"):
-                dom = "elearning.uni-oldenburg.de"
+                # Do not save synthetic worker cookies; real cookies are stored under university domains
+                continue
             item_key = (cookie.key, dom, cookie["path"] or "/")
             if item_key in seen:
                 continue
@@ -451,7 +500,7 @@ class StudIPSession:
         for sso_url in (
             "https://login.uni-oldenburg.de/nidp/app",
             "https://auth.uni-oldenburg.de/osp/a/TOP/auth/app/",
-            "https://stums.uni-oldenburg.de/qisserver/api/identityprovider/redirect/2/login",
+            "https://stums.uni-oldenburg.de/qisserver/pages/cs/sys/portal/hisinoneStartPage.faces",
         ):
             try:
                 async with self._s_get(sso_url, allow_redirects=True, timeout=15) as _:
@@ -526,7 +575,12 @@ class StudIPSession:
         await self.ensure_session()
 
         async def is_done(url, _text):
-            return urlparse(url).netloc == success_host
+            u = urlparse(url)
+            if u.netloc.lower() == success_host.lower():
+                if "/qisserver/" in u.path:
+                    return "/callback/" not in u.path and "error" not in u.path.lower()
+                return True
+            return False
 
         final_url, _ = await self._run_sso_flow(entry_url, referer=referer, is_done=is_done)
         await self.save_cookies()
@@ -566,7 +620,7 @@ class StudIPSession:
                             return await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), tag, depth + 1)
                 
                 # 3. AJAX Content Load (NetIQ specific)
-                ajax_load = re.search(r"getToContent\(['\"]([^'\"]+)['\"]\s*,\s*['\"][^'\"]+['\"]\)", text)
+                ajax_load = re.search(r"getToContent\(['\"]([^'\"]+)['\"]", text)
                 if ajax_load:
                     ajax_url = urljoin(url, ajax_load.group(1))
                     self.logger.info("[%s] Following NetIQ AJAX content load: %s", tag, redact_url(ajax_url))
@@ -574,10 +628,10 @@ class StudIPSession:
                          return await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), tag, depth + 1)
                 
                 # 4. Script-based form auto-submit (e.g., NetIQ authCodeForm)
-                form_submit = re.search(r"document\.forms\[['\"]([^'\"]+)['\"]\]\.submit\(\)", text)
+                form_submit = re.search(r"document\.(?:forms\[['\"]?([^'\"\]]+)['\"]?\]|([a-zA-Z0-9_]+))\s*\.\s*submit\(\)", text)
                 if form_submit:
-                    form_name = form_submit.group(1)
-                    form = soup.find("form", attrs={"name": form_name})
+                    form_name = form_submit.group(1) or form_submit.group(2)
+                    form = soup.find("form", attrs={"name": form_name}) or soup.find("form", id=form_name)
                     if form:
                         inputs = {i.get("name"): (i.get("value") or "") for i in form.find_all("input") if i.get("name")}
                         action = urljoin(url, form.get("action") or "")
@@ -736,7 +790,10 @@ class StudIPSession:
         routed_url, headers = route_proxy_url(url, merged, cookie_jar=cookie_jar)
         if headers:
             kwargs["headers"] = headers
-        return self.session.get(routed_url, **kwargs)
+        resp = await self.session.get(routed_url, **kwargs)
+        target_host = (urlsplit(url).hostname or "").lower()
+        self._capture_response_cookies(resp, target_host)
+        return resp
 
     async def post(self, url, **kwargs):
         await self.ensure_session()
@@ -745,7 +802,10 @@ class StudIPSession:
         routed_url, headers = route_proxy_url(url, merged, cookie_jar=cookie_jar)
         if headers:
             kwargs["headers"] = headers
-        return self.session.post(routed_url, **kwargs)
+        resp = await self.session.post(routed_url, **kwargs)
+        target_host = (urlsplit(url).hostname or "").lower()
+        self._capture_response_cookies(resp, target_host)
+        return resp
 
     async def close(self):
         if self.session and not self.session.closed:

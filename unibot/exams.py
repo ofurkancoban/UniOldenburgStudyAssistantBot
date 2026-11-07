@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
@@ -358,10 +358,16 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
     except Exception as exc:
         logging.error("StuMS document download failed for %s: %s", doc_key, exc)
         await _stop_loading_animation(stop_evt, anim_task)
+        server = state.login_server
+        kb_rows = []
+        if server:
+            kb_rows.append([InlineKeyboardButton("🔐 Sign In / Refresh Session", web_app=WebAppInfo(url=server.app_url()))])
+        kb_rows.append([InlineKeyboardButton("🔄 Retry", callback_data=f"stums_doc|{doc_key}")])
         await status_msg.edit_text(
             f"❌ Unable to download <b>{html.escape(spec['label'])}</b> via StuMS:\n"
-            "<i>Official documents require an active StuMS student session. Please check your credentials or access StuMS directly.</i>",
+            "<i>Official documents require an active StuMS student session. Tap below to sign in or retry.</i>",
             parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(kb_rows),
         )
         return
     finally:
@@ -392,9 +398,14 @@ async def build_tuition_status_text(session=None, user_id=None) -> tuple[str, In
             "💶 <b>Tuition &amp; Semester Fees (Rückmeldung)</b>",
             "━━━━━━━━━━━━━━━━━━━━━━━━━━",
             "ℹ️ <i>Tuition data could not be retrieved from StuMS at this time.</i>\n"
-            "Please check the official <a href='https://stums.uni-oldenburg.de'>StuMS Portal</a> directly.",
+            "If your StuMS session expired, please tap below to sign in or retry.",
         ]
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data="tuition_status")]])
+        server = state.login_server
+        kb_rows = []
+        if server:
+            kb_rows.append([InlineKeyboardButton("🔐 Sign In / Refresh Session", web_app=WebAppInfo(url=server.app_url()))])
+        kb_rows.append([InlineKeyboardButton("🔄 Retry", callback_data="tuition_status")])
+        kb = InlineKeyboardMarkup(kb_rows)
         return "\n".join(lines), kb
 
     lines = [

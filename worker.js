@@ -11,6 +11,7 @@ const ALLOWED_TARGET_HOSTS = new Set([
   "stums.uni-oldenburg.de",
   "idp.uni-oldenburg.de",
   "login.uni-oldenburg.de",
+  "auth.uni-oldenburg.de",
 ]);
 
 export default {

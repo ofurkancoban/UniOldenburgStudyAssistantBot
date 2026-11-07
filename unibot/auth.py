@@ -337,6 +337,15 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
         if studip_user or display_name:
             db.upsert_user(telegram_id=user_id, studip_username=studip_user)
 
+    # Seamless StuMS SSO handoff while NetIQ SSO session is warm
+    try:
+        from exam_reminder import _establish_stums_session
+        await _establish_stums_session(session)
+        await session.save_cookies()
+        logging.info("🎓 StuMS session established successfully during login for user %s", user_id)
+    except Exception as exc:
+        logging.debug("StuMS SSO handoff after proxy login skipped/failed: %s", exc)
+
     if is_new_session and (user_id is None or is_user_admin(user_id)):
         state._last_notified_studip_cookie = studip_cookie
 

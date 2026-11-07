@@ -49,24 +49,25 @@ PROXY_SESSION_TTL = 3600
 ELEARN_ORIGIN = "https://elearning.uni-oldenburg.de"
 LOGIN_ORIGIN = "https://login.uni-oldenburg.de"
 AUTH_ORIGIN = "https://auth.uni-oldenburg.de"
+STUMS_ORIGIN = "https://stums.uni-oldenburg.de"
 
 LoginCallback = Callable[[str, str, str], Awaitable[tuple[bool, str]]]
 
 # Rewrite leading scheme+host in HTML attributes (action, href, src) without
 # touching query-string parameters like `redirect_uri=https://...`.
 _ATTR_ORIGIN_RE = re.compile(
-    r'(\b(?:action|href|src)\s*=\s*["\'])https://(?:elearning|login|idp|auth)\.uni-oldenburg\.de(?::443)?/',
+    r'(\b(?:action|href|src)\s*=\s*["\'])https://(?:elearning|login|idp|auth|stums)\.uni-oldenburg\.de(?::443)?/',
     re.IGNORECASE,
 )
 
 # Rewrite JS assignments like `window.location.href = "https://..."`
 _JS_ORIGIN_RE = re.compile(
-    r'((?:location(?:\.href)?|redirectUri)\s*=\s*["\'])https://(?:elearning|login|idp|auth)\.uni-oldenburg\.de(?::443)?/',
+    r'((?:location(?:\.href)?|redirectUri)\s*=\s*["\'])https://(?:elearning|login|idp|auth|stums)\.uni-oldenburg\.de(?::443)?/',
     re.IGNORECASE,
 )
 
 _LOCATION_ORIGIN_RE = re.compile(
-    r"^https://(?:elearning|login|idp|auth)\.uni-oldenburg\.de(?::443)?(/.*)?$",
+    r"^https://(?:elearning|login|idp|auth|stums)\.uni-oldenburg\.de(?::443)?(/.*)?$",
     re.IGNORECASE,
 )
 
@@ -101,6 +102,8 @@ def _upstream_for_path(path: str) -> str:
         return LOGIN_ORIGIN
     if path.startswith("/osp/") or path == "/osp":
         return AUTH_ORIGIN
+    if path.startswith("/qisserver/") or path == "/qisserver":
+        return STUMS_ORIGIN
     return ELEARN_ORIGIN
 
 
@@ -554,7 +557,7 @@ class LoginServer:
         if studip_sess is None:
             return web.Response(text="Bot session not initialized", status=503)
         await studip_sess.ensure_session()
-        if request.path.startswith(("/nidp", "/osp", "/sso.php", "/dispatch.php/login")):
+        if request.path.startswith(("/nidp", "/osp", "/sso.php", "/dispatch.php/login", "/qisserver")):
             studip_sess.last_interactive_activity = time.time()
         http = studip_sess.session
 
@@ -626,17 +629,29 @@ class LoginServer:
             text = _ATTR_ORIGIN_RE.sub(r"\1/", text)
             text = _JS_ORIGIN_RE.sub(r"\1/", text)
 
-            # Check if this is an authenticated Stud.IP page
+            # Check if this is an authenticated Stud.IP or StuMS page
             is_studip_auth = (
                 upstream_origin == ELEARN_ORIGIN
                 and ("STUDIP.USER_ID" in text or "/dispatch.php/my_courses" in text)
                 and '"username":"nobody"' not in text
                 and "/dispatch.php/login" not in request.path
             )
-            if is_studip_auth:
+            is_stums_auth = (
+                upstream_origin == STUMS_ORIGIN
+                and "/qisserver/" in request.path
+                and "Login notwendig" not in text
+                and ("hisinone" in text.lower() or "abmelden" in text.lower() or "logout" in text.lower())
+            )
+            if is_stums_auth:
+                studip_sess._stums_verified_at = time.time()
+                studip_sess._stums_referer = f"{STUMS_ORIGIN}{request.path}"
+                self._schedule_auth_hook(user_id)
+
+            if is_studip_auth or is_stums_auth:
                 studip_sess.explicitly_logged_out = False
                 studip_sess.last_interactive_activity = 0.0
-                self._schedule_auth_hook(user_id)
+                if is_studip_auth:
+                    self._schedule_auth_hook(user_id)
                 bar = (
                     _CONNECTED_BANNER_SNIPPET
                     + _STATUS_BAR_SNIPPET.replace("__STATUS_TEXT__", "✅ Bot connected")
