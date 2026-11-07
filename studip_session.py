@@ -10,7 +10,7 @@ import struct
 import base64
 import json
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlsplit
 from yarl import URL
 
 import studip_oauth
