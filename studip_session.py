@@ -221,11 +221,19 @@ class StudIPSession:
         """Check if the browser-less HTML cookie session is currently authenticated.
 
         A positive result is cached for LOGIN_CHECK_CACHE_SECONDS; a negative
-        one never is, and logout/login invalidate the cache."""
-        if use_cache and time.time() < self._logged_in_until:
+        result is cached for 15 seconds to avoid spamming the server."""
+        now = time.time()
+        if use_cache and now < self._logged_in_until:
             return True
+        if use_cache and now < getattr(self, "_logged_out_until", 0.0):
+            return False
         result = await self._check_html_logged_in()
-        self._logged_in_until = time.time() + LOGIN_CHECK_CACHE_SECONDS if result else 0.0
+        if result:
+            self._logged_in_until = now + LOGIN_CHECK_CACHE_SECONDS
+            self._logged_out_until = 0.0
+        else:
+            self._logged_in_until = 0.0
+            self._logged_out_until = now + 15.0  # 15s negative cache
         return result
 
     async def _check_html_logged_in(self) -> bool:
@@ -263,6 +271,12 @@ class StudIPSession:
     async def _heal_session_unlocked(self) -> bool:
         if self.explicitly_logged_out or (time.time() - self.last_interactive_activity < 180):
             return False
+        # Throttle healing attempts: don't hammer NetIQ SSO if it failed in the last 60 seconds
+        now = time.time()
+        if now - getattr(self, "_last_heal_attempt", 0.0) < 60.0:
+            return False
+        self._last_heal_attempt = now
+
         has_cookies = False
         if getattr(self, "user_id", None):
             try:
