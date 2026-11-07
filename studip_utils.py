@@ -107,12 +107,16 @@ def redact_url(url) -> str:
         return "<url>"
 
 
-def route_proxy_url(url: str, extra_headers: dict | None = None) -> tuple[str, dict]:
+def route_proxy_url(
+    url: str,
+    extra_headers: dict | None = None,
+    cookie_jar: Any = None,
+) -> tuple[str, dict]:
     """Route outgoing University of Oldenburg requests through a Cloudflare Worker proxy.
 
     If CLOUDFLARE_WORKER_URL is set in environment, transparently rewrites target
     URLs for Stud.IP, StuMS, and NetIQ SSO to point to the Cloudflare Worker, attaching
-    X-Target-Host and X-Proxy-Secret.
+    X-Target-Host, X-Proxy-Secret, and injected target domain cookies.
     """
     worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
     worker_secret = os.getenv("CLOUDFLARE_WORKER_SECRET", "").strip()
@@ -140,6 +144,28 @@ def route_proxy_url(url: str, extra_headers: dict | None = None) -> tuple[str, d
                 headers["X-Proxy-Secret"] = worker_secret
             if "Accept-Encoding" not in headers:
                 headers["Accept-Encoding"] = "gzip, deflate"
+
+            # Critical: aiohttp CookieJar does not automatically send elearning.uni-oldenburg.de cookies
+            # to worker_url (a different host). When routing through Cloudflare Worker proxy,
+            # explicitly inject matching cookies for the target university domain into the Cookie header.
+            if cookie_jar is not None:
+                try:
+                    from yarl import URL as YarlURL
+                    matching_cookies = cookie_jar.filter_cookies(YarlURL(str(url)))
+                    if matching_cookies:
+                        cookie_parts = []
+                        for k, morsel in matching_cookies.items():
+                            val = morsel.value if hasattr(morsel, "value") else str(morsel)
+                            cookie_parts.append(f"{k}={val}")
+                        injected = "; ".join(cookie_parts)
+                        existing = headers.get("Cookie") or headers.get("cookie")
+                        if existing:
+                            headers["Cookie"] = f"{existing}; {injected}"
+                        else:
+                            headers["Cookie"] = injected
+                except Exception:
+                    pass
+
             return routed, headers
     except Exception:
         pass

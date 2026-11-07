@@ -217,7 +217,7 @@ def get_user_session(user_id: Optional[int] = None) -> StudIPSession:
         return state.global_session
 
     cookie_file = f"studip_cookies_{user_id}.json"
-    if is_user_admin(user_id) and os.path.exists("studip_cookies.json") and not os.path.exists(cookie_file):
+    if is_user_admin(user_id) and os.path.exists("studip_cookies.json"):
         cookie_file = "studip_cookies.json"
 
     sess = StudIPSession(

@@ -332,6 +332,15 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
 
     parts = (query.data or "").split("|", 1)
     doc_key = parts[1].strip() if len(parts) > 1 else ""
+    doc_aliases = {
+        "immatrikulation": "imma",
+        "studienbescheinigung": "imma",
+        "bafoeg": "imma",
+        "studienverlauf": "verlauf",
+        "transcript": "transcript_en",
+        "grades": "grades_en",
+    }
+    doc_key = doc_aliases.get(doc_key, doc_key)
     spec = STUMS_DOCUMENTS.get(doc_key)
     if not spec:
         await query.message.reply_text("⚠️ Unknown document type.")

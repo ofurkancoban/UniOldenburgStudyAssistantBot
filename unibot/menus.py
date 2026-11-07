@@ -110,10 +110,10 @@ def _status_group_view(group: str) -> tuple:
     else:
         title = "📄 <b>Official Documents &amp; Tuition</b>\n\nDownload official StuMS PDF certificates, transcript, and semester fee status:"
         rows = [
-            [InlineKeyboardButton("📄 Immatrikulationsbescheinigung", callback_data="stums_doc|immatrikulation")],
-            [InlineKeyboardButton("📄 Studienbescheinigung", callback_data="stums_doc|studienbescheinigung")],
-            [InlineKeyboardButton("📄 BAföG-Bescheinigung", callback_data="stums_doc|bafoeg")],
-            [InlineKeyboardButton("💶 Tuition & Fees", callback_data="tuition_status"), InlineKeyboardButton("📜 Transcript", callback_data="transcript_summary")],
+            [InlineKeyboardButton("📄 Immatrikulationsbescheinigung", callback_data="stums_doc|imma")],
+            [InlineKeyboardButton("📈 Studienverlaufsbescheinigung", callback_data="stums_doc|verlauf")],
+            [InlineKeyboardButton("🇬🇧 Transcript of Records", callback_data="stums_doc|transcript_en")],
+            [InlineKeyboardButton("💶 Tuition & Fees", callback_data="tuition_status"), InlineKeyboardButton("📊 Grades Summary", callback_data="transcript_summary")],
         ]
     return title, InlineKeyboardMarkup(rows)
 

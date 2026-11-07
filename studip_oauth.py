@@ -237,7 +237,8 @@ async def authorize_with_session(session, timeout: int = 30, user_id: Optional[i
         "state": state,
     }
     logger.info("Requesting consent page...")
-    routed_auth, auth_headers = route_proxy_url(AUTHORIZE_URL)
+    cookie_jar = session.session.cookie_jar if getattr(session, "session", None) else None
+    routed_auth, auth_headers = route_proxy_url(AUTHORIZE_URL, cookie_jar=cookie_jar)
     async with session.session.get(routed_auth, params=params, headers=auth_headers or None, allow_redirects=False,
                                    timeout=timeout) as resp:
         status = resp.status
@@ -296,7 +297,8 @@ async def _exchange_code(session, redirect_location: str, verifier: str, state: 
         "client_id": CLIENT_ID,
         "code_verifier": verifier,
     }
-    routed_tok, tok_headers = route_proxy_url(TOKEN_URL)
+    cookie_jar = session.session.cookie_jar if getattr(session, "session", None) else None
+    routed_tok, tok_headers = route_proxy_url(TOKEN_URL, cookie_jar=cookie_jar)
     async with session.session.post(routed_tok, data=data, headers=tok_headers or None, allow_redirects=False,
                                     timeout=30) as resp:
         status = resp.status
@@ -323,7 +325,8 @@ async def refresh(tokens: Optional[dict] = None, user_id: Optional[int] = None) 
         "refresh_token": tokens["refresh_token"],
         "client_id": CLIENT_ID,
     }
-    routed_tok, tok_headers = route_proxy_url(TOKEN_URL)
+    cookie_jar = session.session.cookie_jar if getattr(session, "session", None) else None
+    routed_tok, tok_headers = route_proxy_url(TOKEN_URL, cookie_jar=cookie_jar)
     async with aiohttp.ClientSession() as http:
         async with http.post(routed_tok, data=data, headers=tok_headers or None, allow_redirects=False, timeout=30) as resp:
             status = resp.status

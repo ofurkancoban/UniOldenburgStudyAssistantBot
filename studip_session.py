@@ -84,7 +84,10 @@ class StudIPSession:
 
     async def ensure_session(self):
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(headers=self.headers)
+            self.session = aiohttp.ClientSession(
+                headers=self.headers,
+                cookie_jar=aiohttp.CookieJar(unsafe=True),
+            )
             await self.load_cookies()
 
     def _get_totp_token(self):
@@ -105,14 +108,37 @@ class StudIPSession:
             logging.warning("TOTP code generation failed (check TOTP_SECRET)", exc_info=True)
             return ""
 
+    def _sync_worker_cookies(self):
+        """Mirror cookies for university domains to the Cloudflare Worker URL in cookie jar."""
+        worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
+        if not worker_url or not self.session:
+            return
+        try:
+            target_hosts = (
+                "elearning.uni-oldenburg.de",
+                "idp.uni-oldenburg.de",
+                "login.uni-oldenburg.de",
+                "stums.uni-oldenburg.de",
+                "studip.uni-oldenburg.de",
+            )
+            for host in target_hosts:
+                cookies = self.session.cookie_jar.filter_cookies(URL(f"https://{host}/"))
+                if cookies:
+                    cookie_dict = {k: (m.value if hasattr(m, "value") else str(m)) for k, m in cookies.items()}
+                    self.session.cookie_jar.update_cookies(cookie_dict, response_url=URL(worker_url))
+        except Exception as exc:
+            self.logger.debug("Worker cookie sync skipped: %s", exc)
+
     def _s_get(self, url, **kwargs):
-        routed_url, headers = route_proxy_url(url, kwargs.pop("headers", None))
+        cookie_jar = self.session.cookie_jar if self.session else None
+        routed_url, headers = route_proxy_url(url, kwargs.pop("headers", None), cookie_jar=cookie_jar)
         if headers:
             kwargs["headers"] = headers
         return self.session.get(routed_url, **kwargs)
 
     def _s_post(self, url, **kwargs):
-        routed_url, headers = route_proxy_url(url, kwargs.pop("headers", None))
+        cookie_jar = self.session.cookie_jar if self.session else None
+        routed_url, headers = route_proxy_url(url, kwargs.pop("headers", None), cookie_jar=cookie_jar)
         if headers:
             kwargs["headers"] = headers
         return self.session.post(routed_url, **kwargs)
@@ -139,6 +165,7 @@ class StudIPSession:
                 "domain": dom,
                 "path": cookie["path"] or "/",
             })
+        self._sync_worker_cookies()
         if getattr(self, "user_id", None):
             try:
                 from unibot import db
@@ -146,6 +173,14 @@ class StudIPSession:
                 self.logger.info("Encrypted cookies saved to DB for user %s", self.user_id)
             except Exception as exc:
                 self.logger.error("Failed to save cookies to DB for user %s: %s", self.user_id, exc)
+
+            user_cookie_file = f"studip_cookies_{self.user_id}.json"
+            if self.cookie_file != user_cookie_file and os.path.exists(user_cookie_file):
+                try:
+                    from studip_vault import write_vault_file
+                    write_vault_file(user_cookie_file, entries, mode=0o600)
+                except Exception:
+                    pass
 
         if self.cookie_file:
             try:
@@ -212,6 +247,7 @@ class StudIPSession:
                                 {key: val},
                                 response_url=URL(worker_url),
                             )
+                self._sync_worker_cookies()
                 return True
             except Exception as e:
                 self.logger.error("Failed to apply cookies to session: %s", e)
@@ -696,7 +732,8 @@ class StudIPSession:
     async def get(self, url, **kwargs):
         await self.ensure_session()
         merged = await self._merged_headers(url, kwargs.pop("headers", None))
-        routed_url, headers = route_proxy_url(url, merged)
+        cookie_jar = self.session.cookie_jar if self.session else None
+        routed_url, headers = route_proxy_url(url, merged, cookie_jar=cookie_jar)
         if headers:
             kwargs["headers"] = headers
         return self.session.get(routed_url, **kwargs)
@@ -704,7 +741,8 @@ class StudIPSession:
     async def post(self, url, **kwargs):
         await self.ensure_session()
         merged = await self._merged_headers(url, kwargs.pop("headers", None))
-        routed_url, headers = route_proxy_url(url, merged)
+        cookie_jar = self.session.cookie_jar if self.session else None
+        routed_url, headers = route_proxy_url(url, merged, cookie_jar=cookie_jar)
         if headers:
             kwargs["headers"] = headers
         return self.session.post(routed_url, **kwargs)
