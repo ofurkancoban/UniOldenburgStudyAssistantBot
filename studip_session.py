@@ -255,6 +255,12 @@ class StudIPSession:
 
     async def heal_session(self) -> bool:
         """Attempt self-healing silent SSO renewal using stored NetIQ SSO cookies."""
+        if self._lock.locked():
+            return await self._heal_session_unlocked()
+        async with self._lock:
+            return await self._heal_session_unlocked()
+
+    async def _heal_session_unlocked(self) -> bool:
         if self.explicitly_logged_out or (time.time() - self.last_interactive_activity < 180):
             return False
         has_cookies = False
@@ -267,24 +273,23 @@ class StudIPSession:
         if not has_cookies and (not self.cookie_file or not os.path.exists(self.cookie_file)):
             return False
 
-        async with self._lock:
-            self.logger.info("🔧 [Self-Healing] Attempting silent SSO renewal using warm NetIQ cookies...")
-            await self.ensure_session()
-            elearn = "https://elearning.uni-oldenburg.de"
-            login_link_cancel = f"{elearn}/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
-            try:
-                await self._run_sso_flow(login_link_cancel, referer=f"{elearn}/dispatch.php/my_courses")
-                if await self.is_html_logged_in(use_cache=False):
-                    self.explicitly_logged_out = False
-                    await self.save_cookies()
-                    self.logger.info("✅ [Self-Healing] Session successfully healed and restored!")
-                    return True
-                else:
-                    self.logger.warning("⚠️ [Self-Healing] Silent SSO flow finished but login markers missing.")
-                    return False
-            except Exception as exc:
-                self.logger.warning("⚠️ [Self-Healing] Silent SSO flow failed: %s", exc)
+        self.logger.info("🔧 [Self-Healing] Attempting silent SSO renewal using warm NetIQ cookies...")
+        await self.ensure_session()
+        elearn = "https://elearning.uni-oldenburg.de"
+        login_link_cancel = f"{elearn}/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
+        try:
+            await self._run_sso_flow(login_link_cancel, referer=f"{elearn}/dispatch.php/my_courses")
+            if await self.is_html_logged_in(use_cache=False):
+                self.explicitly_logged_out = False
+                await self.save_cookies()
+                self.logger.info("✅ [Self-Healing] Session successfully healed and restored!")
+                return True
+            else:
+                self.logger.warning("⚠️ [Self-Healing] Silent SSO flow finished but login markers missing.")
                 return False
+        except Exception as exc:
+            self.logger.warning("⚠️ [Self-Healing] Silent SSO flow failed: %s", exc)
+            return False
 
     async def is_logged_in(self, allow_oauth: bool = True) -> bool:
         """Check if authenticated (via HTML cookie, automatic self-healing, or OAuth2)."""
