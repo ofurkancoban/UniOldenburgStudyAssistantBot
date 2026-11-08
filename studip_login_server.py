@@ -37,6 +37,7 @@ from urllib.parse import parse_qsl, urlsplit
 from aiohttp import web
 from aiohttp.abc import AbstractAccessLogger
 
+from studip_http import interactive_requests, user_agent
 from studip_utils import redact_url
 
 logger = logging.getLogger("StudIPLoginServer")
@@ -50,6 +51,9 @@ ELEARN_ORIGIN = "https://elearning.uni-oldenburg.de"
 LOGIN_ORIGIN = "https://login.uni-oldenburg.de"
 AUTH_ORIGIN = "https://auth.uni-oldenburg.de"
 STUMS_ORIGIN = "https://stums.uni-oldenburg.de"
+# StuMS' own "log in via university SSO" entry; through this proxy it runs the
+# NetIQ login in the bot's cookie jar and lands back on StuMS signed in.
+STUMS_SSO_ENTRY_PATH = "/qisserver/api/identityprovider/redirect/2/login"
 
 LoginCallback = Callable[[str, str, str], Awaitable[tuple[bool, str]]]
 
@@ -75,11 +79,15 @@ _HOP_BY_HOP_REQ = {
     "host", "connection", "keep-alive", "proxy-authenticate",
     "proxy-authorization", "te", "trailers", "transfer-encoding", "upgrade",
     "content-length", "accept-encoding",
+    # added by the Cloudflare tunnel / reverse proxy in front of this server;
+    # the university must neither see the student's IP nor proxy metadata
+    "forwarded", "x-real-ip", "true-client-ip", "cdn-loop",
 }
+_STRIP_REQ_PREFIXES = ("x-forwarded-", "cf-", "x-telegram-")
 
 _STRIP_RESP_HEADERS = {
     "content-encoding", "content-length", "transfer-encoding", "connection",
-    "keep-alive", "set-cookie", "content-security-policy",
+    "keep-alive", "set-cookie", "x-upstream-set-cookie", "content-security-policy",
     "content-security-policy-report-only", "x-frame-options",
     "strict-transport-security",
 }
@@ -182,7 +190,7 @@ _GATE_PAGE = """<!DOCTYPE html>
       box.innerHTML = '<div class="err">' + (data.error || 'Authentication failed.') + '</div>';
       return;
     }
-    window.location.replace(data.redirect || '/_bot/entry');
+    window.location.replace((data.redirect || '/_bot/entry') + window.location.search);
   } catch (e) {
     box.innerHTML = '<div class="err">Network error. Please try again.</div>';
   }
@@ -299,7 +307,9 @@ class LoginServer:
         self._cookie_salt = secrets.token_bytes(16)
         self._runner: Optional[web.AppRunner] = None
         self._busy = False
-        self._last_auth_notify = 0.0
+        # per Telegram user, so two students signing in at once both get
+        # their post-login hook (StuMS handoff, profile sync)
+        self._last_auth_notify: dict = {}
 
     @staticmethod
     def _default_host() -> str:
@@ -347,8 +357,9 @@ class LoginServer:
             return public.rstrip("/")
         return f"http://{_lan_ip()}:{self.port}"
 
-    def app_url(self) -> str:
-        return f"{self.base_url()}/app"
+    def app_url(self, target: str = "") -> str:
+        """Mini App URL; target="stums" signs in to StuMS instead of Stud.IP."""
+        return f"{self.base_url()}/app" + ("?target=stums" if target == "stums" else "")
 
     def new_link(self, user_id: int) -> str:
         self._purge()
@@ -434,9 +445,13 @@ class LoginServer:
         )
 
     # ── auth gate handlers ────────────────────────────────────────────────
+    @staticmethod
+    def _entry_target(request: web.Request) -> str:
+        return "stums" if request.query.get("target") == "stums" else ""
+
     async def _app_gate(self, request: web.Request) -> web.Response:
         if self._check_proxy_session(request):
-            raise web.HTTPFound("/_bot/entry")
+            raise web.HTTPFound("/_bot/entry?target=stums" if self._entry_target(request) else "/_bot/entry")
         return web.Response(
             text=_GATE_PAGE,
             content_type="text/html",
@@ -490,6 +505,11 @@ class LoginServer:
             request.query.get("csrf", ""), self._csrf_token(proxy_sess.get("sid", ""))
         )
         studip_sess = self._resolve_session(user_id)
+        if studip_sess is not None and self._entry_target(request) == "stums" and not relogin:
+            studip_sess.last_interactive_activity = time.time()
+            await studip_sess.ensure_session()
+            studip_sess._stums_verified_at = 0.0
+            raise web.HTTPFound(STUMS_SSO_ENTRY_PATH)
         if studip_sess is not None:
             studip_sess.last_interactive_activity = time.time()
             await studip_sess.ensure_session()
@@ -513,12 +533,13 @@ class LoginServer:
                 if studip_sess.explicitly_logged_out or (not has_cookies and not has_file):
                     studip_sess.session.cookie_jar.clear()
                 try:
-                    async with studip_sess.session.get(
-                        f"{ELEARN_ORIGIN}/dispatch.php/my_courses",
-                        allow_redirects=True,
-                        timeout=10,
-                    ) as _:
-                        pass
+                    with interactive_requests():
+                        async with await studip_sess.get(
+                            f"{ELEARN_ORIGIN}/dispatch.php/my_courses",
+                            allow_redirects=True,
+                            timeout=10,
+                        ) as _:
+                            pass
                 except Exception:
                     logging.debug("Stud.IP login check request failed", exc_info=True)
 
@@ -527,9 +548,9 @@ class LoginServer:
 
     def _schedule_auth_hook(self, user_id: Optional[int] = None) -> None:
         now = time.time()
-        if now - self._last_auth_notify < 15.0:
+        if now - self._last_auth_notify.get(user_id, 0.0) < 15.0:
             return
-        self._last_auth_notify = now
+        self._last_auth_notify[user_id] = now
         if self.on_session_authenticated:
             asyncio.create_task(self._run_auth_hook(user_id))
 
@@ -559,7 +580,6 @@ class LoginServer:
         await studip_sess.ensure_session()
         if request.path.startswith(("/nidp", "/osp", "/sso.php", "/dispatch.php/login", "/qisserver")):
             studip_sess.last_interactive_activity = time.time()
-        http = studip_sess.session
 
         path_qs = request.rel_url.path_qs
         upstream_origin = _upstream_for_path(request.path)
@@ -569,7 +589,12 @@ class LoginServer:
         fwd_headers = {}
         for k, v in request.headers.items():
             kl = k.lower()
-            if kl in _HOP_BY_HOP_REQ or kl == "cookie":
+            if kl in _HOP_BY_HOP_REQ or kl == "cookie" or kl.startswith(_STRIP_REQ_PREFIXES):
+                continue
+            if kl == "user-agent":
+                # one User-Agent per session: the bot keeps using these
+                # cookies in the background with its own User-Agent
+                fwd_headers[k] = user_agent()
                 continue
             if kl == "origin":
                 fwd_headers[k] = upstream_origin
@@ -585,14 +610,16 @@ class LoginServer:
         body = await request.read() if request.can_read_body else None
 
         try:
-            async with http.request(
-                request.method,
-                target_url,
-                headers=fwd_headers,
-                data=body,
-                allow_redirects=False,
-                timeout=30,
-            ) as up_resp:
+            with interactive_requests():
+                up_resp = await studip_sess.request(
+                    request.method,
+                    target_url,
+                    headers=fwd_headers,
+                    data=body,
+                    allow_redirects=False,
+                    timeout=30,
+                )
+            async with up_resp:
                 status = up_resp.status
                 raw_body = await up_resp.read()
                 up_headers = up_resp.headers
@@ -636,11 +663,15 @@ class LoginServer:
                 and '"username":"nobody"' not in text
                 and "/dispatch.php/login" not in request.path
             )
+            lowered = text.lower()
             is_stums_auth = (
                 upstream_origin == STUMS_ORIGIN
                 and "/qisserver/" in request.path
+                and "/callback" not in request.path
                 and "Login notwendig" not in text
-                and ("hisinone" in text.lower() or "abmelden" in text.lower() or "logout" in text.lower())
+                # HISinOne's anonymous pages carry the login form (asdf/fdsa)
+                and 'name="asdf"' not in text
+                and ("abmelden" in lowered or "logout" in lowered)
             )
             if is_stums_auth:
                 studip_sess._stums_verified_at = time.time()

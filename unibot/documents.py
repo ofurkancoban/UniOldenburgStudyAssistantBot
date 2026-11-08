@@ -75,7 +75,7 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
     stop_evt, anim_task = _start_loading_animation(status_msg, f"Preparing 1-Min Audio Summary for {fname}...")
 
     try:
-        session = state.global_session or await login_studip()
+        session = await login_studip()
         file_url = info.get("url")
         content = None
 

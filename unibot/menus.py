@@ -1411,7 +1411,7 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("━━━━━━━━━━━━━━━━━")
 
     try:
-        session = await login_studip()
+        session = await login_studip()  # the acting user's own session
         module_codes = await get_my_module_codes(session, [(course_name, course_cid)])
         exams = await get_all_exam_dates(session)
         matched = filter_exams_by_module_codes(exams, module_codes)

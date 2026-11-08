@@ -35,7 +35,7 @@ from unibot.formatting import (
     parse_date_safe,
 )
 from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, broadcast
-from unibot.auth import is_user_allowed, login_studip
+from unibot.auth import act_as_bot, acting_as, current_user_id, get_user_session, has_stored_login, is_user_allowed, login_studip
 from unibot.studip_api import (
     BASE_URL,
     STUDIP_API_URL,
@@ -63,12 +63,24 @@ watch_tasks = {}  # chat_id -> asyncio.Task
 check_in_progress: set[int] = set()  # chat_id set to prevent concurrent checks
 
 
-def load_message_cache() -> list[dict]:
-    """Load message cache from JSON file."""
-    CACHE_FILE = "messages_cache.json"
+def message_cache_key(user_id: Optional[int] = None) -> str:
+    """Inbox cache per Telegram user; the admin session keeps the original file."""
+    if user_id is None:
+        user_id = current_user_id()
+    if user_id is None:
+        return "messages_cache.json"
+    sess = state.user_sessions.get(user_id)
+    if sess is not None and sess is state.global_session:
+        return "messages_cache.json"
+    return f"messages_cache_{user_id}.json"
+
+
+def load_message_cache(user_id: Optional[int] = None) -> list[dict]:
+    """Load the acting user's message cache."""
+    key = message_cache_key(user_id)
     try:
-        if db.exists(CACHE_FILE):
-            return db.load(CACHE_FILE)
+        if db.exists(key):
+            return db.load(key)
     except Exception as e:
         logging.warning("load_message_cache failed: %s", e)
     return []
@@ -270,7 +282,7 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False):
 
                     if "loginform" in html_text:
                         logging.warning("🔐 Session expired while accessing %s.", course_name)
-                        await session.login(force=True)
+                        await session.login()
                         return course_name, cid, []
 
                     # lxml, not html.parser: this page embeds inline SVG icons with
@@ -721,9 +733,12 @@ MESSAGE_CHECK_LIMIT = 20
 MESSAGE_POLL_SECONDS = 60
 
 
-async def _fetch_messages_api(limit: int = MESSAGE_CHECK_LIMIT) -> list:
+async def _fetch_messages_api(limit: int = MESSAGE_CHECK_LIMIT, session=None) -> list:
     """The newest `limit` inbox messages, newest first, bodies included."""
-    page = await studip_api_get(f"/users/{await studip_api_user_id()}/inbox", {"page[limit]": limit, "include": "sender"})
+    uid = await studip_api_user_id(session=session)
+    if not uid:
+        raise StudipApiError("Stud.IP user id unknown")
+    page = await studip_api_get(f"/users/{uid}/inbox", {"page[limit]": limit, "include": "sender"}, session=session)
     names = _api_names(page.get("included", []))
     return [_api_message(m, names) for m in page.get("data", [])]
 
@@ -758,23 +773,47 @@ async def _fetch_messages_html(session) -> list:
     return all_messages
 
 
+# Other users' inboxes are polled less often: every poll is a request from
+# the same server, and the admin's 60 s cadence times N users adds up.
+MESSAGE_POLL_USER_SECONDS = 5 * 60
+
+
 async def message_poll_loop(app) -> None:
-    """Checks the inbox every MESSAGE_POLL_SECONDS, so a new Stud.IP message
-    reaches Telegram within about half a minute. Skips while the watchers
-    are paused or no logged-in session exists yet."""
+    """Checks the admin inbox every MESSAGE_POLL_SECONDS (so a new Stud.IP
+    message reaches Telegram within about a minute) and every other signed-in
+    user's inbox every MESSAGE_POLL_USER_SECONDS, each with their own session
+    and sent only to them. Skips while the watchers are paused."""
+    import random
+
+    act_as_bot()
     admin_id = next(iter(ALLOWED_USER_IDS), None)
+    last_user_poll: dict[int, float] = {}
     while True:
         await asyncio.sleep(MESSAGE_POLL_SECONDS)
-        if state.global_watcher_paused or state.global_session is None or admin_id is None:
+        if state.global_watcher_paused:
             continue
-        use_oauth = studip_oauth.oauth_enabled()
-        has_auth = os.path.exists(state.global_session.cookie_file) or (use_oauth and studip_oauth.load_tokens() is not None)
-        if not has_auth:
-            continue
-        try:
-            await check_new_messages(app.bot, admin_id, silent=True)
-        except Exception as e:
-            logging.error("❌ Message poll failed: %s", e)
+        with acting_as(None):
+            if state.global_session is not None and admin_id is not None and has_stored_login(state.global_session):
+                try:
+                    await check_new_messages(app.bot, admin_id, silent=True)
+                except Exception as e:
+                    logging.error("❌ Message poll failed: %s", e)
+
+        now = time.time()
+        for uid, sess in list(state.user_sessions.items()):
+            if sess is state.global_session or uid == admin_id:
+                continue
+            if now - last_user_poll.get(uid, 0.0) < MESSAGE_POLL_USER_SECONDS:
+                continue
+            if time.time() - getattr(sess, "last_interactive_activity", 0.0) < 180 or not has_stored_login(sess):
+                continue
+            last_user_poll[uid] = now
+            await asyncio.sleep(random.uniform(1.0, 4.0))  # spread users out
+            with acting_as(uid):
+                try:
+                    await check_new_messages(app.bot, uid, silent=True)
+                except Exception as e:
+                    logging.warning("Message poll failed for user %s: %s", uid, e)
 
 
 _message_check_lock = asyncio.Lock()
@@ -789,22 +828,32 @@ async def check_new_messages(bot, chat_id, silent: bool = False):
 
 
 async def _check_new_messages(bot, chat_id, silent: bool = False):
-    session = state.global_session
+    # the acting user's own inbox (the admin's outside of any user context)
+    session = get_user_session()
+    cache_key = message_cache_key()
     if not silent:
         await bot.send_message(chat_id=chat_id, text="📨 Checking messages...", disable_notification=True)
 
     try:
         try:
-            all_messages = await _fetch_messages_api()
+            all_messages = await _fetch_messages_api(session=session)
         except Exception as e:
             logging.warning("check_new_messages: API failed (%s), falling back to the overview page", e)
             all_messages = await _fetch_messages_html(session)
 
+        if not db.exists(cache_key):
+            # first check for this user: remember the inbox as it is instead
+            # of sending every old message as "new"
+            db.save(cache_key, all_messages[:100])
+            if not silent:
+                await bot.send_message(chat_id=chat_id, text="☑️ No new messages found.", disable_notification=True)
+            return False
+
         old_messages = []
-        if db.exists(CACHE_FILE):
-            try:
-                old_messages = db.load(CACHE_FILE)
-            except (OSError, ValueError): pass
+        try:
+            old_messages = db.load(cache_key)
+        except (OSError, ValueError):
+            pass
 
         old_ids = {m["id"] for m in old_messages}
         new_messages = [m for m in all_messages if m["id"] not in old_ids]
@@ -822,7 +871,7 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
         # Update cache with new messages prepended or appended
         # Best to just store all recent ones
         all_messages_combined = (new_messages + old_messages)[:100]
-        db.save(CACHE_FILE, all_messages_combined)
+        db.save(cache_key, all_messages_combined)
 
         new_messages_sorted = sorted(new_messages, key=lambda m: parse_date_safe(m.get("date", "")))
         for msg in new_messages_sorted:
@@ -855,7 +904,9 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
                     btn_rows.append([InlineKeyboardButton("↩️ Reply on Stud.IP", callback_data=f"msg_reply|{msg['id']}")])
                 btn_rows.append([InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")])
                 markup = InlineKeyboardMarkup(btn_rows)
-            await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup)
+            # a Stud.IP message is private: only its recipient gets it
+            await bot.send_message(chat_id=chat_id, text=text[:4000], parse_mode="HTML", reply_markup=markup)
+            await asyncio.sleep(0.3)
         return True
     except Exception as e:
         logging.error("check_new_messages failed: %s", e)
@@ -1085,14 +1136,15 @@ async def show_last_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
     chat_id = query.message.chat_id
 
     try:
-        # Load message cache
-        if not db.exists(CACHE_FILE):
+        # Load the tapping user's own message cache
+        cache_key = message_cache_key(query.from_user.id)
+        if not db.exists(cache_key):
             await _stop_loading_animation(stop_evt, anim_task)
             await query.edit_message_text("⚠️ No message history available.")
             return
 
         try:
-            all_messages = db.load(CACHE_FILE)
+            all_messages = db.load(cache_key)
         except Exception as e:
             logging.error("Failed to load message cache: %s", e)
             await _stop_loading_animation(stop_evt, anim_task)
@@ -1246,7 +1298,7 @@ async def _run_check_now(update, context):
 
 async def send_studip_message(recipient_id: str, subject: str, message_body: str, _retry: bool = True) -> dict:
     """Send a Stud.IP internal message via `POST /jsonapi.php/v1/messages`."""
-    session = state.global_session or await login_studip()
+    session = await login_studip()  # the acting user sends from their own account
     url = f"{STUDIP_API_URL}/messages"
     payload = {
         "data": {
@@ -1276,7 +1328,7 @@ async def send_studip_message(recipient_id: str, subject: str, message_body: str
         # Self-healing silent SSO renewal attempt
         if await session.heal_session():
             return await send_studip_message(recipient_id, subject, message_body, _retry=False)
-        await session.login(force=True)
+        await session.login()  # respects the failed-login backoff
         return await send_studip_message(recipient_id, subject, message_body, _retry=False)
     if status not in (200, 201, 202, 204):
         raise StudipApiError(f"POST /messages failed: HTTP {status} ({resp_text[:180]})")

@@ -54,7 +54,7 @@ async def send_exam_registration_menu(message, user_id=None):
     """Show currently open-for-registration and currently-registered exams on
     the StuMS/HISinOne portal, each with a Register/Deregister button."""
     user_sess = get_user_session(user_id) if user_id else None
-    session = user_sess or state.global_session or await login_studip()
+    session = user_sess or get_user_session()
 
     try:
         open_exams = await get_open_exam_registrations(session)
@@ -163,7 +163,8 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _show_typing(query)
         stop_evt, anim_task = _start_loading_animation(status_msg, f"Submitting: {verb} {info['title']}...")
         try:
-            session = await login_studip()
+            # always the tapping student's own StuMS session, never the admin's
+            session = get_user_session(query.from_user.id)
             result = await submit_exam_action(session, info["unit_id"], info["action_type"])
         except Exception as e:
             logging.error("exam action failed: %s", e)
@@ -271,11 +272,12 @@ async def handle_examopen_mute_confirm(update: Update, context: ContextTypes.DEF
     if not info:
         await query.edit_message_text("⚠️ This notification has expired.")
         return
-    cache = load_exam_cache()
+    uid = query.from_user.id  # each student mutes only their own reminders
+    cache = load_exam_cache(user_id=uid)
     muted = set(cache.get("muted_codes", []))
     muted.add(info["code"])
     cache["muted_codes"] = sorted(muted)
-    save_exam_cache(cache)
+    save_exam_cache(cache, user_id=uid)
     await query.edit_message_text(f"🔕 Won't remind you about this exam's registration anymore:\n{info['title']}")
 
 
@@ -353,7 +355,7 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
     stop_evt, anim_task = _start_loading_animation(status_msg, f"Generating {spec['label']}...")
     try:
         user_sess = get_user_session(user_id)
-        session = user_sess or state.global_session or await login_studip()
+        session = user_sess or get_user_session()
         pdf_bytes, filename = await download_stums_document(session, doc_key)
     except Exception as exc:
         logging.error("StuMS document download failed for %s: %s", doc_key, exc)
@@ -361,7 +363,7 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
         server = state.login_server
         kb_rows = []
         if server:
-            kb_rows.append([InlineKeyboardButton("🔐 Sign In / Refresh Session", web_app=WebAppInfo(url=server.app_url()))])
+            kb_rows.append([InlineKeyboardButton("🎓 Sign In to StuMS", web_app=WebAppInfo(url=server.app_url("stums")))])
         kb_rows.append([InlineKeyboardButton("🔄 Retry", callback_data=f"stums_doc|{doc_key}")])
         await status_msg.edit_text(
             f"❌ Unable to download <b>{html.escape(spec['label'])}</b> via StuMS:\n"
@@ -389,7 +391,7 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
 async def build_tuition_status_text(session=None, user_id=None) -> tuple[str, InlineKeyboardMarkup]:
     """Fetch and format the StuMS tuition / semester fee (*Rückmeldung*) status."""
     user_sess = get_user_session(user_id) if user_id else None
-    sess = session or user_sess or state.global_session or await login_studip()
+    sess = session or user_sess or get_user_session()
     try:
         info = await get_tuition_status(sess)
     except Exception as exc:
@@ -403,7 +405,7 @@ async def build_tuition_status_text(session=None, user_id=None) -> tuple[str, In
         server = state.login_server
         kb_rows = []
         if server:
-            kb_rows.append([InlineKeyboardButton("🔐 Sign In / Refresh Session", web_app=WebAppInfo(url=server.app_url()))])
+            kb_rows.append([InlineKeyboardButton("🎓 Sign In to StuMS", web_app=WebAppInfo(url=server.app_url("stums")))])
         kb_rows.append([InlineKeyboardButton("🔄 Retry", callback_data="tuition_status")])
         kb = InlineKeyboardMarkup(kb_rows)
         return "\n".join(lines), kb
@@ -587,7 +589,7 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
 
     try:
         user_sess = get_user_session(user_id)
-        session = user_sess or state.global_session or await login_studip()
+        session = user_sess or get_user_session()
         courses = await list_courses(user_id=user_id)
         module_codes = await get_my_module_codes(session, courses)
         exams = await get_all_exam_dates(session)
@@ -653,7 +655,7 @@ async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TY
 
     try:
         user_sess = get_user_session(user_id)
-        session = user_sess or state.global_session or await login_studip()
+        session = user_sess or get_user_session()
         exams = await get_all_exam_dates(session)
     except Exception as e:
         logging.error("All exam dates error: %s", e)
@@ -692,7 +694,7 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
 
     try:
         user_sess = get_user_session(user_id)
-        session = user_sess or state.global_session or await login_studip()
+        session = user_sess or get_user_session()
         grades = await get_grades(session)
     except Exception as e:
         logging.error("Transcript summary error: %s", e)

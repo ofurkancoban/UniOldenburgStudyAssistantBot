@@ -5,10 +5,12 @@ This Cloudflare Worker acts as a distributed reverse proxy for Uni Oldenburg ser
 It ensures that requests originating from the bot reach university servers from rotating Cloudflare edge IP addresses rather than directly from your server's single VPS IP.
 
 ## Features
-- Preserves NetIQ SSO redirects and full authentication flows.
-- Rewrites `Set-Cookie` headers by stripping `Domain=` and setting `Path=/` so `aiohttp` maintains session cookies across routed endpoints.
+- Does not follow redirects itself: the bot follows them hop by hop, so every hop is throttled and carries the right cookies.
+- Moves every upstream `Set-Cookie` header, unmodified, to `X-Upstream-Set-Cookie`. The bot stores those cookies under the real university host (Domain and Path intact). The previous version stripped `Domain=` and forced `Path=/`, which put the `JSESSIONID` of StuMS and of the NetIQ login under one name on the worker's hostname, so they overwrote each other and StuMS never stayed signed in.
 - Whitelists only official University of Oldenburg domains to prevent open-proxy abuse.
-- Protected by a shared `X-Proxy-Secret` token.
+- Requires the shared `X-Proxy-Secret` token (requests are refused when `PROXY_SECRET` is not set), and drops Cloudflare/forwarding headers before contacting the university.
+
+> After updating `worker.js`, redeploy the worker. The bot also still works with an old deployment, but only the current one keeps cookie domains exact.
 
 ---
 

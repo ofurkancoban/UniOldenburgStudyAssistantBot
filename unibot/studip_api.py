@@ -28,7 +28,7 @@ from studip_utils import (
 from unibot import state
 from unibot.storage import get_watch_previous_semester_enabled, load_default_semester, save_studip_user_name
 from unibot.formatting import clean_html_text
-from unibot.auth import get_user_session, is_user_admin, login_studip
+from unibot.auth import current_user_id, get_user_session, is_user_admin, login_studip
 
 
 BASE_URL = "https://elearning.uni-oldenburg.de"
@@ -342,7 +342,7 @@ async def studip_api_get(path: str, params: Optional[dict] = None, session: Opti
         # Self-healing silent SSO renewal attempt
         if await session.heal_session():
             return await studip_api_get(path, params, session=session, user_id=user_id, _retry=False)
-        await session.login(force=True)
+        await session.login()  # respects the failed-login backoff
         return await studip_api_get(path, params, session=session, user_id=user_id, _retry=False)
     if status != 200:
         raise StudipApiError(f"{path}: HTTP {status}")
@@ -372,9 +372,27 @@ async def studip_api_get_all(
             return data, included
 
 
+# Stud.IP profile per Telegram user (the admin's lives in state._studip_user_profile)
+_user_profiles: dict[int, dict] = {}
+
+
+def _uses_global_profile(user_id: Optional[int]) -> bool:
+    """The admin session's profile is cached globally, everyone else's per user."""
+    if user_id is None:
+        return True
+    sess = state.user_sessions.get(user_id)
+    return sess is not None and sess is state.global_session
+
+
 async def get_studip_user_profile(user_id: Optional[int] = None, session: Optional[object] = None) -> dict:
     """Fetch profile of the currently authenticated user from Stud.IP /users/me."""
-    if user_id is None and state._studip_user_profile:
+    if user_id is None and session is None:
+        user_id = current_user_id()
+    if user_id is not None and not _uses_global_profile(user_id):
+        cached = _user_profiles.get(user_id)
+        if cached and cached.get("id"):
+            return cached
+    if _uses_global_profile(user_id) and session is None and state._studip_user_profile:
         return state._studip_user_profile
     try:
         res = await studip_api_get("/users/me", session=session, user_id=user_id)
@@ -394,19 +412,29 @@ async def get_studip_user_profile(user_id: Optional[int] = None, session: Option
             "family_name": family_name,
             "display_name": display_name,
         }
-        if user_id is None:
+        if _uses_global_profile(user_id):
             state._studip_api_user_id = studip_id
             state._studip_user_profile = profile
             if display_name:
                 save_studip_user_name(display_name)
+        elif studip_id:
+            _user_profiles[user_id] = profile
         return profile
     except Exception as exc:
         logging.warning("Could not fetch Stud.IP user profile: %s", exc)
-        return (state._studip_user_profile or {}) if user_id is None else {}
+        return (state._studip_user_profile or {}) if _uses_global_profile(user_id) else {}
+
+
+def forget_user_profile(user_id: Optional[int]) -> None:
+    """Drop a cached profile (after a logout or a login with another account)."""
+    if user_id is not None:
+        _user_profiles.pop(user_id, None)
 
 
 async def studip_api_user_id(session: Optional[object] = None, user_id: Optional[int] = None) -> str:
-    if user_id is not None:
+    if user_id is None:
+        user_id = getattr(session, "user_id", None) if session is not None else current_user_id()
+    if user_id is not None and not _uses_global_profile(user_id):
         profile = await get_studip_user_profile(user_id=user_id, session=session)
         return profile.get("id") or ""
     if not state._studip_api_user_id:

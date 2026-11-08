@@ -422,7 +422,7 @@ class WatcherCycleTests(unittest.TestCase):
             return run
 
         async def fake_sleep(seconds):
-            if seconds == 90:  # end of the first full cycle
+            if seconds == 180:  # end of the first full cycle
                 raise _StopWatcher
 
         cache = {}
@@ -470,7 +470,7 @@ class WatcherCycleTests(unittest.TestCase):
         for expected in ("morning", "calendar", "schedule_changes", "tasks", "exam_registrations", "grades",
                          "tuition", "exam_dates", "registered", "file_exams", "health", "announcements", "forum"):
             self.assertIn(expected, calls)
-        self.assertNotIn("files", calls)  # files run every second cycle
+        self.assertIn("files", calls)  # throttled to every 30 min, so due on the first cycle
         self.assertEqual(cache["health_state"], {"studip": False})
         self.assertIn("last_exam_date_check", cache)
         self.assertTrue(any("Health check failed" in t and "down &lt;now&gt;" in t for t in sent))
@@ -592,12 +592,13 @@ class StumsHandoffTests(unittest.TestCase):
         import exam_reminder
         self.er = exam_reminder
 
-    def session(self, planner_pages):
+    def session(self, planner_pages, has_stums_cookie=False):
         s = mock.MagicMock()
         s.explicitly_logged_out = False
         s._stums_verified_at = 0.0
         s.stums_blocked_until = 0.0
         s.sso_handoff = mock.AsyncMock(return_value="https://stums.uni-oldenburg.de/start")
+        s.session.cookie_jar.filter_cookies.return_value = {"JSESSIONID": "x"} if has_stums_cookie else {}
         pages = iter(planner_pages)
 
         async def get(url, **kwargs):
@@ -606,15 +607,22 @@ class StumsHandoffTests(unittest.TestCase):
         s.get = get
         return s
 
+    def test_warm_stums_cookie_needs_no_handoff(self):
+        # the keep-alive keeps StuMS' own session warm: one request, no SSO round trip
+        s = self.session(["<h1>Studienplaner</h1>"], has_stums_cookie=True)
+        self.assertEqual(asyncio.run(self.er._establish_stums_session(s)), self.er.STUMS_START_URL)
+        asyncio.run(self.er._establish_stums_session(s))  # remembered: no second request
+        self.assertEqual(s.sso_handoff.await_count, 0)
+
     def test_valid_login_is_used_and_remembered(self):
         s = self.session(["<h1>Studienplaner</h1>"])
         self.assertEqual(asyncio.run(self.er._establish_stums_session(s)), "https://stums.uni-oldenburg.de/start")
-        asyncio.run(self.er._establish_stums_session(s))  # within 60 s: no second handoff or check
+        asyncio.run(self.er._establish_stums_session(s))  # within the trust window: no second handoff or check
         self.assertEqual(s.sso_handoff.await_count, 1)
         s.session.cookie_jar.clear_domain.assert_not_called()
 
     def test_expired_session_signs_in_again(self):
-        s = self.session(["Login notwendig", "<h1>Studienplaner</h1>"])
+        s = self.session(["Login notwendig", "Login notwendig", "<h1>Studienplaner</h1>"], has_stums_cookie=True)
         asyncio.run(self.er._establish_stums_session(s))
         self.assertEqual(s.sso_handoff.await_count, 2)
         s.session.cookie_jar.clear_domain.assert_called_once_with("stums.uni-oldenburg.de")
@@ -624,6 +632,13 @@ class StumsHandoffTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "still shows you as logged out"):
             asyncio.run(self.er._establish_stums_session(s))
         self.assertEqual(s._stums_verified_at, 0.0)
+
+    def test_expired_sso_asks_for_a_sign_in(self):
+        s = self.session([])
+        s.sso_handoff = mock.AsyncMock(side_effect=RuntimeError("Interactive login required (no stored username)"))
+        with self.assertRaisesRegex(self.er.StumsLoginUnavailable, "/login"):
+            asyncio.run(self.er._establish_stums_session(s))
+        self.assertGreater(s.stums_blocked_until, __import__("time").time())
 
     def test_pauses_after_refusal_and_logs_once(self):
         s = self.session(["Login notwendig", "Login notwendig"])
@@ -678,7 +693,7 @@ class StumsHandoffTests(unittest.TestCase):
 
     def test_handoff_errors_are_wrapped(self):
         s = self.session([])
-        s.sso_handoff.side_effect = RuntimeError("Interactive login required (no stored password)")
+        s.sso_handoff.side_effect = RuntimeError("SSO flow did not complete; stuck at https://login.example/x")
         with self.assertRaisesRegex(RuntimeError, "StuMS SSO handoff failed"):
             asyncio.run(self.er._establish_stums_session(s))
 

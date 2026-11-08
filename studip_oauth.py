@@ -43,10 +43,12 @@ import os
 import re
 import time
 from typing import Optional
+from urllib.parse import urlsplit
 
 import aiohttp
 from bs4 import BeautifulSoup
 
+from studip_http import THROTTLE, parse_retry_after, user_agent
 from studip_utils import route_proxy_url
 
 logger = logging.getLogger("StudIPOAuth")
@@ -237,10 +239,7 @@ async def authorize_with_session(session, timeout: int = 30, user_id: Optional[i
         "state": state,
     }
     logger.info("Requesting consent page...")
-    cookie_jar = session.session.cookie_jar if getattr(session, "session", None) else None
-    routed_auth, auth_headers = route_proxy_url(AUTHORIZE_URL, cookie_jar=cookie_jar)
-    async with session.session.get(routed_auth, params=params, headers=auth_headers or None, allow_redirects=False,
-                                   timeout=timeout) as resp:
+    async with await session.get(AUTHORIZE_URL, params=params, allow_redirects=False, timeout=timeout) as resp:
         status = resp.status
         body = await resp.text()
         location = resp.headers.get("Location", "")
@@ -266,8 +265,7 @@ async def authorize_with_session(session, timeout: int = 30, user_id: Optional[i
     payload["allow"] = ""  # empty value == approve; "1" is read as a rejection
 
     logger.info("Submitting consent...")
-    async with session.session.post(routed_auth, data=payload, headers=auth_headers or None, allow_redirects=False,
-                                    timeout=timeout) as resp:
+    async with await session.post(AUTHORIZE_URL, data=payload, allow_redirects=False, timeout=timeout) as resp:
         status = resp.status
         location = resp.headers.get("Location", "")
         body = await resp.text()
@@ -297,10 +295,7 @@ async def _exchange_code(session, redirect_location: str, verifier: str, state: 
         "client_id": CLIENT_ID,
         "code_verifier": verifier,
     }
-    cookie_jar = session.session.cookie_jar if getattr(session, "session", None) else None
-    routed_tok, tok_headers = route_proxy_url(TOKEN_URL, cookie_jar=cookie_jar)
-    async with session.session.post(routed_tok, data=data, headers=tok_headers or None, allow_redirects=False,
-                                    timeout=30) as resp:
+    async with await session.post(TOKEN_URL, data=data, allow_redirects=False, timeout=30) as resp:
         status = resp.status
         text = await resp.text()
 
@@ -325,10 +320,21 @@ async def refresh(tokens: Optional[dict] = None, user_id: Optional[int] = None) 
         "refresh_token": tokens["refresh_token"],
         "client_id": CLIENT_ID,
     }
-    cookie_jar = session.session.cookie_jar if getattr(session, "session", None) else None
-    routed_tok, tok_headers = route_proxy_url(TOKEN_URL, cookie_jar=cookie_jar)
-    async with aiohttp.ClientSession() as http:
-        async with http.post(routed_tok, data=data, headers=tok_headers or None, allow_redirects=False, timeout=30) as resp:
+    # Token refresh carries no cookies, so it needs no user session; it is
+    # still routed through the optional worker and the shared host throttle.
+    routed_tok, tok_headers = route_proxy_url(TOKEN_URL, {"User-Agent": user_agent()})
+    host = urlsplit(TOKEN_URL).hostname or ""
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()) as http:
+        async with THROTTLE.slot(host):
+            try:
+                resp_cm = http.post(routed_tok, data=data, headers=tok_headers, allow_redirects=False,
+                                    timeout=aiohttp.ClientTimeout(total=30))
+                resp = await resp_cm
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+                THROTTLE.report(host, failed=True)
+                raise
+        async with resp:
+            THROTTLE.report(host, resp.status, parse_retry_after(resp.headers.get("Retry-After")))
             status = resp.status
             text = await resp.text()
 

@@ -40,7 +40,7 @@ from unibot.storage import (
 )
 from unibot.formatting import _short_id, clean_course_title
 from unibot.telegram_ui import _download_telegram_file, get_main_keyboard, nav_names
-from unibot.auth import is_user_allowed, login_studip
+from unibot.auth import get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import BASE_URL, _normalize_url, list_courses, list_files
 from unibot.ai import _call_openrouter, _extract_json_object
 from unibot.weather import get_weather_snapshot
@@ -822,7 +822,7 @@ async def _voice_intent_exam_register(update, context, result, transcript, inten
     """Voice intent: exam_register / exam_deregister."""
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     try:
-        session = await login_studip()
+        session = get_user_session(update.effective_user.id)
         if intent == "exam_register":
             exams = await get_open_exam_registrations(session)
             action_type = "anmelden"

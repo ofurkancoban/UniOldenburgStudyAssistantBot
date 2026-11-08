@@ -121,11 +121,18 @@ class LoginBackoffTests(unittest.TestCase):
         self.assertTrue(asyncio.run(s.is_html_logged_in(use_cache=False)))
         self.assertEqual(s._check_html_logged_in.await_count, 2)
 
-    def test_negative_login_check_is_not_cached(self):
+    def test_negative_login_check_is_cached_briefly(self):
+        # a logged-out answer is kept for 15 s so a burst of handlers does not
+        # re-download Stud.IP pages; use_cache=False always asks again
         s = self._session()
         asyncio.run(s.is_html_logged_in())
         asyncio.run(s.is_html_logged_in())
+        self.assertEqual(s._check_html_logged_in.await_count, 1)
+        asyncio.run(s.is_html_logged_in(use_cache=False))
         self.assertEqual(s._check_html_logged_in.await_count, 2)
+        s._logged_out_until = time.time() - 1
+        asyncio.run(s.is_html_logged_in())
+        self.assertEqual(s._check_html_logged_in.await_count, 3)
 
 
 class BotStateTests(unittest.TestCase):

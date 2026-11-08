@@ -16,7 +16,11 @@ The ultimate Telegram companion for students at the **University of Oldenburg**.
 
 Courses, files and folders, announcements, messages and forum posts are read from Stud.IP's own JSON:API (`/jsonapi.php/v1`), using the same logged-in session as the web pages, so no API registration is needed. Each of them falls back to reading the HTML page if the API ever fails. Logging in (SSO with TOTP), enrolment and everything from StuMS (exam dates, registration, grades) still go through the web pages, since there is no API for them.
 
-All outgoing requests to Stud.IP, StuMS, and NetIQ SSO can optionally be routed through a **Cloudflare Worker reverse proxy** (`CLOUDFLARE_WORKER_URL`). This routes bot requests through Cloudflare's rotating edge IPs to preserve privacy, avoid rate-limiting, and mask the VPS host IP, while preserving session cookies and redirects. If unset, the bot falls back directly to transparent native requests.
+All outgoing requests to Stud.IP, StuMS, and NetIQ SSO can optionally be routed through a **Cloudflare Worker reverse proxy** (`CLOUDFLARE_WORKER_URL`). This routes bot requests through Cloudflare's rotating edge IPs to preserve privacy and mask the VPS host IP, while preserving session cookies and redirects. If unset, the bot falls back directly to transparent native requests.
+
+Every request to a university host goes through one transport (`studip_http.py` + `StudIPSession.request`), shared by all users: redirects are followed hop by hop with the exact cookies a browser would send to that host and path, parallel requests per host are capped, background requests are spaced out, and a host that answers 429/503 is paused instead of retried. StuMS checks first reuse the existing StuMS session (kept warm by the keep-alive) and only run the SSO handoff when StuMS reports "Login notwendig", so a student account is not signed in over and over. If the university SSO session itself has expired, the bot asks the student to use **🎓 Sign In to StuMS** in `/login` once.
+
+**Multi-user:** each student's StuMS checks (registrations, grades, fees, exam dates) run with their own session, their own cache file (`exam_reminder_cache_<telegram_id>.json`) and are sent only to them, one student after another with a short random pause. Stud.IP inbox messages are private too (`messages_cache_<telegram_id>.json`). Course content (announcements, files, forum) is fetched once and fanned out to the students of that course.
 
 ---
 

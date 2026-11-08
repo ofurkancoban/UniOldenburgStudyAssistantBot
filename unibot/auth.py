@@ -3,6 +3,8 @@
 Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
+import contextlib
+import contextvars
 import errno
 import html
 import logging
@@ -16,6 +18,7 @@ from telegram.error import TelegramError
 
 import studip_oauth
 from studip_login_server import LoginServer
+from studip_http import BACKGROUND, INTERACTIVE, set_request_priority
 from studip_session import StudIPSession
 from studip_tunnel import QuickTunnel
 
@@ -42,11 +45,58 @@ USERNAME = ""
 PASSWORD = ""
 TOTP_SECRET = ""
 
+# The Telegram user an update (or a per-user background job) acts for. Set by
+# _authorization_gate for every allowed update and by `acting_as()`, so code
+# that asks for "the session" without naming a user gets that user's own
+# Stud.IP/StuMS session instead of the admin's.
+_current_user: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("current_telegram_user", default=None)
+
+
+def current_user_id() -> Optional[int]:
+    return _current_user.get()
+
+
+def act_as_bot() -> None:
+    """Mark the current task as the bot's own (background jobs started from a
+    user's update must not inherit that user or its request priority)."""
+    _current_user.set(None)
+    set_request_priority(BACKGROUND)
+
+
+def has_stored_login(sess) -> bool:
+    """Whether a session has anything to sign in with (cookies or OAuth tokens)."""
+    if sess is None or sess.explicitly_logged_out:
+        return False
+    if getattr(sess, "user_id", None):
+        try:
+            if db.load_user_credential(sess.user_id, "cookies"):
+                return True
+        except Exception:
+            pass
+    if sess.cookie_file and os.path.exists(sess.cookie_file):
+        return True
+    return bool(studip_oauth.oauth_enabled()
+                and studip_oauth.load_tokens(getattr(sess, "user_id", None)) is not None)
+
+
+@contextlib.contextmanager
+def acting_as(user_id: Optional[int]):
+    """Run a block on behalf of `user_id` (None: the bot's admin session)."""
+    token = _current_user.set(user_id)
+    try:
+        yield
+    finally:
+        _current_user.reset(token)
+
 
 async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Drop or onboard updates. Allowed users proceed; new users can redeem invite codes."""
     user = update.effective_user
+    _current_user.set(None)
+    set_request_priority(BACKGROUND)
     if user is not None and is_user_allowed(user.id):
+        _current_user.set(user.id)
+        set_request_priority(INTERACTIVE)
         action = None
         if update.callback_query and update.callback_query.data:
             action = f"cb:{update.callback_query.data[:30]}"
@@ -202,7 +252,12 @@ SELECTORS = {
 
 # ── Stud.IP login ──────────────────────────────────────────────────────────────
 def get_user_session(user_id: Optional[int] = None) -> StudIPSession:
-    """Retrieve or initialize the StudIPSession for a specific Telegram user."""
+    """Retrieve or initialize the StudIPSession for a specific Telegram user.
+
+    Without an explicit user_id the user the current update acts for is used;
+    only outside of any user context (background jobs) is it the admin session."""
+    if user_id is None:
+        user_id = current_user_id()
     if user_id is None:
         if state.global_session is None:
             state.global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
@@ -232,6 +287,8 @@ def get_user_session(user_id: Optional[int] = None) -> StudIPSession:
 
 
 async def login_studip(notify=None, user_id: Optional[int] = None):
+    if user_id is None:
+        user_id = current_user_id()
     session = get_user_session(user_id)
     if await session.is_logged_in():
         return session
@@ -282,6 +339,19 @@ async def _notify_repeated_login_failure() -> None:
             logging.warning("Could not send login-failure alert to %s: %s", uid, exc)
 
 
+def is_new_login_for(session: StudIPSession) -> bool:
+    """True when the session's Stud.IP cookie changed since the last check."""
+    current = None
+    if session.session:
+        for c in session.session.cookie_jar:
+            if c.key == "Studip_Session":
+                current = c.value
+                break
+    previous = vars(session).get("_last_seen_studip_cookie")
+    session._last_seen_studip_cookie = current
+    return bool(current) and current != previous
+
+
 def _login_public_url() -> str:
     """Live public address of the login page, tunnel first."""
     if state.quick_tunnel and state.quick_tunnel.url:
@@ -295,9 +365,11 @@ def _get_or_init_session() -> StudIPSession:
 
 async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None:
     """Called when the user completes login in the proxied Stud.IP Mini App."""
-    from unibot.studip_api import get_studip_user_profile
+    from unibot.studip_api import forget_user_profile, get_studip_user_profile
 
     session = get_user_session(user_id)
+    if is_new_login_for(session):
+        forget_user_profile(user_id)
     session.explicitly_logged_out = False
     session.last_interactive_activity = 0.0
     session.reset_login_backoff()
@@ -482,6 +554,7 @@ async def _send_login_prompt(reply_target, user_id: int) -> None:
     if public.startswith("https://"):
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔐 Open Stud.IP (Mini App)", web_app=WebAppInfo(url=server.app_url()))],
+            [InlineKeyboardButton("🎓 Sign In to StuMS (exams, grades)", web_app=WebAppInfo(url=server.app_url("stums")))],
         ])
         await reply_target.reply_text(
             "Tap the button below to open Stud.IP and sign in.\n"
@@ -504,6 +577,9 @@ async def _send_login_prompt(reply_target, user_id: int) -> None:
 
 async def _perform_logout(user_id: Optional[int] = None) -> None:
     """Log out of Stud.IP and clear stored session cookies and OAuth2 tokens."""
+    from unibot.studip_api import forget_user_profile
+
+    forget_user_profile(user_id)
     if user_id is not None:
         sess = state.user_sessions.pop(user_id, None)
         if sess is not None:

@@ -160,13 +160,14 @@ def route_proxy_url(
             if "Accept-Encoding" not in headers:
                 headers["Accept-Encoding"] = "gzip, deflate"
 
-            # Critical: aiohttp CookieJar does not automatically send target domain cookies
-            # to worker_url (a different host). When routing through Cloudflare Worker proxy,
-            # explicitly inject matching cookies for the target university domain into the Cookie header.
-            if cookie_jar is not None:
+            # aiohttp does not send the target's cookies to the worker (a
+            # different host), so inject the ones matching the full target URL
+            # (path-scoped cookies such as StuMS' /qisserver session included).
+            # StudIPSession.request() injects them itself and passes no jar.
+            if cookie_jar is not None and host in target_hosts:
                 try:
                     from yarl import URL as YarlURL
-                    matching_cookies = cookie_jar.filter_cookies(YarlURL(f"https://{target_host}/"))
+                    matching_cookies = cookie_jar.filter_cookies(YarlURL(str(url)))
                     if matching_cookies:
                         cookie_parts = []
                         for k, morsel in matching_cookies.items():
@@ -189,7 +190,8 @@ def route_proxy_url(
 
 
 def unroute_proxy_url(url: str) -> str:
-    """If url points to Cloudflare Worker proxy, reconstruct original uni url."""
+    """If url points to the Cloudflare Worker proxy, reconstruct the original uni url
+    (path, trailing slash and query string preserved)."""
     worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
     if not worker_url:
         return str(url)
@@ -198,12 +200,14 @@ def unroute_proxy_url(url: str) -> str:
         parts = urlsplit(str(url))
         worker_parts = urlsplit(worker_url)
         if parts.netloc.lower() == worker_parts.netloc.lower():
-            # Check if path starts with target host
-            path_segments = [s for s in parts.path.split("/") if s]
-            if path_segments and "uni-oldenburg.de" in path_segments[0].lower():
-                target_host = path_segments[0].lower()
-                rest_path = "/" + "/".join(path_segments[1:])
-                return urlunsplit((parts.scheme, target_host, rest_path, parts.query, parts.fragment))
+            path = parts.path
+            base = worker_parts.path.rstrip("/")
+            if base and path.startswith(base + "/"):
+                path = path[len(base):]
+            segment, _, rest = path.lstrip("/").partition("/")
+            if segment.lower().endswith(".uni-oldenburg.de"):
+                # university hosts are HTTPS-only, whatever the worker URL uses
+                return urlunsplit(("https", segment.lower(), "/" + rest, parts.query, parts.fragment))
     except Exception:
         pass
 

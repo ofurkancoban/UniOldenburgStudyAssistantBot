@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
+from studip_http import UNSPACED, set_request_priority
+
 BASE_URL = "https://elearning.uni-oldenburg.de"
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
 PENDING_FILE = "fastenroll_pending.json"
@@ -215,6 +217,9 @@ async def run_fast_enroll(session, sem_id: str, target_time_str: str, target_dat
 
     Returns (success: bool, message: str).
     """
+    # clock sampling and the submit itself must not wait for request spacing
+    set_request_priority(UNSPACED)
+
     async def notify(msg: str):
         logging.info("[fast_enroll] %s", msg)
         if on_progress:
@@ -499,6 +504,7 @@ async def enroll_now(session, sem_id: str) -> tuple:
     pick up an unrelated icon's accessibility label instead of the real page
     title), which reads as confusing/wrong even on a successful enrolment.
     """
+    set_request_priority(UNSPACED)
     try:
         security_token = await _fetch_security_token(session, sem_id)
     except EnrollError as e:

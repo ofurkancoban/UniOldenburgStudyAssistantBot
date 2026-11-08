@@ -6,12 +6,15 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 import asyncio
 import html
 import logging
+import random
 import time
 from datetime import datetime
 from typing import Optional
 
 from exam_reminder import (
+    adopt_legacy_exam_cache,
     background_stums,
+    exam_cache_user,
     load_exam_cache,
     check_exam_date_reminders,
     check_exam_reminders,
@@ -34,7 +37,7 @@ from unibot.storage import (
     update_general_cache,
 )
 from unibot.telegram_ui import broadcast
-from unibot.auth import get_user_session, login_studip
+from unibot.auth import act_as_bot, acting_as, get_user_session, has_stored_login, login_studip
 from unibot.schedule import (
     check_calendar_reminders,
     check_course_schedule_changes,
@@ -73,6 +76,9 @@ EXAM_REGISTRATION_CHECK_INTERVAL_SECONDS = 60 * 60
 EXAM_REGISTRATION_OPEN_INTERVAL_SECONDS = 30 * 60  # while a registration window is open
 TUITION_ATTEMPT_INTERVAL_SECONDS = 60 * 60  # check_tuition_reminders itself runs once a day
 HEALTH_CHECK_INTERVAL_SECONDS = 30 * 60
+# Pause between two students' StuMS checks, so N users never hit StuMS as
+# one burst from the server's IP.
+STUMS_USER_GAP_SECONDS = (4.0, 10.0)
 
 
 async def _guarded(label: str, job, *args, start_message: Optional[str] = None, **kwargs):
@@ -175,13 +181,67 @@ def _exam_registration_interval() -> int:
         else EXAM_REGISTRATION_CHECK_INTERVAL_SECONDS
 
 
-async def _run_throttled(cache_key: str, now: datetime, interval: int, label: str, job, *args, start_message=None):
+async def _run_throttled(cache_key: str, now: datetime, interval: int, label: str, job, *args,
+                         start_message=None, **kwargs):
     """Run a job when its interval has passed; the attempt is recorded even
     when it fails, so a broken StuMS is not retried on every cycle."""
     if not _is_due(cache_key, now, interval):
         return
-    await _guarded(label, job, *args, start_message=start_message)
+    await _guarded(label, job, *args, start_message=start_message, **kwargs)
     update_general_cache({cache_key: now.isoformat()})
+
+
+def _user_sender(user_id: int):
+    """broadcast()-compatible sender that only reaches one student: StuMS data
+    (registrations, grades, fees) is personal."""
+    async def send(bot, text, parse_mode="HTML", disable_notification=True, reply_markup=None, cid=None):
+        try:
+            await bot.send_message(chat_id=user_id, text=text, parse_mode=parse_mode,
+                                   disable_notification=disable_notification, reply_markup=reply_markup)
+        except Exception as e:
+            logging.warning("Could not send StuMS alert to %s: %s", user_id, e)
+    return send
+
+
+def _stums_users() -> list:
+    """(telegram_id, session) of every active student with a stored login."""
+    users = []
+    for uid in _get_active_user_ids():
+        try:
+            sess = get_user_session(uid)
+        except Exception as e:
+            logging.debug("No session for %s: %s", uid, e)
+            continue
+        if has_stored_login(sess):
+            users.append((uid, sess))
+    return users
+
+
+async def _run_stums_checks(bot, session, now: datetime, cache_suffix: str = "", send=None):
+    """Exam registrations, grades and fees for one StuMS account."""
+    send = send or broadcast
+    await _run_throttled(f"last_exam_registration_check{cache_suffix}", now, _exam_registration_interval(),
+                         "Exam reminder check", check_exam_reminders, session, bot, send, exam_action_cache,
+                         start_message="🎓 Checking exam registrations...")
+    await _run_throttled(f"last_grade_check{cache_suffix}", now, GRADE_CHECK_INTERVAL_SECONDS, "Grade reminder check",
+                         check_grade_reminders, session, bot, send,
+                         start_message="🎓 Checking for new grades...")
+    await _run_throttled(f"last_tuition_attempt{cache_suffix}", now, TUITION_ATTEMPT_INTERVAL_SECONDS,
+                         "Tuition reminder check", check_tuition_reminders, session, bot, send,
+                         start_message="💶 Checking tuition / fee status...")
+
+
+async def _for_each_stums_user(job):
+    """Run `job(uid, session)` for every signed-in student, one at a time and
+    spaced out; each runs in that student's user and exam-cache context."""
+    admin_id = next(iter(ALLOWED_USER_IDS), None)
+    for index, (uid, sess) in enumerate(_stums_users()):
+        if index:
+            await asyncio.sleep(random.uniform(*STUMS_USER_GAP_SECONDS))
+        if uid == admin_id:
+            adopt_legacy_exam_cache(uid)
+        with acting_as(uid), exam_cache_user(uid):
+            await _guarded(f"StuMS checks for {uid}", job, uid, sess)
 
 
 async def _run_reminder_checks(bot, session, now: datetime):
@@ -191,16 +251,14 @@ async def _run_reminder_checks(bot, session, now: datetime):
     await _guarded("Course schedule change check", check_course_schedule_changes, session, bot)
     # Personal task reminders (local JSON, no network calls needed)
     await _guarded("Task reminder check", check_task_reminders, bot)
-    # StuMS: exam registrations, grades and fees, each on its own interval
-    await _run_throttled("last_exam_registration_check", now, _exam_registration_interval(), "Exam reminder check",
-                         check_exam_reminders, session, bot, broadcast, exam_action_cache,
-                         start_message="🎓 Checking exam registrations...")
-    await _run_throttled("last_grade_check", now, GRADE_CHECK_INTERVAL_SECONDS, "Grade reminder check",
-                         check_grade_reminders, session, bot, broadcast,
-                         start_message="🎓 Checking for new grades...")
-    await _run_throttled("last_tuition_attempt", now, TUITION_ATTEMPT_INTERVAL_SECONDS, "Tuition reminder check",
-                         check_tuition_reminders, session, bot, broadcast,
-                         start_message="💶 Checking tuition / fee status...")
+    # StuMS: exam registrations, grades and fees, per student, each on its own interval
+    if _stums_users():
+        await _for_each_stums_user(
+            lambda uid, sess: _run_stums_checks(bot, sess, now, f"_{uid}", _user_sender(uid))
+        )
+    else:
+        # single-account setup without per-user logins
+        await _run_stums_checks(bot, session, now)
 
 
 async def _check_file_exam_reminders(bot, session):
@@ -218,8 +276,13 @@ async def _run_exam_date_checks(bot, session, now: datetime):
     """Upcoming exam dates (StuMS and course files), throttled to every 3 hours."""
     if not _is_due("last_exam_date_check", now, EXAM_DATE_CHECK_INTERVAL_SECONDS):
         return
-    await _guarded("Exam date reminder check", check_exam_date_reminders, session, bot, broadcast,
-                   start_message="🎓 Checking upcoming exam dates...")
+    if _stums_users():
+        await _for_each_stums_user(
+            lambda uid, sess: check_exam_date_reminders(sess, bot, _user_sender(uid))
+        )
+    else:
+        await _guarded("Exam date reminder check", check_exam_date_reminders, session, bot, broadcast,
+                       start_message="🎓 Checking upcoming exam dates...")
     await _guarded("File exam reminder check", _check_file_exam_reminders, bot, session)
     update_general_cache({"last_exam_date_check": now.isoformat()})
 
@@ -282,6 +345,7 @@ async def unified_watcher_controller(app):
 
     logging.info("🟢 Unified Watcher Controller STARTED")
     state.watcher_controller_running = True
+    act_as_bot()  # this task acts for the bot itself, never for a user
 
     # Wait 2 minutes for initial check (for bot to fully start)
     await asyncio.sleep(120)
@@ -342,18 +406,22 @@ SESSION_KEEPALIVE_SECONDS = 600  # 10 min keep-alive for OAuth + Stud.IP/NetIQ c
 async def session_keepalive_loop():
     """Periodically refresh OAuth2 tokens and touch Stud.IP / NetIQ IDP cookies
     so sessions stay alive indefinitely without re-entering credentials."""
+    act_as_bot()  # this task acts for the bot itself, never for a user
     while True:
-        await asyncio.sleep(SESSION_KEEPALIVE_SECONDS)
-        try:
-            if state.global_session is not None:
-                await state.global_session.keep_alive()
-            for uid, sess in list(state.user_sessions.items()):
-                if sess is not None and sess is not state.global_session:
-                    await sess.keep_alive()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logging.debug("Session keep-alive error: %s", exc)
+        await asyncio.sleep(SESSION_KEEPALIVE_SECONDS + random.uniform(0, 60))
+        sessions = []
+        if state.global_session is not None:
+            sessions.append(state.global_session)
+        sessions += [s for s in state.user_sessions.values() if s is not None and s is not state.global_session]
+        for index, sess in enumerate(sessions):
+            if index:
+                await asyncio.sleep(random.uniform(2.0, 6.0))  # never all users at once
+            try:
+                await sess.keep_alive()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logging.debug("Session keep-alive error for %s: %s", getattr(sess, "user_id", None), exc)
 
 
 async def start_unified_watcher(app):

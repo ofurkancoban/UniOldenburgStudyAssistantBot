@@ -46,7 +46,8 @@ WA_FORWARD_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to
 STUMS_BASE = "https://stums.uni-oldenburg.de"
 SSO_ENTRY_URL = f"{STUMS_BASE}/qisserver/api/identityprovider/redirect/2/login"
 STUMS_HOST = "stums.uni-oldenburg.de"
-STUMS_VERIFIED_SECONDS = 60  # how long a verified StuMS login is trusted without re-checking
+STUMS_START_URL = f"{STUMS_BASE}/qisserver/pages/cs/sys/portal/hisinoneStartPage.faces"
+STUMS_VERIFIED_SECONDS = 5 * 60  # how long a verified StuMS login is trusted without re-checking
 TUITION_CHECK_SECONDS = 24 * 3600  # fee status changes rarely
 STUMS_RETRY_SECONDS = 30 * 60  # pause after StuMS refused the login (a new /login retries at once)
 
@@ -126,10 +127,51 @@ FOOTER_NOISE = {
 }
 
 
-def load_exam_cache() -> dict:
-    if os.path.exists(EXAM_CACHE_PATH):
+# Whose StuMS data a check is about. Each student has their own registrations,
+# grades and fees, so each gets their own cache file (and notifications only
+# go to them); None is the bot's original single-user cache file.
+_exam_cache_user = contextvars.ContextVar("exam_cache_user", default=None)
+
+
+@contextlib.contextmanager
+def exam_cache_user(user_id):
+    """Use `user_id`'s exam cache for every load/save inside this block."""
+    token = _exam_cache_user.set(user_id)
+    try:
+        yield
+    finally:
+        _exam_cache_user.reset(token)
+
+
+def exam_cache_path(user_id=None) -> str:
+    uid = user_id if user_id is not None else _exam_cache_user.get()
+    if uid is None:
+        return EXAM_CACHE_PATH
+    root, ext = os.path.splitext(EXAM_CACHE_PATH)
+    return f"{root}_{int(uid)}{ext or '.json'}"
+
+
+def adopt_legacy_exam_cache(user_id) -> None:
+    """Give the original single-user cache to `user_id` (the account it was
+    built for) the first time per-user caches are used, so nothing is
+    re-notified after the switch."""
+    target = exam_cache_path(user_id)
+    if user_id is None or os.path.exists(target) or not os.path.exists(EXAM_CACHE_PATH):
+        return
+    try:
+        with open(EXAM_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        save_exam_cache(data, user_id=user_id)
+        logging.info("exam_reminder: adopted %s for user %s", EXAM_CACHE_PATH, user_id)
+    except Exception as e:
+        logging.warning("Could not adopt the legacy exam cache for %s: %s", user_id, e)
+
+
+def load_exam_cache(user_id=None) -> dict:
+    path = exam_cache_path(user_id)
+    if os.path.exists(path):
         try:
-            with open(EXAM_CACHE_PATH, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
             logging.warning("Could not load exam reminder cache: %s", e)
@@ -139,73 +181,121 @@ def load_exam_cache() -> dict:
     }
 
 
-def save_exam_cache(data: dict) -> None:
+def save_exam_cache(data: dict, user_id=None) -> None:
+    path = exam_cache_path(user_id)
     try:
-        tmp = EXAM_CACHE_PATH + ".tmp"
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, EXAM_CACHE_PATH)
+        os.replace(tmp, path)
     except Exception as e:
         logging.error("Could not save exam reminder cache: %s", e)
 
 
+def _stums_lock(session) -> asyncio.Lock:
+    """One StuMS sign-in at a time per user session (the watcher, a button
+    press and parallel detail fetches would otherwise each start their own
+    SSO handoff and invalidate each other's StuMS JSESSIONID)."""
+    loop = asyncio.get_running_loop()
+    entry = vars(session).get("_stums_lock_entry")
+    if entry is None or entry[1] is not loop:
+        entry = (asyncio.Lock(), loop)
+        vars(session)["_stums_lock_entry"] = entry
+    return entry[0]
+
+
+def _stums_verified(session) -> bool:
+    verified_at = vars(session).get("_stums_verified_at", 0.0) or 0.0
+    return (not session.explicitly_logged_out
+            and time.time() - verified_at < STUMS_VERIFIED_SECONDS
+            and bool(vars(session).get("_stums_referer")))
+
+
+def _mark_stums_verified(session, referer: str) -> str:
+    session._stums_verified_at = time.time()
+    session._stums_referer = referer
+    session.stums_blocked_until = 0.0
+    return referer
+
+
 async def _establish_stums_session(session) -> str:
-    """Follow the SSO handoff so the shared Stud.IP cookies are valid on stums.uni-oldenburg.de too.
+    """Make sure this user's session is signed in to StuMS and return a Referer
+    for the following requests (the JSF app rejects deep links without one).
 
-    Returns the resulting portal URL, used as a Referer for subsequent requests
-    (the JSF app rejects deep links without one).
+    1. A StuMS login verified in the last STUMS_VERIFIED_SECONDS is reused.
+    2. Otherwise the existing StuMS cookie is tried first: the keep-alive loop
+       keeps it warm, so most checks need a single request and no SSO round
+       trip at all (fewer logins means less risk of the account being flagged).
+    3. Only when StuMS shows "Login notwendig" does it run the SSO handoff
+       (`sso_handoff`), which reuses the warm NetIQ SSO cookies. If that still
+       lands logged out, the stale StuMS cookies are dropped and the handoff
+       runs once more.
 
-    The cross-domain NetIQ SSO trust (login.uni-oldenburg.de) can expire on its own
-    schedule, independently of the Stud.IP elearning session cookie, so a still-valid
-    elearning login does not guarantee a plain redirect reaches stums directly. This
-    reuses the session's shared NetIQ state machine (`sso_handoff`), which
-    transparently falls through to the same credential-entry steps `login()` uses
-    (Ecom fields, TOTP/contract page) whenever that happens.
-
-    Reaching the StuMS host is not proof of a StuMS login: once the StuMS
-    session has expired, the entry URL lands on the portal start page as an
-    anonymous visitor, and every page then says "Login notwendig". So the
-    login is verified on a protected page; if it is missing, the stale StuMS
-    cookies are dropped and the handoff runs once more, which sends the
-    browser through the identity provider again. A verified login is
-    remembered for STUMS_VERIFIED_SECONDS so one watcher cycle (registrations,
-    grades, tuition) checks it only once.
+    After a refusal, background checks pause for STUMS_RETRY_SECONDS; anything
+    the user triggers tries again right away. Without a stored password the
+    handoff cannot answer a NetIQ password/2FA prompt; the user then has to
+    sign in once through the /login Mini App (StuMS button).
     """
-    verified_at = getattr(session, "_stums_verified_at", 0.0)
-    if not session.explicitly_logged_out and time.time() - verified_at < STUMS_VERIFIED_SECONDS:
+    if _stums_verified(session):
         return session._stums_referer
-    blocked_until = getattr(session, "stums_blocked_until", 0.0)
-    if _stums_background.get() and time.time() < blocked_until:
+    async with _stums_lock(session):
+        if _stums_verified(session):  # another task signed in while we waited
+            return session._stums_referer
+        blocked_until = vars(session).get("stums_blocked_until", 0.0) or 0.0
+        if _stums_background.get() and time.time() < blocked_until:
+            raise StumsLoginUnavailable(
+                f"StuMS refused the login earlier; background checks retry at "
+                f"{time.strftime('%H:%M', time.localtime(blocked_until))}", quiet=True,
+            )
+
+        known_referer = vars(session).get("_stums_referer") or STUMS_START_URL
+        if _has_stums_cookie(session):
+            try:
+                if await _stums_logged_in(session, known_referer):
+                    return _mark_stums_verified(session, known_referer)
+            except Exception as exc:  # a network blip here just means: do the handoff
+                logging.debug("exam_reminder: StuMS pre-check failed: %s", exc)
+
+        for attempt in (1, 2):
+            try:
+                referer = await session.sso_handoff(SSO_ENTRY_URL, STUMS_HOST)
+            except RuntimeError as e:
+                if "Interactive login required" in str(e):
+                    session.stums_blocked_until = time.time() + STUMS_RETRY_SECONDS
+                    raise StumsLoginUnavailable(
+                        "StuMS needs a fresh university sign-in (the SSO session expired). "
+                        "Open /login and choose the StuMS sign-in once; background checks "
+                        f"retry in {STUMS_RETRY_SECONDS // 60} min."
+                    ) from e
+                raise RuntimeError(f"StuMS SSO handoff failed: {e}") from e
+            if await _stums_logged_in(session, referer):
+                return _mark_stums_verified(session, referer)
+            if attempt == 1:
+                logging.info("exam_reminder: StuMS session expired; dropping StuMS cookies and signing in again")
+                session.session.cookie_jar.clear_domain(STUMS_HOST)
+        session.stums_blocked_until = time.time() + STUMS_RETRY_SECONDS
         raise StumsLoginUnavailable(
-            f"StuMS refused the login earlier; background checks retry at "
-            f"{time.strftime('%H:%M', time.localtime(blocked_until))}", quiet=True,
+            "StuMS did not sign this account in: the university login succeeded, but the "
+            "StuMS portal still shows you as logged out. Background checks retry in "
+            f"{STUMS_RETRY_SECONDS // 60} min."
         )
 
-    for attempt in (1, 2):
-        try:
-            referer = await session.sso_handoff(SSO_ENTRY_URL, STUMS_HOST)
-        except RuntimeError as e:
-            raise RuntimeError(f"StuMS SSO handoff failed: {e}") from e
-        if await _stums_logged_in(session, referer):
-            session._stums_verified_at = time.time()
-            session._stums_referer = referer
-            session.stums_blocked_until = 0.0
-            return referer
-        if attempt == 1:
-            logging.info("exam_reminder: StuMS session expired; dropping StuMS cookies and signing in again")
-            session.session.cookie_jar.clear_domain(STUMS_HOST)
-    session.stums_blocked_until = time.time() + STUMS_RETRY_SECONDS
-    raise StumsLoginUnavailable(
-        "StuMS did not sign this account in: the university login succeeded, but the "
-        "StuMS portal still shows you as logged out. Background checks retry in "
-        f"{STUMS_RETRY_SECONDS // 60} min."
-    )
+
+def _has_stums_cookie(session) -> bool:
+    try:
+        from yarl import URL
+        return bool(session.session.cookie_jar.filter_cookies(URL(STUDY_PLANNER_URL)))
+    except Exception:
+        return True
 
 
 async def _stums_logged_in(session, referer: str) -> bool:
     """Whether StuMS treats this session as signed in (checked on the study planner)."""
     async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
         html_text = await r.text()
+        final_url = str(getattr(r, "url", "") or "")
+    if final_url and STUMS_HOST not in final_url:
+        return False  # bounced to the identity provider
     return "Login notwendig" not in html_text
 
 

@@ -9,12 +9,30 @@ import time
 import struct
 import base64
 import json
+import random
 import re
+from http.cookies import CookieError, SimpleCookie
 from urllib.parse import urljoin, urlparse, urlsplit
 from yarl import URL
 
 import studip_oauth
+from studip_http import (
+    DEFAULT_TIMEOUT,
+    THROTTLE,
+    UNI_HOSTS,
+    UniResponse,
+    parse_retry_after,
+    rewrite_headers,
+    to_timeout,
+    user_agent,
+)
 from studip_utils import redact_url, route_proxy_url, unroute_proxy_url
+
+_REDIRECT_CODES = {301, 302, 303, 307, 308}
+
+
+def _worker_url() -> str:
+    return os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
 
 # Wait this long after the 1st, 2nd, 3rd, 4th+ failed password/TOTP login in a
 # row before the next automatic attempt. Without it every button tap and
@@ -42,8 +60,11 @@ class StudIPSession:
         self.cookie_file = cookie_file
         self.user_id = user_id
         self.session = None
+        # Cookie-less twin of `session` for requests sent through the
+        # Cloudflare Worker: their cookies are managed by hand (see request()).
+        self._proxy_http = None
         self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'User-Agent': user_agent(),
             'Accept-Encoding': 'gzip, deflate',
         }
         self.logger = logging.getLogger("StudIPSession")
@@ -79,16 +100,24 @@ class StudIPSession:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+        await self.close()
 
     async def ensure_session(self):
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession(
                 headers=self.headers,
                 cookie_jar=aiohttp.CookieJar(unsafe=True),
+                connector=aiohttp.TCPConnector(limit=20, limit_per_host=6, ttl_dns_cache=300),
+                timeout=DEFAULT_TIMEOUT,
             )
             await self.load_cookies()
+        if self._proxy_http is None or self._proxy_http.closed:
+            self._proxy_http = aiohttp.ClientSession(
+                headers=self.headers,
+                cookie_jar=aiohttp.DummyCookieJar(),
+                connector=aiohttp.TCPConnector(limit=20, limit_per_host=8, ttl_dns_cache=300),
+                timeout=DEFAULT_TIMEOUT,
+            )
 
     def _get_totp_token(self):
         if self.totp_code:
@@ -108,102 +137,153 @@ class StudIPSession:
             logging.warning("TOTP code generation failed (check TOTP_SECRET)", exc_info=True)
             return ""
 
-    def _sync_worker_cookies(self):
-        """Mirror cookies for university domains to the Cloudflare Worker URL in cookie jar."""
-        worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
-        if not worker_url or not self.session:
-            return
-        try:
-            target_hosts = (
-                "elearning.uni-oldenburg.de",
-                "idp.uni-oldenburg.de",
-                "login.uni-oldenburg.de",
-                "auth.uni-oldenburg.de",
-                "stums.uni-oldenburg.de",
-                "studip.uni-oldenburg.de",
-            )
-            for host in target_hosts:
-                cookies = self.session.cookie_jar.filter_cookies(URL(f"https://{host}/"))
-                if cookies:
-                    cookie_dict = {k: (m.value if hasattr(m, "value") else str(m)) for k, m in cookies.items()}
-                    self.session.cookie_jar.update_cookies(cookie_dict, response_url=URL(worker_url))
-        except Exception as exc:
-            self.logger.debug("Worker cookie sync skipped: %s", exc)
+    # ── HTTP transport ────────────────────────────────────────────────────
+    # Every request of this session goes through `request()`: redirects are
+    # followed hop by hop, so each hop is throttled, carries exactly the
+    # cookies the browser would send to that host and path, and stores the
+    # cookies it receives under the real university host. With the optional
+    # Cloudflare Worker this keeps one cookie jar per real host instead of
+    # mixing every host's JSESSIONID under the worker's hostname.
 
-    def _capture_response_cookies(self, resp, target_host: str):
-        """Extract Set-Cookie headers from proxy responses and map them back to university host."""
-        if not self.session or not target_host:
-            return
-        try:
-            worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
-            set_cookies = resp.headers.getall("Set-Cookie", [])
-            if not set_cookies:
-                return
+    def _via_worker(self, host: str) -> bool:
+        return bool(_worker_url()) and host in UNI_HOSTS
 
-            from http.cookies import SimpleCookie
-            for sc in set_cookies:
-                c = SimpleCookie()
-                try:
-                    c.load(sc)
-                except Exception:
-                    continue
-                for key, morsel in c.items():
-                    val = morsel.value
-                    if val is not None:
-                        host_clean = target_host.split(":")[0].lower()
-                        self.session.cookie_jar.update_cookies(
-                            {key: val},
-                            response_url=URL(f"https://{host_clean}/"),
-                        )
-                        if worker_url:
-                            self.session.cookie_jar.update_cookies(
-                                {key: val},
-                                response_url=URL(worker_url),
-                            )
-        except Exception as exc:
-            self.logger.debug("Failed capturing response cookies for %s: %s", target_host, exc)
+    def _store_proxied_cookies(self, resp, real_url: str) -> None:
+        """Store cookies a Worker-proxied response carried, under the real host."""
+        raw = resp.headers.getall("X-Upstream-Set-Cookie", [])
+        if not raw:
+            # Older worker deployments pass a rewritten Set-Cookie (Domain removed)
+            raw = resp.headers.getall("Set-Cookie", [])
+        for header in raw:
+            jar_entry = SimpleCookie()
+            try:
+                jar_entry.load(header)
+            except CookieError:
+                self.logger.debug("Skipping unparsable cookie from %s", redact_url(real_url))
+                continue
+            if jar_entry:
+                self.session.cookie_jar.update_cookies(jar_entry, response_url=URL(real_url))
 
-    class _SRequestContext:
-        def __init__(self, session_obj, method: str, url: str, **kwargs):
-            self.session_obj = session_obj
-            self.method = method
-            self.url = str(url)
-            self.kwargs = kwargs
+    async def _send_once(self, method: str, url: str, headers: dict, body: dict, timeout, extra: dict):
+        host = (urlsplit(url).hostname or "").lower()
+        hdrs = dict(headers)
+        if self._via_worker(host):
+            # The worker's hostname differs from the target, so aiohttp would
+            # not attach the target's cookies itself: send them explicitly,
+            # matched against the full URL (path-scoped cookies included).
+            cookies = self.session.cookie_jar.filter_cookies(URL(url))
+            if cookies:
+                injected = "; ".join(f"{k}={m.value}" for k, m in cookies.items())
+                existing = hdrs.pop("Cookie", None) or hdrs.pop("cookie", None)
+                hdrs["Cookie"] = f"{existing}; {injected}" if existing else injected
+            routed, hdrs = route_proxy_url(url, hdrs)
+            http = self._proxy_http
+        else:
+            routed, http = url, self.session
+        async with THROTTLE.slot(host):
+            try:
+                resp = await http.request(
+                    method, routed, headers=hdrs or None, allow_redirects=False,
+                    timeout=timeout or DEFAULT_TIMEOUT, **body, **extra,
+                )
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
+                THROTTLE.report(host, failed=True)
+                raise
+        THROTTLE.report(host, resp.status, parse_retry_after(resp.headers.get("Retry-After")))
+        if http is self._proxy_http:
+            self._store_proxied_cookies(resp, url)
+        return resp
+
+    async def request(self, method: str, url, *, allow_redirects: bool = True, max_redirects: int = 20,
+                      headers: dict | None = None, params=None, data=None, json=None, timeout=None,
+                      **extra) -> UniResponse:
+        """Send a request (following redirects manually) and return a UniResponse."""
+        await self.ensure_session()
+        method = method.upper()
+        url = unroute_proxy_url(str(url))
+        if params:
+            url = str(URL(url).extend_query(params))
+        req_headers = dict(headers or {})
+        req_headers.update(await self._bearer_headers(url))
+        body = {k: v for k, v in (("data", data), ("json", json)) if v is not None}
+        timeout = to_timeout(timeout)
+        history: list[str] = []
+        current = url
+        for _hop in range(max_redirects + 1):
+            resp = await self._send_with_retry(method, current, req_headers, body, timeout, extra)
+            location = resp.headers.get("Location")
+            real_location = unroute_proxy_url(urljoin(current, location)) if location else None
+            if not allow_redirects or resp.status not in _REDIRECT_CODES or not real_location:
+                headers_out = None
+                if location or self._via_worker((urlsplit(current).hostname or "").lower()):
+                    headers_out = rewrite_headers(resp.headers, real_location)
+                return UniResponse(resp, current, headers=headers_out, history=history)
+            resp.release()
+            history.append(current)
+            if resp.status == 303 or (resp.status in (301, 302) and method == "POST"):
+                if method != "HEAD":
+                    method = "GET"
+                body = {}
+                for key in [k for k in req_headers if k.lower() in ("content-type", "content-length")]:
+                    req_headers.pop(key, None)
+            if urlsplit(real_location).hostname != urlsplit(current).hostname:
+                for key in [k for k in req_headers if k.lower() == "authorization"]:
+                    req_headers.pop(key, None)
+            current = real_location
+        raise RuntimeError(f"Too many redirects for {redact_url(url)}")
+
+    async def _send_with_retry(self, method, url, headers, body, timeout, extra):
+        """Idempotent requests get two quiet retries on network errors or 502/504."""
+        attempts = 3 if method in ("GET", "HEAD") else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = await self._send_once(method, url, headers, body, timeout, extra)
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as exc:
+                if attempt == attempts:
+                    raise
+                self.logger.debug("Retrying %s after %s", redact_url(url), exc.__class__.__name__)
+            else:
+                if resp.status not in (502, 504) or attempt == attempts:
+                    return resp
+                resp.release()
+            await asyncio.sleep(1.5 * attempt + random.uniform(0, 1.0))
+        raise RuntimeError("unreachable")
+
+    class _RequestContext:
+        """`async with session._s_get(url) as r:` support."""
+
+        def __init__(self, session_obj, method: str, url, kwargs):
+            self._args = (session_obj, method, url, kwargs)
             self._resp = None
 
         async def __aenter__(self):
-            cookie_jar = self.session_obj.session.cookie_jar if self.session_obj.session else None
-            routed_url, headers = route_proxy_url(self.url, self.kwargs.pop("headers", None), cookie_jar=cookie_jar)
-            if headers:
-                self.kwargs["headers"] = headers
-            target_host = (urlsplit(self.url).hostname or "").lower()
-            self._resp = await self.session_obj.session.request(self.method, routed_url, **self.kwargs)
-            self.session_obj._capture_response_cookies(self._resp, target_host)
+            session_obj, method, url, kwargs = self._args
+            self._resp = await session_obj.request(method, url, **kwargs)
             return self._resp
 
         async def __aexit__(self, exc_type, exc_val, exc_tb):
-            if self._resp:
-                await self._resp.__aexit__(exc_type, exc_val, exc_tb)
+            if self._resp is not None:
+                self._resp.release()
 
     def _s_get(self, url, **kwargs):
-        return self._SRequestContext(self, "GET", url, **kwargs)
+        return self._RequestContext(self, "GET", url, kwargs)
 
     def _s_post(self, url, **kwargs):
-        return self._SRequestContext(self, "POST", url, **kwargs)
+        return self._RequestContext(self, "POST", url, kwargs)
 
     async def save_cookies(self):
         if not self.session:
             return
-        worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
-        worker_host = urlparse(worker_url).netloc.lower() if worker_url else ""
+        jar = self.session.cookie_jar
+        host_only = getattr(jar, "_host_only_cookies", None)
+        worker_host = (urlsplit(_worker_url()).hostname or "").lower() if _worker_url() else ""
 
         entries = []
         seen = set()
-        for cookie in self.session.cookie_jar:
-            dom = cookie["domain"] or "elearning.uni-oldenburg.de"
-            if worker_host and (dom.lower() == worker_host or dom.lower() == f".{worker_host}"):
-                # Do not save synthetic worker cookies; real cookies are stored under university domains
-                continue
+        for cookie in jar:
+            dom = (cookie["domain"] or "elearning.uni-oldenburg.de").lower()
+            if worker_host and dom.lstrip(".") == worker_host:
+                continue  # never persist cookies scoped to the proxy itself
             item_key = (cookie.key, dom, cookie["path"] or "/")
             if item_key in seen:
                 continue
@@ -213,13 +293,13 @@ class StudIPSession:
                 "value": cookie.value,
                 "domain": dom,
                 "path": cookie["path"] or "/",
+                "host_only": (dom, cookie.key) in host_only if host_only is not None else True,
             })
-        self._sync_worker_cookies()
         if getattr(self, "user_id", None):
             try:
                 from unibot import db
                 db.save_user_credential(self.user_id, "cookies", entries)
-                self.logger.info("Encrypted cookies saved to DB for user %s", self.user_id)
+                self.logger.debug("Encrypted cookies saved to DB for user %s", self.user_id)
             except Exception as exc:
                 self.logger.error("Failed to save cookies to DB for user %s: %s", self.user_id, exc)
 
@@ -235,9 +315,18 @@ class StudIPSession:
             try:
                 from studip_vault import write_vault_file
                 write_vault_file(self.cookie_file, entries, mode=0o600)
-                self.logger.info("Encrypted cookies saved to %s (mode 0600)", self.cookie_file)
+                self.logger.debug("Encrypted cookies saved to %s (mode 0600)", self.cookie_file)
             except Exception as exc:
                 self.logger.error("Failed to save encrypted cookies to %s: %s", self.cookie_file, exc)
+
+    def _restore_cookie(self, key: str, val: str, dom: str, path: str, host_only: bool) -> None:
+        morsel_holder = SimpleCookie()
+        morsel_holder[key] = val
+        morsel = morsel_holder[key]
+        morsel["path"] = path or "/"
+        if not host_only:
+            morsel["domain"] = dom
+        self.session.cookie_jar.update_cookies(morsel_holder, response_url=URL(f"https://{dom}/"))
 
     async def load_cookies(self):
         data = None
@@ -263,40 +352,33 @@ class StudIPSession:
                 self.logger.error("Failed to load cookies: %s", e)
 
         if self.session and data:
+            worker_host = (urlsplit(_worker_url()).hostname or "").lower() if _worker_url() else ""
             try:
-                worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
                 if isinstance(data, list):
                     for entry in data:
                         key = entry.get("key")
                         val = entry.get("value")
-                        dom = (entry.get("domain") or "elearning.uni-oldenburg.de").lstrip(".")
-                        path = entry.get("path") or "/"
-                        if key is not None and val is not None:
-                            self.session.cookie_jar.update_cookies(
-                                {key: val},
-                                response_url=URL(f"https://{dom}{path}"),
-                            )
-                            if worker_url:
-                                self.session.cookie_jar.update_cookies(
-                                    {key: val},
-                                    response_url=URL(worker_url),
-                                )
+                        dom = (entry.get("domain") or "elearning.uni-oldenburg.de").lstrip(".").lower()
+                        if key is None or val is None or (worker_host and dom == worker_host):
+                            continue
+                        host_only = entry.get("host_only")
+                        if host_only is None:
+                            # older files: a bare parent domain can only be a domain cookie
+                            host_only = dom.count(".") > 1
+                        try:
+                            self._restore_cookie(key, val, dom, entry.get("path") or "/", bool(host_only))
+                        except (CookieError, ValueError):
+                            self.logger.debug("Skipping unrestorable cookie %s", key)
                 elif isinstance(data, dict):
                     for key, val in data.items():
                         if key in ("JSESSIONID", "UrnNovellNidpClusterMemberId", "_PA_SDK_SSO_") or key.startswith("x-oidp-"):
                             dom = "idp.uni-oldenburg.de"
                         else:
                             dom = "elearning.uni-oldenburg.de"
-                        self.session.cookie_jar.update_cookies(
-                            {key: val},
-                            response_url=URL(f"https://{dom}/"),
-                        )
-                        if worker_url:
-                            self.session.cookie_jar.update_cookies(
-                                {key: val},
-                                response_url=URL(worker_url),
-                            )
-                self._sync_worker_cookies()
+                        try:
+                            self._restore_cookie(key, val, dom, "/", True)
+                        except (CookieError, ValueError):
+                            self.logger.debug("Skipping unrestorable cookie %s", key)
                 return True
             except Exception as e:
                 self.logger.error("Failed to apply cookies to session: %s", e)
@@ -456,6 +538,9 @@ class StudIPSession:
             try:
                 async with self._s_get(start_url):
                     pass
+            except Exception as exc:  # priming is best-effort; the SSO flow decides
+                self.logger.debug("Login priming request failed: %s", exc)
+            try:
                 await self._run_sso_flow(login_link_cancel, referer=start_url)
                 self.explicitly_logged_out = False
                 self.reset_login_backoff()
@@ -497,11 +582,16 @@ class StudIPSession:
             except Exception as exc:
                 self.logger.debug("OAuth keep-alive skipped: %s", exc)
 
-        for sso_url in (
+        keepalive_urls = [
             "https://login.uni-oldenburg.de/nidp/app",
             "https://auth.uni-oldenburg.de/osp/a/TOP/auth/app/",
-            "https://stums.uni-oldenburg.de/qisserver/pages/cs/sys/portal/hisinoneStartPage.faces",
-        ):
+        ]
+        stums_start = "https://stums.uni-oldenburg.de/qisserver/pages/cs/sys/portal/hisinoneStartPage.faces"
+        # Touch StuMS only when this user has a StuMS session to keep warm;
+        # without one the request would just open an anonymous session.
+        if self.session.cookie_jar.filter_cookies(URL(stums_start)):
+            keepalive_urls.append(stums_start)
+        for sso_url in keepalive_urls:
             try:
                 async with self._s_get(sso_url, allow_redirects=True, timeout=15) as _:
                     pass
@@ -783,31 +873,17 @@ class StudIPSession:
         headers.update(await self._bearer_headers(url))
         return headers or None
 
-    async def get(self, url, **kwargs):
-        await self.ensure_session()
-        merged = await self._merged_headers(url, kwargs.pop("headers", None))
-        cookie_jar = self.session.cookie_jar if self.session else None
-        routed_url, headers = route_proxy_url(url, merged, cookie_jar=cookie_jar)
-        if headers:
-            kwargs["headers"] = headers
-        resp = await self.session.get(routed_url, **kwargs)
-        target_host = (urlsplit(url).hostname or "").lower()
-        self._capture_response_cookies(resp, target_host)
-        return resp
+    async def get(self, url, **kwargs) -> UniResponse:
+        return await self.request("GET", url, **kwargs)
 
-    async def post(self, url, **kwargs):
-        await self.ensure_session()
-        merged = await self._merged_headers(url, kwargs.pop("headers", None))
-        cookie_jar = self.session.cookie_jar if self.session else None
-        routed_url, headers = route_proxy_url(url, merged, cookie_jar=cookie_jar)
-        if headers:
-            kwargs["headers"] = headers
-        resp = await self.session.post(routed_url, **kwargs)
-        target_host = (urlsplit(url).hostname or "").lower()
-        self._capture_response_cookies(resp, target_host)
-        return resp
+    async def post(self, url, **kwargs) -> UniResponse:
+        return await self.request("POST", url, **kwargs)
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        closed = False
+        for http in (self.session, getattr(self, "_proxy_http", None)):
+            if http is not None and not http.closed:
+                await http.close()
+                closed = True
+        if closed:
             self.logger.info("Session closed.")
