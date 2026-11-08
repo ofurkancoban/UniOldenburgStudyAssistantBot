@@ -48,6 +48,7 @@ from unibot.monitoring import (
     check_new_files_parallel,
     check_new_forum_posts_parallel,
     message_poll_loop,
+    watched_courses,
 )
 from unibot.exams import (
     check_file_exam_reminders,
@@ -322,15 +323,21 @@ async def _run_health_check(bot, now: datetime):
 async def _run_content_watchers(bot, admin_id, cycle_count: int, now: datetime):
     """Announcements, files and forum posts. Messages are polled separately
     every MESSAGE_POLL_SECONDS by message_poll_loop, not once per cycle."""
+    # every signed-in user's courses, each fetched once with a participant's session
+    try:
+        courses = await watched_courses()
+    except Exception as e:
+        logging.error("❌ Could not build the course watch plan: %s", e)
+        return
     await _guarded("Announcement check", check_new_announcements_parallel, bot, admin_id, silent=True,
-                   start_message="📢 Checking announcements...")
+                   courses=courses, start_message="📢 Checking announcements...")
     await asyncio.sleep(15)
     await _guarded("Forum check", check_new_forum_posts_parallel, bot, admin_id, silent=True,
-                   start_message="💬 Checking forum posts...")
+                   courses=courses, start_message="💬 Checking forum posts...")
     await asyncio.sleep(15)
     # File checks recursively query folder hierarchies; throttle to once every 30 minutes.
     await _run_throttled("last_file_check", now, FILE_WATCHER_INTERVAL, "File check",
-                         check_new_files_parallel, bot, admin_id, silent=True,
+                         check_new_files_parallel, bot, admin_id, silent=True, courses=courses,
                          start_message="📁 Checking files...")
 
 

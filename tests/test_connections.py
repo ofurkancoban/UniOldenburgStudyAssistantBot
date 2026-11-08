@@ -836,3 +836,65 @@ class StumsFixtureTests(unittest.TestCase):
         self.assertEqual([(e["code"], e["start_date"]) for e in open_exams],
                          [("inf007_P", "2026-10-20T00:00:00")])
         self.assertTrue(any("unitId=11111" in u for u in requested))
+
+
+class CourseWatchPlanTests(unittest.TestCase):
+    """Every user's courses are watched, each once, and alerts reach participants only."""
+
+    def setUp(self):
+        from unibot import monitoring, state
+        self.monitoring, self.state = monitoring, state
+        self.saved = (dict(state.user_sessions), state.global_session, dict(state.user_courses_map))
+        self.addCleanup(self._restore)
+        monitoring._course_list_fetched.clear()
+
+    def _restore(self):
+        self.state.user_sessions.clear()
+        self.state.user_sessions.update(self.saved[0])
+        self.state.global_session = self.saved[1]
+        self.state.user_courses_map.clear()
+        self.state.user_courses_map.update(self.saved[2])
+
+    def test_plan_covers_every_users_courses_once(self):
+        m, state = self.monitoring, self.state
+        s1, s2 = object(), object()
+        state.user_sessions.clear()
+        state.user_sessions.update({1: s1, 2: s2})
+        state.global_session = None
+        state.user_courses_map.clear()
+        listed = []
+
+        async def fake_list(session=None, user_id=None, semester_id=None):
+            listed.append(user_id)
+            state.user_courses_map[user_id] = {1: {"c1": "Math", "c2": "Stats"}, 2: {"c2": "Stats", "c3": "AI"}}[user_id]
+
+        with mock.patch.object(m, "list_courses", fake_list), \
+                mock.patch.object(m, "has_stored_login", lambda s: True), \
+                mock.patch.object(m.db, "get_all_users", lambda: [{"telegram_id": 1}, {"telegram_id": 2}]), \
+                mock.patch.object(m, "ALLOWED_USER_IDS", {1}):
+            plan = asyncio.run(m.watched_courses())
+            again = asyncio.run(m.watched_courses())
+        self.assertEqual(sorted((cid, sess is s1) for _n, cid, sess in plan),
+                         [("c1", True), ("c2", True), ("c3", False)])
+        self.assertEqual(state.course_members["c2"], {1, 2})
+        self.assertEqual(state.course_members["c3"], {2})
+        self.assertEqual(len(again), 3)
+        self.assertEqual(sorted(listed), [1, 2])  # course lists are cached between cycles
+
+    def test_course_alerts_reach_participants_only(self):
+        from unibot import telegram_ui
+        sent = []
+
+        class Bot:
+            async def send_message(self, chat_id, **kwargs):
+                sent.append(chat_id)
+
+        users = [{"telegram_id": 1}, {"telegram_id": 2}, {"telegram_id": 3}]
+        with mock.patch.object(telegram_ui, "ALLOWED_USER_IDS", {1, 2}), \
+                mock.patch.object(telegram_ui.db, "get_all_users", lambda: users), \
+                mock.patch.object(telegram_ui.db, "exists", lambda key: False):
+            asyncio.run(telegram_ui.broadcast(Bot(), "x", cid="c3", members={2}))
+            self.assertEqual(sorted(sent), [2])  # admin 1 does not take c3
+            sent.clear()
+            asyncio.run(telegram_ui.broadcast(Bot(), "x", cid="c3"))
+            self.assertEqual(sorted(sent), [1, 2])  # unknown participants: old rules

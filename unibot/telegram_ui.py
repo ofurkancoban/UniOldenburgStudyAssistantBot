@@ -62,18 +62,21 @@ async def broadcast(
     disable_notification=True,
     reply_markup=None,
     cid: Optional[str] = None,
+    members=None,
 ):
     """Send a message to allowed and active users with optional reply markup.
     If cid is provided, filters recipients to students enrolled in or tracking that course,
-    plus primary administrators.
+    plus primary administrators. With `members` (the course's known
+    participants) administrators are no exception: only participants and
+    users tracking the course get it.
     """
-    targets = set(ALLOWED_USER_IDS)
+    targets = set(members) if members is not None else set(ALLOWED_USER_IDS)
     try:
         for u in db.get_all_users():
             if not u.get("is_active", 1):
                 continue
             uid = u["telegram_id"]
-            if uid in ALLOWED_USER_IDS:
+            if uid in ALLOWED_USER_IDS and members is None:
                 targets.add(uid)
                 continue
             if cid is not None:

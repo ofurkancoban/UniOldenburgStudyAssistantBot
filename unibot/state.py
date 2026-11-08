@@ -65,3 +65,6 @@ message_watcher_paused = False
 announcement_watcher_paused = False
 file_watcher_paused = False
 _gwdg_blocked_until = 0.0
+
+# cid -> set of telegram ids taking that course (built by monitoring.watched_courses)
+course_members: dict = {}
