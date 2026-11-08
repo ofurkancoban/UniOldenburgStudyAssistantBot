@@ -624,6 +624,18 @@ async def _send_login_prompt(reply_target, user_id: int) -> None:
         )
 
 
+async def close_all_sessions() -> None:
+    """Close every user's HTTP connections (on shutdown)."""
+    sessions = {id(s): s for s in state.user_sessions.values() if s is not None}
+    if state.global_session is not None:
+        sessions[id(state.global_session)] = state.global_session
+    for sess in sessions.values():
+        try:
+            await sess.close()
+        except Exception:
+            logging.debug("Closing a session failed", exc_info=True)
+
+
 async def _perform_logout(user_id: Optional[int] = None) -> None:
     """Log out of Stud.IP and clear stored session cookies and OAuth2 tokens."""
     from unibot.studip_api import forget_user_profile
@@ -644,6 +656,8 @@ async def _perform_logout(user_id: Optional[int] = None) -> None:
             state._studip_api_user_id = None
             state._studip_user_profile = None
             state._last_notified_studip_cookie = None
+        if sess is not None and sess is not state.global_session:
+            await sess.close()  # its HTTP connections would otherwise leak
         return
 
     state._studip_api_user_id = None

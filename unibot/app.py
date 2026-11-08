@@ -41,6 +41,7 @@ from unibot.auth import (
     _authorization_gate,
     _start_login_infra,
     acquire_instance_lock,
+    close_all_sessions,
     pick_watcher_session,
     login_command,
     login_studip,
@@ -494,9 +495,8 @@ async def main():
         link_cache.flush()
         await close_shared_http()
 
-        if state.global_session:
-            await state.global_session.close()
-        
+        await close_all_sessions()
+
         release_instance_lock()
         logging.info("✅ Bot shutdown complete")
 

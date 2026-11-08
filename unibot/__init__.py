@@ -19,6 +19,7 @@ MODULE_ORDER = (
     "config",       # environment, constants, logging (side effects: chdir, .env)
     "db",           # SQLite document store (caches and settings)
     "state",        # mutable runtime state
+    "diagnostics",  # read-only connection report for /healthcheck
     "storage",      # JSON caches, stored settings, shared HTTP session, job locks
     "formatting",   # text/HTML/date helpers
     "telegram_ui",  # Telegram message helpers

@@ -83,7 +83,7 @@ async def _worker_refusal(resp) -> str:
 # The pause doubles with every failure in a row, up to WORKER_DOWN_MAX_SECONDS.
 WORKER_DOWN_MIN_SECONDS = 120
 WORKER_DOWN_MAX_SECONDS = 1800
-_WORKER_HEALTH = {"down_until": 0.0, "failures": 0}
+_WORKER_HEALTH = {"down_until": 0.0, "failures": 0, "failovers": 0}
 
 
 def _worker_failure(resp) -> str:
@@ -98,6 +98,18 @@ def _worker_failure(resp) -> str:
     return ""
 
 
+def worker_status() -> dict:
+    """The worker's routing state for /healthcheck."""
+    url = _worker_url()
+    now = time.time()
+    return {
+        "configured": bool(url),
+        "down_for": max(0.0, _WORKER_HEALTH["down_until"] - now),
+        "failovers": _WORKER_HEALTH.get("failovers", 0),
+        "refused_hosts": sorted(h for h, until in _WORKER_REFUSED.items() if until > now),
+    }
+
+
 def _worker_available() -> bool:
     return time.time() >= _WORKER_HEALTH["down_until"]
 
@@ -105,7 +117,8 @@ def _worker_available() -> bool:
 def _mark_worker_down(logger, reason: str) -> None:
     failures = _WORKER_HEALTH["failures"] + 1
     pause = min(WORKER_DOWN_MAX_SECONDS, WORKER_DOWN_MIN_SECONDS * 2 ** (failures - 1))
-    _WORKER_HEALTH.update(failures=failures, down_until=time.time() + pause)
+    _WORKER_HEALTH.update(failures=failures, down_until=time.time() + pause,
+                          failovers=_WORKER_HEALTH.get("failovers", 0) + 1)
     logger.warning("Cloudflare Worker unavailable (%s); sending requests directly for %s min.",
                    reason, max(1, pause // 60))
 
@@ -113,7 +126,7 @@ def _mark_worker_down(logger, reason: str) -> None:
 def _mark_worker_up(logger) -> None:
     if _WORKER_HEALTH["failures"]:
         logger.info("Cloudflare Worker reachable again; routing requests through it.")
-    _WORKER_HEALTH.update(failures=0, down_until=0.0)
+    _WORKER_HEALTH.update(failures=0, down_until=0.0)  # "failovers" keeps counting
 
 
 def _worker_url() -> str:

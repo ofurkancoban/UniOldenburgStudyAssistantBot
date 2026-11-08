@@ -132,6 +132,8 @@ class HostThrottle:
         self._cooldown_until: dict[str, float] = {}
         self._failures: dict[str, int] = {}
         self._spacing_lock: dict[str, asyncio.Lock] = {}
+        # counters since start per host, shown by /healthcheck
+        self.stats: dict[str, dict[str, int]] = {}
 
     def _semaphore(self, host: str) -> asyncio.Semaphore:
         loop = asyncio.get_running_loop()
@@ -184,6 +186,19 @@ class HostThrottle:
         host = (host or "").lower()
         if host not in UNI_HOSTS:
             return
+        counts = self.stats.setdefault(host, {"requests": 0, "ok": 0, "client_errors": 0,
+                                               "throttled": 0, "server_errors": 0, "network_errors": 0})
+        counts["requests"] += 1
+        if failed:
+            counts["network_errors"] += 1
+        elif status in (429, 503):
+            counts["throttled"] += 1
+        elif status is not None and status >= 500:
+            counts["server_errors"] += 1
+        elif status is not None and status >= 400:
+            counts["client_errors"] += 1
+        else:
+            counts["ok"] += 1
         if status in (429, 503):
             streak = self._failures.get(host, 0) + 1
             self._failures[host] = streak

@@ -38,6 +38,7 @@ from unibot.storage import (
     load_default_semester,
     shared_http,
 )
+from unibot.diagnostics import connection_report
 from unibot.auth import (
     _get_login_server,
     _login_public_url,
@@ -181,6 +182,9 @@ async def healthcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         icon = "✅" if ok else "❌"
         lines.append(f"{icon} {HEALTH_CHECK_LABELS[key]}: {html.escape(detail)}")
     lines.append("━━━━━━━━━━━━━━━━━")
+    if is_user_admin(user_id):
+        lines += connection_report()
+        lines.append("━━━━━━━━━━━━━━━━━")
 
     try:
         commit = subprocess.check_output(

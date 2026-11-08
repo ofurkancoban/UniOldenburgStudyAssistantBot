@@ -536,3 +536,75 @@ class ExamWindowParsingTests(unittest.TestCase):
             asyncio.run(er.check_exam_reminders(object(), None, send, {}))
         self.assertFalse([t for t in sent if "REGISTRATION OPEN" in t])
         self.assertIn("inf007_P:2026-10-19T00:00:00:2026-11-20T23:59:00", cache["notified_open"])
+
+
+class ResourceHygieneTests(unittest.TestCase):
+    def test_one_console_and_one_file_handler(self):
+        import logging
+        from logging.handlers import RotatingFileHandler
+        import unibot.config  # noqa: F401 - configures logging on import
+        handlers = logging.getLogger().handlers
+        self.assertEqual(sum(isinstance(h, RotatingFileHandler) for h in handlers), 1)
+        self.assertEqual(sum(type(h) is logging.StreamHandler for h in handlers), 1)
+
+    def test_logout_and_shutdown_close_connections(self):
+        from unibot import auth, state
+
+        class Sess:
+            def __init__(self):
+                self.closed = 0
+                self.explicitly_logged_out = False
+
+            async def logout(self):
+                self.explicitly_logged_out = True
+
+            async def close(self):
+                self.closed += 1
+
+        saved = (dict(state.user_sessions), state.global_session)
+        a, b, watcher = Sess(), Sess(), Sess()
+        state.user_sessions.clear()
+        state.user_sessions.update({1: a, 2: b})
+        state.global_session = watcher
+        try:
+            with mock.patch.object(auth.db, "delete_user_credentials", lambda uid: None), \
+                    mock.patch.object(auth.db, "update_user_studip", lambda uid, name: None), \
+                    mock.patch.object(auth.studip_oauth, "oauth_enabled", return_value=False):
+                asyncio.run(auth._perform_logout(user_id=1))
+                self.assertEqual(a.closed, 1)
+                asyncio.run(auth.close_all_sessions())
+            self.assertEqual((b.closed, watcher.closed), (1, 1))
+        finally:
+            state.user_sessions.clear()
+            state.user_sessions.update(saved[0])
+            state.global_session = saved[1]
+
+
+class DiagnosticsTests(unittest.TestCase):
+    def test_counters_and_report(self):
+        from unibot import diagnostics, state
+        throttle = studip_http.HostThrottle(min_interval=0)
+        for status in (200, 200, 429, 502):
+            throttle.report(STUMS, status)
+        throttle.report(STUMS, failed=True)
+        self.assertEqual(throttle.stats[STUMS], {"requests": 5, "ok": 2, "client_errors": 0, "throttled": 1,
+                                                 "server_errors": 1, "network_errors": 1})
+        sess = studip_session.StudIPSession("", "", "", cookie_file=None, user_id=7)
+        sess._stums_verified_at = time.time() - 120
+        saved = (dict(state.user_sessions), state.global_session)
+        state.user_sessions.clear()
+        state.user_sessions[7] = sess
+        state.global_session = sess
+        try:
+            with mock.patch.object(diagnostics, "THROTTLE", throttle), \
+                    mock.patch.dict(os.environ, {"CLOUDFLARE_WORKER_URL": ""}):
+                text = "\n".join(diagnostics.connection_report())
+        finally:
+            state.user_sessions.clear()
+            state.user_sessions.update(saved[0])
+            state.global_session = saved[1]
+        self.assertIn(f"{STUMS}: 5 req, 2 ok, 1 throttled, 1 5xx, 1 network", text)
+        self.assertIn("cooldown", text)  # the 429 started one
+        self.assertIn("not configured", text)
+        self.assertIn("<code>7</code> 👁: active", text)
+        self.assertIn("StuMS ✅ 2 min ago", text)

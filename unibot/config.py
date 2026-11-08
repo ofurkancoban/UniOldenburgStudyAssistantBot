@@ -69,11 +69,6 @@ PRIMARY_ADMIN_ID = _first_user_id(ADMIN_USER_IDS_ENV, ALLOWED_USER_IDS_ENV)
 LOG_FILE = os.getenv("BOT_LOG_FILE", "watch_log.txt")
 # SQLite database holding every cache/settings document (see unibot/db.py)
 DB_FILE = os.getenv("BOT_DB_FILE", "bot_data.sqlite3")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
 try:
     _file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3)
 except (PermissionError, OSError):
@@ -81,10 +76,16 @@ except (PermissionError, OSError):
     print(f"⚠️ Permission denied for {LOG_FILE}, logging to {_temp_log} instead.")
     _file_handler = RotatingFileHandler(_temp_log, maxBytes=5 * 1024 * 1024, backupCount=3)
 
-_file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+# Exactly one console and one file handler with one format (basicConfig plus
+# an extra StreamHandler used to print every line twice in two formats).
+_LOG_FORMAT = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
 _console_handler = logging.StreamHandler()
-_console_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+for _handler in (_file_handler, _console_handler):
+    _handler.setFormatter(_LOG_FORMAT)
 root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+for _old_handler in list(root_logger.handlers):
+    root_logger.removeHandler(_old_handler)
 root_logger.addHandler(_file_handler)
 root_logger.addHandler(_console_handler)
 # httpx logs every request URL at INFO, and Telegram's URLs carry the bot
