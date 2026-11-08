@@ -28,7 +28,7 @@ from telegram.error import TelegramError
 
 from studip_session import StudIPSession
 
-from unibot import state
+from unibot import db, state
 from unibot.config import (
     ALLOWED_USER_IDS,
     PROJECT_ROOT,
@@ -384,8 +384,6 @@ def _startup_admin_session() -> StudIPSession:
 
     It used to be created without a user id or cookie file, so after every
     restart the watcher ran logged out until somebody signed in again."""
-    from unibot import db
-
     candidates = list(ALLOWED_USER_IDS)
     try:
         candidates += [u["telegram_id"] for u in db.get_all_users() if u.get("role") == "admin"]
