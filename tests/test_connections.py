@@ -857,6 +857,42 @@ class CookieStorageTests(unittest.TestCase):
         db.delete_user_credentials(4242)
 
 
+    def test_stums_state_survives_a_restart_and_not_a_logout(self):
+        from unibot import db
+        db.delete_user_credentials(4343)
+        db.save_user_credential(4343, "cookies", [{"key": "Studip_Session", "value": "abc",
+                                                   "domain": "elearning.uni-oldenburg.de", "path": "/",
+                                                   "host_only": True}])
+        paused = time.time() + 900
+
+        async def first_run():
+            sess = studip_session.StudIPSession("", "", "", cookie_file=None, user_id=4343)
+            await sess.ensure_session()
+            sess.stums.verified_at, sess.stums.referer, sess.stums.blocked_until = 123.0, "https://stums/x", paused
+            await sess.close()  # a graceful shutdown
+
+        async def second_run():
+            sess = studip_session.StudIPSession("", "", "", cookie_file=None, user_id=4343)
+            await sess.ensure_session()
+            try:
+                return sess.stums
+            finally:
+                await sess.close()
+
+        try:
+            asyncio.run(first_run())
+            restored = asyncio.run(second_run())
+            self.assertEqual((restored.verified_at, restored.referer, restored.blocked_until),
+                             (123.0, "https://stums/x", paused))
+            # after a logout the state is neither kept nor written again
+            db.delete_user_credentials(4343)
+            sess = studip_session.StudIPSession("", "", "", cookie_file=None, user_id=4343)
+            sess.explicitly_logged_out = True
+            sess.save_stums_state()
+            self.assertIsNone(db.load_user_credential(4343, "stums_state"))
+        finally:
+            db.delete_user_credentials(4343)
+
 class RetireImportedFilesTests(unittest.TestCase):
     def test_files_already_in_the_database_are_renamed(self):
         from unibot import db

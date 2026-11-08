@@ -91,6 +91,9 @@ root_logger.addHandler(_console_handler)
 # httpx logs every request URL at INFO, and Telegram's URLs carry the bot
 # token (api.telegram.org/bot<token>/...), so it would end up in the logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
+# pypdf warns about every malformed object in a course PDF ("Multiple
+# definitions in dictionary ..."); the text is still extracted fine.
+logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 # ── WhatsApp microservice ─────────────────────────────────────────────────────
 # The Node service only listens on 127.0.0.1 and rejects requests without this

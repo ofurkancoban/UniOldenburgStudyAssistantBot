@@ -218,7 +218,8 @@ def acquire_instance_lock():
                     logging.error("❌ Another bot instance is actually running (PID %s). Exiting.", pid)
                     return False
                 else:
-                    logging.warning("⚠️ Stale lock file found (PID %s not running). Removing it.", pid)
+                    # normal after every restart (PM2 stops the old process first)
+                    logging.info("Stale lock file found (PID %s not running). Removing it.", pid)
                     os.remove(LOCK_FILE)
             except Exception as e:
                 logging.warning("⚠️ Failed to read/validate lock file: %s. Attempting to overwrite.", e)

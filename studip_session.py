@@ -138,6 +138,14 @@ class StumsState:
     _lock: Optional[asyncio.Lock] = field(default=None, repr=False)
     _lock_loop: object = field(default=None, repr=False)
 
+    def to_dict(self) -> dict:
+        return {"verified_at": self.verified_at, "referer": self.referer, "blocked_until": self.blocked_until}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "StumsState":
+        return cls(verified_at=float(data.get("verified_at") or 0.0), referer=data.get("referer") or None,
+                   blocked_until=float(data.get("blocked_until") or 0.0))
+
     def lock(self) -> asyncio.Lock:
         """One StuMS sign-in at a time for this account (bound to the running loop)."""
         loop = asyncio.get_running_loop()
@@ -412,7 +420,30 @@ class StudIPSession(SsoFlowMixin):
     def _s_post(self, url, **kwargs):
         return self._RequestContext(self, "POST", url, kwargs)
 
+    def save_stums_state(self) -> None:
+        """Keep the StuMS sign-in state across restarts (stored with the login,
+        so a logout removes it). The retry pause after a refused login thus
+        survives a restart too."""
+        if not getattr(self, "user_id", None) or self.explicitly_logged_out:
+            return
+        try:
+            from unibot import db
+            db.save_user_credential(self.user_id, "stums_state", self.stums.to_dict())
+        except Exception as exc:
+            self.logger.debug("StuMS state not saved for user %s: %s", self.user_id, exc)
+
+    def _load_stums_state(self) -> None:
+        try:
+            from unibot import db
+            data = db.load_user_credential(self.user_id, "stums_state")
+        except Exception as exc:
+            self.logger.debug("StuMS state not loaded for user %s: %s", self.user_id, exc)
+            return
+        if isinstance(data, dict):
+            self.stums = StumsState.from_dict(data)
+
     async def save_cookies(self):
+        self.save_stums_state()
         if not self.session:
             return
         jar = self._client.cookie_jar
@@ -486,6 +517,7 @@ class StudIPSession(SsoFlowMixin):
                 data = db.load_user_credential(self.user_id, "cookies")
                 if data:
                     self.logger.info("Encrypted cookies loaded from DB for user %s", self.user_id)
+                    self._load_stums_state()
             except Exception as exc:
                 self.logger.warning("Failed to load cookies from DB for user %s: %s", self.user_id, exc)
 
@@ -835,6 +867,7 @@ class StudIPSession(SsoFlowMixin):
         return await self.request("POST", url, **kwargs)
 
     async def close(self):
+        self.save_stums_state()
         closed = False
         for http in (self.session, getattr(self, "_proxy_http", None)):
             if http is not None and not http.closed:
