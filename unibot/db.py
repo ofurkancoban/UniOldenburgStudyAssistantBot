@@ -170,6 +170,27 @@ def keys() -> list[str]:
         return [r[0] for r in _connection().execute("SELECT key FROM documents ORDER BY key")]
 
 
+def retire_imported_files() -> int:
+    """Rename every JSON file whose document already lives in the database to
+    <file>.imported, so stale copies can't be mistaken for the live data.
+    Returns how many files were renamed."""
+    renamed = 0
+    with _lock:
+        for (key,) in _connection().execute("SELECT key FROM documents").fetchall():
+            path = key if os.path.isabs(key) else os.path.join(PROJECT_ROOT, key)
+            if not os.path.isfile(path):
+                continue
+            try:
+                os.replace(path, path + ".imported")
+                renamed += 1
+            except OSError:
+                logging.debug("Could not rename %s", path, exc_info=True)
+    if renamed:
+        logging.info("Renamed %s JSON file(s) already stored in %s to *.imported",
+                     renamed, os.path.basename(_db_path()))
+    return renamed
+
+
 def close() -> None:
     global _conn, _conn_path
     with _lock:

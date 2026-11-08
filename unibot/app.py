@@ -391,6 +391,7 @@ async def main():
             from unibot.config import ADMIN_USER_IDS
             from unibot import db
             db.bootstrap_admins(ADMIN_USER_IDS)
+            db.retire_imported_files()
             # Logins live per user in the DB vault. The single-user era files
             # cannot be attributed to one account reliably (they were also
             # written by sessions bound to nobody), so they are retired instead

@@ -746,3 +746,21 @@ class CookieStorageTests(unittest.TestCase):
         self.assertEqual([c["value"] for c in stored if c["key"] == "Studip_Session"], ["abc"])
         self.assertFalse(os.path.exists(cookie_file))
         db.delete_user_credentials(4242)
+
+
+class RetireImportedFilesTests(unittest.TestCase):
+    def test_files_already_in_the_database_are_renamed(self):
+        from unibot import db
+        tmp = tempfile.mkdtemp()
+        stale = os.path.join(tmp, "stale_cache.json")
+        db.save(stale, {"live": True})
+        with open(stale, "w") as fh:
+            fh.write('{"live": false}')
+        other = os.path.join(tmp, "unrelated.json")
+        with open(other, "w") as fh:
+            fh.write("{}")
+        self.assertGreaterEqual(db.retire_imported_files(), 1)
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(stale + ".imported"))
+        self.assertTrue(os.path.exists(other))  # not a stored document: untouched
+        self.assertEqual(db.load(stale), {"live": True})
