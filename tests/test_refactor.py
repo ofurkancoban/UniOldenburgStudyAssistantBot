@@ -640,6 +640,23 @@ class StumsHandoffTests(unittest.TestCase):
             asyncio.run(self.er._establish_stums_session(s))
         self.assertGreater(s.stums_blocked_until, __import__("time").time())
 
+    def test_stuck_at_university_login_asks_for_sign_in_and_pauses(self):
+        s = self.session([])
+        s.sso_handoff = mock.AsyncMock(side_effect=RuntimeError(
+            "SSO flow did not complete; stuck at https://auth.uni-oldenburg.de/osp/a/TOP/auth/oauth2/grant?x=1"))
+        with self.assertRaisesRegex(self.er.StumsLoginUnavailable, "Sign In to StuMS"):
+            asyncio.run(self.er._establish_stums_session(s))
+        with self.er.background_stums(), self.assertRaises(self.er.StumsLoginUnavailable):
+            asyncio.run(self.er._establish_stums_session(s))
+        self.assertEqual(s.sso_handoff.await_count, 1)  # the watcher does not retry during the pause
+
+    def test_any_failed_handoff_pauses_background_retries(self):
+        s = self.session([])
+        s.sso_handoff = mock.AsyncMock(side_effect=RuntimeError("SSO flow did not complete; stuck at https://x.example/"))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(self.er._establish_stums_session(s))
+        self.assertGreater(s.stums_blocked_until, __import__("time").time())
+
     def test_pauses_after_refusal_and_logs_once(self):
         s = self.session(["Login notwendig", "Login notwendig"])
         with self.assertRaises(self.er.StumsLoginUnavailable) as first:

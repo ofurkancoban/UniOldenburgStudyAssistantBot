@@ -267,6 +267,18 @@ async def _establish_stums_session(session) -> str:
                         "Open /login and choose the StuMS sign-in once; background checks "
                         f"retry in {STUMS_RETRY_SECONDS // 60} min."
                     ) from e
+                if "Interactive login or logout active" in str(e):
+                    raise RuntimeError(f"StuMS SSO handoff failed: {e}") from e
+                # Pause background retries after any failed handoff: the same
+                # SSO flow would fail again and every attempt is a login try.
+                session.stums_blocked_until = time.time() + STUMS_RETRY_SECONDS
+                if "stuck at https://" in str(e) and any(
+                        h in str(e) for h in ("login.uni-oldenburg.de", "auth.uni-oldenburg.de", "idp.uni-oldenburg.de")):
+                    raise StumsLoginUnavailable(
+                        "StuMS sign-in stopped at the university login (the SSO session has probably expired). "
+                        "Open /login and use \U0001f393 Sign In to StuMS once; background checks retry in "
+                        f"{STUMS_RETRY_SECONDS // 60} min."
+                    ) from e
                 raise RuntimeError(f"StuMS SSO handoff failed: {e}") from e
             if await _stums_logged_in(session, referer):
                 return _mark_stums_verified(session, referer)
