@@ -249,7 +249,8 @@ async def watched_courses() -> list:
             plan.setdefault(cid, (name, cid, watcher))
             if getattr(watcher, "user_id", None):
                 members.setdefault(cid, set()).add(watcher.user_id)
-    for uid, sess in signed_in_accounts():
+    for account in signed_in_accounts():
+        uid, sess = account.user_id, account.session
         if time.time() - _course_list_fetched.get(uid, 0.0) > COURSE_LIST_REFRESH_SECONDS \
                 or uid not in state.user_courses_map:
             try:

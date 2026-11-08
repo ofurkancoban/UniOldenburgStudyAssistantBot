@@ -4,6 +4,7 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import contextlib
+from dataclasses import dataclass
 import contextvars
 import errno
 import html
@@ -19,7 +20,7 @@ from telegram.error import TelegramError
 import studip_oauth
 from studip_login_server import LoginServer
 from studip_http import BACKGROUND, INTERACTIVE, set_request_priority
-from studip_session import StudIPSession
+from studip_session import StudIPSession, StumsState
 from studip_tunnel import NamedTunnel, QuickTunnel
 
 from unibot import db
@@ -648,24 +649,60 @@ def all_sessions() -> list:
     return list(sessions.values())
 
 
-def signed_in_accounts() -> list:
-    """(telegram_id, session) of every active user with a stored login,
-    admins from the environment first."""
+@dataclass(frozen=True)
+class Account:
+    """One Telegram user's university account: it owns the user's
+    StudIPSession (Stud.IP and StuMS sign-in, cookies, HTTP connections) and
+    answers everything the bot needs to know about that account."""
+    user_id: int
+    session: StudIPSession
+
+    @property
+    def signed_in(self) -> bool:
+        """Has a stored login (cookies or tokens) and did not log out."""
+        return has_stored_login(self.session)
+
+    @property
+    def stums(self) -> StumsState:
+        return self.session.stums
+
+    @property
+    def courses(self) -> dict:
+        """{cid: name} of the courses Stud.IP lists for this user."""
+        return state.user_courses_map.get(self.user_id) or {}
+
+    @property
+    def is_watcher(self) -> bool:
+        return self.session is state.global_session
+
+    async def close(self) -> None:
+        await self.session.close()
+
+
+def get_account(user_id: int) -> Account:
+    """The user's Account, creating its session on first use."""
+    return Account(user_id, state.user_sessions.get(user_id) or get_user_session(user_id))
+
+
+def accounts() -> list:
+    """Every active user's Account, admins from the environment first."""
     try:
         active = [u["telegram_id"] for u in db.get_all_users() if u.get("is_active", 1)]
     except Exception:
         logging.debug("User list unavailable", exc_info=True)
         active = []
-    accounts = []
+    found = []
     for uid in dict.fromkeys(sorted(ALLOWED_USER_IDS) + active):
         try:
-            sess = state.user_sessions.get(uid) or get_user_session(uid)
+            found.append(get_account(uid))
         except Exception:
             logging.debug("No session for %s", uid, exc_info=True)
-            continue
-        if has_stored_login(sess):
-            accounts.append((uid, sess))
-    return accounts
+    return found
+
+
+def signed_in_accounts() -> list:
+    """The Accounts with a stored login: the ones background checks run for."""
+    return [account for account in accounts() if account.signed_in]
 
 
 async def close_all_sessions() -> None:

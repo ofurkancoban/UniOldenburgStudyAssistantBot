@@ -209,7 +209,7 @@ def _user_sender(user_id: int):
 
 
 def _stums_users() -> list:
-    """(telegram_id, session) of every active student with a stored login."""
+    """The Accounts of every active student with a stored login."""
     return signed_in_accounts()
 
 
@@ -231,7 +231,8 @@ async def _for_each_stums_user(job):
     """Run `job(uid, session)` for every signed-in student, one at a time and
     spaced out; each runs in that student's user and exam-cache context."""
     admin_id = next(iter(ALLOWED_USER_IDS), None)
-    for index, (uid, sess) in enumerate(_stums_users()):
+    for index, account in enumerate(_stums_users()):
+        uid, sess = account.user_id, account.session
         if index:
             await asyncio.sleep(random.uniform(*STUMS_USER_GAP_SECONDS))
         if uid == admin_id:

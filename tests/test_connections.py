@@ -914,7 +914,10 @@ class AccountRegistryTests(unittest.TestCase):
             with mock.patch.object(auth, "has_stored_login", lambda s: s is b), \
                     mock.patch.object(auth.db, "get_all_users", lambda: [{"telegram_id": 2}, {"telegram_id": 3, "is_active": 0}]), \
                     mock.patch.object(auth, "ALLOWED_USER_IDS", {1}):
-                self.assertEqual(auth.signed_in_accounts(), [(2, b)])
+                (account,) = auth.signed_in_accounts()
+                self.assertEqual((account.user_id, account.session), (2, b))
+                self.assertFalse(account.is_watcher)
+                self.assertTrue(auth.get_account(1).is_watcher)
         finally:
             state.user_sessions.clear()
             state.user_sessions.update(saved[0])
