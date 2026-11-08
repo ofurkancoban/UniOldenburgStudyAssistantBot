@@ -172,7 +172,11 @@ async def _run_scheduled_jobs(bot, session, now: datetime):
 
 async def _send_calendar_reminders(bot):
     for uid in _get_active_user_ids():
-        await check_calendar_reminders(bot, uid, silent=True)
+        # a signed-out user has nothing to read; asking anyway only earns 401s
+        if not has_stored_login(get_user_session(uid)):
+            continue
+        with acting_as(uid):
+            await check_calendar_reminders(bot, uid, silent=True)
 
 
 def _exam_registration_interval() -> int:

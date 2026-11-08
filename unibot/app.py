@@ -393,20 +393,14 @@ async def main():
             from unibot.config import ADMIN_USER_IDS
             from unibot import db
             db.bootstrap_admins(ADMIN_USER_IDS)
-            # The single-user era files belong to one account only: move them
-            # to the primary admin once and retire them, never copy them to
-            # every admin (that signed other admins in as the primary one).
-            from unibot.config import PRIMARY_ADMIN_ID
-            from studip_vault import load_vault_json
-            for legacy, kind in (("studip_cookies.json", "cookies"), ("studip_oauth_tokens.json", "oauth_tokens")):
-                if PRIMARY_ADMIN_ID is None or not os.path.exists(legacy):
-                    continue
-                if not db.load_user_credential(PRIMARY_ADMIN_ID, kind):
-                    data = load_vault_json(legacy)
-                    if data:
-                        db.save_user_credential(PRIMARY_ADMIN_ID, kind, data)
-                        logging.info("Migrated %s into DB for admin %s", legacy, PRIMARY_ADMIN_ID)
-                os.replace(legacy, legacy + ".migrated")
+            # Logins live per user in the DB vault. The single-user era files
+            # cannot be attributed to one account reliably (they were also
+            # written by sessions bound to nobody), so they are retired instead
+            # of being copied into an admin's vault.
+            for legacy in ("studip_cookies.json", "studip_oauth_tokens.json"):
+                if os.path.exists(legacy):
+                    os.replace(legacy, legacy + ".retired")
+                    logging.info("Retired the shared %s; each user signs in with their own login", legacy)
         except Exception as exc:
             logging.debug("Credentials DB bootstrap skipped: %s", exc)
 
