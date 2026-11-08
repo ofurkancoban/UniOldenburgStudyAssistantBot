@@ -666,6 +666,8 @@ async def _status_button_detect_wa_groups(update, context, query):
                             data = await resp.json()
                             if data.get("name"):
                                 g["name"] = data["name"]
+                        elif resp.status == 404:
+                            g["not_member"] = True
             except Exception:
                 logging.debug("WhatsApp group discovery request failed", exc_info=True)
         await asyncio.gather(*(_resolve(g) for g in missing))
@@ -674,6 +676,8 @@ async def _status_button_detect_wa_groups(update, context, query):
     kb = []
     for g in groups:
         label = g.get("name") or g["groupId"]
+        if g.get("not_member"):
+            label = f"⚠️ {label} (not a member)"
         if g["groupId"] == current_id:
             label = f"✅ {label} (active)"
         kb.append([InlineKeyboardButton(label, callback_data=f"set_wa_group|{g['groupId']}")])

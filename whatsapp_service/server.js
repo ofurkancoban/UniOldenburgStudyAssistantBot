@@ -492,10 +492,31 @@ app.get('/group_name', async (req, res) => {
         }
         res.json({ name });
     } catch (err) {
+        if (isNotAGroupMember(err)) {
+            // WhatsApp answers without a <group> node (or "item-not-found" /
+            // "forbidden") for a group this account has left or never joined:
+            // that is a normal answer, not a server failure.
+            console.log(`Group ${groupId} is unknown to this WhatsApp account (left or never joined)`);
+            return res.status(404).json({ error: 'Not a member of this group', notMember: true });
+        }
         console.error('Error resolving group name:', err);
         res.status(500).json({ error: `Internal server error: ${err && err.message ? err.message : String(err)}` });
     }
 });
+
+// Baileys reports "this account is not in that group" in several ways
+// depending on the server's reply; all of them mean the same to callers.
+function isNotAGroupMember(err) {
+    const message = String((err && err.message) || err || '').toLowerCase();
+    const status = err && err.output && err.output.statusCode;
+    return (
+        message.includes('missing <group> node') ||
+        message.includes('item-not-found') ||
+        message.includes('forbidden') ||
+        message.includes('not-authorized') ||
+        status === 403 || status === 404
+    );
+}
 
 // sock.sendMessage() can resolve to undefined without throwing in some edge
 // cases - there's no reliable way to tell from here whether the message
