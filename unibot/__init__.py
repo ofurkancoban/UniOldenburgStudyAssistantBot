@@ -32,6 +32,9 @@ MODULE_ORDER = (
     "wardrobe",
     "schedule",     # calendar, rooms, study windows
     "whatsapp",
+    "monitoring_fetch",   # watcher fetch layer: Stud.IP reads and parsing
+    "monitoring_diff",    # watcher change detection (pure)
+    "monitoring_alerts",  # watcher notification layer
     "monitoring",   # announcement/file/forum/message watchers
     "exams",
     "study_plan",

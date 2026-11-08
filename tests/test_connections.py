@@ -910,8 +910,10 @@ class StumsFixtureTests(unittest.TestCase):
         async def signed_in(session):
             return er.STUMS_START_URL
 
-        with mock.patch.object(er, "_establish_stums_session", signed_in), \
-                mock.patch.object(er, "berlin_now", lambda: er.datetime(2026, 11, 8, 12, 0)):
+        import stums_client
+        # The fetcher lives in the client layer, so its collaborators are patched there.
+        with mock.patch.object(stums_client, "_establish_stums_session", signed_in), \
+                mock.patch.object(stums_client, "berlin_now", lambda: er.datetime(2026, 11, 8, 12, 0)):
             open_exams = asyncio.run(er.get_open_exam_registrations(Session()))
         self.assertEqual([(e["code"], e["start_date"]) for e in open_exams],
                          [("inf007_P", "2026-10-20T00:00:00")])
@@ -1026,3 +1028,39 @@ class LayeringTests(unittest.TestCase):
         import exam_reminder
         import stums_parsers
         self.assertIs(exam_reminder._parse_examination_periods, stums_parsers._parse_examination_periods)
+
+    @staticmethod
+    def _imports(rel_path: str) -> set:
+        import ast
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, rel_path), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found |= {a.name for a in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                found.add(node.module or "")
+        return found
+
+    def test_stums_client_does_not_notify(self):
+        imported = self._imports("stums_client.py")
+        self.assertFalse({m for m in imported if m.startswith(("telegram", "unibot", "exam_reminder"))})
+
+    def test_monitoring_layers(self):
+        # change detection is pure; neither lower layer reaches up to the watchers
+        self.assertEqual(self._imports("unibot/monitoring_diff.py"), {"datetime", "unibot.studip_api"})
+        for rel in ("unibot/monitoring_fetch.py", "unibot/monitoring_diff.py", "unibot/monitoring_alerts.py"):
+            self.assertNotIn("unibot.monitoring", self._imports(rel), rel)
+        self.assertNotIn("telegram", {m.split(".")[0] for m in self._imports("unibot/monitoring_fetch.py")})
+
+    def test_split_modules_are_reexported(self):
+        import exam_reminder
+        import stums_client
+        from unibot import monitoring, monitoring_alerts, monitoring_diff, monitoring_fetch
+        self.assertIs(exam_reminder.get_grades, stums_client.get_grades)
+        self.assertIs(exam_reminder._establish_stums_session, stums_client._establish_stums_session)
+        self.assertIs(monitoring._forum_thread_entry, monitoring_fetch._forum_thread_entry)
+        self.assertIs(monitoring._diff_course_files, monitoring_diff._diff_course_files)
+        # one shared dict, so tasks.py and the alert buttons see the same entries
+        self.assertIs(monitoring.task_suggestion_cache, monitoring_alerts.task_suggestion_cache)

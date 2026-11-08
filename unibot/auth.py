@@ -461,7 +461,7 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
     # One sign-in connects both services: sign this session in to StuMS on
     # the server while the NetIQ SSO session from the Mini App is fresh.
     try:
-        from exam_reminder import _establish_stums_session
+        from stums_client import _establish_stums_session
         session.stums.blocked_until = 0.0  # a fresh login lifts the background pause
         await _establish_stums_session(session)
         await session.save_cookies()

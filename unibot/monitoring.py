@@ -1,5 +1,9 @@
 """Watchers for announcements, files, forum posts and messages, plus 'show last' views.
 
+Layers: unibot.monitoring_fetch reads Stud.IP, unibot.monitoring_diff finds
+changed files, unibot.monitoring_alerts builds and sends the alerts; this
+module keeps the caches, runs the checks and serves the commands.
+
 Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
@@ -8,7 +12,6 @@ import html
 import json
 import logging
 import os
-import re
 import tempfile
 import time
 from datetime import datetime
@@ -20,7 +23,7 @@ from telegram.ext import ContextTypes
 
 import studip_oauth
 from typing import Optional
-from studip_utils import TZ_BERLIN, berlin_now, redact_url
+from studip_utils import berlin_now
 
 from unibot import db
 from unibot import state
@@ -29,7 +32,6 @@ from unibot.storage import link_cache, load_files_cache, save_files_cache, singl
 from unibot.formatting import (
     _course_abbrev,
     _short_id,
-    _truncate_with_ellipsis,
     clean_for_html,
     clean_html_text,
     parse_date_safe,
@@ -49,26 +51,49 @@ from unibot.studip_api import (
     BASE_URL,
     STUDIP_API_URL,
     StudipApiError,
-    _api_berlin,
-    _api_html_to_text,
-    _api_message,
     _api_names,
     _api_rel_id,
     _ensure_watched_courses_map,
     list_courses,
-    _parse_file_date_v2,
     list_files,
     studip_api_get,
-    studip_api_get_all,
-    studip_api_user_id,
 )
 from unibot.ai import transcribe_voice_message
+from unibot.monitoring_fetch import (  # noqa: F401 - the fetch layer, re-exported for callers
+    JSONAPI_HEADERS,
+    MESSAGE_CHECK_LIMIT,
+    _course_announcements_api,
+    _fetch_course_forum,
+    _fetch_messages_api,
+    _fetch_messages_html,
+    _forum_author_name,
+    _forum_thread_entry,
+    _friendly_forum_date,
+    _html_to_text,
+    _parse_ann_date,
+    _post_author_id,
+    fetch_message_body,
+)
+from unibot.monitoring_diff import (  # noqa: F401 - change detection, re-exported for callers
+    _diff_course_files,
+    _file_events,
+    _file_was_updated,
+    _snapshot_course_files,
+)
+from unibot.monitoring_alerts import (  # noqa: F401 - the notification layer, re-exported for callers
+    _file_alert,
+    _format_exam_dates_message,
+    _forum_alert_markup,
+    _forum_alert_text,
+    _send_file_alerts,
+    announcement_task_cache,
+    course_members,
+    task_suggestion_cache,
+)
 
 
 global_message_watcher = None
 global_announcement_watcher = None
-task_suggestion_cache = {}  # short_id -> { text, due_time (ISO or None), course }
-announcement_task_cache = {}  # short_id -> { course, subject, body } - raw announcement, converted to a task on demand when "📝 Add as Task" is tapped
 watch_tasks = {}  # chat_id -> asyncio.Task
 check_in_progress: set[int] = set()  # chat_id set to prevent concurrent checks
 
@@ -195,37 +220,6 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def _parse_ann_date(s: str) -> datetime:
-    """Safely convert Stud.IP announcement date string (default: very old)."""
-    if not s:
-        return datetime.min
-    s = s.strip()
-    fmts = [
-        "%d/%m/%y", "%d/%m/%Y",  # 17/09/25
-        "%d.%m.%y", "%d.%m.%Y",  # 17.09.2025
-        "%d %b %y", "%d %b %Y",  # 17 Sep 25
-        "%d.%m.%y %H:%M", "%d.%m.%Y %H:%M",
-        "%d/%m/%y %H:%M", "%d/%m/%Y %H:%M",
-    ]
-    for f in fmts:
-        try:
-            return datetime.strptime(s, f)
-        except (ValueError, TypeError):
-            pass
-    # If text comes and contains 2-digit year, rough estimate:
-    try:
-        parts = re.findall(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})", s)
-        if parts:
-            d, m, y = parts[0]
-            y = int(y)
-            if y < 100:  # 25 -> 2025 assumption
-                y += 2000
-            return datetime(int(y), int(m), int(d))
-    except (ValueError, IndexError):
-        pass
-    return datetime.min
-
-
 # ── course watch plan ─────────────────────────────────────────────────────────
 # Every course of every signed-in user is watched, each fetched once with the
 # session of one of its participants, and alerts go to its participants only.
@@ -264,39 +258,6 @@ async def watched_courses() -> list:
             members.setdefault(cid, set()).add(uid)
     state.course_members = members
     return list(plan.values())
-
-
-def course_members(cid: Optional[str]):
-    """Participants of a watched course, or None when unknown (then broadcast
-    falls back to its old recipient rules)."""
-    if cid is None:
-        return None
-    return (getattr(state, "course_members", None) or {}).get(cid)
-
-
-async def _course_announcements_api(cid, course_name, session=None) -> list:
-    """The course's currently published announcements from the JSON:API, in
-    the same shape (and with the same "cid:news_id" key) as the ones scraped
-    from the course overview page."""
-    news, included = await studip_api_get_all(f"/courses/{cid}/news", {"include": "author"}, session=session)
-    names = _api_names(included)
-    now = datetime.now(TZ_BERLIN)
-    result = []
-    for n in news:
-        a = n["attributes"]
-        start, end = _api_berlin(a.get("publication-start")), _api_berlin(a.get("publication-end"))
-        if (start and start > now) or (end and end < now):
-            continue
-        dt = _api_berlin(a.get("publication-start") or a.get("mkdate"))
-        date_s = dt.strftime("%d/%m/%y") if dt else ""
-        result.append({
-            "key": f"{cid}:{n['id']}", "cid": cid, "course": course_name,
-            "subject": a.get("title") or "(No subject)",
-            "sender": names.get(_api_rel_id(n, "author"), "Unknown"),
-            "date": date_s, "dt": _parse_ann_date(date_s).isoformat(),
-            "body": _api_html_to_text(a.get("content")) or "(No content)",
-        })
-    return result
 
 
 async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, courses=None):
@@ -441,53 +402,6 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
         logging.error("check_new_announcements_parallel fatal: %s", e)
 
 
-async def fetch_message_body(session, message_url):
-    """Fetch message body from detail page with improved parsing."""
-    try:
-        async with await session.get(message_url) as resp:
-            if resp.status != 200:
-                return f"[HTTP Error: {resp.status}]"
-            html = await resp.text()
-
-        # lxml, not html.parser - see the comment in check_new_announcements_parallel
-        # on the same inline-SVG-icon parse-tree corruption bug.
-        soup = BeautifulSoup(html, "lxml")
-
-        # Try different content containers
-        content_selectors = [
-            "div.formatted-content",
-            "div.message-content",
-            "div.news-content",
-            "div.mail_content",
-            ".formatted-content.ck-content"
-        ]
-
-        for selector in content_selectors:
-            content = soup.select_one(selector)
-            if content:
-                # Remove unnecessary elements
-                for elem in content.select("script, style, nav, header, footer"):
-                    elem.decompose()
-
-                text = clean_html_text(content)
-                if text and len(text.strip()) > 10:  # Meaningful content check
-                    return text
-
-        # Fallback: extract text from entire page
-        main_content = soup.select_one("main") or soup.select_one("article") or soup
-        text = clean_html_text(main_content)
-
-        # Truncate if too long
-        if len(text) > 3000:
-            text = text[:3000] + "..."
-
-        return text if text.strip() else "No content found."
-
-    except Exception as e:
-        logging.error("fetch_message_body failed for %s: %s", redact_url(message_url), e)
-        return f"[Error fetching content: {str(e)[:100]}]"
-
-
 async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Display the last 5 announcements (with labeled header)."""
     query = update.callback_query
@@ -618,81 +532,6 @@ async def check_new_files(bot, chat_id, silent: bool = False):
     return await check_new_files_parallel(bot, chat_id, silent)
 
 
-def _snapshot_course_files(files: list) -> dict:
-    """Files of one course listing keyed by name, with a modified_ts added."""
-    current = {}
-    for f in files:
-        if f.get("type") != "file" or not f.get("name"):
-            continue
-        dt = _parse_file_date_v2(f.get("modified"), f.get("modified_iso"))
-        f["modified_ts"] = None if dt == datetime.min else int(dt.timestamp())
-        current[f["name"]] = f
-    return current
-
-
-def _file_was_updated(old: dict, cur: dict) -> bool:
-    """Whether a file seen before really changed.
-
-    A size change always counts. With the same size, only a timestamp jump of
-    more than 24 hours counts: smaller differences are the day-level date
-    resolution of some listings or a re-upload of the same file, and a
-    timestamp appearing or disappearing is just a format change.
-    """
-    old_size = str(old.get("size", "-")).strip()
-    cur_size = str(cur.get("size", "-")).strip()
-    if old_size != cur_size:
-        return True
-    old_ts, cur_ts = old.get("modified_ts"), cur.get("modified_ts")
-    if old_ts is None or cur_ts is None:
-        return False
-    return abs(cur_ts - old_ts) > 86400
-
-
-def _diff_course_files(current: dict, old: dict) -> tuple[list, list]:
-    """(new files, updated files) of one course."""
-    new_files = [f for name, f in current.items() if name not in old]
-    changed = [f for name, f in current.items() if name in old and _file_was_updated(old.get(name, {}), f)]
-    return new_files, changed
-
-
-def _file_events(course_name: str, cid: str, new_files: list, changed_files: list) -> list[dict]:
-    events = []
-    for kind, flist in (("new", new_files), ("changed", changed_files)):
-        for f in flist:
-            events.append({
-                "type": kind,
-                "cid": cid,
-                "course": course_name,
-                "name": f.get("name"),
-                "size": f.get("size", "-"),
-                "modified": f.get("modified", "-"),
-                "modified_iso": f.get("modified_iso"),
-                "dt": _parse_file_date_v2(f.get("modified"), f.get("modified_iso")),
-                "url": f.get("url"),
-            })
-    return events
-
-
-def _file_alert(it: dict, sid: str) -> tuple[str, InlineKeyboardMarkup]:
-    """Notification text and buttons (download, plus an audio summary for
-    PDF/PPTX/HTML) for one new or updated file."""
-    title = "🔥 🆕 <b>NEW FILE ADDED</b> 🔥" if it["type"] == "new" else "🔥 ♻️ <b>FILE UPDATED</b> 🔥"
-    text = (
-        f"{title}\n"
-        "                 \n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📚 <b>Course:</b> {html.escape(str(it['course']))}\n"
-        f"📄 <b>File:</b> {html.escape(str(it['name']))}\n"
-        f"📅 <b>Date:</b> {html.escape(str(it['modified']))}\n"
-        f"💾 <b>Size:</b> {html.escape(str(it['size']))}\n"
-        "━━━━━━━━━━━━━━━━━━"
-    )
-    btn_rows = [[InlineKeyboardButton("📥 Download", callback_data=f"file|{sid}")]]
-    if os.path.splitext(it.get("name") or "")[1].lower() in (".pdf", ".pptx", ".html"):
-        btn_rows.append([InlineKeyboardButton("🎧 1-Min Audio Summary", callback_data=f"file_audio_sum|{sid}")])
-    return text, InlineKeyboardMarkup(btn_rows)
-
-
 async def _scan_course_files(course_name: str, cid: str, cache: dict, session=None) -> tuple[list, bool]:
     """(new/updated file events, cache changed) for one course.
 
@@ -714,29 +553,6 @@ async def _scan_course_files(course_name: str, cid: str, cache: dict, session=No
     except Exception as e:
         logging.warning("Error while checking files for %s: %s", course_name, e)
         return [], False
-
-
-async def _send_file_alerts(bot, events: list) -> None:
-    """Send file notifications in chronological order, each with download buttons."""
-    for it in sorted(events, key=lambda x: (x["dt"], x["course"], x["name"])):
-        try:
-            sid = _short_id()
-            link_cache[sid] = {
-                "cid": it["cid"],
-                "name": it["name"],
-                "course": it["course"],
-                "url": it.get("url"),
-                "ts": time.time(),
-                # a participant's session can download it (an admin's may not be enrolled)
-                "user_id": next(iter(sorted(course_members(it.get("cid")) or ())), None)
-                or next(iter(ALLOWED_USER_IDS), None),
-            }
-            text, keyboard = _file_alert(it, sid)
-            await broadcast(bot, text, parse_mode="HTML", reply_markup=keyboard, cid=it.get("cid"),
-                            members=course_members(it.get("cid")))
-            await asyncio.sleep(0.3)  # Rate limiting
-        except Exception as e:
-            logging.error("Error sending notification for file %s: %s", it.get('name'), e)
 
 
 @single_flight
@@ -791,52 +607,9 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False, courses=N
         logging.error("check_new_files_parallel fatal: %s", e)
 
 
-# How many of the newest inbox messages each check compares against the
-# cache (the overview page showed about this many).
-MESSAGE_CHECK_LIMIT = 20
 # The inbox is one small API request, so it's polled on its own short loop
 # (see message_poll_loop) instead of once per multi-minute watcher cycle.
 MESSAGE_POLL_SECONDS = 60
-
-
-async def _fetch_messages_api(limit: int = MESSAGE_CHECK_LIMIT, session=None) -> list:
-    """The newest `limit` inbox messages, newest first, bodies included."""
-    uid = await studip_api_user_id(session=session)
-    if not uid:
-        raise StudipApiError("Stud.IP user id unknown")
-    page = await studip_api_get(f"/users/{uid}/inbox", {"page[limit]": limit, "include": "sender"}, session=session)
-    names = _api_names(page.get("included", []))
-    return [_api_message(m, names) for m in page.get("data", [])]
-
-
-async def _fetch_messages_html(session) -> list:
-    """Overview-page rows (no bodies), the fallback when the API fails."""
-    url = f"{BASE_URL}/dispatch.php/messages/overview"
-    async with await session.get(url) as resp:
-        html_text = await resp.text()
-
-    # lxml, not html.parser: see the comment in check_new_announcements_parallel
-    # on the same inline-SVG-icon parse-tree corruption bug.
-    soup = BeautifulSoup(html_text, "lxml")
-    rows = soup.select("table#messages tbody tr[id^='message_']")
-    all_messages = []
-    for tr in rows:
-        link_tag = tr.select_one("td.title a[href*='dispatch.php/messages/read/']")
-        if not link_tag: continue
-        href = link_tag["href"].strip()
-        title = link_tag.get_text(strip=True)
-        sender_tag = tr.select_one("td:nth-of-type(3)")
-        sender = sender_tag.get_text(strip=True) if sender_tag else "Unknown"
-        date_tag = tr.select_one("td:nth-of-type(4)")
-        date = date_tag.get_text(strip=True) if date_tag else "Unknown"
-
-        if not href.startswith('http'):
-            href = f"{BASE_URL}/{href.lstrip('/')}"
-
-        all_messages.append({
-            "id": tr["id"].replace("message_", ""), "title": title, "sender": sender, "date": date, "url": href,
-        })
-    return all_messages
 
 
 # Other users' inboxes are polled less often: every poll is a request from
@@ -980,103 +753,6 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
 
 
 FORUM_CACHE_PATH = "forum_cache.json"
-JSONAPI_HEADERS = {"Accept": "application/vnd.api+json"}
-
-
-def _forum_author_name(posts_data: dict, author_id) -> str:
-    """Author name from the postings response's included forum members."""
-    if author_id and "included" in posts_data:
-        for inc in posts_data["included"]:
-            if inc.get("type") == "forum-members" and inc.get("id") == author_id:
-                return inc.get("attributes", {}).get("name", "Unknown")
-    return "Unknown"
-
-
-def _friendly_forum_date(iso_str) -> str:
-    if not iso_str:
-        return "Unknown date"
-    try:
-        return datetime.fromisoformat(iso_str).strftime("%Y-%m-%d %H:%M")
-    except (ValueError, TypeError):
-        return str(iso_str)
-
-
-def _post_author_id(post: dict):
-    return post.get("relationships", {}).get("author", {}).get("data", {}).get("id")
-
-
-def _html_to_text(content_html: str) -> str:
-    return BeautifulSoup(content_html, "html.parser").get_text(separator=" ", strip=True)
-
-
-def _forum_thread_entry(course_name: str, cid: str, disc: dict, posts_data: dict) -> Optional[dict]:
-    """Cache/notification entry for one discussion and its postings, or None
-    when the discussion has no postings."""
-    posts = posts_data.get("data", [])
-    if not posts:
-        return None
-    title = disc.get("attributes", {}).get("title", "Unknown")
-    disc_id = disc.get("id")
-
-    # The whole conversation for context, at most the last 15 messages so
-    # the message stays under Telegram's 4096 character limit.
-    history = []
-    for post in posts:
-        attrs = post.get("attributes", {})
-        p_html = attrs.get("content-html", "")
-        p_body = _truncate_with_ellipsis(_html_to_text(p_html), 400) if p_html else "No content"
-        p_author = _forum_author_name(posts_data, _post_author_id(post))
-        history.append(f"👤 <b>{html.escape(p_author)}</b> <i>({_friendly_forum_date(attrs.get('mkdate', ''))})</i>:\n{html.escape(p_body)}")
-    if len(history) > 15:
-        history = ["<i>... (older messages omitted) ...</i>"] + history[-15:]
-
-    last_post = posts[-1]
-    last_attrs = last_post.get("attributes", {})
-    time_str = _friendly_forum_date(last_attrs.get("mkdate", berlin_now().isoformat()))
-    last_content_html = last_attrs.get("content-html", "")
-    last_message_plain = _html_to_text(last_content_html) if last_content_html else ""
-    if len(history) > 1:
-        final_body = "💬 <b>Conversation History:</b>\n\n" + "\n\n".join(history)
-    else:
-        body = _truncate_with_ellipsis(last_message_plain, 3000) if last_message_plain else "No content"
-        final_body = f"📩 <b>Last message:</b>\n{html.escape(body)}"
-
-    return {
-        "course": course_name,
-        "thread": title,
-        "author": _forum_author_name(posts_data, _post_author_id(last_post)),
-        "date": time_str,
-        "body": final_body,
-        "last_message_plain": last_message_plain,
-        "key": f"{cid}:{title}:{disc_id}",
-        # A thread counts as new when Stud.IP reports unread postings
-        "is_new": disc.get("meta", {}).get("unread-postings-count", 0) > 0,
-        "timestamp": time_str,
-    }
-
-
-async def _fetch_course_forum(session, course_name: str, cid: str) -> list:
-    """Entries for the 10 most recently updated discussions of one course."""
-    try:
-        url = f"{BASE_URL}/jsonapi.php/v1/courses/{cid}/forum-discussions"
-        async with await session.get(url, headers=JSONAPI_HEADERS) as r:
-            if r.status != 200:
-                return []
-            data = await r.json()
-        entries = []
-        for disc in data.get("data", [])[:10]:
-            posts_url = f"{BASE_URL}/jsonapi.php/v1/forum-discussions/{disc.get('id')}/postings?include=author"
-            async with await session.get(posts_url, headers=JSONAPI_HEADERS) as r2:
-                if r2.status != 200:
-                    continue
-                posts_data = await r2.json()
-            entry = _forum_thread_entry(course_name, cid, disc, posts_data)
-            if entry:
-                entries.append(entry)
-        return entries
-    except Exception as e:
-        logging.warning("Error while checking forum API for %s: %s", course_name, e)
-        return []
 
 
 def _load_forum_cache() -> dict:
@@ -1088,37 +764,6 @@ def _load_forum_cache() -> dict:
     except Exception:
         logging.warning("⚠️ Failed to load forum cache, using empty.")
         return {}
-
-
-def _forum_alert_text(p: dict) -> str:
-    return (
-        "🔥 💬 <b>NEW FORUM POST</b> 🔥\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"🏫 <b>Course:</b> {html.escape(p.get('course', ''))}\n"
-        f"📂 <b>Thread:</b> {html.escape(p.get('thread', ''))}\n"
-        f"👤 <b>By:</b> {html.escape(p.get('author', ''))}\n"
-        f"🕒 <b>Date:</b> {html.escape(p.get('date', '-'))}\n"
-        "━━━━━━━━━━━━━━━━━\n"
-        f"{p['body']}\n"
-        "━━━━━━━━━━━━━━━━━"
-    )
-
-
-async def _forum_alert_markup(p: dict) -> InlineKeyboardMarkup:
-    """Forward button, plus an "Add as task" button when the AI finds a task."""
-    from unibot.tasks import extract_task_suggestion
-    buttons = [[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]]
-    if p.get("last_message_plain"):
-        try:
-            suggestion = await extract_task_suggestion(p.get('course', ''), p.get('thread'), p['last_message_plain'])
-        except Exception as e:
-            logging.warning("Task suggestion extraction failed for forum post: %s", e)
-            suggestion = None
-        if suggestion:
-            sid = _short_id()
-            task_suggestion_cache[sid] = {**suggestion, "course": p.get('course')}
-            buttons.append([InlineKeyboardButton(f"📝 Add as task: {suggestion['text'][:40]}", callback_data=f"tasksug_add|{sid}")])
-    return InlineKeyboardMarkup(buttons)
 
 
 async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, courses=None):
@@ -1473,29 +1118,6 @@ async def handle_studip_message_reply_cancel(update: Update, context: ContextTyp
     context.user_data.pop("pending_step", None)
     context.user_data.pop("studip_reply_target", None)
     await query.edit_message_text("❌ Stud.IP reply cancelled.")
-
-
-def _format_exam_dates_message(header: str, exams: list[dict], show_status: bool = True) -> list[str]:
-    """`show_status` controls the per-exam registration-status line (Registered /
-    Not registered / Passed / Failed). Off for the full-curriculum list, where
-    most entries are irrelevant to the student and that line is just noise."""
-    from unibot.exams import _exam_registration_status_line, _registration_period_line
-    lines = [header, "━━━━━━━━━━━━━━━━━"]
-    for e in exams:
-        title = e["title"]
-        if e.get("group_label"):
-            title += f" ({e['group_label']})"
-        lines.append(f"📘 <b>{title}</b>")
-        lines.append(f"📅 {e['exam_date_display']}")
-        if e.get("room"):
-            lines.append(f"📍 {e['room']}")
-        period_line = _registration_period_line(e)
-        if period_line:
-            lines.append(period_line)
-        if show_status:
-            lines.append(_exam_registration_status_line(e))
-        lines.append("━━━━━━━━━━━━━━━━━")
-    return lines
 
 
 # ── /check and /watch commands ───────────────────────────────────────────────

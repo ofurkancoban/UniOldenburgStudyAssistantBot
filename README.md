@@ -226,7 +226,7 @@ HF_TOKEN=your_free_huggingface_read_token_here    # huggingface.co/settings/toke
 | `/progress` | Per-course study progress (studied vs. lectures held so far), courses you're behind on, and buttons to mark lectures as studied. |
 | `/trackcourses` | Choose which courses are tracked in `/progress` and the weekly study plan (automatic by default: every course with lectures held this semester). |
 | `/status` | View system health, uptime, last sync timestamps, and access **Course Enrollment (Fast Enroll / Enroll Course / Sign Out), Default Semester, Exam Registration, Transcript, and WhatsApp settings**. |
-| `/healthcheck` | On-demand, full check of every subsystem the bot depends on: Stud.IP login, WhatsApp connection, Open-Meteo (weather), a real live OpenRouter (AI) call, GWDG with what's left of its daily/monthly quota, and free disk space on the server (fails below 5 GB), plus the currently-running git commit, so "is everything actually working" is one command instead of SSHing into the server. The same checks also run automatically every 30 minutes in the background (minus the live OpenRouter call, to not spend API quota that often) and **proactively message you** the moment something breaks (🔴) or recovers (🟢), no need to go looking for it. |
+| `/healthcheck` | On-demand, full check of every subsystem the bot depends on: Stud.IP login, WhatsApp connection, Open-Meteo (weather), a real live OpenRouter (AI) call, GWDG with what's left of its daily/monthly quota, and free disk space on the server (fails below 5 GB), plus the currently-running git commit, so "is everything actually working" is one command instead of SSHing into the server. The same checks also run automatically every 30 minutes in the background (minus the live OpenRouter call, to not spend API quota that often) and **proactively message you** the moment something breaks (🔴) or recovers (🟢), no need to go looking for it. Every day from 09:00 the admins also get a **daily health digest**: errors and warnings of the last 24 hours grouped by message, university requests per host (throttled, 5xx, network errors) since the previous digest, Cloudflare Worker failovers and the Stud.IP/StuMS state of every signed-in account. |
 
 ### ⌨️ Persistent Keyboard
 
@@ -264,8 +264,9 @@ The microservice (`whatsapp_service/`) talks to WhatsApp via **[Baileys](https:/
 graph TD
     A["Telegram"] <--> B["unibot package"]
     B --> C["studip_session (aiohttp)"]
-    B --> K["exam_reminder.py"]
-    K -->|Shared SSO session| C
+    B --> K["exam_reminder.py (reminders)"]
+    K --> P["stums_client.py (fetch) + stums_parsers.py (parse)"]
+    P -->|Shared SSO session| C
     C -->|CLOUDFLARE_WORKER_URL| W["Cloudflare Worker (Rotating Edge IPs)"]
     W --> D["Stud.IP (JSON:API / HTML pages)"]
     W --> L["StuMS / HISinOne Portal"]
@@ -284,12 +285,12 @@ graph TD
 | :--- | :--- |
 | Foundation | `config` (all `.env` settings, checked at startup by `validate_settings()`), `db`, `state`, `storage`, `formatting`, `telegram_ui` |
 | Stud.IP and services | `auth`, `studip_api`, `ai`, `documents`, `weather`, `mensa`, `wardrobe`, `schedule`, `whatsapp` |
-| Features | `monitoring`, `exams`, `study_plan`, `tasks`, `enrollment`, `morning`, `voice`, `system`, `menus` |
+| Features | `monitoring` (on top of `monitoring_fetch`, `monitoring_diff`, `monitoring_alerts`), `exams`, `study_plan`, `tasks`, `enrollment`, `morning`, `voice`, `system`, `menus` |
 | Runtime | `watcher` (background loop), `app` (startup and handler registration) |
 
 Shared runtime state (the Stud.IP session, the login server, watcher flags) lives in `unibot/state.py` and is always read as `state.<name>`, so every module sees the current value.
 
-**Persistent data** (caches, settings, tasks, wardrobe, study progress) is stored in one SQLite database, `bot_data.sqlite3` (`unibot/db.py`), one row per document, each save a single transaction. Existing JSON files from older versions are imported automatically the first time they are read and then left in place as a backup. Back up `bot_data.sqlite3` (together with `.env` and `.vault_key`) to back up the bot.
+**Persistent data** (caches, settings, tasks, wardrobe, study progress) is stored in one SQLite database, `bot_data.sqlite3` (`unibot/db.py`), one row per document, each save a single transaction. Existing JSON files from older versions are imported automatically the first time they are read and then renamed to `.imported`. Back up `bot_data.sqlite3` (together with `.env` and `.vault_key`) to back up the bot.
 
 > **exam_reminder.py** shares the same authenticated session as the bot (Stud.IP's SSO trust extends to the StuMS/HISinOne exam portal) to track registrations, exam dates, and grades, so no separate login is required.
 >

@@ -45,4 +45,4 @@ files = [
 ]
 
 [tool.coverage.run]
-source = ["unibot", "studip_utils", "studip_session", "studip_oauth", "studip_vault", "studip_http", "stums_parsers"]
+source = ["unibot", "studip_utils", "studip_session", "studip_oauth", "studip_vault", "studip_http", "stums_parsers", "stums_client", "exam_reminder"]
