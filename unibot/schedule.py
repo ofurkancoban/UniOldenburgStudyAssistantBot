@@ -39,7 +39,7 @@ from unibot.formatting import (
     clean_course_title,
 )
 from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, broadcast
-from unibot.auth import get_user_session, is_user_allowed, login_studip
+from unibot.auth import current_user_id, get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import (
     BASE_URL,
     _api_berlin,
@@ -50,6 +50,7 @@ from unibot.studip_api import (
     studip_api_user_id,
 )
 from unibot.weather import build_weather_text_line, get_weather_snapshot
+from unibot.study_day import CAMPUS_INFO, menu_highlight, plan_day
 
 
 fastenroll_tasks: dict[int, dict[str, asyncio.Task]] = {}  # chat_id -> {sem_id -> asyncio.Task}
@@ -191,7 +192,15 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
 
                 duration_str = _format_hours(w["duration_minutes"])
                 desc = w.get("description", "focused study window")
-                desc_formatted = desc[0].upper() + desc[1:] if desc else "Focused study window"
+                desc_formatted = html.escape(desc[0].upper() + desc[1:] if desc else "Focused study window")
+                kind = w.get("study_type") or {}
+                extra = ""
+                if kind:
+                    extra += f"{kind['emoji']} <b>{kind['label']}</b>: {html.escape(kind['hint'])}\n"
+                if w.get("travel_minutes"):
+                    extra += f"🚌 {w['travel_minutes']} min to {CAMPUS_INFO[w['travel_to']]['name']} first\n"
+                if w.get("study_spot"):
+                    extra += f"📍 {html.escape(w['study_spot'])}\n"
                 text = (
                     "🔔 <b>STUDY TIME REMINDER</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
@@ -199,6 +208,7 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                     f"🕒 Starting in <b>{int(minutes_left)} minutes</b> ({start_dt:%H:%M} – {w['end_dt']:%H:%M})\n"
                     f"⏳ Duration: <b>{duration_str}</b>\n"
                     f"💡 <i>{desc_formatted}</i>\n"
+                    f"{extra}"
                     "━━━━━━━━━━━━━━━━━━"
                 )
                 keyboard = [
@@ -215,6 +225,22 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                     updated = True
                 except Exception as e:
                     logging.error("Failed to send study session reminder: %s", e)
+
+            # The block has just started: send the study pack (course, work
+            # type, deadlines and the files to open right away).
+            if -STUDY_PACK_LATE_MINUTES < minutes_left <= 0:
+                start_key = f"study_start|{w['date_key']}|{int(start_dt.timestamp())}"
+                if start_key in reminders:
+                    continue
+                from unibot.study_plan import build_study_pack
+                try:
+                    pack_text, pack_markup = await build_study_pack(w, chat_id, now)
+                    await bot.send_message(chat_id=chat_id, text=pack_text, parse_mode="HTML", reply_markup=pack_markup)
+                    logging.info("📚 Sent study pack for the %s block to %s", f"{start_dt:%H:%M}", chat_id)
+                    reminders[start_key] = int(now.timestamp())
+                    updated = True
+                except Exception as e:
+                    logging.error("Failed to send study pack: %s", e)
 
         # Cleanup old reminders (older than 24 hours)
         cutoff = now.timestamp() - 86400
@@ -635,6 +661,51 @@ def _format_event_markdown_block(ev: dict) -> str:
     return "\n".join(lines)
 
 
+_MENU_HIGHLIGHT_CACHE: dict[tuple, Optional[str]] = {}  # (date, menu_path) -> "Falafel Bowl & dessert"
+
+
+async def _lunch_menu_highlight(lunch: Optional[dict], session) -> Optional[str]:
+    """Today's main dishes at the lunch break's mensa (only today's menu is
+    published, and only for the mensas the Stud.IP widget covers)."""
+    if not lunch or not lunch.get("menu_path") or lunch["date_key"] != berlin_now().date() or session is None:
+        return None
+    key = (lunch["date_key"], lunch["menu_path"])
+    if key not in _MENU_HIGHLIGHT_CACHE:
+        from unibot.mensa import fetch_todays_menu_items
+        try:
+            _MENU_HIGHLIGHT_CACHE[key] = menu_highlight(await fetch_todays_menu_items(session, lunch["menu_path"]))
+        except Exception as e:
+            logging.warning("Lunch menu highlight unavailable: %s", e)
+            return None
+    return _MENU_HIGHLIGHT_CACHE[key]
+
+
+def _plan_entry_lines(entry: dict, indent: str = "", menu: Optional[str] = None, remaining: bool = False) -> list[str]:
+    """Markdown lines for one study window or the lunch break."""
+    span = f"`{entry['start_dt']:%H:%M}–{entry['end_dt']:%H:%M}`"
+    if entry.get("kind") == "lunch":
+        dishes = f" ({_md(menu)})" if menu else ""
+        return [f"{indent}🥗 {span} Lunch at {_md(entry['mensa'])}{dishes}"]
+    if remaining:
+        length = f" 🟢 _({_format_hours(entry['duration_minutes'])} left, available now)_"
+    else:
+        length = f" ({_format_hours(entry['duration_minutes'])})"
+    desc = entry.get("description", "")
+    desc_formatted = desc[0].upper() + desc[1:] if desc else "Study window"
+    lines = [f"{indent}🕒 {span}{length} - {_md(desc_formatted)}"]
+    kind = entry.get("study_type") or {}
+    details = []
+    if kind:
+        details.append(f"{kind['emoji']} {kind['label']}")
+    if entry.get("travel_minutes"):
+        details.append(f"🚌 {entry['travel_minutes']} min to {CAMPUS_INFO[entry['travel_to']]['name']} first")
+    if entry.get("study_spot"):
+        details.append(f"📍 {entry['study_spot']}")
+    if details:
+        lines.append(f"{indent}   " + _md(" · ".join(details)))
+    return lines
+
+
 async def send_daily_calendar(sender, events: list, target_date, week_start):
     """Send a specific day's schedule with a 'Week Plan' button. Matches backup UI."""
     today_events = [ev for ev in events if ev["date_key"] == target_date]
@@ -666,19 +737,13 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
         text = "\n".join(lines) + weather_block
 
     now = datetime.now(TZ_BERLIN)
-    study_windows = find_study_windows_for_day(events, target_date, reference_now=now if target_date == now.date() else None)
-    if study_windows:
+    plan = plan_study_day(events, target_date, reference_now=now if target_date == now.date() else None)
+    study_windows, lunch = plan["windows"], plan["lunch"]
+    if study_windows or lunch:
+        menu = await _lunch_menu_highlight(lunch, get_user_session())
         gap_lines = ["\n📚 *Good Times to Study*", "━━━━━━━━━━━━━━━━━━"]
-        for g in study_windows:
-            if g.get("is_remaining"):
-                rem_tag = f" 🟢 _({_format_hours(g['duration_minutes'])} left, available now)_"
-            else:
-                rem_tag = f" ({_format_hours(g['duration_minutes'])})"
-            desc = g.get("description", "")
-            desc_formatted = desc[0].upper() + desc[1:] if desc else "Study window"
-            gap_lines.append(
-                f"🕒 `{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}`{rem_tag} - {_md(desc_formatted)}"
-            )
+        for entry in sorted(study_windows + ([lunch] if lunch else []), key=lambda e: e["start_dt"]):
+            gap_lines.extend(_plan_entry_lines(entry, menu=menu, remaining=bool(entry.get("is_remaining"))))
         text += "\n" + "\n".join(gap_lines)
     elif target_date == now.date() and target_date.weekday() < 5:
         all_today_windows = find_study_windows_for_day(events, target_date, reference_now=None)
@@ -715,15 +780,16 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
     await sender.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
 
-def _week_tasks_for_range(week_start, week_end) -> list:
-    """Return personal tasks due within [week_start, week_end] (inclusive),
-    sorted by due time -- regardless of which ALLOWED_USER_IDS entry created
-    them, same reasoning as prepare_morning_summary's today_tasks (they're the
-    same person's other devices)."""
+def _week_tasks_for_range(week_start, week_end, user_id: Optional[int] = None) -> list:
+    """The user's own tasks due within [week_start, week_end] (inclusive),
+    sorted by due time. `user_id` defaults to the user the current update
+    acts for; other students' tasks are never included."""
+    user_id = user_id if user_id is not None else current_user_id()
     try:
         tasks = [
             t for t in load_tasks()
-            if t.get("due_time") and week_start <= datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() <= week_end
+            if t.get("user_id") == user_id and t.get("due_time")
+            and week_start <= datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() <= week_end
         ]
     except Exception as e:
         logging.warning("_week_tasks_for_range: tasks fetch failed: %s", e)
@@ -735,6 +801,8 @@ STUDY_WINDOW_DAY_START = dtime(9, 0)
 STUDY_WINDOW_DAY_END = dtime(19, 0)
 STUDY_WINDOW_BETWEEN_MIN_MINUTES = 60  # a gap squeezed between two classes
 STUDY_WINDOW_EDGE_MIN_MINUTES = 60  # before the first / after the last class
+# The study pack goes out when a block starts; a watcher cycle this late still sends it.
+STUDY_PACK_LATE_MINUTES = 10
 STUDY_WINDOW_REMAINING_MIN_MINUTES = 30  # today: still worth showing a window already under way
 
 FREE_DAY_SESSIONS = [
@@ -745,12 +813,20 @@ FREE_DAY_SESSIONS = [
 
 
 def find_study_windows_for_day(events: list, target_date: date, reference_now: Optional[datetime] = None) -> list[dict]:
+    """The day's study windows (see plan_study_day, which also returns the lunch break)."""
+    return plan_study_day(events, target_date, reference_now)["windows"]
+
+
+def plan_study_day(events: list, target_date: date, reference_now: Optional[datetime] = None) -> dict:
     """Find good study windows for a single day:
       - Divided focus sessions (Mon-Fri) if no classes are scheduled.
       - Free time before the first class (09:00 to first class start, if >= 60 mins).
       - Free time between classes (gaps >= 60 mins).
       - Free time after the last class (last class end to 19:00, if >= 60 mins).
-    Bounds are the STUDY_WINDOW_* constants.
+    Bounds are the STUDY_WINDOW_* constants. study_day.plan_day then takes
+    the travel time between campuses off, places the lunch break and adds
+    campus, study spot and work type to each window.
+    Returns {"windows": [...], "lunch": {...} or None}.
     If `reference_now` is provided and target_date == reference_now.date(),
     dynamically excludes expired windows and updates ongoing windows to reflect
     remaining time today.
@@ -786,15 +862,19 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
         for ev in sorted(day_events, key=lambda e: e["start_dt"]):
             s, e = ev["start_dt"], ev["end_dt"]
             title = clean_course_title(ev.get("title", "")) or "class"
+            loc, cid = ev.get("location") or "", ev.get("course_id")
             if not busy_intervals:
-                busy_intervals.append({"start": s, "end": e, "first_title": title, "last_title": title})
+                busy_intervals.append({"start": s, "end": e, "first_title": title, "last_title": title,
+                                       "first_location": loc, "last_location": loc, "first_cid": cid, "last_cid": cid})
             else:
                 last = busy_intervals[-1]
                 if s <= last["end"]:
+                    if e >= last["end"]:
+                        last["last_title"], last["last_location"], last["last_cid"] = title, loc, cid
                     last["end"] = max(last["end"], e)
-                    last["last_title"] = title
                 else:
-                    busy_intervals.append({"start": s, "end": e, "first_title": title, "last_title": title})
+                    busy_intervals.append({"start": s, "end": e, "first_title": title, "last_title": title,
+                                           "first_location": loc, "last_location": loc, "first_cid": cid, "last_cid": cid})
 
         # 1. Before first class
         first_busy = busy_intervals[0]
@@ -810,6 +890,8 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
                     "description": f"before {first_title}",
                     "after": "morning",
                     "before": first_title,
+                    "before_location": first_busy["first_location"],
+                    "before_cid": first_busy["first_cid"],
                     "is_remaining": False,
                 })
 
@@ -829,6 +911,10 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
                     "description": f"between {prev_title} and {next_title}",
                     "after": prev_title,
                     "before": next_title,
+                    "after_location": busy_intervals[i]["last_location"],
+                    "before_location": busy_intervals[i + 1]["first_location"],
+                    "after_cid": busy_intervals[i]["last_cid"],
+                    "before_cid": busy_intervals[i + 1]["first_cid"],
                     "is_remaining": False,
                 })
 
@@ -847,10 +933,17 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
                     "description": f"after {last_title}",
                     "after": last_title,
                     "before": "evening",
+                    "after_location": last_busy["last_location"],
+                    "after_cid": last_busy["last_cid"],
                     "is_remaining": False,
                 })
 
+    planned = plan_day(day_events, windows, target_date, STUDY_WINDOW_DAY_START, STUDY_WINDOW_DAY_END)
+    windows, lunch = planned["windows"], planned["lunch"]
+
     if reference_now and reference_now.date() == target_date:
+        if lunch and lunch["end_dt"] <= reference_now:
+            lunch = None
         active = []
         for w in windows:
             if w["end_dt"] <= reference_now:
@@ -865,9 +958,9 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
                     active.append(w_c)
             else:
                 active.append(w)
-        return active
+        return {"windows": active, "lunch": lunch}
 
-    return windows
+    return {"windows": windows, "lunch": lunch}
 
 
 def find_weekly_study_gaps(events: list, week_start: Optional[date] = None) -> list:
@@ -961,13 +1054,9 @@ async def send_weekly_calendar(sender, events: list, week_start):
             if not windows_for_day:
                 continue
             gap_lines.append(f"\n🔹 *{d.strftime('%A, %d.%m')}*")
-            for g in windows_for_day:
-                desc = g.get("description", "")
-                desc_formatted = desc[0].upper() + desc[1:] if desc else "Study window"
-                gap_lines.append(
-                    f"   🕒 `{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}` "
-                    f"({_format_hours(g['duration_minutes'])}) - {_md(desc_formatted)}"
-                )
+            lunch = plan_study_day(events, d)["lunch"]
+            for entry in sorted(windows_for_day + ([lunch] if lunch else []), key=lambda e: e["start_dt"]):
+                gap_lines.extend(_plan_entry_lines(entry, indent="   "))
         text += "\n" + "\n".join(gap_lines)
 
     # Navigation buttons

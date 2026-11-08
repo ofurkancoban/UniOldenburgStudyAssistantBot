@@ -34,7 +34,7 @@ from unibot.storage import (
 )
 from unibot.formatting import _get_course_icon, _get_location_emoji, _safe_loc, clean_course_title
 from unibot.telegram_ui import _download_telegram_file, _show_typing
-from unibot.auth import is_user_admin, is_user_allowed
+from unibot.auth import current_user_id, is_user_admin, is_user_allowed
 from unibot.ai import _ai_patience, _call_openrouter, _pcm_to_ogg_voice, synthesize_speech
 from unibot.weather import build_weather_text_line, get_weather_snapshot
 from unibot.mensa import _friendly_menu_category_label, build_food_recommendation, fetch_dish_photo_url
@@ -697,9 +697,11 @@ async def send_daily_plan_voice(sender, events: list, target_date, user_id=None)
     today_events = [ev for ev in events if ev["date_key"] == target_date]
     name = (get_user_name(user_id) if user_id is not None else None) or get_primary_user_name()
     try:
+        owner = user_id if user_id is not None else current_user_id()
         today_tasks = [
             t for t in load_tasks()
-            if t.get("due_time") and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == target_date
+            if t.get("user_id") == owner and t.get("due_time")
+            and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == target_date
         ]
     except Exception as e:
         logging.warning("send_daily_plan_voice: tasks fetch failed: %s", e)

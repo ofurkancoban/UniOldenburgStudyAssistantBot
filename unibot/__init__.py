@@ -30,6 +30,7 @@ MODULE_ORDER = (
     "weather",
     "mensa",
     "wardrobe",
+    "study_day",    # lunch break, campus travel and work type around study windows (pure)
     "schedule",     # calendar, rooms, study windows
     "whatsapp",
     "monitoring_fetch",   # watcher fetch layer: Stud.IP reads and parsing

@@ -22,7 +22,7 @@ from telegram.ext import ContextTypes
 
 from exam_reminder import get_registered_exam_schedule
 from fast_enroll import get_course_type_map, get_open_courses, get_semester_options
-from studip_utils import TZ_BERLIN
+from studip_utils import TZ_BERLIN, format_hours
 
 from unibot import db
 from unibot.config import (
@@ -31,8 +31,11 @@ from unibot.config import (
     GWDG_EMBEDDING_MODEL,
 )
 from unibot import state
+from unibot.study_day import plan_day
 from unibot.storage import (
     get_scan_previous_semester_enabled,
+    link_cache,
+    load_tasks,
     get_weekly_study_plan_enabled,
     load_study_plan_cache,
     save_study_plan_cache,
@@ -40,7 +43,7 @@ from unibot.storage import (
     shared_http,
     single_flight,
 )
-from unibot.formatting import _course_abbrev, _hours, _progress_bar, clean_course_title
+from unibot.formatting import _course_abbrev, _hours, _progress_bar, _short_id, clean_course_title
 from unibot.telegram_ui import (
     _reply_or_edit,
     _show_typing,
@@ -78,6 +81,8 @@ async def handle_toggle_weekly_study_plan(update: Update, context: ContextTypes.
     )
 
 
+# A piece of a window split by the lunch break is still scheduled from this length.
+STUDY_LUNCH_PIECE_MIN_MINUTES = 45
 STUDY_GAP_MIN_MINUTES = 90  # weekly study plan: shorter free windows aren't worth scheduling a session into
 
 
@@ -1164,9 +1169,10 @@ def find_free_study_windows(events: list, week_start) -> list:
     also counts the morning before the first class, the afternoon after
     the last one and fully free days. Cancelled classes ("fällt aus") are
     treated as free time. Weekends are deliberately excluded."""
-    windows = []
+    windows: list[dict] = []
     for i in range(5):
         day = week_start + timedelta(days=i)
+        day_windows: list[dict] = []
         day_start = datetime.combine(day, _dtime(STUDY_DAY_START_HOUR, 0), tzinfo=TZ_BERLIN)
         day_end = datetime.combine(day, _dtime(STUDY_DAY_END_HOUR, 0), tzinfo=TZ_BERLIN)
         busy = sorted(
@@ -1174,24 +1180,35 @@ def find_free_study_windows(events: list, week_start) -> list:
             key=lambda ev: ev["start_dt"],
         )
         cursor, after = day_start, ("no classes that day" if not busy else "start of day")
+        after_location = None
         for ev in busy + [None]:
             if ev is None:
                 end, before = day_end, ("no classes that day" if not busy else "end of day")
+                before_location = None
             else:
                 end, before = min(ev["start_dt"], day_end), clean_course_title(ev.get("title", "")) or "your next class"
+                before_location = ev.get("location")
             minutes = (end - cursor).total_seconds() / 60
             if minutes >= STUDY_GAP_MIN_MINUTES:
-                windows.append({
+                day_windows.append({
                     "date_key": day,
                     "start_dt": cursor,
                     "end_dt": end,
                     "duration_minutes": int(minutes),
                     "after": after,
                     "before": before,
+                    "after_location": after_location,
+                    "before_location": before_location,
                 })
-            if ev is not None and ev["end_dt"] > cursor:
+            if ev is not None and ev["end_dt"] >= cursor:  # a class ending at day start still counts
                 cursor = max(cursor, ev["end_dt"])
                 after = clean_course_title(ev.get("title", "")) or "your previous class"
+                after_location = ev.get("location")
+        # travel between campuses and the lunch break are not study time
+        planned = plan_day(busy, day_windows, day, _dtime(STUDY_DAY_START_HOUR, 0), _dtime(STUDY_DAY_END_HOUR, 0))
+        windows.extend(w for w in planned["windows"]
+                       if w["duration_minutes"] >= STUDY_GAP_MIN_MINUTES
+                       or ("lunch" in (w["after"], w["before"]) and w["duration_minutes"] >= STUDY_LUNCH_PIECE_MIN_MINUTES))
     return windows
 
 
@@ -1669,3 +1686,92 @@ async def study_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logging.exception("study_plan_command failed")
     finally:
         study_plan_in_progress.discard(chat_id)
+
+
+# ── study pack: the material for a study block that just started ──────────────
+STUDY_PACK_DUE_DAYS = 7  # tasks due within this many days are listed with the pack
+STUDY_PACK_KINDS = ("problem_set", "slides")  # newest file of each kind is offered
+
+
+def pick_study_pack_files(files: list) -> list[dict]:
+    """The newest problem set and the newest slides among a course's
+    (folder, item) files, problem set first."""
+    newest: dict[str, tuple[datetime, dict]] = {}
+    for folder, item in files:
+        kind = classify_workload_file(item.get("name") or "", folder)
+        if kind not in STUDY_PACK_KINDS or not item.get("url"):
+            continue
+        dt = _parse_file_date_v2(item.get("modified"), item.get("modified_iso"))
+        if kind not in newest or dt > newest[kind][0]:
+            newest[kind] = (dt, {**item, "kind": kind})
+    return [newest[k][1] for k in STUDY_PACK_KINDS if k in newest]
+
+
+def _due_tasks(user_id: int, now: datetime, course: Optional[str] = None) -> list[dict]:
+    """The student's own open tasks due in the next STUDY_PACK_DUE_DAYS days,
+    soonest first (only that course's when `course` is given)."""
+    horizon = now + timedelta(days=STUDY_PACK_DUE_DAYS)
+    due = []
+    for t in load_tasks():
+        if t.get("user_id") != user_id or not t.get("due_time"):  # a done task is deleted
+            continue
+        try:
+            when = datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN)
+        except ValueError:
+            continue
+        if now <= when <= horizon and (course is None or t.get("course") == course):
+            due.append({**t, "due_dt": when})
+    return sorted(due, key=lambda t: t["due_dt"])
+
+
+def study_pack_course(window: dict, user_id: int, now: datetime) -> Optional[tuple[str, str]]:
+    """(cid, course name) the block is for: preparing the next class, else
+    reviewing the one that just ended, else the course with the nearest
+    deadline. None when nothing points to a course."""
+    courses = state.user_courses_map.get(user_id) or state.courses_map
+    for key, title_key in (("before_cid", "before"), ("after_cid", "after")):
+        cid = window.get(key)
+        if cid:
+            return cid, courses.get(cid) or window.get(title_key) or "your course"
+    by_name = {name: cid for cid, name in courses.items()}
+    for task in _due_tasks(user_id, now):
+        if task.get("course") in by_name:
+            return by_name[task["course"]], task["course"]
+    return None
+
+
+async def build_study_pack(window: dict, user_id: int, now: datetime) -> tuple[str, Optional[InlineKeyboardMarkup]]:
+    """HTML text and download buttons for a study block that starts now."""
+    kind = window.get("study_type") or {}
+    course = study_pack_course(window, user_id, now)
+    title = f"📘 <b>{html.escape(course[1])}</b>" if course else "📚 <b>Study block</b>"
+    lines = [
+        "📚 <b>STUDY BLOCK STARTED</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"{title} · {kind.get('emoji', '')} {html.escape(kind.get('label', 'Study'))}",
+        f"🕒 Until {window['end_dt']:%H:%M} ({format_hours(window['duration_minutes'])})",
+    ]
+    if kind.get("hint"):
+        lines.append(f"💡 <i>{html.escape(kind['hint'])}</i>")
+    if window.get("study_spot"):
+        lines.append(f"📍 {html.escape(window['study_spot'])}")
+    for task in _due_tasks(user_id, now, course[1] if course else None)[:2]:
+        lines.append(f"⏰ Due {task['due_dt']:%a %d.%m %H:%M}: {html.escape(str(task['text']))}")
+
+    buttons = []
+    if course:
+        try:
+            picked = pick_study_pack_files(await _list_course_files_deep(course[0]))
+        except Exception as e:
+            logging.warning("Study pack: listing files failed for %s: %s", course[0], e)
+            picked = []
+        for item in picked:
+            sid = _short_id()
+            link_cache[sid] = {"cid": course[0], "name": item["name"], "course": course[1], "url": item.get("url"),
+                               "ts": time.time(), "user_id": user_id}
+            icon = "📝" if item["kind"] == "problem_set" else "📊"
+            buttons.append([InlineKeyboardButton(f"{icon} {item['name'][:40]}", callback_data=f"file|{sid}")])
+        if picked:
+            lines.append("📎 Ready for you:")
+    lines.append("━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines), (InlineKeyboardMarkup(buttons) if buttons else None)
