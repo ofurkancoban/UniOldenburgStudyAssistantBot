@@ -45,7 +45,11 @@ def _describe_page(soup, text: str) -> str:
             forms.append(f"{(form.get('method') or 'get').upper()} {redact_url(form.get('action') or '')} [{fields}]")
         hints = [h for h in ("submit()", "location", "onload", "setTimeout", "fetch(", "XMLHttpRequest")
                  if h in text]
-        return f"title={title!r} forms={forms} scripts={hints} len={len(text)}"
+        snippet = ""
+        if not forms and len(text) <= 300:
+            # a tiny formless reply is an IdP error message, safe to show
+            snippet = " body=" + repr(re.sub(r"\s+", " ", text).strip()[:200])
+        return f"title={title!r} forms={forms} scripts={hints} len={len(text)}{snippet}"
     except Exception as exc:
         return f"<page not described: {exc}>"
 
