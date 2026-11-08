@@ -77,6 +77,45 @@ async def _worker_refusal(resp) -> str:
     return ""
 
 
+# Backup path: while the worker itself is down (unreachable, timing out, or
+# answering with a Cloudflare platform error such as the daily request limit),
+# requests go directly to the university and the worker is retried later.
+# The pause doubles with every failure in a row, up to WORKER_DOWN_MAX_SECONDS.
+WORKER_DOWN_MIN_SECONDS = 120
+WORKER_DOWN_MAX_SECONDS = 1800
+_WORKER_HEALTH = {"down_until": 0.0, "failures": 0}
+
+
+def _worker_failure(resp) -> str:
+    """Why a worker response is the worker's own failure (not the university's), or ""."""
+    error = resp.headers.get("X-Proxy-Error", "")
+    if error == "upstream":
+        return "the worker could not reach the university"
+    if error or resp.headers.get("X-Proxy-Upstream"):
+        return ""
+    if resp.status == 429 or resp.status >= 500:
+        return f"Cloudflare answered HTTP {resp.status}"
+    return ""
+
+
+def _worker_available() -> bool:
+    return time.time() >= _WORKER_HEALTH["down_until"]
+
+
+def _mark_worker_down(logger, reason: str) -> None:
+    failures = _WORKER_HEALTH["failures"] + 1
+    pause = min(WORKER_DOWN_MAX_SECONDS, WORKER_DOWN_MIN_SECONDS * 2 ** (failures - 1))
+    _WORKER_HEALTH.update(failures=failures, down_until=time.time() + pause)
+    logger.warning("Cloudflare Worker unavailable (%s); sending requests directly for %s min.",
+                   reason, max(1, pause // 60))
+
+
+def _mark_worker_up(logger) -> None:
+    if _WORKER_HEALTH["failures"]:
+        logger.info("Cloudflare Worker reachable again; routing requests through it.")
+    _WORKER_HEALTH.update(failures=0, down_until=0.0)
+
+
 def _worker_url() -> str:
     return os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
 
@@ -192,7 +231,7 @@ class StudIPSession:
     # mixing every host's JSESSIONID under the worker's hostname.
 
     def _via_worker(self, host: str) -> bool:
-        if not _worker_url() or host not in UNI_HOSTS:
+        if not _worker_url() or host not in UNI_HOSTS or not _worker_available():
             return False
         return time.time() >= _WORKER_REFUSED.get(host, 0.0)
 
@@ -228,16 +267,33 @@ class StudIPSession:
             http = self._proxy_http
         else:
             routed, http = url, self.session
+        via_worker = http is self._proxy_http
         async with THROTTLE.slot(host):
             try:
                 resp = await http.request(
                     method, routed, headers=hdrs or None, allow_redirects=False,
                     timeout=timeout or DEFAULT_TIMEOUT, **body, **extra,
                 )
-            except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
-                THROTTLE.report(host, failed=True)
+            except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as exc:
+                if not via_worker:
+                    THROTTLE.report(host, failed=True)
+                    raise
+                _mark_worker_down(self.logger, exc.__class__.__name__)
+                # A request that never reached the worker is safe to resend;
+                # after a timeout a POST may already have been delivered.
+                if method in ("GET", "HEAD") or isinstance(exc, aiohttp.ClientConnectorError):
+                    return await self._send_once(method, url, headers, body, timeout, extra)
                 raise
-        if http is self._proxy_http:
+        if via_worker:
+            failure = _worker_failure(resp)
+            if failure:
+                resp.release()
+                _mark_worker_down(self.logger, failure)
+                if method in ("GET", "HEAD"):
+                    return await self._send_once(method, url, headers, body, timeout, extra)
+                raise aiohttp.ClientConnectionError(f"Cloudflare Worker failed: {failure}")
+            _mark_worker_up(self.logger)
+        if via_worker:
             reason = await _worker_refusal(resp)
             if reason:
                 resp.release()
@@ -249,7 +305,7 @@ class StudIPSession:
                 )
                 return await self._send_once(method, url, headers, body, timeout, extra)
         THROTTLE.report(host, resp.status, parse_retry_after(resp.headers.get("Retry-After")))
-        if http is self._proxy_http:
+        if via_worker:
             self._store_proxied_cookies(resp, url)
         return resp
 

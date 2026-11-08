@@ -52,7 +52,7 @@ export default {
     const url = new URL(request.url);
 
     if (url.pathname === "/healthz") {
-      return new Response(JSON.stringify({ status: "ok", service: "studip-cf-worker-proxy", version: 2 }), {
+      return new Response(JSON.stringify({ status: "ok", service: "studip-cf-worker-proxy", version: 3 }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
@@ -100,6 +100,9 @@ export default {
     for (const c of rawCookies) {
       respHeaders.append("X-Upstream-Set-Cookie", c);
     }
+    // Marks a genuine university response, so the bot can tell it apart from
+    // an error page of the Cloudflare platform itself (limits, crashes).
+    respHeaders.set("X-Proxy-Upstream", "1");
 
     return new Response(response.body, {
       status: response.status,

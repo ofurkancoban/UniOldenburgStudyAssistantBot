@@ -24,8 +24,10 @@ class FakeWorker:
     plays StuMS + the NetIQ IdP behind it. Both hosts use a JSESSIONID, which
     is exactly what collided under the worker's hostname before."""
 
-    def __init__(self, legacy=False, refuse=()):
+    def __init__(self, legacy=False, refuse=(), platform_error=None, upstream_status=None):
         self.refuse = set(refuse)  # hosts an outdated worker.js does not allow
+        self.platform_error = platform_error  # Cloudflare's own error page (no proxy headers)
+        self.upstream_status = upstream_status  # a genuine university error, marked by the worker
         self.legacy = legacy  # old worker: rewritten Set-Cookie, Location pointing at the worker
         self.seen = []
         self.base = ""
@@ -50,6 +52,10 @@ class FakeWorker:
         self.seen.append((host, path, cookie, request.headers.get("X-Proxy-Secret")))
         if host in self.refuse:
             return web.Response(status=403, text=f"Forbidden: host '{host}' is not allowed")
+        if self.platform_error:
+            return web.Response(status=self.platform_error, text="error code: 1027")
+        if self.upstream_status:
+            return web.Response(status=self.upstream_status, text="busy", headers={"X-Proxy-Upstream": "1"})
         if host == STUMS and path == "/qisserver/start":
             if "JSESSIONID=stums-auth" in cookie:
                 return web.Response(text="Willkommen <a>Abmelden</a>")
@@ -183,6 +189,105 @@ class WorkerRefusalTests(unittest.TestCase):
         self.assertEqual(direct_calls, [f"https://{LOGIN}/nidp/app"] * 2)
         # the worker was asked once; the second request went straight out
         self.assertEqual([h for h, *_ in worker.seen], [LOGIN])
+
+
+class _DirectResp:
+    status = 200
+
+    def __init__(self):
+        import multidict
+        self.headers = multidict.CIMultiDictProxy(multidict.CIMultiDict())
+
+    async def text(self):
+        return "direct ok"
+
+    def release(self):
+        pass
+
+
+class WorkerFailoverTests(unittest.TestCase):
+    """While the worker itself is down, requests go directly to the university."""
+
+    def setUp(self):
+        studip_session._WORKER_HEALTH.update(failures=0, down_until=0.0)
+        studip_session._WORKER_REFUSED.clear()
+        self.addCleanup(studip_session._WORKER_HEALTH.update, failures=0, down_until=0.0)
+
+    def _run(self, worker, method="GET"):
+        direct_calls = []
+
+        async def scenario(sess):
+            async def direct_request(m, url, **kwargs):
+                direct_calls.append((m, url))
+                return _DirectResp()
+
+            await sess.ensure_session()
+            sess.session.request = direct_request
+            results = []
+            for _ in range(2):
+                try:
+                    async with await sess.request(method, f"https://{LOGIN}/nidp/app") as r:
+                        results.append((r.status, await r.text()))
+                except Exception as exc:  # noqa: BLE001 - the POST case expects a failure
+                    results.append(exc.__class__.__name__)
+            return results
+
+        return _run_with_worker(worker, scenario), direct_calls
+
+    def test_cloudflare_platform_error_switches_to_direct(self):
+        worker = FakeWorker(platform_error=429)  # e.g. the free plan's daily limit
+        results, direct_calls = self._run(worker)
+        self.assertEqual(results, [(200, "direct ok")] * 2)
+        self.assertEqual(len(direct_calls), 2)
+        self.assertEqual(len(worker.seen), 1)  # the second request skipped the worker
+        self.assertGreater(studip_session._WORKER_HEALTH["down_until"], time.time() + 60)
+
+    def test_university_errors_through_the_worker_are_not_a_failover(self):
+        worker = FakeWorker(upstream_status=503)
+        results, direct_calls = self._run(worker)
+        self.assertEqual(direct_calls, [])
+        self.assertEqual(studip_session._WORKER_HEALTH["failures"], 0)
+
+    def test_post_is_never_resent_after_a_worker_error(self):
+        worker = FakeWorker(platform_error=503)
+        results, direct_calls = self._run(worker, method="POST")
+        # the failed POST is not resent (it may have been delivered) ...
+        self.assertEqual(results[0], "ClientConnectionError")
+        # ... only the next, new POST goes directly while the worker is down
+        self.assertEqual(results[1], (200, "direct ok"))
+        self.assertEqual(direct_calls, [("POST", f"https://{LOGIN}/nidp/app")])
+        self.assertEqual(len(worker.seen), 1)
+
+    def test_unreachable_worker_switches_to_direct_and_recovers(self):
+        async def scenario():
+            env = {"CLOUDFLARE_WORKER_URL": "http://127.0.0.1:9", "CLOUDFLARE_WORKER_SECRET": "x"}
+            sess = studip_session.StudIPSession("", "", "", cookie_file=None)
+            calls = []
+
+            async def direct_request(m, url, **kwargs):
+                calls.append(url)
+                return _DirectResp()
+
+            try:
+                with mock.patch.dict(os.environ, env), \
+                        mock.patch.object(studip_session.studip_oauth, "oauth_enabled", return_value=False), \
+                        mock.patch.object(studip_session, "THROTTLE", studip_http.HostThrottle(min_interval=0)):
+                    await sess.ensure_session()
+                    sess.session.request = direct_request
+                    async with await sess.get(f"https://{LOGIN}/nidp/app") as r:
+                        body = await r.text()
+                    down = studip_session._WORKER_HEALTH["down_until"] > time.time()
+                    # once the pause is over the worker is tried again
+                    studip_session._WORKER_HEALTH["down_until"] = 0.0
+                    self.assertTrue(sess._via_worker(LOGIN))
+                    return body, down, calls
+            finally:
+                await sess.close()
+
+        body, down, calls = asyncio.run(scenario())
+        self.assertEqual(body, "direct ok")
+        self.assertTrue(down)
+        self.assertEqual(calls, [f"https://{LOGIN}/nidp/app"])
 
 
 class UnrouteTests(unittest.TestCase):
