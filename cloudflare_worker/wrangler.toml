@@ -3,6 +3,8 @@ main = "worker.js"
 compatibility_date = "2024-01-01"
 # keep variables set in the Cloudflare dashboard (a deploy would drop them)
 keep_vars = true
+# the worker is reachable only at its workers.dev address
+preview_urls = false
 
 # PROXY_SECRET is a secret, never a plain [vars] entry: a [vars] value would
 # overwrite the deployed secret on every `wrangler deploy` and lock the bot out.
