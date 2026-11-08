@@ -6,6 +6,8 @@ anywhere and unit-tested without starting the bot.
 
 from __future__ import annotations
 
+import logging
+
 import html
 import json
 import os
@@ -180,11 +182,11 @@ def route_proxy_url(
                         else:
                             headers["Cookie"] = injected
                 except Exception:
-                    pass
+                    logging.debug("Ignored a non-critical error", exc_info=True)
 
             return routed, headers
     except Exception:
-        pass
+        logging.debug("Ignored a non-critical error", exc_info=True)
 
     return url, headers
 
@@ -209,6 +211,6 @@ def unroute_proxy_url(url: str) -> str:
                 # university hosts are HTTPS-only, whatever the worker URL uses
                 return urlunsplit(("https", segment.lower(), "/" + rest, parts.query, parts.fragment))
     except Exception:
-        pass
+        logging.debug("Ignored a non-critical error", exc_info=True)
 
     return str(url)

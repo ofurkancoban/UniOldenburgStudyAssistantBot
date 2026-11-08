@@ -531,7 +531,7 @@ class LoginServer:
                         from unibot import db
                         has_cookies = bool(db.load_user_credential(studip_sess.user_id, "cookies"))
                     except Exception:
-                        pass
+                        logging.debug("Ignored a non-critical error", exc_info=True)
                 has_file = bool(studip_sess.cookie_file and os.path.exists(studip_sess.cookie_file))
                 if studip_sess.explicitly_logged_out or (not has_cookies and not has_file):
                     studip_sess.session.cookie_jar.clear()

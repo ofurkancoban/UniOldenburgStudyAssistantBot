@@ -9,7 +9,6 @@ import errno
 import html
 import logging
 import os
-import time
 from typing import Optional
 
 import psutil
@@ -74,7 +73,7 @@ def has_stored_login(sess) -> bool:
             if db.load_user_credential(sess.user_id, "cookies"):
                 return True
         except Exception:
-            pass
+            logging.debug("Ignored a non-critical error", exc_info=True)
     if sess.cookie_file and os.path.exists(sess.cookie_file):
         return True
     return bool(studip_oauth.oauth_enabled()
@@ -109,7 +108,7 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             update_user_activity(user.id, action=action)
         except Exception:
-            pass
+            logging.debug("Ignored a non-critical error", exc_info=True)
         return
 
     # User is not allowed yet. Check if they are submitting an invite code in private chat.
@@ -261,7 +260,7 @@ def _admin_candidates() -> list[int]:
     try:
         ids += [u["telegram_id"] for u in db.get_all_users() if u.get("role") == "admin"]
     except Exception:
-        pass
+        logging.debug("Ignored a non-critical error", exc_info=True)
     return [uid for i, uid in enumerate(ids) if uid not in ids[:i] and is_user_admin(uid)]
 
 

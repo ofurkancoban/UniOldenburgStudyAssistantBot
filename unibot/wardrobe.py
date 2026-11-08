@@ -56,7 +56,7 @@ from unibot.telegram_ui import (
     _start_loading_animation,
     _stop_loading_animation,
 )
-from unibot.auth import is_user_admin, is_user_allowed
+from unibot.auth import is_user_admin
 from unibot.ai import (
     _call_gwdg_chat,
     _call_openrouter,

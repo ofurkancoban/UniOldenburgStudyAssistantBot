@@ -135,7 +135,7 @@ def load_tokens(user_id: Optional[int] = None) -> Optional[dict]:
             if user_id in ADMIN_USER_IDS:
                 is_admin = True
         except Exception:
-            pass
+            logging.debug("Ignored a non-critical error", exc_info=True)
         if not is_admin:
             return None
 
@@ -184,7 +184,7 @@ def save_tokens(tokens: dict, fresh: bool = True, user_id: Optional[int] = None)
             if user_id in ADMIN_USER_IDS:
                 save_file = True
         except Exception:
-            pass
+            logging.debug("Ignored a non-critical error", exc_info=True)
 
     if save_file:
         from studip_vault import write_vault_file

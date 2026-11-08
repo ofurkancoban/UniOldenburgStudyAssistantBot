@@ -128,7 +128,7 @@ def _get_active_user_ids() -> list[int]:
         if active:
             return active
     except Exception:
-        pass
+        logging.debug("Ignored a non-critical error", exc_info=True)
     return list(ALLOWED_USER_IDS)
 
 

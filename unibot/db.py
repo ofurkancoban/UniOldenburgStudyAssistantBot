@@ -246,7 +246,9 @@ def upsert_user(
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (telegram_id, role, username, full_name, studip_username, is_active, now, now, 0),
             )
-        return get_user(telegram_id)
+        user = get_user(telegram_id)
+        assert user is not None  # just written in this transaction
+        return user
 
 
 def update_user_activity(telegram_id: int, action: Optional[str] = None) -> None:

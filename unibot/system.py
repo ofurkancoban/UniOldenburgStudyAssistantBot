@@ -226,7 +226,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 prof = await get_studip_user_profile(user_id=user_id, session=sess)
                 profile_name = prof.get("formatted_name") or prof.get("given_name") or prof.get("username") or db_studip
             except Exception:
-                pass
+                logging.debug("Ignored a non-critical error", exc_info=True)
 
         default_semester = load_default_semester()
         default_semester_label = default_semester.get("label") or "Not set"

@@ -424,7 +424,7 @@ class StudIPSession:
                     from studip_vault import write_vault_file
                     write_vault_file(user_cookie_file, entries, mode=0o600)
                 except Exception:
-                    pass
+                    logging.debug("Ignored a non-critical error", exc_info=True)
 
         if self.cookie_file:
             try:
@@ -565,7 +565,7 @@ class StudIPSession:
                 from unibot import db
                 has_cookies = bool(db.load_user_credential(self.user_id, "cookies"))
             except Exception:
-                pass
+                logging.debug("Ignored a non-critical error", exc_info=True)
         if not has_cookies and (not self.cookie_file or not os.path.exists(self.cookie_file)):
             return False
 
@@ -686,7 +686,7 @@ class StudIPSession:
                 from unibot import db
                 has_cookies = bool(db.load_user_credential(self.user_id, "cookies"))
             except Exception:
-                pass
+                logging.debug("Ignored a non-critical error", exc_info=True)
         has_file = bool(self.cookie_file and os.path.exists(self.cookie_file))
         if not has_cookies and not has_file and (not use_oauth or studip_oauth.load_tokens(getattr(self, "user_id", None)) is None):
             return

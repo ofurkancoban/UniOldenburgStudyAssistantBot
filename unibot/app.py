@@ -27,7 +27,7 @@ from telegram.ext import (
 from telegram.error import TelegramError
 
 
-from unibot import db, state
+from unibot import state
 from unibot.config import (
     ALLOWED_USER_IDS,
     PROJECT_ROOT,
@@ -38,9 +38,6 @@ from unibot.config import (
 from unibot.storage import close_shared_http, link_cache
 from unibot.telegram_ui import _show_typing
 from unibot.auth import (
-    PASSWORD,
-    TOTP_SECRET,
-    USERNAME,
     _authorization_gate,
     _start_login_infra,
     acquire_instance_lock,

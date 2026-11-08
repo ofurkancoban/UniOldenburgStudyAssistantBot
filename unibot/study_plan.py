@@ -989,7 +989,7 @@ def load_study_progress(user_id: Optional[int] = None) -> dict:
             try:
                 return db.load(STUDY_PROGRESS_PATH)
             except Exception:
-                pass
+                logging.debug("Ignored a non-critical error", exc_info=True)
         return {}
 
     if db.exists(STUDY_PROGRESS_PATH):
@@ -1011,7 +1011,7 @@ def save_study_progress(data: dict, user_id: Optional[int] = None) -> None:
             try:
                 db.save(STUDY_PROGRESS_PATH, data)
             except Exception:
-                pass
+                logging.debug("Ignored a non-critical error", exc_info=True)
         return
 
     try:
@@ -1614,7 +1614,6 @@ async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAU
             return
         _toggle_studied(progress, unit, row["cid"])
         save_study_progress(progress, user_id=user_id)
-        courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
         rows = compute_course_progress(
             {row["cid"]: load_study_plan_cache().get(row["cid"], {})},
             progress.get("held", {}),

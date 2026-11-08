@@ -446,7 +446,6 @@ class MultiUserSessionTests(unittest.TestCase):
 
     def test_set_user_role_and_user_logout_isolation(self):
         from unibot.auth import _perform_logout, get_user_session
-        from studip_session import StudIPSession
 
         # Test role modification
         self.db.upsert_user(3001, role="student")
@@ -456,8 +455,8 @@ class MultiUserSessionTests(unittest.TestCase):
         self.assertEqual(self.db.get_user(3001)["role"], "student")
 
         # Setup mock user sessions and credentials
-        sess1 = get_user_session(3001)
-        sess2 = get_user_session(3002)
+        get_user_session(3001)
+        get_user_session(3002)
         self.state.user_courses_map[3001] = {"c1": "Math"}
         self.state.user_courses_map[3002] = {"c2": "Physics"}
         self.db.save_user_credential(3001, "cookies", [{"key": "c1", "value": "v1"}])
@@ -541,7 +540,7 @@ class MultiUserSessionTests(unittest.TestCase):
             self.assertNotIn(6001, self.state.user_sessions)
 
     def test_per_user_study_progress_and_tracked_isolation(self):
-        from unibot.study_plan import load_study_progress, save_study_progress, _auto_tracked_cids
+        from unibot.study_plan import load_study_progress, save_study_progress
 
         p1 = load_study_progress(user_id=7001)
         p1["tracked"] = ["course_algo"]

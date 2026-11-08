@@ -90,7 +90,7 @@ async def broadcast(
                 continue
             targets.add(uid)
     except Exception:
-        pass
+        logging.debug("Ignored a non-critical error", exc_info=True)
     for uid in targets:
         try:
             await bot.send_message(
