@@ -378,6 +378,32 @@ def register_handlers(app) -> None:
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 
+
+def _startup_admin_session() -> StudIPSession:
+    """The watcher's session, bound to the primary admin's stored login.
+
+    It used to be created without a user id or cookie file, so after every
+    restart the watcher ran logged out until somebody signed in again."""
+    from unibot import db
+
+    candidates = list(ALLOWED_USER_IDS)
+    try:
+        candidates += [u["telegram_id"] for u in db.get_all_users() if u.get("role") == "admin"]
+    except Exception:
+        pass
+    for aid in candidates:
+        try:
+            has_login = bool(db.load_user_credential(aid, "cookies"))
+        except Exception:
+            has_login = False
+        if has_login or os.path.exists(f"studip_cookies_{aid}.json"):
+            sess = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET,
+                                 cookie_file=f"studip_cookies_{aid}.json", user_id=aid)
+            state.user_sessions[aid] = sess
+            logging.info("🔐 Watcher session uses the stored login of admin %s", aid)
+            return sess
+    return StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
+
 async def main():
     logging.info("Telegram bot running (100% browser-less Stud.IP automation)...")
 
@@ -408,8 +434,8 @@ async def main():
         except Exception as exc:
             logging.debug("Credentials DB bootstrap skipped: %s", exc)
 
-        state.global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
-        
+        state.global_session = _startup_admin_session()
+
         logging.info("🔐 Checking Stud.IP session...")
         if not await state.global_session.login():
             logging.warning("⚠️ Not logged in to Stud.IP yet. Starting bot so you can sign in via /login.")
