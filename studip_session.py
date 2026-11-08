@@ -54,6 +54,29 @@ def _describe_page(soup, text: str) -> str:
         return f"<page not described: {exc}>"
 
 
+# Hosts the deployed worker refused (an older worker.js without that host in
+# its allow-list, or a wrong secret): sent directly until the time stored here.
+_WORKER_REFUSED: dict[str, float] = {}
+WORKER_REFUSAL_RETRY_SECONDS = 3600
+
+
+async def _worker_refusal(resp) -> str:
+    """Why the worker itself (not the university) refused a request, or ""."""
+    if resp.status not in (401, 403):
+        return ""
+    if resp.headers.get("X-Proxy-Error"):
+        return resp.headers["X-Proxy-Error"]
+    if "text/plain" not in resp.headers.get("Content-Type", "text/plain"):
+        return ""
+    try:
+        body = (await resp.text())[:120]
+    except Exception:
+        return ""
+    if body.startswith("Forbidden: host") or body.strip() == "Unauthorized":
+        return body.strip()
+    return ""
+
+
 def _worker_url() -> str:
     return os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
 
@@ -169,7 +192,9 @@ class StudIPSession:
     # mixing every host's JSESSIONID under the worker's hostname.
 
     def _via_worker(self, host: str) -> bool:
-        return bool(_worker_url()) and host in UNI_HOSTS
+        if not _worker_url() or host not in UNI_HOSTS:
+            return False
+        return time.time() >= _WORKER_REFUSED.get(host, 0.0)
 
     def _store_proxied_cookies(self, resp, real_url: str) -> None:
         """Store cookies a Worker-proxied response carried, under the real host."""
@@ -212,6 +237,17 @@ class StudIPSession:
             except (aiohttp.ClientConnectionError, asyncio.TimeoutError):
                 THROTTLE.report(host, failed=True)
                 raise
+        if http is self._proxy_http:
+            reason = await _worker_refusal(resp)
+            if reason:
+                resp.release()
+                _WORKER_REFUSED[host] = time.time() + WORKER_REFUSAL_RETRY_SECONDS
+                self.logger.warning(
+                    "Cloudflare Worker refused %s (%s); sending it directly for %s min. "
+                    "Redeploy cloudflare_worker/worker.js to route it through the worker again.",
+                    host, reason[:80], WORKER_REFUSAL_RETRY_SECONDS // 60,
+                )
+                return await self._send_once(method, url, headers, body, timeout, extra)
         THROTTLE.report(host, resp.status, parse_retry_after(resp.headers.get("Retry-After")))
         if http is self._proxy_http:
             self._store_proxied_cookies(resp, url)

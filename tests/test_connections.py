@@ -24,7 +24,8 @@ class FakeWorker:
     plays StuMS + the NetIQ IdP behind it. Both hosts use a JSESSIONID, which
     is exactly what collided under the worker's hostname before."""
 
-    def __init__(self, legacy=False):
+    def __init__(self, legacy=False, refuse=()):
+        self.refuse = set(refuse)  # hosts an outdated worker.js does not allow
         self.legacy = legacy  # old worker: rewritten Set-Cookie, Location pointing at the worker
         self.seen = []
         self.base = ""
@@ -47,6 +48,8 @@ class FakeWorker:
         path = "/" + rest
         cookie = request.headers.get("Cookie", "")
         self.seen.append((host, path, cookie, request.headers.get("X-Proxy-Secret")))
+        if host in self.refuse:
+            return web.Response(status=403, text=f"Forbidden: host '{host}' is not allowed")
         if host == STUMS and path == "/qisserver/start":
             if "JSESSIONID=stums-auth" in cookie:
                 return web.Response(text="Willkommen <a>Abmelden</a>")
@@ -140,6 +143,46 @@ class WorkerRoutingTests(unittest.TestCase):
         page_url = _run_with_worker(worker, scenario)
         from urllib.parse import urljoin
         self.assertEqual(urljoin(page_url, "/qisserver/submit"), f"https://{STUMS}/qisserver/submit")
+
+
+class WorkerRefusalTests(unittest.TestCase):
+    def test_refused_host_falls_back_to_direct(self):
+        worker = FakeWorker(refuse={LOGIN})
+        direct_calls = []
+
+        class DirectResp:
+            status = 200
+            headers = __import__("multidict").CIMultiDictProxy(__import__("multidict").CIMultiDict())
+
+            async def text(self):
+                return "direct ok"
+
+            def release(self):
+                pass
+
+        async def scenario(sess):
+            studip_session._WORKER_REFUSED.clear()
+
+            async def direct_request(method, url, **kwargs):
+                direct_calls.append(url)
+                return DirectResp()
+
+            await sess.ensure_session()
+            sess.session.request = direct_request
+            async with await sess.get(f"https://{LOGIN}/nidp/app") as r:
+                first = await r.text()
+            async with await sess.get(f"https://{LOGIN}/nidp/app") as r:
+                await r.text()
+            return first
+
+        try:
+            first = _run_with_worker(worker, scenario)
+        finally:
+            studip_session._WORKER_REFUSED.clear()
+        self.assertEqual(first, "direct ok")
+        self.assertEqual(direct_calls, [f"https://{LOGIN}/nidp/app"] * 2)
+        # the worker was asked once; the second request went straight out
+        self.assertEqual([h for h, *_ in worker.seen], [LOGIN])
 
 
 class UnrouteTests(unittest.TestCase):
