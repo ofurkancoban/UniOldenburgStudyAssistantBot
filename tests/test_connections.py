@@ -764,3 +764,75 @@ class RetireImportedFilesTests(unittest.TestCase):
         self.assertTrue(os.path.exists(stale + ".imported"))
         self.assertTrue(os.path.exists(other))  # not a stored document: untouched
         self.assertEqual(db.load(stale), {"live": True})
+
+
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+
+def _fixture(name):
+    with open(os.path.join(FIXTURES, name), encoding="utf-8") as fh:
+        return fh.read()
+
+
+class StumsFixtureTests(unittest.TestCase):
+    """Parsers against anonymised copies of the real HISinOne page structure."""
+
+    def test_study_planner_units_and_actions(self):
+        import exam_reminder as er
+        html_text = _fixture("stums_study_planner.html")
+        candidates = er._parse_candidate_units(html_text)
+        self.assertEqual([(u["code"], u["unit_id"], u["period_id"]) for u in candidates],
+                         [("inf007_P", "11111", "222")])  # only "Apply" units, deduplicated
+        status = {u["code"]: u for u in er._parse_registration_status(html_text)}
+        self.assertEqual(sorted(status), ["inf007_P", "wir874_P1", "wir901_P"])
+        self.assertEqual(status["inf007_P"]["action_type"], "register")
+        self.assertEqual(status["wir874_P1"]["action_type"], "deregister")
+        self.assertIsNone(status["wir901_P"]["action_type"])
+        self.assertEqual(status["inf007_P"]["action"]["params"], {"unitId": "11111", "periodId": "222"})
+        self.assertEqual(status["wir874_P1"]["status"], "Registered")
+
+    def test_detail_page_sittings(self):
+        import exam_reminder as er
+        from bs4 import BeautifulSoup
+        body = BeautifulSoup(_fixture("stums_exam_detail.html"), "html.parser").get_text("\n", strip=True)
+        main, resit = er._parse_examination_periods(body, now=er.datetime(2026, 11, 8, 12, 0))
+        self.assertEqual((main["start_date"], main["end_date"]), ("2026-10-20T00:00:00", "2027-02-05T23:59:00"))
+        self.assertTrue(main["is_open"])
+        self.assertFalse(resit["is_open"])
+        self.assertEqual(main["exam_date"], "2027-02-08")
+        self.assertIn("10:00 - 12:00", main["exam_date_display"])
+        self.assertEqual(main["group_label"], "group 1")
+        self.assertEqual((main["room"], resit["room"]), ("A14 1-101", "A14 1-102"))
+
+    def test_open_registrations_end_to_end(self):
+        import exam_reminder as er
+        pages = {"studyPlanner": _fixture("stums_study_planner.html"), "detailView": _fixture("stums_exam_detail.html")}
+        requested = []
+
+        class Resp:
+            def __init__(self, text):
+                self._text = text
+
+            async def text(self):
+                return self._text
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class Session:
+            async def get(self, url, **kwargs):
+                requested.append(url)
+                return Resp(pages["detailView"] if "detailView-flow" in url else pages["studyPlanner"])
+
+        async def signed_in(session):
+            return er.STUMS_START_URL
+
+        with mock.patch.object(er, "_establish_stums_session", signed_in), \
+                mock.patch.object(er, "berlin_now", lambda: er.datetime(2026, 11, 8, 12, 0)):
+            open_exams = asyncio.run(er.get_open_exam_registrations(Session()))
+        self.assertEqual([(e["code"], e["start_date"]) for e in open_exams],
+                         [("inf007_P", "2026-10-20T00:00:00")])
+        self.assertTrue(any("unitId=11111" in u for u in requested))

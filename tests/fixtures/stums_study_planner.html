@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<!-- Anonymised HISinOne (StuMS) study planner: structure as served by
+     stums.uni-oldenburg.de, names, ids and numbers are made up. -->
+<html><head><title>Study planner with module plan</title></head>
+<body>
+<a href="/qisserver/pages/cs/sys/portal/hisinoneStartPage.faces">Home</a> <a href="#">Abmelden</a>
+<form id="studyPlannerForm" name="studyPlannerForm" method="post" action="/qisserver/pages/cm/exa/enrollment/studyPlanner.faces">
+<div id="studyPlannerForm:studyPlannerTree">
+<table>
+  <tr><td>
+    <div class="StudyPlannerPruefungNodeData">
+      <div class="unit-information">inf007_P Exam</div>
+      <div class="unit-title-container">Introduction to Programming</div>
+      <a href="/qisserver/pages/startFlow.xhtml?_flowId=detailView-flow&amp;unitId=11111&amp;periodId=222">Details</a>
+      <button id="studyPlannerForm:node:0:anmelden" onclick="myfaces.oam.submitForm('studyPlannerForm','studyPlannerForm:node:0:anmelden',null,[['unitId','11111'],['periodId','222']]);return false;">Apply</button>
+      <button data-popupbutton="true">Not registered</button>
+    </div>
+  </td></tr>
+  <tr><td>
+    <div class="StudyPlannerPruefungNodeData">
+      <div class="unit-information">wir874_P1 Exam</div>
+      <div class="unit-title-container">Econometrics</div>
+      <a href="/qisserver/pages/startFlow.xhtml?_flowId=detailView-flow&amp;unitId=33333&amp;periodId=222">Details</a>
+      <button id="studyPlannerForm:node:1:abmelden" onclick="myfaces.oam.submitForm('studyPlannerForm','studyPlannerForm:node:1:abmelden',null,[['unitId','33333'],['periodId','222']]);return false;">Sign off/Cancel</button>
+      <button data-popupbutton="true">Registered</button>
+    </div>
+  </td></tr>
+  <tr><td>
+    <div class="StudyPlannerPruefungNodeData">
+      <div class="unit-information">wir901_P Exam</div>
+      <div class="unit-title-container">Development Economics</div>
+      <a href="/qisserver/pages/startFlow.xhtml?_flowId=detailView-flow&amp;unitId=44444&amp;periodId=222">Details</a>
+    </div>
+  </td></tr>
+  <tr><td>
+    <!-- the same unit listed again under a second module: must be deduplicated -->
+    <div class="StudyPlannerPruefungNodeData">
+      <div class="unit-information">inf007_P Exam</div>
+      <div class="unit-title-container">Introduction to Programming</div>
+      <a href="/qisserver/pages/startFlow.xhtml?_flowId=detailView-flow&amp;unitId=11111&amp;periodId=222">Details</a>
+      <button id="studyPlannerForm:node:3:anmelden" onclick="myfaces.oam.submitForm('studyPlannerForm','studyPlannerForm:node:3:anmelden',null,[['unitId','11111'],['periodId','222']]);return false;">Apply</button>
+    </div>
+  </td></tr>
+</table>
+</div>
+</form>
+</body></html>

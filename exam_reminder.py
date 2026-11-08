@@ -570,11 +570,22 @@ def _parse_examination_periods(body_text: str, now: Optional[datetime] = None) -
                 if exam_time_range:
                     exam_date_display += f", {exam_time_range}"
 
+        # The page renders the window's dates in their own elements, so the
+        # flattened text can spread "from ... until ..." over several lines:
+        # read the enrollment line together with the lines that follow it.
+        window_lines = [enroll_line]
+        for follow in block[enroll_idx + 1: enroll_idx + 6]:
+            if PERIOD_HEADER_RE.match(follow) or "Disenrollment" in follow or "Prüfer" in follow:
+                break
+            window_lines.append(follow)
+        window_end = enroll_idx + len(window_lines) - 1
+
         # Positionally, "Examiner" and "Room" follow right after the
-        # Enrollment/Disenrollment lines in the page's table layout.
+        # Enrollment/Disenrollment lines in the page's table layout (counted
+        # from the window's last line, which may not be the Enrollment line).
         room = None
         for offset in (2, 3):
-            idx = enroll_idx + offset
+            idx = window_end + offset
             if idx >= len(block):
                 break
             candidate = block[idx]
@@ -588,14 +599,6 @@ def _parse_examination_periods(body_text: str, now: Optional[datetime] = None) -
             break
 
         is_open = "was feasible" not in enroll_line and "was possible" not in enroll_line
-        # The page renders the window's dates in their own elements, so the
-        # flattened text can spread "from ... until ..." over several lines:
-        # read the enrollment line together with the lines that follow it.
-        window_lines = [enroll_line]
-        for follow in block[enroll_idx + 1: enroll_idx + 6]:
-            if PERIOD_HEADER_RE.match(follow) or "Disenrollment" in follow or "Prüfer" in follow:
-                break
-            window_lines.append(follow)
         window_text = " ".join(window_lines)
         stamps = _parse_window_datetimes(window_text)
         start_dt = stamps[0] if stamps else None
