@@ -666,6 +666,8 @@ class DailyDigestTests(unittest.TestCase):
         ])
         counts = diagnostics.scan_log_problems([path, path + ".missing"], datetime(2026, 11, 8, 0, 0))
         self.assertEqual(counts["ERROR"]["❌ Login error in watcher: timeout #"], 2)
+        self.assertEqual(diagnostics._normalise_message("profile: HTTP 401 after 3 tries"),
+                         "profile: HTTP 401 after # tries")
         self.assertEqual(counts["ERROR"]["disk full"], 1)
         self.assertEqual(sum(counts["ERROR"].values()), 3)
         self.assertEqual(dict(counts["WARNING"]), {"slow host": 1})

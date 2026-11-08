@@ -19,12 +19,14 @@ from unibot import state
 def _session_line(uid, sess) -> str:
     jar = getattr(getattr(sess, "session", None), "cookie_jar", None)
     hosts = {c["domain"].lstrip(".") for c in jar} if jar is not None else set()
-    studip = "✅" if any(h.startswith("elearning.") for h in hosts) else "—"
+    studip = "✅" if any(h.startswith("elearning.") for h in hosts) else "❌"
     verified_at = sess.stums.verified_at
     if verified_at:
         stums = f"✅ {int((time.time() - verified_at) // 60)} min ago"
     else:
-        stums = "—"
+        # verified_at lives in memory: after a restart it is empty until the
+        # next StuMS check (every few hours) signs in again
+        stums = "not checked since restart"
     paused = sess.stums.blocked_until - time.time()
     if paused > 0:
         stums += f" (paused {int(paused // 60) + 1} min)"
@@ -79,7 +81,9 @@ DIGEST_TOP_MESSAGES = 5
 
 def _normalise_message(message: str) -> str:
     """Group log lines that differ only in numbers (ids, counts, times)."""
-    return re.sub(r"\d+", "#", message.strip())[:120]
+    # HTTP status codes stay readable ("HTTP 401"), other numbers are grouped
+    text = re.sub(r"(?<!HTTP )\b\d+", "#", message.strip())
+    return text[:120]
 
 
 def scan_log_problems(paths: Iterable[str], since: datetime) -> dict[str, Counter]:
