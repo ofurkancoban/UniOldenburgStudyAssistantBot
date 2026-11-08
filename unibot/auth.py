@@ -416,6 +416,14 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
     state._login_failure_notified = False
     await session.save_cookies()
 
+    # Signed in through StuMS: sign the same session in to Stud.IP as well.
+    try:
+        if not await session.is_html_logged_in(use_cache=False):
+            if await session.heal_session():
+                logging.info("✅ Stud.IP session established during login for user %s", user_id)
+    except Exception as exc:
+        logging.info("Stud.IP SSO handoff after proxy login failed for user %s: %s", user_id, exc)
+
     studip_cookie = None
     if session.session:
         for c in session.session.cookie_jar:
@@ -449,20 +457,16 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
         if studip_user or display_name:
             db.upsert_user(telegram_id=user_id, studip_username=studip_user)
 
-    # Seamless StuMS SSO handoff while the NetIQ SSO session is warm. When the
-    # Mini App is already chaining the browser on to StuMS, leave it to that
-    # chain: a parallel server-side handoff would replace its JSESSIONID.
-    if time.time() < (vars(session).get("_sso_chain_until", 0.0) or 0.0):
-        logging.info("🎓 StuMS sign-in for user %s continues in the Mini App", user_id)
-    else:
-        try:
-            from exam_reminder import _establish_stums_session
-            session.stums_blocked_until = 0.0  # a fresh login lifts the background pause
-            await _establish_stums_session(session)
-            await session.save_cookies()
-            logging.info("🎓 StuMS session established during login for user %s", user_id)
-        except Exception as exc:
-            logging.info("StuMS SSO handoff after proxy login failed for user %s: %s", user_id, exc)
+    # One sign-in connects both services: sign this session in to StuMS on
+    # the server while the NetIQ SSO session from the Mini App is fresh.
+    try:
+        from exam_reminder import _establish_stums_session
+        session.stums_blocked_until = 0.0  # a fresh login lifts the background pause
+        await _establish_stums_session(session)
+        await session.save_cookies()
+        logging.info("🎓 StuMS session established during login for user %s", user_id)
+    except Exception as exc:
+        logging.info("StuMS SSO handoff after proxy login failed for user %s: %s", user_id, exc)
 
     if is_new_session and (user_id is None or is_user_admin(user_id)):
         state._last_notified_studip_cookie = studip_cookie

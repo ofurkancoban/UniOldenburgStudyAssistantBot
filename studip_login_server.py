@@ -54,15 +54,6 @@ STUMS_ORIGIN = "https://stums.uni-oldenburg.de"
 # StuMS' own "log in via university SSO" entry; through this proxy it runs the
 # NetIQ login in the bot's cookie jar and lands back on StuMS signed in.
 STUMS_SSO_ENTRY_PATH = "/qisserver/api/identityprovider/redirect/2/login"
-# Stud.IP's OIDC sign-in, started from the proxied Mini App.
-STUDIP_SSO_LOGIN_PATH = "/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
-# How long the hook leaves the second sign-in to the browser chain.
-SSO_CHAIN_SECONDS = 120.0
-
-_CHAIN_SNIPPET = """
-<iframe id="_bot_chain" src="__TARGET__" aria-hidden="true" tabindex="-1" style="position:absolute;width:1px;height:1px;left:-9999px;top:-9999px;border:0;visibility:hidden;"></iframe>
-"""
-
 LoginCallback = Callable[[str, str, str], Awaitable[tuple[bool, str]]]
 
 # Rewrite leading scheme+host in HTML attributes (action, href, src) without
@@ -245,35 +236,19 @@ _CONNECTED_BANNER_SNIPPET = """
   </div>
 </div>
 <script>
-function _botReallyClose() {
+// Close the Mini App. telegram-web-app.js may still be loading, so retry
+// briefly before falling back to window.close().
+function _botCloseApp(tries) {
+  tries = typeof tries === 'number' ? tries : 0;
   try {
-    if (window.Telegram && Telegram.WebApp && Telegram.WebApp.initData) {
-      Telegram.WebApp.close();
-    } else {
-      window.close();
-    }
+    if (window.Telegram && Telegram.WebApp) { Telegram.WebApp.close(); return; }
   } catch(e){}
-}
-// The second service (StuMS or Stud.IP) signs in inside a hidden iframe;
-// closing waits for it (at most 25 s) so the Mini App never cuts it off.
-function _botChainDone() {
-  var f = document.getElementById('_bot_chain');
-  if (!f) return true;
-  try {
-    // the proxy marks signed-in pages with the success banner
-    return !!f.contentDocument.getElementById('_bot_modal_backdrop');
-  } catch(e) { return false; }
-}
-var _botCloseStarted = 0;
-function _botCloseApp() {
-  if (!_botCloseStarted) _botCloseStarted = Date.now();
-  if (_botChainDone() || Date.now() - _botCloseStarted > 25000) { _botReallyClose(); return; }
-  setTimeout(_botCloseApp, 400);
+  if (tries < 15) { setTimeout(function(){ _botCloseApp(tries + 1); }, 100); return; }
+  try { window.close(); } catch(e){}
 }
 (function(){
-  if (window.frameElement && window.frameElement.id === '_bot_chain') return;
-  // close automatically once signed in
-  setTimeout(_botCloseApp, 1500);
+  // close automatically one second after the sign-in
+  setTimeout(function(){ _botCloseApp(0); }, 1000);
   try {
     var b = document.getElementById('_bot_bar');
     if (b) b.style.display = 'none';
@@ -536,9 +511,6 @@ class LoginServer:
             studip_sess.last_interactive_activity = time.time()
             await studip_sess.ensure_session()
             studip_sess._stums_verified_at = 0.0
-            proxy_sess.pop("chained", None)
-            if await studip_sess.is_html_logged_in():
-                proxy_sess["studip_seen"] = True  # no Stud.IP detour after StuMS
             raise web.HTTPFound(STUMS_SSO_ENTRY_PATH)
         if studip_sess is not None:
             studip_sess.last_interactive_activity = time.time()
@@ -549,12 +521,7 @@ class LoginServer:
             elif await studip_sess.is_html_logged_in(use_cache=False):
                 studip_sess.explicitly_logged_out = False
                 studip_sess.last_interactive_activity = 0.0
-                proxy_sess["studip_seen"] = True
-                if not proxy_sess.get("chained") and not await self._stums_signed_in(studip_sess):
-                    # Stud.IP is still signed in but StuMS is not: connect
-                    # StuMS through the browser in the same Mini App visit.
-                    # The next Stud.IP page signs in to StuMS in the background.
-                    proxy_sess["pending_chain"] = STUMS_SSO_ENTRY_PATH
+                # the hook also signs this session in to StuMS on the server
                 self._schedule_auth_hook(user_id)
                 raise web.HTTPFound("/dispatch.php/my_courses")
             else:
@@ -581,44 +548,6 @@ class LoginServer:
 
         # Start the real Uni Oldenburg OIDC SSO flow
         raise web.HTTPFound("/dispatch.php/login?again=yes&sso=oidc&cancel_login=1")
-
-    @staticmethod
-    async def _stums_signed_in(studip_sess) -> bool:
-        """Cheap check whether this session is already signed in to StuMS."""
-        try:
-            from exam_reminder import _has_stums_cookie, _stums_logged_in, _stums_verified, STUMS_START_URL
-            if _stums_verified(studip_sess):
-                return True
-            if not _has_stums_cookie(studip_sess):
-                return False
-            referer = vars(studip_sess).get("_stums_referer") or STUMS_START_URL
-            with interactive_requests():
-                return await _stums_logged_in(studip_sess, referer)
-        except Exception as exc:
-            logger.debug("StuMS sign-in check failed: %s", exc)
-            return True  # unknown: do not force a detour
-
-    @staticmethod
-    def _chain_target(request: web.Request, proxy_sess: dict,
-                      is_studip_auth: bool, is_stums_auth: bool) -> Optional[str]:
-        """After a sign-in in this Mini App session, send the browser on to the
-        other service once, so a single university login connects both Stud.IP
-        and StuMS (the fresh SSO session makes the second sign-in silent).
-        Only top-level page loads qualify, never AJAX fragments."""
-        if request.method != "GET" or proxy_sess.get("chained"):
-            return None
-        # Telegram Web hosts the Mini App in an iframe, so "iframe" counts as a page load.
-        if request.headers.get("X-Requested-With") or request.headers.get("Sec-Fetch-Dest", "document") not in ("document", "iframe"):
-            return None
-        if is_studip_auth and proxy_sess.get("pending_chain"):
-            return proxy_sess.pop("pending_chain")
-        if not proxy_sess.get("idp_seen"):
-            return None
-        if is_studip_auth and not proxy_sess.get("stums_seen"):
-            return STUMS_SSO_ENTRY_PATH
-        if is_stums_auth and not proxy_sess.get("studip_seen"):
-            return STUDIP_SSO_LOGIN_PATH
-        return None
 
     def _schedule_auth_hook(self, user_id: Optional[int] = None) -> None:
         now = time.time()
@@ -652,12 +581,13 @@ class LoginServer:
         if studip_sess is None:
             return web.Response(text="Bot session not initialized", status=503)
         await studip_sess.ensure_session()
-        if request.path.startswith(("/nidp", "/osp", "/sso.php", "/dispatch.php/login", "/qisserver")):
+        stums_signed_in = time.time() - (vars(studip_sess).get("_stums_verified_at", 0.0) or 0.0) < 120
+        if request.path.startswith(("/nidp", "/osp", "/sso.php", "/dispatch.php/login")) or (
+                request.path.startswith("/qisserver") and not stums_signed_in):
+            # a sign-in is in progress: background SSO handoffs wait for it.
+            # Page requests of an already signed-in StuMS do not count, or they
+            # would block the server-side Stud.IP handoff after a StuMS login.
             studip_sess.last_interactive_activity = time.time()
-        if request.path.startswith(("/nidp", "/osp")):
-            # The user went through the university login in this Mini App
-            # session, so the other service can reuse that fresh SSO session.
-            proxy_sess["idp_seen"] = True
 
         path_qs = request.rel_url.path_qs
         upstream_origin = _upstream_for_path(request.path)
@@ -751,40 +681,21 @@ class LoginServer:
                 and 'name="asdf"' not in text
                 and ("abmelden" in lowered or "logout" in lowered)
             )
-            chain_to = self._chain_target(request, proxy_sess, is_studip_auth, is_stums_auth)
-            if is_studip_auth:
-                proxy_sess["studip_seen"] = True
             if is_stums_auth:
-                proxy_sess["stums_seen"] = True
                 studip_sess._stums_verified_at = time.time()
                 studip_sess._stums_referer = f"{STUMS_ORIGIN}{request.path}"
                 studip_sess.stums_blocked_until = 0.0  # interactive sign-in lifts the pause
-            if chain_to:
-                proxy_sess["chained"] = True
-                # the browser signs in to the second service; the auth hook
-                # must not start a competing server-side handoff meanwhile
-                studip_sess._sso_chain_until = time.time() + SSO_CHAIN_SECONDS
 
             if is_studip_auth or is_stums_auth:
                 studip_sess.explicitly_logged_out = False
                 studip_sess.last_interactive_activity = 0.0
-                if is_studip_auth:
-                    self._schedule_auth_hook(user_id)
-                elif chain_to is None:
-                    if proxy_sess.get("studip_seen"):
-                        # end of a Stud.IP -> StuMS chain: just persist the StuMS cookies
-                        studip_sess._sso_chain_until = 0.0
-                        asyncio.create_task(studip_sess.save_cookies())
-                    else:
-                        self._schedule_auth_hook(user_id)
-            if is_studip_auth or is_stums_auth:
-                chain_frame = ""
-                if chain_to:
-                    chain_frame = _CHAIN_SNIPPET.replace("__TARGET__", chain_to)
+                # The hook signs in to the other service on the server
+                # (Stud.IP -> StuMS and StuMS -> Stud.IP) with the fresh SSO
+                # session, so the Mini App can close right away.
+                self._schedule_auth_hook(user_id)
                 bar = (
-                    chain_frame
+                    _STATUS_BAR_SNIPPET.replace("__STATUS_TEXT__", "✅ Bot connected")
                     + _CONNECTED_BANNER_SNIPPET
-                    + _STATUS_BAR_SNIPPET.replace("__STATUS_TEXT__", "✅ Bot connected")
                 )
             else:
                 bar = (
