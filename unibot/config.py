@@ -179,6 +179,8 @@ WEATHER_LONGITUDE = os.getenv("WEATHER_LONGITUDE", "8.2146")
 # ── /login Mini App ───────────────────────────────────────────────────────────
 LOGIN_PUBLIC_URL = os.getenv("LOGIN_PUBLIC_URL", "").strip()
 CLOUDFLARE_TUNNEL = os.getenv("CLOUDFLARE_TUNNEL", "").strip().lower()
+# token of a named tunnel (CLOUDFLARE_TUNNEL=named); the hostname is LOGIN_PUBLIC_URL
+CLOUDFLARE_TUNNEL_TOKEN = os.getenv("CLOUDFLARE_TUNNEL_TOKEN", "").strip()
 
 
 # ── WhatsApp target group ─────────────────────────────────────────────────────
@@ -217,8 +219,10 @@ def validate_settings() -> list[str]:
                 raise ValueError
         except (TypeError, ValueError):
             warnings.append(f"{name}={value!r} is not a valid coordinate.")
-    if CLOUDFLARE_TUNNEL not in ("", "quick"):
-        warnings.append(f"CLOUDFLARE_TUNNEL={CLOUDFLARE_TUNNEL!r} is not supported (use 'quick' or leave it empty).")
+    if CLOUDFLARE_TUNNEL not in ("", "quick", "named"):
+        warnings.append(f"CLOUDFLARE_TUNNEL={CLOUDFLARE_TUNNEL!r} is not supported (use 'quick', 'named' or leave it empty).")
+    if CLOUDFLARE_TUNNEL == "named" and not (CLOUDFLARE_TUNNEL_TOKEN and LOGIN_PUBLIC_URL.startswith("https://")):
+        warnings.append("CLOUDFLARE_TUNNEL=named needs CLOUDFLARE_TUNNEL_TOKEN and an https:// LOGIN_PUBLIC_URL.")
     if not OPENROUTER_API_KEY and not GWDG_API_KEY:
         warnings.append("Neither OPENROUTER_API_KEY nor GWDG_API_KEY is set: AI features are disabled.")
     return warnings

@@ -647,3 +647,46 @@ class ExamWindowStateTests(unittest.TestCase):
         self.assertEqual(sorted(cache["notified_open"]),
                          ["wir874_P1:2026-10-28T00:00:00:2027-02-05T23:59:00",
                           "wir874_P1:2026-10-28T00:00:00:2027-03-03T23:59:00"])
+
+
+class NamedTunnelTests(unittest.TestCase):
+    def test_fixed_url_token_in_env_and_reuse(self):
+        import shutil
+        import tempfile
+        import studip_tunnel
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fake = os.path.join(tmp, "cloudflared")
+        seen = os.path.join(tmp, "seen.txt")
+        with open(fake, "w") as fh:  # records its arguments and token, then stays up
+            # no exec: like the real binary, the process keeps "cloudflared" in its command line
+            fh.write(f'#!/bin/sh\necho "$@ token=$TUNNEL_TOKEN" > {seen}\nsleep 30\n')
+        os.chmod(fake, 0o755)
+
+        async def scenario():
+            with mock.patch.object(studip_tunnel, "STATE_DIR", tmp):
+                tunnel = studip_tunnel.NamedTunnel(18999, "https://bot.example.com/", "tok123", binary=fake)
+                url = await tunnel.start(timeout=10)
+                await tunnel.stop()
+                for _ in range(50):  # let the fake binary record its arguments
+                    if os.path.exists(seen) and os.path.getsize(seen):
+                        break
+                    await asyncio.sleep(0.1)
+                again = studip_tunnel.NamedTunnel(18999, "https://bot.example.com", "tok123", binary=fake)
+                pid_before = tunnel._pid
+                reused_pid, reused_url = again._read_existing()
+                studip_tunnel._kill(pid_before)
+                return url, pid_before, reused_pid, reused_url
+
+        url, pid, reused_pid, reused_url = asyncio.run(scenario())
+        self.assertEqual(url, "https://bot.example.com")
+        self.assertEqual((reused_pid, reused_url), (pid, "https://bot.example.com"))
+        for _ in range(50):
+            if os.path.exists(seen) and os.path.getsize(seen):
+                break
+            time.sleep(0.1)
+        with open(seen) as fh:
+            recorded = fh.read()
+        self.assertIn("tunnel --no-autoupdate run", recorded)
+        self.assertIn("token=tok123", recorded)
+        self.assertNotIn("tok123 ", recorded.split("token=")[0])  # not on the command line

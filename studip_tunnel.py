@@ -261,3 +261,49 @@ class QuickTunnel:
             except OSError:
                 pass
             await asyncio.sleep(0.25)
+
+
+class NamedTunnel(QuickTunnel):
+    """A named Cloudflare Tunnel: a fixed public hostname (LOGIN_PUBLIC_URL) on
+    your own Cloudflare domain, so the Mini App URL survives every restart.
+
+    Create it once in the Cloudflare dashboard (Zero Trust > Networks > Tunnels),
+    route the hostname to http://127.0.0.1:<login port>, and put the tunnel
+    token in CLOUDFLARE_TUNNEL_TOKEN. The token is handed to cloudflared in the
+    environment (TUNNEL_TOKEN), never on the command line where `ps` shows it.
+    """
+
+    def __init__(self, port: int, public_url: str, token: str, binary: Optional[str] = None,
+                 on_url_change: Optional[UrlCallback] = None):
+        super().__init__(port, binary=binary, on_url_change=on_url_change)
+        self.public_url = public_url.rstrip("/")
+        self.token = token
+        self._pid_file = os.path.join(STATE_DIR, f"cloudflared_named_{self.port}.pid")
+        self._log_file = os.path.join(STATE_DIR, f"cloudflared_named_{self.port}.log")
+
+    def _read_existing(self) -> tuple[Optional[int], str]:
+        pid = None
+        if os.path.exists(self._pid_file):
+            try:
+                with open(self._pid_file, "r", encoding="utf-8") as fh:
+                    pid = int(fh.read().strip())
+            except (OSError, ValueError):
+                pid = None
+        if not pid or not _pid_alive(pid):
+            return None, ""
+        return pid, self.public_url
+
+    async def _spawn_detached(self) -> None:
+        logging.info("🌐 Starting named Cloudflare tunnel for %s -> port %s", self.public_url, self.port)
+        shell_cmd = (
+            f"nohup {shlex.quote(self.binary)} tunnel --no-autoupdate run "
+            f">/dev/null 2>{shlex.quote(self._log_file)} </dev/null & echo $! > {shlex.quote(self._pid_file)}"
+        )
+        self._spawned_at = time.monotonic()
+        await asyncio.to_thread(
+            subprocess.run,
+            ["/bin/sh", "-c", shell_cmd],
+            start_new_session=True,
+            check=False,
+            env={**os.environ, "TUNNEL_TOKEN": self.token},
+        )

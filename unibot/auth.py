@@ -20,7 +20,7 @@ import studip_oauth
 from studip_login_server import LoginServer
 from studip_http import BACKGROUND, INTERACTIVE, set_request_priority
 from studip_session import StudIPSession
-from studip_tunnel import QuickTunnel
+from studip_tunnel import NamedTunnel, QuickTunnel
 
 from unibot import db
 from unibot import state
@@ -28,6 +28,7 @@ from unibot.config import (
     ADMIN_USER_IDS,
     ALLOWED_USER_IDS,
     CLOUDFLARE_TUNNEL,
+    CLOUDFLARE_TUNNEL_TOKEN,
     LOGIN_PUBLIC_URL,
     PRIMARY_ADMIN_ID,
     TELEGRAM_TOKEN,
@@ -530,7 +531,15 @@ async def _start_login_infra(app) -> None:
     mode = CLOUDFLARE_TUNNEL
     server = _get_login_server()
 
-    if mode == "quick":
+    if mode == "named" and CLOUDFLARE_TUNNEL_TOKEN and LOGIN_PUBLIC_URL.startswith("https://"):
+        state.quick_tunnel = NamedTunnel(server.port, LOGIN_PUBLIC_URL, CLOUDFLARE_TUNNEL_TOKEN,
+                                         on_url_change=_on_tunnel_url)
+        try:
+            await state.quick_tunnel.start()
+        except Exception as exc:
+            logging.error("❌ Named Cloudflare tunnel failed: %s", exc)
+            state.quick_tunnel = None
+    elif mode == "quick":
         state.quick_tunnel = QuickTunnel(server.port, on_url_change=_on_tunnel_url)
         try:
             await state.quick_tunnel.start()
