@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import time
+from typing import Any
 
 import psutil
 import atexit
@@ -187,7 +188,7 @@ from unibot.menus import (
 from unibot.watcher import start_unified_watcher
 
 
-start_in_progress = set()  # chat_id currently running /start
+start_in_progress: set[int] = set()  # chat_id currently running /start
 
 
 # ── BEGIN FLOW (login + course list) ──────────────────────────────────────────
@@ -409,7 +410,7 @@ async def main():
         if not await state.global_session.login():
             logging.warning("⚠️ Not logged in to Stud.IP yet. Starting bot so you can sign in via /login.")
 
-        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        app = ApplicationBuilder().token(TELEGRAM_TOKEN or "").build()  # validate_settings() requires it
         register_handlers(app)
 
         # Explicitly initialize and start the application
@@ -457,7 +458,7 @@ async def main():
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                loop.add_signal_handler(sig, lambda s=sig: stop_event.set())
+                loop.add_signal_handler(sig, stop_event.set)
             except (NotImplementedError, RuntimeError):
                 pass
 
@@ -543,7 +544,7 @@ def start_whatsapp_microservice():
         return
     _cleanup_stale_whatsapp_service(wa_service_dir)
     logging.info("Starting WhatsApp microservice...")
-    kwargs = {}
+    kwargs: dict[str, Any] = {}
     if os.name != 'nt':
         kwargs['preexec_fn'] = os.setsid
     try:

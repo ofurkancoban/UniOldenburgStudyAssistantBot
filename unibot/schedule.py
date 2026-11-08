@@ -9,7 +9,7 @@ import logging
 import re
 import time
 from datetime import date, datetime, time as dtime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -52,7 +52,7 @@ from unibot.studip_api import (
 from unibot.weather import build_weather_text_line, get_weather_snapshot
 
 
-fastenroll_tasks = {}  # chat_id -> {sem_id -> asyncio.Task}
+fastenroll_tasks: dict[int, dict[str, asyncio.Task]] = {}  # chat_id -> {sem_id -> asyncio.Task}
 
 
 MORNING_SUMMARY_HOUR = 7
@@ -324,11 +324,8 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
             is_cancelled = bool(attr.get("is-cancelled", False))
             meta = ev.get("meta") or {}
             raw_topics = meta.get("topics") or []
-            topics = [
-                (t.get("title") if isinstance(t, dict) else str(t)).strip()
-                for t in raw_topics
-                if (t.get("title") if isinstance(t, dict) else str(t))
-            ]
+            titles = ((t.get("title") if isinstance(t, dict) else str(t)) for t in raw_topics)
+            topics = [title.strip() for title in titles if title]
             desc = (attr.get("description") or "").strip()
             key = (start_dt.isoformat(), clean_course_title(title).lower())
             seen_keys.add(key)
@@ -360,9 +357,9 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
         until = _api_berlin(rec.get("UNTIL"))
         interval = int(rec.get("INTERVAL") or 1)
         exdates = {
-            _api_berlin(x).date()
-            for x in (rec.get("EXDATES") or [])
-            if _api_berlin(x) is not None
+            moment.date()
+            for moment in (_api_berlin(x) for x in (rec.get("EXDATES") or []))
+            if moment is not None
         }
         for offset in range(days):
             d = week_start + timedelta(days=offset)
@@ -563,7 +560,10 @@ async def _fetch_course_rooms_map(session, cid: str) -> dict:
     if task is None:
         task = asyncio.create_task(_download_course_rooms_map(session, cid))
         _COURSE_ROOMS_INFLIGHT[cid] = task
-        task.add_done_callback(lambda _t, c=cid: _COURSE_ROOMS_INFLIGHT.pop(c, None))
+        def _forget(_task: asyncio.Task, c: str = cid) -> None:
+            _COURSE_ROOMS_INFLIGHT.pop(c, None)
+
+        task.add_done_callback(_forget)
     return await asyncio.shield(task)
 
 
@@ -577,8 +577,8 @@ async def get_calendar_events(session, week_start, days: int = 7, user_id: Optio
     if not events:
         return []
 
-    cids_to_fetch = {
-        ev.get("course_id")
+    cids_to_fetch: set[str] = {
+        ev["course_id"]
         for ev in events
         if ev.get("course_id") and not ev.get("location")
     }
@@ -612,7 +612,7 @@ def _format_event_markdown_block(ev: dict) -> str:
     including cancellation status, topics, and session notes from JSON:API."""
     original_title = ev.get("title", "")
     is_cancelled = bool(ev.get("is_cancelled", False))
-    status = "🚫" if is_cancelled else _status_emoji(ev.get("status"))
+    status = "🚫" if is_cancelled else _status_emoji(ev.get("status") or "")
     course_icon = _get_course_icon(original_title)
     display_title = clean_course_title(original_title)
     loc_icon = _get_location_emoji(ev.get("location", ""))
@@ -764,7 +764,7 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
     day_study_start = datetime.combine(target_date, STUDY_WINDOW_DAY_START, tzinfo=TZ_BERLIN)
     day_study_end = datetime.combine(target_date, STUDY_WINDOW_DAY_END, tzinfo=TZ_BERLIN)
 
-    windows = []
+    windows: list[dict[str, Any]] = []
 
     if not day_events:
         if target_date.weekday() < 5:  # Mon to Fri
@@ -782,7 +782,7 @@ def find_study_windows_for_day(events: list, target_date: date, reference_now: O
                     "is_remaining": False,
                 })
     else:
-        busy_intervals = []
+        busy_intervals: list[dict[str, Any]] = []
         for ev in sorted(day_events, key=lambda e: e["start_dt"]):
             s, e = ev["start_dt"], ev["end_dt"]
             title = clean_course_title(ev.get("title", "")) or "class"
@@ -907,7 +907,7 @@ async def send_weekly_calendar(sender, events: list, week_start):
         )
     else:
         # Group events by date_key
-        events_by_day = {}
+        events_by_day: dict[Any, list] = {}
         for event in events:
             dk = event["date_key"]
             if dk not in events_by_day:
@@ -1263,7 +1263,7 @@ async def fetch_activity_stream_api(limit: int = 20, activity_filter: Optional[s
 
         actor_name = (actor_inc.get("attributes") or {}).get("formatted-name") or ""
         ctx_title = (ctx_inc.get("attributes") or {}).get("title") or ""
-        courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+        courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
         if not ctx_title and ctx_ref.get("type") == "courses" and ctx_ref.get("id") in courses_dict:
             ctx_title = courses_dict[ctx_ref["id"]]
 
@@ -1618,17 +1618,17 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
     try:
         registered = await get_registered_exam_schedule(session)
         today = now.date()
-        for e in registered:
-            exam_date = datetime.fromisoformat(e["date"]).date()
+        for exam in registered:
+            exam_date = datetime.fromisoformat(exam["date"]).date()
             if exam_date < today:
                 continue
-            if e.get("start_datetime"):
-                dt = datetime.fromisoformat(e["start_datetime"])
+            if exam.get("start_datetime"):
+                dt = datetime.fromisoformat(exam["start_datetime"])
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=TZ_BERLIN)
             else:
                 dt = datetime(exam_date.year, exam_date.month, exam_date.day, tzinfo=TZ_BERLIN)
-            items.append((dt, f"📚 <b>Exam:</b> {e['title']} – {_format_relative(dt, now)}"))
+            items.append((dt, f"📚 <b>Exam:</b> {exam['title']} – {_format_relative(dt, now)}"))
     except Exception as e:
         logging.warning("Upcoming dashboard: exam date fetch failed: %s", e)
 
@@ -1686,12 +1686,12 @@ async def handle_upcoming_dashboard(update: Update, context: ContextTypes.DEFAUL
     await query.message.reply_text(text, parse_mode="HTML")
 
 
-async def schedule_fastenroll_job(chat_id: int, sem_id: str, target_time_str: str, target_date_str: Optional[str], context: ContextTypes.DEFAULT_TYPE) -> str:
+async def schedule_fastenroll_job(chat_id: int, sem_id: Optional[str], target_time_str: Optional[str], target_date_str: Optional[str], context: ContextTypes.DEFAULT_TYPE) -> str:
     """Validate, persist and launch a fast-enroll job. Returns the reply text to show the user."""
     from unibot.tasks import _run_fastenroll_task
     from unibot.enrollment import validate_fastenroll_args
     error = validate_fastenroll_args(sem_id, target_time_str, target_date_str)
-    if error:
+    if error or sem_id is None or target_time_str is None:  # the validator rejects missing values
         return f"⚠️ {error}"
 
     existing = fastenroll_tasks.get(chat_id, {}).get(sem_id)
@@ -1770,7 +1770,7 @@ def schedule_study_sessions(gaps: list, rows: list, exams: list, week_start) -> 
                     })
 
     score = {r["cid"]: r["backlog_minutes"] / 60 + (STUDY_PLAN_EXAM_WINDOW_DAYS + 1 - exam_days[r["cid"]] if r["cid"] in exam_days else 0) for r in rows}
-    needed = {}
+    needed: dict[str, Any] = {}
     for it in items:
         if it["reason"] != "preview":
             needed[it["cid"]] = needed.get(it["cid"], 0) + it["remaining"]

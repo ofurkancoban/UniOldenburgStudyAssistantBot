@@ -17,7 +17,7 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
-from studip_utils import TZ_BERLIN, berlin_now
+from studip_utils import TZ_BERLIN, berlin_now, tag_attr
 
 from unibot import db
 from unibot import state
@@ -247,7 +247,7 @@ async def fetch_todays_menu_items(session, sub_path="2/") -> list:
                 name_cell, price_cell = cols[0], cols[1]
 
                 temp_cell = BeautifulSoup(str(name_cell), 'html.parser')
-                codes = set()
+                codes: set[str] = set()
                 for span in temp_cell.find_all('span', class_='attributes'):
                     span_text = span.get_text(strip=True)
                     if span_text:
@@ -340,7 +340,7 @@ async def fetch_dish_photo_candidates(target_date=None, loc_id: str = "2") -> li
             title = str(title).strip()
             if not title:
                 continue
-            candidates.append((title, MENSA_PHOTO_BASE_URL + img["src"].lstrip("/")))
+            candidates.append((title, MENSA_PHOTO_BASE_URL + tag_attr(img, "src").lstrip("/")))
         return candidates
     except Exception as e:
         logging.warning("fetch_dish_photo_candidates: parse failed: %s", e)
@@ -621,7 +621,7 @@ def _parse_menu_row(row) -> tuple[set, Optional[dict]]:
     if len(cols) < 2:
         return set(), None
     temp_cell = BeautifulSoup(str(cols[0]), "html.parser")
-    codes = set()
+    codes: set[str] = set()
     allergens_text = ""
     for span in temp_cell.find_all("span", class_="attributes"):
         span_text = span.get_text(strip=True)
@@ -937,7 +937,7 @@ def _food_preferences_management_view(category="main"):
         buttons = []
         for key in keys:
             item = FOOD_PREF_LEGEND[key]
-            is_avoided = bool(avoid_codes_set & item["codes"])
+            is_avoided = bool(avoid_codes_set & set(item["codes"]))
             prefix = "🚫 " if is_avoided else "⚪ "
             buttons.append(
                 InlineKeyboardButton(
@@ -959,9 +959,9 @@ def _food_preferences_management_view(category="main"):
 
     # Main category overview
     avoided_items = []
-    accounted_codes = set()
+    accounted_codes: set[str] = set()
     for item in FOOD_PREF_LEGEND.values():
-        if avoid_codes_set & item["codes"]:
+        if avoid_codes_set & set(item["codes"]):
             avoided_items.append(f"🚫 {item['name']}")
             accounted_codes.update(item["codes"])
 
@@ -1090,7 +1090,7 @@ async def handle_foodpref_category(update: Update, context: ContextTypes.DEFAULT
     if not is_user_allowed(user_id):
         return
 
-    cat_name = query.data.split("|")[1] if "|" in query.data else "main"
+    cat_name = (query.data or "").split("|")[1] if "|" in (query.data or "") else "main"
     text, keyboard = _food_preferences_management_view(category=cat_name)
     try:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
@@ -1117,7 +1117,7 @@ async def handle_foodpref_toggle(update: Update, context: ContextTypes.DEFAULT_T
 
     prefs = load_food_preferences()
     current_codes = set(prefs.get("avoid_codes", []))
-    item_codes = item["codes"]
+    item_codes = set(item["codes"])
 
     is_avoided = bool(current_codes & item_codes)
     if is_avoided:

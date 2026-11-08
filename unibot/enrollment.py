@@ -27,6 +27,7 @@ from unibot.storage import (
     set_watch_previous_semester_enabled,
 )
 from unibot.telegram_ui import (
+    user_data,
     _show_typing,
     _start_loading_animation,
     _stop_loading_animation,
@@ -47,11 +48,11 @@ def extract_sem_id(text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
-def validate_fastenroll_args(sem_id: str, target_time_str: str, target_date_str: Optional[str]) -> Optional[str]:
+def validate_fastenroll_args(sem_id: Optional[str], target_time_str: Optional[str], target_date_str: Optional[str]) -> Optional[str]:
     """Return an error message if invalid, else None."""
     if not sem_id or not re.fullmatch(r"[a-f0-9]{32}", sem_id):
         return "Could not find a valid course id (expected a 32-char hex sem_id, or a course link containing one)."
-    if not re.fullmatch(r"[0-9]{2}:[0-9]{2}:[0-9]{2}", target_time_str):
+    if not target_time_str or not re.fullmatch(r"[0-9]{2}:[0-9]{2}:[0-9]{2}", target_time_str):
         return "Time must be in HH:MM:SS format (Europe/Berlin)."
     if target_date_str and not re.fullmatch(r"[0-9]{2}\.[0-9]{2}\.[0-9]{4}", target_date_str):
         return "Date must be in DD.MM.YYYY format."
@@ -528,7 +529,7 @@ async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.
             )
             return True  # pending_step stays "fastenroll_date" — ask again
         state["target_date_str"] = date_str
-        context.user_data["pending_step"] = "fastenroll_time"
+        user_data(context)["pending_step"] = "fastenroll_time"
         await update.message.reply_text(FASTENROLL_ASK_TIME, reply_markup=get_main_keyboard())
         return True
 
@@ -540,7 +541,7 @@ async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.
             )
             return True  # pending_step stays "fastenroll_time" — ask again
         state["target_time_str"] = text
-        context.user_data["pending_step"] = "fastenroll_link"
+        user_data(context)["pending_step"] = "fastenroll_link"
         await update.message.reply_text(FASTENROLL_ASK_LINK, reply_markup=get_main_keyboard())
         return True
 

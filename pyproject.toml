@@ -29,8 +29,8 @@ ignore = ["B905"]
 python_version = "3.10"
 ignore_missing_imports = true
 check_untyped_defs = true
-# Only the listed modules are type checked so far; widen the list as more
-# modules get annotations. Imported modules are analysed but not reported.
+# Every module of the bot is listed (tests and scripts are not).
+# Imported modules are analysed but not reported.
 follow_imports = "silent"
 files = [
     "studip_http.py",
@@ -58,7 +58,51 @@ files = [
     "stums_client.py",
     "exam_reminder.py",
     "fast_enroll.py",
+    "studip_bot.py",
+    "studip_oauth.py",
+    "studip_vault.py",
+    "unibot/ai.py",
+    "unibot/app.py",
+    "unibot/weather.py",
+    "unibot/documents.py",
+    "unibot/morning.py",
+    "unibot/whatsapp.py",
+    "unibot/system.py",
+    "unibot/voice.py",
+    "unibot/study_plan.py",
+    "unibot/schedule.py",
+    "unibot/tasks.py",
+    "unibot/mensa.py",
+    "unibot/wardrobe.py",
+    "unibot/menus.py",
+    "unibot/enrollment.py",
+    "unibot/exams.py",
 ]
+
+# The Telegram feature modules read python-telegram-bot objects that are typed
+# Optional for update kinds these handlers never receive (update.callback_query
+# in a callback handler, query.message, query.data, context.user_data). Only
+# that one check is off there; every other check still applies, and
+# non-Telegram Optionals in these modules were fixed instead of silenced.
+[[tool.mypy.overrides]]
+module = [
+    "unibot.app",
+    "unibot.weather",
+    "unibot.documents",
+    "unibot.morning",
+    "unibot.whatsapp",
+    "unibot.system",
+    "unibot.voice",
+    "unibot.study_plan",
+    "unibot.schedule",
+    "unibot.tasks",
+    "unibot.mensa",
+    "unibot.wardrobe",
+    "unibot.menus",
+    "unibot.enrollment",
+    "unibot.exams",
+]
+disable_error_code = ["union-attr"]
 
 [tool.coverage.run]
 source = ["unibot", "studip_utils", "studip_session", "studip_oauth", "studip_vault", "studip_http", "stums_parsers", "stums_client", "exam_reminder"]

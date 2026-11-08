@@ -12,6 +12,7 @@ import random
 import tempfile
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
@@ -51,6 +52,7 @@ from unibot.storage import (
     shared_http,
 )
 from unibot.telegram_ui import (
+    user_data,
     _download_telegram_file,
     _show_typing,
     _start_loading_animation,
@@ -124,7 +126,7 @@ def _add_required_outerwear(items: list[dict], chosen: list[dict], weather: Opti
     if not _outerwear_required(weather) or any(it.get("type") == "outerwear" for it in chosen):
         return chosen
     pool = _prefer_unworn([it for it in items if it.get("type") == "outerwear"], recent_ids)
-    preferred = "coat" if _temperature_band(weather.get("temp_max")) in ("very_cold", "cold") else "light_jacket"
+    preferred = "coat" if _temperature_band((weather or {}).get("temp_max")) in ("very_cold", "cold") else "light_jacket"
     outer = next((it for it in pool if it.get("subtype") == preferred), None) or (pool[0] if pool else None)
     return chosen + [outer] if outer else chosen
 
@@ -370,7 +372,7 @@ async def handle_wardrobe_add_item(update: Update, context: ContextTypes.DEFAULT
     if not is_user_admin(user_id):
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
-    context.user_data["pending_step"] = "wardrobe_add_item"
+    user_data(context)["pending_step"] = "wardrobe_add_item"
     await query.message.reply_text("📸 Send a photo of one clothing item.")
 
 
@@ -381,7 +383,7 @@ async def handle_wardrobe_set_reference(update: Update, context: ContextTypes.DE
     if not is_user_admin(user_id):
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
-    context.user_data["pending_step"] = "wardrobe_set_reference"
+    user_data(context)["pending_step"] = "wardrobe_set_reference"
     await query.message.reply_text("🖼️ Send one clear full-body photo of yourself — I'll reuse it every morning.")
 
 
@@ -692,7 +694,7 @@ async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -
             paths.append(path)
             with open(path, "wb") as f:
                 f.write(data)
-            urls.append(await fal_client.upload_file_async(path))
+            urls.append(await fal_client.upload_file_async(Path(path)))
 
         result = await fal_client.subscribe_async(
             FAL_GEMINI_TRYON_MODEL,
@@ -741,8 +743,8 @@ async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optio
                 f.write(person_bytes)
             with open(garment_path, "wb") as f:
                 f.write(garment_bytes)
-            person_url = await fal_client.upload_file_async(person_path)
-            garment_url = await fal_client.upload_file_async(garment_path)
+            person_url = await fal_client.upload_file_async(Path(person_path))
+            garment_url = await fal_client.upload_file_async(Path(garment_path))
             result = await fal_client.subscribe_async(
                 FAL_TRYON_MODEL,
                 arguments={"model_image": person_url, "garment_image": garment_url},
@@ -961,8 +963,8 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
         result = await asyncio.to_thread(_call)
         output_path = result[0] if isinstance(result, (list, tuple)) else result
         if output_path and os.path.exists(output_path):
-            with open(output_path, "rb") as f:
-                return f.read()
+            with open(output_path, "rb") as result_file:
+                return result_file.read()
         return None
     except Exception as e:
         logging.warning("generate_outfit_tryon_accessories failed: %s", e)

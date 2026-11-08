@@ -303,18 +303,20 @@ def get_user_session(user_id: Optional[int] = None) -> StudIPSession:
     if user_id is None:
         user_id = current_user_id()
     if user_id is None:
-        if state.global_session is None:
-            state.global_session = pick_watcher_session()
-        return state.global_session
+        watcher = state.global_session
+        if watcher is None:
+            watcher = state.global_session = pick_watcher_session()
+        return watcher
 
     if user_id in state.user_sessions:
         return state.user_sessions[user_id]
 
-    if is_user_admin(user_id) and state.global_session is not None and not state.global_session.user_id:
-        state.global_session.user_id = user_id
-        state.global_session.cookie_file = f"studip_cookies_{user_id}.json"
-        state.user_sessions[user_id] = state.global_session
-        return state.global_session
+    watcher = state.global_session
+    if is_user_admin(user_id) and watcher is not None and not watcher.user_id:
+        watcher.user_id = user_id
+        watcher.cookie_file = f"studip_cookies_{user_id}.json"
+        state.user_sessions[user_id] = watcher
+        return watcher
 
     # Always the user's own file: the single-user era studip_cookies.json is
     # migrated to the primary admin at startup and never shared between admins.

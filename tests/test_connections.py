@@ -948,6 +948,57 @@ class DatabaseBackupTests(unittest.TestCase):
                 asyncio.run(watcher._run_daily_backup(datetime(2026, 11, 9, 3, 5, tzinfo=watcher.TZ_BERLIN)))
         self.assertEqual(calls, [1])
 
+
+class CallerSessionTests(unittest.TestCase):
+    """Course file downloads use the session of the student they run for,
+    not the admin's watcher session (which may not be in that course)."""
+
+    def test_workload_download_uses_the_given_session(self):
+        from unibot import state, study_plan
+        fetched = []
+
+        class Resp:
+            status = 200
+
+            async def read(self):
+                return b"%PDF-1.4"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class Sess:
+            def __init__(self, label):
+                self.label = label
+
+            async def get(self, url, **kwargs):
+                fetched.append(self.label)
+                return Resp()
+
+        async def files(cid):
+            return [(None, {"name": "slides.pdf", "url": "https://elearning.uni-oldenburg.de/f", "size": "1 MB",
+                            "type": "file"})]
+
+        saved = state.global_session
+        state.global_session = Sess("admin")
+        try:
+            with mock.patch.object(study_plan, "_list_course_files_deep", files), \
+                    mock.patch.object(study_plan, "load_workload_cache", lambda: {}), \
+                    mock.patch.object(study_plan, "save_workload_cache", lambda data: None), \
+                    mock.patch.object(study_plan, "_measure_workload_file", lambda kind, name, content: {"pages": 1}):
+                asyncio.run(study_plan.collect_course_workload(Sess("student"), ["c1"]))
+        finally:
+            state.global_session = saved
+        self.assertEqual(fetched, ["student"])
+
+    def test_fast_enroll_validation_handles_missing_values(self):
+        from unibot.enrollment import validate_fastenroll_args
+        self.assertIn("course id", validate_fastenroll_args(None, "08:00:00", None))
+        self.assertIn("HH:MM:SS", validate_fastenroll_args("a" * 32, None, None))
+        self.assertIsNone(validate_fastenroll_args("a" * 32, "08:00:00", None))
+
 class RetireImportedFilesTests(unittest.TestCase):
     def test_files_already_in_the_database_are_renamed(self):
         from unibot import db

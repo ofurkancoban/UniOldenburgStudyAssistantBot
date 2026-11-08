@@ -14,6 +14,7 @@ from telegram.ext import ContextTypes
 from studip_utils import TZ_BERLIN
 
 from unibot import db
+from unibot.telegram_ui import user_data
 from unibot.config import (
     WEATHER_LATITUDE,
     WEATHER_LONGITUDE,
@@ -93,7 +94,7 @@ async def handle_set_weather_location(update: Update, context: ContextTypes.DEFA
     if not is_user_allowed(user_id):
         return
 
-    context.user_data["pending_step"] = "weather_location"
+    user_data(context)["pending_step"] = "weather_location"
     current = load_weather_location()
     current_line = f"\nCurrently: {current['name']}, {current['country']}" if current else ""
     await query.message.reply_text(f"📍 Where should I check the weather for? (city or place name){current_line}")

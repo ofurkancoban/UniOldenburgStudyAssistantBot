@@ -7,6 +7,7 @@ import asyncio
 import html
 import logging
 import time
+from typing import Any, Optional
 from datetime import datetime, timedelta
 
 from bs4 import BeautifulSoup
@@ -40,6 +41,7 @@ from unibot.storage import (
 )
 from unibot.formatting import _short_id, clean_html_text
 from unibot.telegram_ui import (
+    user_data,
     _breadcrumb,
     _reply_or_edit,
     _send_file_bytes,
@@ -85,7 +87,7 @@ from unibot.voice import nav_stack
 from unibot.system import status_command
 
 
-user_courses = {}  # user_id -> cid
+user_courses: dict[int, str] = {}  # user_id -> cid
 START_MENU_DEDUP_SECONDS = 30
 
 
@@ -709,7 +711,7 @@ async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    handler = _STATUS_BUTTON_HANDLERS.get(query.data)
+    handler = _STATUS_BUTTON_HANDLERS.get(query.data or "")
     if handler is not None:
         await handler(update, context, query)
 
@@ -778,8 +780,8 @@ async def _selection_file(update, context, query, data, user_id):
     # Check cached or current URL
     temp_url = info.get("url")
     current_url = info.get("current_url")
-    user_sess = get_user_session(user_id)
-    active_session = user_sess or state.global_session
+    # get_user_session falls back to the watcher session by itself
+    user_sess = active_session = get_user_session(user_id)
 
     # Try cached URL first
     if temp_url:
@@ -1002,8 +1004,7 @@ async def _selection_message(update, context, query, data, user_id):
         except Exception as api_err:
             logging.warning("Message %s: API failed (%s), reading the HTML page", msg_id, api_err)
             msg_url = f"https://elearning.uni-oldenburg.de/dispatch.php/messages/read/{msg_id}/rec"
-            active_session = user_sess or state.global_session
-            async with await active_session.get(msg_url) as resp:
+            async with await user_sess.get(msg_url) as resp:
                 html = await resp.text()
 
             # lxml, not html.parser - see the comment in check_new_announcements_parallel
@@ -1111,7 +1112,7 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # custom keyboard (get_main_keyboard()) even after it's resent later, so instead
 # each step is tracked in context.user_data["pending_step"] and plain text answers
 # (no forced reply) are matched against it here.
-async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text_override: str = None) -> bool:
+async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text_override: Optional[str] = None) -> bool:
     """If the user has an active multi-step wizard pending, consume this message
     as that step's answer and return True. Otherwise return False so the caller
     falls through to normal button/text handling.
@@ -1230,7 +1231,7 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer()
         data = query.data.split("|")
         chat_id = query.message.chat_id
-        sender = query
+        sender: Any = query.message  # a CallbackQuery itself has no reply_text
     else:
         text = (message.text or "").strip()
         # Study buttons have their own status messages, so they skip the
@@ -1370,7 +1371,7 @@ async def send_course_picker(message, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("ℹ️ No enrolled courses found.")
         return
 
-    context.user_data["course_view_options"] = courses
+    user_data(context)["course_view_options"] = courses
     keyboard = [
         [InlineKeyboardButton(f"📘 {name[:40]}", callback_data=f"course_view|{i}")]
         for i, (name, cid) in enumerate(courses)
@@ -1434,11 +1435,11 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
         lines.append("📅 <b>Exams:</b> none upcoming")
     else:
         lines.append("📅 <b>Exams</b>")
-        for e in upcoming:
-            title = e["title"]
-            if e.get("group_label"):
-                title += f" ({e['group_label']})"
-            lines.append(f"{title} - {e['exam_date_display']}")
+        for exam in upcoming:
+            title = exam["title"]
+            if exam.get("group_label"):
+                title += f" ({exam['group_label']})"
+            lines.append(f"{title} - {exam['exam_date_display']}")
 
     await query.message.reply_text("\n".join(lines), parse_mode="HTML")
 

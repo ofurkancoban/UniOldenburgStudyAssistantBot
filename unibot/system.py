@@ -21,7 +21,7 @@ import studip_oauth
 from studip_utils import TZ_BERLIN, berlin_now
 
 from unibot import db, state
-from unibot.telegram_ui import broadcast
+from unibot.telegram_ui import user_data, broadcast
 from unibot.config import (
     ALLOWED_USER_IDS,
     PROJECT_ROOT,
@@ -491,7 +491,7 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await broadcast(context.bot, announcement, parse_mode="HTML", disable_notification=False)
         await update.message.reply_text("✅ Announcement broadcasted to all active students.", parse_mode="HTML")
     else:
-        context.user_data["pending_step"] = "admin_broadcast_text"
+        user_data(context)["pending_step"] = "admin_broadcast_text"
         await update.message.reply_text(
             "📢 <b>Broadcast Announcement</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
@@ -694,7 +694,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     if data == "admin_broadcast_prompt":
-        context.user_data["pending_step"] = "admin_broadcast_text"
+        user_data(context)["pending_step"] = "admin_broadcast_text"
         keyboard = [[InlineKeyboardButton("❌ Cancel", callback_data="admin_menu")]]
         await query.edit_message_text(
             "📢 <b>Broadcast Announcement</b>\n"

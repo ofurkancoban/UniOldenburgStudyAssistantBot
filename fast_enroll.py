@@ -72,7 +72,7 @@ def list_pending_jobs(chat_id) -> dict:
     return load_pending().get(str(chat_id), {})
 
 
-def save_pending_job(chat_id, sem_id: str, target_time_str: str, target_date_str: str):
+def save_pending_job(chat_id, sem_id: str, target_time_str: str, target_date_str: Optional[str]):
     pending = load_pending()
     pending.setdefault(str(chat_id), {})[sem_id] = {
         "sem_id": sem_id,

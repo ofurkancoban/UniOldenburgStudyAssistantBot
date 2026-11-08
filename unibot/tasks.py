@@ -19,7 +19,7 @@ from fast_enroll import clear_pending_job, run_fast_enroll
 from studip_utils import TZ_BERLIN
 
 from unibot.storage import load_tasks, save_tasks
-from unibot.telegram_ui import get_main_keyboard
+from unibot.telegram_ui import user_data, get_main_keyboard
 from unibot.auth import get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import list_courses
 from unibot.ai import _call_openrouter, _extract_json_object
@@ -27,10 +27,10 @@ from unibot.schedule import fastenroll_tasks
 from unibot.monitoring import announcement_task_cache, task_suggestion_cache
 
 
-task_reminder_cache = {}  # task_id -> full task dict -- a fired reminder, kept around so its Done/Snooze buttons still work after the task's removed from tasks_cache.json
+task_reminder_cache: dict[str, dict] = {}  # task_id -> full task dict -- a fired reminder, kept around so its Done/Snooze buttons still work after the task's removed from tasks_cache.json
 
 
-async def _run_fastenroll_task(chat_id: int, sem_id: str, target_time_str: str, target_date_str: str, context: ContextTypes.DEFAULT_TYPE):
+async def _run_fastenroll_task(chat_id: int, sem_id: str, target_time_str: str, target_date_str: Optional[str], context: ContextTypes.DEFAULT_TYPE):
     async def on_progress(msg: str):
         try:
             await context.bot.send_message(chat_id=chat_id, text=f"⏱️ {msg}", disable_notification=True)
@@ -147,7 +147,7 @@ async def handle_task_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if query.data == "task_add":
         context.user_data.pop("task_wizard", None)
-        context.user_data["pending_step"] = "task_text"
+        user_data(context)["pending_step"] = "task_text"
         await query.message.reply_text(TASK_ASK_TEXT, reply_markup=get_main_keyboard())
         return
 
@@ -196,7 +196,7 @@ async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAUL
         # No date found (or extraction unavailable) - fall back to the
         # original text and the explicit follow-up question, unchanged.
         state["text"] = text
-        context.user_data["pending_step"] = "task_time"
+        user_data(context)["pending_step"] = "task_time"
         await update.effective_message.reply_text(TASK_ASK_TIME, reply_markup=get_main_keyboard())
         return True
 

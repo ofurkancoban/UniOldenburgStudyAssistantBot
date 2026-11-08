@@ -29,6 +29,14 @@ from unibot.config import ALLOWED_USER_IDS
 nav_names: dict[int, list[str]] = {}  # user_id -> [name1, name2, ...]  (for breadcrumb)
 
 
+def user_data(context) -> dict:
+    """context.user_data as a plain dict. PTB types it Optional because
+    updates without a user (channel posts) have none; handlers here always
+    run for a user, so the empty fallback is never actually written to."""
+    data = context.user_data
+    return data if data is not None else {}
+
+
 def _breadcrumb(user_id: int) -> str:
     """Format the navigation breadcrumb for the user."""
     parts = nav_names.get(user_id, [])

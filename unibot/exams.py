@@ -11,7 +11,7 @@ import os
 import re
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import ContextTypes
@@ -47,7 +47,7 @@ from unibot.whatsapp import EXAM_DATES_FOOTER, WA_FORWARD_ASK_MARKUP, _send_text
 from unibot.monitoring import _format_exam_dates_message
 
 
-exam_action_cache = {}  # short_id -> { unit_id, action_type ("anmelden"|"abmelden"), title, ts }
+exam_action_cache: dict[str, dict] = {}  # short_id -> { unit_id, action_type ("anmelden"|"abmelden"), title, ts }
 
 
 async def send_exam_registration_menu(message, user_id=None):
@@ -1028,7 +1028,7 @@ async def refresh_stums_exam_sittings(session, all_exams: Optional[list] = None)
         course_codes = set(codes.get(cid, []))
         if not course_codes:
             continue
-        seen = {}
+        seen: dict[str, Any] = {}
         for e in all_exams:
             # A course listed under several modules (e.g. a core elective
             # pool) must not take the date of one the student already passed.
@@ -1059,6 +1059,10 @@ async def scan_course_files_for_exams(session) -> list:
     with "previous_date" set when it replaced an older date of the same
     kind), for notify_new_file_exam_events."""
     from unibot.study_plan import _auto_tracked_cids, _file_size_mb, _list_course_files, classify_lecture_file, load_study_progress
+    # downloads use the session the caller passed in (a participant's), not the admin's
+    http = session or state.global_session
+    if http is None:
+        return []
     await _ensure_watched_courses_map(session)
     progress = load_study_progress()
     tracked = progress.get("tracked")
@@ -1098,7 +1102,7 @@ async def scan_course_files_for_exams(session) -> list:
                     continue
 
                 try:
-                    async with await state.global_session.get(url) as resp:
+                    async with await http.get(url) as resp:
                         if resp.status != 200:
                             continue
                         content = await resp.read()
@@ -1135,15 +1139,15 @@ async def scan_course_files_for_exams(session) -> list:
         if e["date"] and e["date"] >= today
     }
     new_events = []
-    for key, e in current.items():
+    for key, exam in current.items():
         if key in notified:
             continue
         replaced = next(
             (old for old_key, old in notified.items()
-             if old_key not in current and old.get("cid") == e["cid"] and old.get("kind") == e["kind"] and old.get("date", "") >= today),
+             if old_key not in current and old.get("cid") == exam["cid"] and old.get("kind") == exam["kind"] and old.get("date", "") >= today),
             None,
         )
-        new_events.append({**e, "previous_date": replaced["date"] if replaced else None})
+        new_events.append({**exam, "previous_date": replaced["date"] if replaced else None})
     cache = load_exam_file_cache()
     cache["notified"] = {k: v for k, v in current.items()}
     save_exam_file_cache(cache)

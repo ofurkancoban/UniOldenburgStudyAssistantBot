@@ -176,7 +176,7 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
     # headers) even though the course details underneath differ. _sem_label
     # is only set on items at all when two semesters were actually merged
     # (see above), so this is a no-op grouping-by-module-alone otherwise.
-    grouped = {}
+    grouped: dict[tuple, list] = {}
     for c in open_courses:
         grouped.setdefault((c.get("_sem_label"), c["module"]), []).append(c)
 
@@ -352,7 +352,8 @@ def _chunk_text(text: str) -> list:
     possible, overlapping a little so a sentence split across two is
     still found whole in one of them."""
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    chunks, start = [], 0
+    chunks: list[str] = []
+    start = 0
     while start < len(text) and len(chunks) < COURSE_INDEX_MAX_CHUNKS_PER_FILE:
         end = min(len(text), start + COURSE_INDEX_CHUNK_CHARS)
         if end < len(text):
@@ -387,7 +388,7 @@ async def embed_texts(texts: list) -> Optional[list]:
                 if status != 429 or attempt:
                     break
                 await asyncio.sleep(GWDG_BURST_WAIT_SECONDS)
-        if status != 200:
+        if status != 200 or data is None:
             logging.warning("GWDG embeddings failed: HTTP %s", status)
             return None
         return [d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"])]
@@ -404,7 +405,8 @@ async def index_course_files(session) -> dict:
     COURSE_INDEX_MAX_CALLS embedding requests and continues next run.
     Returns {"indexed": n_files, "chunks": n_chunks, "removed": n}."""
     stats = {"indexed": 0, "chunks": 0, "removed": 0}
-    if not GWDG_API_KEY:
+    http = session or state.global_session  # downloads use the caller's session
+    if not GWDG_API_KEY or http is None:
         return stats
     await _ensure_watched_courses_map(session)
     index = load_course_index()
@@ -434,7 +436,7 @@ async def index_course_files(session) -> dict:
             if calls >= COURSE_INDEX_MAX_CALLS:
                 continue
             try:
-                async with await state.global_session.get(url) as resp:
+                async with await http.get(url) as resp:
                     if resp.status != 200:
                         continue
                     content = await resp.read()
@@ -513,7 +515,7 @@ async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
     if user_id is None or is_user_admin(user_id):
         await _ensure_watched_courses_map(session)
     tracked = load_study_progress(user_id=user_id).get("tracked")
-    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
     courses = [(name, cid) for cid, name in courses_dict.items() if tracked is None or cid in tracked]
     if not courses:
         return {}
@@ -522,6 +524,8 @@ async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
     semaphore = asyncio.Semaphore(3)
 
     active_session = session or state.global_session
+    if active_session is None:
+        return {}
 
     async def process_course(course_name, cid):
         async with semaphore:
@@ -751,7 +755,7 @@ def _measure_workload_file(kind: str, name: str, content: bytes) -> dict:
 async def _list_course_files_deep(cid) -> list:
     """Like _list_course_files, plus the problem-set/project subfolders
     inside weekly dated folders ("20261013/PS/PS_BaseR.pdf")."""
-    out = []
+    out: list[tuple[Optional[str], dict]] = []  # (dated folder or None, file)
     for item in await list_files(cid):
         if item.get("type") == "file":
             out.append((None, item))
@@ -782,6 +786,9 @@ async def collect_course_workload(session, cids: list) -> dict:
     """Measure every schedulable file of the given courses (downloads only
     new/changed files; videos are never downloaded, only their size is
     used) and return {cid: {rel_path: entry}} for them."""
+    http = session or state.global_session  # downloads use the caller's session
+    if http is None:
+        return {}
     cache = load_workload_cache()
     semaphore = asyncio.Semaphore(3)
 
@@ -793,7 +800,7 @@ async def collect_course_workload(session, cids: list) -> dict:
                 logging.warning("collect_course_workload: listing failed for %s: %s", cid, e)
                 return
             old_entries = cache.get(cid, {})
-            entries = {}
+            entries: dict[str, dict] = {}
             for folder, f in files:
                 name, url = f.get("name"), f.get("url")
                 kind = classify_workload_file(name or "", folder)
@@ -815,7 +822,7 @@ async def collect_course_workload(session, cids: list) -> dict:
                     entries[key] = old
                     continue
                 try:
-                    async with await state.global_session.get(url) as resp:
+                    async with await http.get(url) as resp:
                         if resp.status != 200:
                             continue
                         content = await resp.read()
@@ -1065,7 +1072,7 @@ async def _get_lectures_held(session, progress: dict, refresh: bool = False, use
     today_iso = datetime.now(TZ_BERLIN).date().isoformat()
     if not refresh and progress.get("held_date") == today_iso and "held" in progress:
         return progress["held"]
-    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
     course_candidates = [(name, cid) for cid, name in courses_dict.items()]
     held = await count_lectures_held(session, course_candidates)
     progress["held"] = held
@@ -1207,7 +1214,7 @@ async def gather_weekly_study_inputs(session, user_id: Optional[int] = None) -> 
         raw_exams = []
 
     course_files = await collect_course_topics(session, user_id=user_id)
-    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
     course_candidates = [(name, cid) for cid, name in courses_dict.items()]
     exams = []
     for exam in raw_exams:
@@ -1393,7 +1400,7 @@ async def _load_progress_rows(refresh: bool = False, user_id: Optional[int] = No
             await list_courses(session=active_session, user_id=user_id)
         except Exception as e:
             logging.warning("_load_progress_rows: failed to fetch courses for user %s: %s", user_id, e)
-    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
     if refresh:
         await collect_course_topics(active_session, user_id=user_id)
     progress = load_study_progress(user_id=user_id)
@@ -1440,7 +1447,7 @@ def _auto_tracked_cids(progress: dict, user_id: Optional[int] = None) -> list:
     semester or with progress already logged."""
     held = progress.get("held", {})
     studied = progress.get("studied", {})
-    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
     return [cid for cid in courses_dict if held.get(cid, 0) > 0 or studied.get(cid)]
 
 
@@ -1457,7 +1464,7 @@ def render_track_menu(progress: dict, user_id: Optional[int] = None) -> tuple:
         "Tap a course to add or remove it.",
     ]
     keyboard = []
-    courses_dict = state.user_courses_map.get(user_id) if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
     for cid, name in sorted(courses_dict.items(), key=lambda kv: (kv[0] not in selected, kv[1].lower())):
         mark = "✅" if cid in selected else "⬜"
         n = held.get(cid, 0)

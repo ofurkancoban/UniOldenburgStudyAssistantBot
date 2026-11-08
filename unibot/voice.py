@@ -9,7 +9,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, cast
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
@@ -39,7 +39,7 @@ from unibot.storage import (
     set_wardrobe_reference_photo,
 )
 from unibot.formatting import _short_id, clean_course_title
-from unibot.telegram_ui import _download_telegram_file, get_main_keyboard, nav_names
+from unibot.telegram_ui import user_data, _download_telegram_file, get_main_keyboard, nav_names
 from unibot.auth import get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import BASE_URL, _normalize_url, list_courses, list_files
 from unibot.ai import _call_openrouter, _extract_json_object
@@ -65,7 +65,7 @@ from unibot.enrollment import send_fastenroll_list
 from unibot.morning import send_daily_plan_voice, send_text_and_voice, send_weekly_plan_voice
 
 
-nav_stack = {}  # user_id -> [url1, url2, ...]
+nav_stack: dict[int, list[Optional[str]]] = {}  # user_id -> [url1, url2, ...]
 
 
 # ── Voice intent routing (free-tier OpenRouter LLM) ─────────────────────────
@@ -278,15 +278,15 @@ async def _upcoming_exams(session):
 
     now = berlin_now()
     upcoming = []
-    for e in registered:
-        if not e.get("date"):
+    for exam in registered:
+        if not exam.get("date"):
             continue
-        if e.get("start_datetime"):
-            dt = datetime.fromisoformat(e["start_datetime"])
+        if exam.get("start_datetime"):
+            dt = datetime.fromisoformat(exam["start_datetime"])
         else:
-            dt = datetime.fromisoformat(e["date"]).replace(hour=9, minute=0)
+            dt = datetime.fromisoformat(exam["date"]).replace(hour=9, minute=0)
         if dt >= now:
-            upcoming.append((e["title"], dt))
+            upcoming.append((exam["title"], dt))
 
     upcoming.sort(key=lambda x: x[1])
     return upcoming
@@ -323,16 +323,16 @@ async def _find_exam_datetime(session, query_text: Optional[str]):
         all_exams = []
 
     pool = []  # (title, datetime, has_exact_time)
-    for e in registered:
-        if not e.get("date"):
+    for exam in registered:
+        if not exam.get("date"):
             continue
-        if e.get("start_datetime"):
-            pool.append((e["title"], datetime.fromisoformat(e["start_datetime"]), True))
+        if exam.get("start_datetime"):
+            pool.append((exam["title"], datetime.fromisoformat(exam["start_datetime"]), True))
         else:
-            pool.append((e["title"], datetime.fromisoformat(e["date"]).replace(hour=9, minute=0), False))
-    for e in all_exams:
-        if e.get("exam_date"):
-            pool.append((e["title"], datetime.fromisoformat(e["exam_date"]).replace(hour=9, minute=0), False))
+            pool.append((exam["title"], datetime.fromisoformat(exam["date"]).replace(hour=9, minute=0), False))
+    for exam in all_exams:
+        if exam.get("exam_date"):
+            pool.append((exam["title"], datetime.fromisoformat(exam["exam_date"]).replace(hour=9, minute=0), False))
 
     if not pool:
         return None, None, False
@@ -471,7 +471,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await status_msg.edit_text("⚠️ Couldn't recognize that item — try a clearer photo of just this one piece of clothing, or /status to cancel.")
             return  # pending_step stays set so a retry just works
         # Best effort: without it the GWDG try-on describes the item later.
-        tags["description"] = await describe_wardrobe_item(tags, image_bytes)
+        tags["description"] = await describe_wardrobe_item(tags, image_bytes or b"")
         item = add_wardrobe_item(user_id, tags, file_id=file_id)
         context.user_data.pop("pending_step", None)
         subtype_note = f"/{item['subtype']}" if item.get("subtype") else ""
@@ -509,7 +509,7 @@ async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     if pending["step"]:
-        context.user_data["pending_step"] = pending["step"]
+        user_data(context)["pending_step"] = pending["step"]
         await handle_pending_step(update, context, text_override=pending["text"])
         return
 
@@ -629,7 +629,7 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
 async def _voice_intent_check_status(update, context, result, transcript, intent, query_text, alternatives, message):
     """Voice intent: check_status."""
     from unibot.system import status_command
-    await status_command(_UpdateMessageShim(update), context)
+    await status_command(cast(Update, _UpdateMessageShim(update)), context)  # duck-typed shim
     return True
 
 
@@ -1000,7 +1000,7 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Unreachable given VOICE_INTENTS, but degrade to task creation rather
     # than silently dropping the voice note if a new intent is ever added
     # here without a branch.
-    context.user_data["pending_step"] = "task_text"
+    user_data(context)["pending_step"] = "task_text"
     context.user_data.pop("task_wizard", None)
     await handle_pending_step(update, context, text_override=transcript)
 
