@@ -836,7 +836,8 @@ async def _voice_intent_exam_register(update, context, result, transcript, inten
     matched_exam = _best_title_match(query_text, [(e["title"], e) for e in exams])
     if matched_exam:
         sid = str(uuid.uuid4())[:8]
-        exam_action_cache[sid] = {"unit_id": matched_exam["unit_id"], "action_type": action_type, "title": matched_exam["title"]}
+        exam_action_cache[sid] = {"unit_id": matched_exam["unit_id"], "action_type": action_type,
+                                  "title": matched_exam["title"], "user_id": update.effective_user.id}
         label = "📝 Register" if intent == "exam_register" else "🗑️ Deregister"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"{label}: {matched_exam['title'][:40]}?", callback_data=f"exam_ask|{sid}")]])
         await message.reply_text(f"🎙️ Found a match: {matched_exam['title']}", reply_markup=keyboard)

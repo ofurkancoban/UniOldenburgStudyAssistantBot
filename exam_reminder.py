@@ -344,6 +344,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
             "action_type": "anmelden",
             "title": exam["title"],
             "code": code,
+            "user_id": getattr(session, "user_id", None),  # whose notification this is
             # Carried along so "📲 Forward to WA" (handle_examopen_wa_confirm,
             # studip_bot.py) can rebuild the same detailed text the Telegram
             # notification itself shows, instead of just the course title.

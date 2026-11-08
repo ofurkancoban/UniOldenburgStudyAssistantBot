@@ -50,6 +50,20 @@ from unibot.monitoring import _format_exam_dates_message
 exam_action_cache: dict[str, dict] = {}  # short_id -> { unit_id, action_type ("anmelden"|"abmelden"), title, ts }
 
 
+def _exam_action(sid: str, user_id: int) -> Optional[dict]:
+    """The cached exam button action, or None when it expired or belongs to
+    another student (a button seen in a group chat or a forwarded message
+    must not act on someone else's exam list)."""
+    info = exam_action_cache.get(sid)
+    if not info:
+        return None
+    owner = info.get("user_id")
+    if owner is not None and owner != user_id:
+        logging.warning("Exam button of user %s tapped by user %s; ignored", owner, user_id)
+        return None
+    return info
+
+
 async def send_exam_registration_menu(message, user_id=None):
     """Show currently open-for-registration and currently-registered exams on
     the StuMS/HISinOne portal, each with a Register/Deregister button."""
@@ -84,6 +98,7 @@ async def send_exam_registration_menu(message, user_id=None):
                 "unit_id": exam["unit_id"],
                 "action_type": "anmelden",
                 "title": exam["title"],
+                "user_id": getattr(session, "user_id", None),
             }
             label = f"📝 {exam['title']}"
             if exam.get("exam_date_text"):
@@ -98,6 +113,7 @@ async def send_exam_registration_menu(message, user_id=None):
                 "unit_id": exam["unit_id"],
                 "action_type": "abmelden",
                 "title": exam["title"],
+                "user_id": getattr(session, "user_id", None),
             }
             keyboard.append([InlineKeyboardButton(f"🗑️ {exam['title']}"[:64], callback_data=f"exam_ask|{sid}")])
 
@@ -139,7 +155,7 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     action, sid = query.data.split("|", 1)
-    info = exam_action_cache.get(sid)
+    info = _exam_action(sid, query.from_user.id)
     if not info:
         await query.message.reply_text("⚠️ This exam action has expired. Please open the Exam Registration menu again.")
         return
@@ -193,7 +209,7 @@ async def handle_examopen_wa_ask(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
     sid = query.data.split("|", 1)[1]
-    info = exam_action_cache.get(sid)
+    info = _exam_action(sid, query.from_user.id)
     if not info:
         await query.message.reply_text("⚠️ This notification has expired.")
         return
@@ -212,7 +228,7 @@ async def handle_examopen_wa_confirm(update: Update, context: ContextTypes.DEFAU
     query = update.callback_query
     await query.answer("Sending to WhatsApp...")
     sid = query.data.split("|", 1)[1]
-    info = exam_action_cache.get(sid)
+    info = _exam_action(sid, query.from_user.id)
     if not info:
         await query.edit_message_text("⚠️ This notification has expired.")
         return
@@ -245,7 +261,7 @@ async def handle_examopen_mute_ask(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     sid = query.data.split("|", 1)[1]
-    info = exam_action_cache.get(sid)
+    info = _exam_action(sid, query.from_user.id)
     if not info:
         await query.message.reply_text("⚠️ This notification has expired.")
         return
@@ -268,7 +284,7 @@ async def handle_examopen_mute_confirm(update: Update, context: ContextTypes.DEF
     query = update.callback_query
     await query.answer()
     sid = query.data.split("|", 1)[1]
-    info = exam_action_cache.get(sid)
+    info = _exam_action(sid, query.from_user.id)
     if not info:
         await query.edit_message_text("⚠️ This notification has expired.")
         return

@@ -1075,7 +1075,13 @@ async def _selection_start_watchers(update, context, query, data, user_id):
     await handle_status_buttons(update, context)
 
 
+async def _selection_show_menu(update, context, query, data, user_id):
+    """Inline button callback: back to the main keyboard (e.g. from an empty course list)."""
+    await query.message.reply_text("🏠 Main menu", reply_markup=get_main_keyboard())
+
+
 _SELECTION_HANDLERS = {
+    "show_menu": _selection_show_menu,
     "course": _selection_course,
     "folder": _selection_folder,
     "file": _selection_file,
