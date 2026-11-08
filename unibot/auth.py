@@ -4,27 +4,31 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import contextlib
-from dataclasses import dataclass
 import contextvars
 import errno
 import html
 import logging
 import os
+from dataclasses import dataclass
 from typing import Optional
 
 import psutil
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonDefault, Update, WebAppInfo
-from telegram.ext import ApplicationHandlerStop, ContextTypes
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonDefault,
+    Update,
+    WebAppInfo,
+)
 from telegram.error import TelegramError
+from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 import studip_oauth
-from studip_login_server import LoginServer
 from studip_http import BACKGROUND, INTERACTIVE, set_request_priority
+from studip_login_server import LoginServer
 from studip_session import StudIPSession, StumsState
 from studip_tunnel import NamedTunnel, QuickTunnel
-
-from unibot import db
-from unibot import state
+from unibot import db, state
 from unibot.config import (
     ADMIN_USER_IDS,
     ALLOWED_USER_IDS,
@@ -40,7 +44,6 @@ from unibot.db import (
     redeem_invite_token,
     update_user_activity,
 )
-
 
 # Credentials are never stored in .env or in memory; authentication happens via
 # the Telegram Mini App (/login) which persists only cookies & OAuth2 tokens.
@@ -752,22 +755,26 @@ async def _perform_logout(user_id: Optional[int] = None) -> None:
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/login - open the Stud.IP login page (Mini App or browser)."""
-    user = update.effective_user
-    if not is_user_allowed(user.id if user else None):
-        await update.message.reply_text("⛔ Not authorised.")
+    user, message = update.effective_user, update.message
+    if message is None:
         return
-    await _send_login_prompt(update.message, user.id)
+    if user is None or not is_user_allowed(user.id):
+        await message.reply_text("⛔ Not authorised.")
+        return
+    await _send_login_prompt(message, user.id)
 
 
 async def logout_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/logout - sign out of Stud.IP and clear stored session cookies & OAuth2 tokens."""
-    user = update.effective_user
+    user, message = update.effective_user, update.message
     uid = user.id if user else None
+    if message is None:
+        return
     if not is_user_allowed(uid):
-        await update.message.reply_text("⛔ Not authorised.")
+        await message.reply_text("⛔ Not authorised.")
         return
     await _perform_logout(user_id=uid)
-    await update.message.reply_text(
+    await message.reply_text(
         "🚪 Logged out from Stud.IP. Saved session cookies and OAuth2 tokens have been cleared.\n"
         "Use /login or the 🔐 Login button under ℹ️ Status whenever you want to sign in again."
     )

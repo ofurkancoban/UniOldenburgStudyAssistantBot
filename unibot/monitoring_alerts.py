@@ -20,10 +20,8 @@ from unibot.telegram_ui import (
     broadcast,
 )
 
-task_suggestion_cache = {}  # short_id -> { text, due_time (ISO or None), course }
-
-
-announcement_task_cache = {}  # short_id -> { course, subject, body } - raw announcement, converted to a task on demand when "📝 Add as Task" is tapped
+task_suggestion_cache: dict[str, dict] = {}  # short_id -> { text, due_time (ISO or None), course }
+announcement_task_cache: dict[str, dict] = {}  # short_id -> { course, subject, body } - raw announcement, converted to a task on demand when "📝 Add as Task" is tapped
 
 
 def course_members(cid: Optional[str]):

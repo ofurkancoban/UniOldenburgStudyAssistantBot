@@ -5,31 +5,38 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 
 import json
 import logging
+import posixpath
 import re
+import zipfile
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from io import BytesIO
+from typing import Any, Optional
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
 import studip_oauth
-import posixpath
-import zipfile
-from io import BytesIO
 from fast_enroll import get_semester_options
 from studip_utils import (
     TZ_BERLIN,
     berlin_now,
     redact_url,
+    tag_attr,
+)
+from studip_utils import (
     safe_filename as _safe_filename,
+)
+from studip_utils import (
     safe_zip_path as _safe_zip_path,
 )
-
 from unibot import state
-from unibot.storage import get_watch_previous_semester_enabled, load_default_semester, save_studip_user_name
-from unibot.formatting import clean_html_text
 from unibot.auth import current_user_id, get_user_session, is_user_admin, login_studip
-
+from unibot.formatting import clean_html_text
+from unibot.storage import (
+    get_watch_previous_semester_enabled,
+    load_default_semester,
+    save_studip_user_name,
+)
 
 BASE_URL = "https://elearning.uni-oldenburg.de"
 
@@ -70,7 +77,7 @@ def _record_course(cid: str, name: str, user_id: Optional[int] = None) -> None:
 # ── course listing ────────────────────────────────────────────────────────────
 async def list_courses(
     semester_id: Optional[str] = None,
-    session: Optional[object] = None,
+    session: Any = None,
     user_id: Optional[int] = None,
 ):
     """[(name, cid), ...] of the user's courses in semester_id (the current
@@ -90,7 +97,7 @@ async def list_courses(
 
 async def _list_courses_html(
     semester_id: Optional[str] = None,
-    session: Optional[object] = None,
+    session: Any = None,
     user_id: Optional[int] = None,
 ):
     """
@@ -197,9 +204,9 @@ async def _list_courses_html(
         
         # Pattern 1: Table rows with data-course-id (Common in desktop view)
         for row in soup.find_all(["tr", "div", "li"], attrs={"data-course-id": True}):
-            cid = row.get("data-course-id")
+            cid = tag_attr(row, "data-course-id")
             # Try to find a name in the text contents or a title
-            name = row.get("title") or row.get_text(" ", strip=True)
+            name = tag_attr(row, "title") or row.get_text(" ", strip=True)
             if cid and name and len(name) > 3:
                 all_courses_dict[cid] = name
                 _record_course(cid, name, user_id=user_id)
@@ -207,7 +214,7 @@ async def _list_courses_html(
         # Pattern 2: Any link containing a course ID pattern
         course_links = soup.find_all("a", href=re.compile(r"(?:course_id=|to=|details\.php\?id=)([a-f0-9]{32})"))
         for a in course_links:
-            href = a.get("href", "")
+            href = tag_attr(a, "href")
             match = re.search(r"(?:course_id=|to=|details\.php\?id=)([a-f0-9]{32})", href)
             if match:
                 cid = match.group(1)
@@ -324,7 +331,7 @@ class StudipApiError(Exception):
     pass
 
 
-async def studip_api_get(path: str, params: Optional[dict] = None, session: Optional[object] = None, user_id: Optional[int] = None, _retry: bool = True) -> dict:
+async def studip_api_get(path: str, params: Optional[dict] = None, session: Any = None, user_id: Optional[int] = None, _retry: bool = True) -> dict:
     """GET one JSON:API resource ("/users/me" or a "/jsonapi.php/..." link).
 
     The bearer header is added by StudIPSession, so API traffic uses the
@@ -355,7 +362,7 @@ async def studip_api_get(path: str, params: Optional[dict] = None, session: Opti
 async def studip_api_get_all(
     path: str,
     params: Optional[dict] = None,
-    session: Optional[object] = None,
+    session: Any = None,
     user_id: Optional[int] = None,
 ) -> tuple[list, list]:
     """Every page of a JSON:API collection, as (data, included)."""
@@ -384,7 +391,7 @@ def _uses_global_profile(user_id: Optional[int]) -> bool:
     return sess is not None and sess is state.global_session
 
 
-async def get_studip_user_profile(user_id: Optional[int] = None, session: Optional[object] = None) -> dict:
+async def get_studip_user_profile(user_id: Optional[int] = None, session: Any = None) -> dict:
     """Fetch profile of the currently authenticated user from Stud.IP /users/me."""
     if user_id is None and session is None:
         user_id = current_user_id()
@@ -417,7 +424,7 @@ async def get_studip_user_profile(user_id: Optional[int] = None, session: Option
             state._studip_user_profile = profile
             if display_name:
                 save_studip_user_name(display_name)
-        elif studip_id:
+        elif studip_id and user_id is not None:
             _user_profiles[user_id] = profile
         return profile
     except Exception as exc:
@@ -431,7 +438,7 @@ def forget_user_profile(user_id: Optional[int]) -> None:
         _user_profiles.pop(user_id, None)
 
 
-async def studip_api_user_id(session: Optional[object] = None, user_id: Optional[int] = None) -> str:
+async def studip_api_user_id(session: Any = None, user_id: Optional[int] = None) -> str:
     if user_id is None:
         user_id = getattr(session, "user_id", None) if session is not None else current_user_id()
     if user_id is not None and not _uses_global_profile(user_id):
@@ -467,7 +474,7 @@ def _api_berlin(iso: Optional[str]) -> Optional[datetime]:
 
 async def _list_courses_api(
     semester_id: Optional[str] = None,
-    session: Optional[object] = None,
+    session: Any = None,
     user_id: Optional[int] = None,
 ) -> list:
     """(name, cid) for the user's courses in semester_id (the current
@@ -563,7 +570,7 @@ async def _list_files_html(cid, folder_url=None, session=None, user_id=None):
     url = _normalize_url(folder_url) if folder_url else f"{BASE_URL}/dispatch.php/course/files?cid={cid}"
     logging.info(">>> list_files called with cid=%s, folder_url=%s => %s", cid, redact_url(folder_url), redact_url(url))
     
-    active_session = session or get_user_session(user_id) or state.global_session
+    active_session: Any = session or get_user_session(user_id) or state.global_session
     try:
         async with await active_session.get(url) as resp:
             html_text = await resp.text()
@@ -578,8 +585,8 @@ async def _list_files_html(cid, folder_url=None, session=None, user_id=None):
     form = soup.select_one("form#files_table_form")
     if form:
         try:
-            data_files_raw = form.get("data-files")
-            data_folders_raw = form.get("data-folders")
+            data_files_raw = tag_attr(form, "data-files")
+            data_folders_raw = tag_attr(form, "data-folders")
             
             data_files = json.loads(data_files_raw) if data_files_raw else []
             data_folders = json.loads(data_folders_raw) if data_folders_raw else []
@@ -663,13 +670,13 @@ async def _list_files_html(cid, folder_url=None, session=None, user_id=None):
         link_tag = row.select_one("td:nth-child(3) a")
         if not link_tag: continue
         name = link_tag.get_text(strip=True)
-        href = link_tag.get("href")
+        href: Optional[str] = tag_attr(link_tag, "href") or None
         if href:
             href = urljoin(BASE_URL, href)
         
         time_tag = row.find("time")
         modified = time_tag.get_text(strip=True) if time_tag else "-"
-        modified_iso = time_tag.get("datetime") if time_tag else None
+        modified_iso = tag_attr(time_tag, "datetime") or None
         
         items.append({
             "type": "folder",
@@ -687,18 +694,18 @@ async def _list_files_html(cid, folder_url=None, session=None, user_id=None):
         name = name_tag.get_text(strip=True)
         
         download_btn = row.select_one("a[title^='Download file'], a[href*='download/file']")
-        href = download_btn.get("href") if download_btn else None
+        href = tag_attr(download_btn, "href") or None
         if not href:
-            link_tag = row.select_one("td:nth-child(3) a")
-            href = link_tag.get("href") if link_tag else None
+            href = tag_attr(row.select_one("td:nth-child(3) a"), "href") or None
             
         if href:
             href = urljoin(BASE_URL, href)
             
         time_tag = row.find("time")
         modified = time_tag.get_text(strip=True) if time_tag else "-"
-        modified_iso = time_tag.get("datetime") if time_tag else None
-        size = row.select_one("td:nth-child(4) span").get_text(strip=True) if row.select_one("td:nth-child(4) span") else "-"
+        modified_iso = tag_attr(time_tag, "datetime") or None
+        size_tag = row.select_one("td:nth-child(4) span")
+        size = size_tag.get_text(strip=True) if size_tag else "-"
         
         items.append({
             "type": "file",
@@ -755,7 +762,7 @@ async def get_fresh_file_url(cid, filename, current_url=None, session=None, user
 # ── recursive ZIP (downloads all files + subfolders) ───────────────────────────
 async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=None, session=None, user_id=None):
     """Download all files (including subfolders) recursively browser-less."""
-    active_session = session or get_user_session(user_id) or state.global_session
+    active_session: Any = session or get_user_session(user_id) or state.global_session
 
     async def _crawl(url, path_prefix, collected, empty_folders):
         try:
@@ -775,8 +782,8 @@ async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=
                 sub_prefix = posixpath.join(path_prefix, it["name"])
                 await _crawl(it["url"], sub_prefix, collected, empty_folders)
 
-    all_files = []
-    empty_folders = set()
+    all_files: list[dict] = []
+    empty_folders: set[str] = set()
     await _crawl(base_url, root_name, all_files, empty_folders)
     total = len(all_files)
 

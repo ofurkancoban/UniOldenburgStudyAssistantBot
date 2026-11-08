@@ -9,6 +9,7 @@ import logging
 import re
 import uuid
 from datetime import datetime
+from typing import Any
 
 from bs4 import BeautifulSoup
 
@@ -83,7 +84,7 @@ def _parse_tooltip_fields(tip_html: str) -> dict:
     # Unescape and clean
     tip_html = html.unescape(tip_html)
     
-    res = {}
+    res: dict[str, Any] = {}
     # Try as HTML first
     if "<" in tip_html and ">" in tip_html:
         try:

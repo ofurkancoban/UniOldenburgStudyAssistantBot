@@ -42,6 +42,22 @@ files = [
     "unibot/state.py",
     "unibot/diagnostics.py",
     "unibot/watcher.py",
+    "unibot/storage.py",
+    "unibot/formatting.py",
+    "unibot/telegram_ui.py",
+    "unibot/auth.py",
+    "unibot/studip_api.py",
+    "unibot/monitoring_fetch.py",
+    "unibot/monitoring_diff.py",
+    "unibot/monitoring_alerts.py",
+    "unibot/monitoring.py",
+    "studip_session.py",
+    "studip_sso.py",
+    "studip_login_server.py",
+    "studip_tunnel.py",
+    "stums_client.py",
+    "exam_reminder.py",
+    "fast_enroll.py",
 ]
 
 [tool.coverage.run]

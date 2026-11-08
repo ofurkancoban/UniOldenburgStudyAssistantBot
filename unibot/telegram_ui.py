@@ -11,18 +11,22 @@ import tempfile
 import uuid
 from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.constants import ChatAction
-from telegram.ext import ContextTypes
 from telegram.error import TelegramError
+from telegram.ext import ContextTypes
 
-from studip_utils import md_escape as _md, safe_filename as _safe_filename
-
+from studip_utils import md_escape as _md
+from studip_utils import safe_filename as _safe_filename
 from unibot import db, state
 from unibot.config import ALLOWED_USER_IDS
 
-
-nav_names = {}  # user_id -> [name1, name2, ...]  (for breadcrumb)
+nav_names: dict[int, list[str]] = {}  # user_id -> [name1, name2, ...]  (for breadcrumb)
 
 
 def _breadcrumb(user_id: int) -> str:

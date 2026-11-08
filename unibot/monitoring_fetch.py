@@ -10,7 +10,7 @@ from typing import Optional
 
 from bs4 import BeautifulSoup
 
-from studip_utils import TZ_BERLIN, berlin_now, redact_url
+from studip_utils import TZ_BERLIN, berlin_now, redact_url, tag_attr
 from unibot.formatting import (
     _truncate_with_ellipsis,
     clean_html_text,
@@ -161,7 +161,7 @@ async def _fetch_messages_html(session) -> list:
     for tr in rows:
         link_tag = tr.select_one("td.title a[href*='dispatch.php/messages/read/']")
         if not link_tag: continue
-        href = link_tag["href"].strip()
+        href = tag_attr(link_tag, "href").strip()
         title = link_tag.get_text(strip=True)
         sender_tag = tr.select_one("td:nth-of-type(3)")
         sender = sender_tag.get_text(strip=True) if sender_tag else "Unknown"
@@ -172,7 +172,7 @@ async def _fetch_messages_html(session) -> list:
             href = f"{BASE_URL}/{href.lstrip('/')}"
 
         all_messages.append({
-            "id": tr["id"].replace("message_", ""), "title": title, "sender": sender, "date": date, "url": href,
+            "id": tag_attr(tr, "id").replace("message_", ""), "title": title, "sender": sender, "date": date, "url": href,
         })
     return all_messages
 

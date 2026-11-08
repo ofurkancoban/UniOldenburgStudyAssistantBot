@@ -294,9 +294,9 @@ class LoginServer:
                  on_session_authenticated: Optional[Callable[..., Awaitable[None]]] = None,
                  is_allowed_callback: Optional[Callable[[int], bool]] = None):
         self.on_login = on_login
-        self.port = int(port or os.getenv("LOGIN_PORT", "8899"))
+        self.port = int(port) if port else int(os.getenv("LOGIN_PORT") or "8899")
         self.host = host or self._default_host()
-        self.bot_token = bot_token or os.getenv("TELEGRAM_TOKEN", "")
+        self.bot_token: str = bot_token or os.getenv("TELEGRAM_TOKEN") or ""
         self.allowed_user_ids = allowed_user_ids or set()
         self.base_url_provider = base_url_provider
         self.session_provider = session_provider
@@ -469,7 +469,7 @@ class LoginServer:
         if not user:
             return web.json_response({"ok": False, "error": "Invalid Telegram data."}, status=401)
         user_id = user.get("id")
-        if not self._is_allowed(user_id):
+        if not isinstance(user_id, int) or not self._is_allowed(user_id):
             logger.warning("Mini App access from unauthorised user %s", user_id)
             return web.json_response({"ok": False, "error": "Not authorized."}, status=403)
 
@@ -723,6 +723,9 @@ class LoginServer:
             headers=resp_headers,
         )
 
+    async def _health(self, _request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
     # ── fallback JSON API login ───────────────────────────────────────────
     async def _api_login(self, request: web.Request) -> web.Response:
         user = verify_init_data(request.headers.get("X-Telegram-Init-Data", ""), self.bot_token)
@@ -760,7 +763,7 @@ class LoginServer:
         app.router.add_get("/_bot/entry", self._bot_entry)
         app.router.add_get("/login/{token}", self._token_login)
         app.router.add_post("/api/login", self._api_login)
-        app.router.add_get("/health", lambda _r: web.Response(text="ok"))
+        app.router.add_get("/health", self._health)
         app.router.add_route("*", "/{tail:.*}", self._proxy)
         self._runner = web.AppRunner(app, access_log_class=_RedactedAccessLogger)
         await self._runner.setup()

@@ -15,6 +15,7 @@ import os
 import tempfile
 import time
 from datetime import datetime
+from typing import Any, Optional
 
 from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -22,21 +23,9 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 import studip_oauth
-from typing import Optional
 from studip_utils import berlin_now
-
-from unibot import db
-from unibot import state
-from unibot.config import ALLOWED_USER_IDS
-from unibot.storage import link_cache, load_files_cache, save_files_cache, single_flight
-from unibot.formatting import (
-    _course_abbrev,
-    _short_id,
-    clean_for_html,
-    clean_html_text,
-    parse_date_safe,
-)
-from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, broadcast
+from unibot import db, state
+from unibot.ai import transcribe_voice_message
 from unibot.auth import (
     act_as_bot,
     acting_as,
@@ -47,18 +36,30 @@ from unibot.auth import (
     login_studip,
     signed_in_accounts,
 )
-from unibot.studip_api import (
-    BASE_URL,
-    STUDIP_API_URL,
-    StudipApiError,
-    _api_names,
-    _api_rel_id,
-    _ensure_watched_courses_map,
-    list_courses,
-    list_files,
-    studip_api_get,
+from unibot.config import ALLOWED_USER_IDS
+from unibot.formatting import (
+    _course_abbrev,
+    _short_id,
+    clean_for_html,
+    clean_html_text,
+    parse_date_safe,
 )
-from unibot.ai import transcribe_voice_message
+from unibot.monitoring_alerts import (  # noqa: F401 - the notification layer, re-exported for callers
+    _file_alert,
+    _format_exam_dates_message,
+    _forum_alert_markup,
+    _forum_alert_text,
+    _send_file_alerts,
+    announcement_task_cache,
+    course_members,
+    task_suggestion_cache,
+)
+from unibot.monitoring_diff import (  # noqa: F401 - change detection, re-exported for callers
+    _diff_course_files,
+    _file_events,
+    _file_was_updated,
+    _snapshot_course_files,
+)
 from unibot.monitoring_fetch import (  # noqa: F401 - the fetch layer, re-exported for callers
     JSONAPI_HEADERS,
     MESSAGE_CHECK_LIMIT,
@@ -74,27 +75,28 @@ from unibot.monitoring_fetch import (  # noqa: F401 - the fetch layer, re-export
     _post_author_id,
     fetch_message_body,
 )
-from unibot.monitoring_diff import (  # noqa: F401 - change detection, re-exported for callers
-    _diff_course_files,
-    _file_events,
-    _file_was_updated,
-    _snapshot_course_files,
+from unibot.storage import link_cache, load_files_cache, save_files_cache, single_flight
+from unibot.studip_api import (
+    BASE_URL,
+    STUDIP_API_URL,
+    StudipApiError,
+    _api_names,
+    _api_rel_id,
+    _ensure_watched_courses_map,
+    list_courses,
+    list_files,
+    studip_api_get,
 )
-from unibot.monitoring_alerts import (  # noqa: F401 - the notification layer, re-exported for callers
-    _file_alert,
-    _format_exam_dates_message,
-    _forum_alert_markup,
-    _forum_alert_text,
-    _send_file_alerts,
-    announcement_task_cache,
-    course_members,
-    task_suggestion_cache,
+from unibot.telegram_ui import (
+    _show_typing,
+    _start_loading_animation,
+    _stop_loading_animation,
+    broadcast,
 )
-
 
 global_message_watcher = None
 global_announcement_watcher = None
-watch_tasks = {}  # chat_id -> asyncio.Task
+watch_tasks: dict[int, asyncio.Task] = {}  # chat_id -> asyncio.Task
 check_in_progress: set[int] = set()  # chat_id set to prevent concurrent checks
 
 
@@ -145,7 +147,7 @@ def get_show_last_keyboard():
 
 async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Display the last 5 files with labeled header."""
-    query = update.callback_query
+    query: Any = update.callback_query  # PTB's Optional/MaybeInaccessible types
     await query.answer()
     chat_id = query.message.chat_id
     FILES_CACHE_PATH = "files_cache.json"
@@ -269,7 +271,7 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
 
     try:
         CACHE_PATH = "announcement_cache.json"
-        cache = {"seen": [], "history": []}
+        cache: dict[str, list] = {"seen": [], "history": []}
         if db.exists(CACHE_PATH):
             try:
                 cache = db.load(CACHE_PATH)
@@ -404,7 +406,7 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
 
 async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Display the last 5 announcements (with labeled header)."""
-    query = update.callback_query
+    query: Any = update.callback_query  # PTB's Optional/MaybeInaccessible types
     await query.answer()
     chat_id = query.message.chat_id
     CACHE_PATH = "announcement_cache.json"
@@ -455,7 +457,7 @@ async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_
 
 async def show_last_forum_posts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Display the last 5 forum posts (with labeled header)."""
-    query = update.callback_query
+    query: Any = update.callback_query  # PTB's Optional/MaybeInaccessible types
     await query.answer()
     chat_id = query.message.chat_id
     CACHE_PATH = FORUM_CACHE_PATH
@@ -583,7 +585,7 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False, courses=N
         all_events = []
         updated = False
         for result in results:
-            if isinstance(result, Exception):
+            if isinstance(result, BaseException):
                 logging.error("Course check failed: %s", result)
                 continue
             events, changed = result
@@ -839,7 +841,7 @@ MAX_CACHE_SIZE = 200  # upper limit to avoid bloating cache
 
 async def show_last_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Display the last 5 messages with full content including message body."""
-    query = update.callback_query
+    query: Any = update.callback_query  # PTB's Optional/MaybeInaccessible types
     await query.answer()
 
     # First show "Loading..." message
@@ -1054,7 +1056,7 @@ async def send_studip_message(recipient_id: str, subject: str, message_body: str
 
 async def handle_studip_message_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle `msg_reply|<msg_id>` callback to initiate a direct Stud.IP message reply."""
-    query = update.callback_query
+    query: Any = update.callback_query  # PTB's Optional/MaybeInaccessible types
     await query.answer()
 
     if not is_user_allowed(query.from_user.id):
@@ -1091,8 +1093,9 @@ async def handle_studip_message_reply_start(update: Update, context: ContextType
         return
 
     reply_subject = orig_subject if orig_subject.lower().startswith("re:") else f"Re: {orig_subject}"
-    context.user_data["pending_step"] = "studip_msg_reply"
-    context.user_data["studip_reply_target"] = {
+    user_data: Any = context.user_data
+    user_data["pending_step"] = "studip_msg_reply"
+    user_data["studip_reply_target"] = {
         "msg_id": msg_id,
         "recipient_id": sender_id,
         "sender": sender_name,
@@ -1113,10 +1116,11 @@ async def handle_studip_message_reply_start(update: Update, context: ContextType
 
 async def handle_studip_message_reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel a pending Stud.IP message reply."""
-    query = update.callback_query
+    query: Any = update.callback_query  # PTB's Optional/MaybeInaccessible types
     await query.answer("Reply cancelled")
-    context.user_data.pop("pending_step", None)
-    context.user_data.pop("studip_reply_target", None)
+    user_data = context.user_data or {}
+    user_data.pop("pending_step", None)
+    user_data.pop("studip_reply_target", None)
     await query.edit_message_text("❌ Stud.IP reply cancelled.")
 
 
@@ -1184,13 +1188,16 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None or not is_user_allowed(user_id):
         return
+    message, chat, user_data = update.message, update.effective_chat, context.user_data
+    if message is None or message.voice is None or chat is None or user_data is None:
+        return
 
-    status_msg = await update.message.reply_text("🎙️ Transcribing...", disable_notification=True)
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+    status_msg = await message.reply_text("🎙️ Transcribing...", disable_notification=True)
+    await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
 
-    ogg_path = os.path.join(tempfile.gettempdir(), f"voice_{update.message.voice.file_unique_id}.oga")
+    ogg_path = os.path.join(tempfile.gettempdir(), f"voice_{message.voice.file_unique_id}.oga")
     try:
-        file = await context.bot.get_file(update.message.voice.file_id)
+        file = await context.bot.get_file(message.voice.file_id)
         await file.download_to_drive(ogg_path)
         transcript = await transcribe_voice_message(ogg_path)
     except Exception as e:
@@ -1202,7 +1209,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # committed yet. `step` is None when there's no wizard waiting, which is
     # what tells handle_voice_confirm to run intent classification instead of
     # feeding straight into handle_pending_step.
-    step = context.user_data.get("pending_step") or None
+    step = user_data.get("pending_step") or None
 
     # For read-only, instantly-answerable intents (currently just "what
     # should I eat"), classify right away and skip the "Heard...Is this
@@ -1217,7 +1224,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await _route_voice_intent(update, context, intent_result, transcript)
             return
 
-    context.user_data["pending_voice"] = {"step": step, "text": transcript, "intent_result": intent_result}
+    user_data["pending_voice"] = {"step": step, "text": transcript, "intent_result": intent_result}
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Yes", callback_data="voice_confirm"),
         InlineKeyboardButton("✏️ Try again", callback_data="voice_reject"),
@@ -1226,14 +1233,17 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    message, chat = update.message, update.effective_chat
+    if message is None or chat is None:
+        return
+    chat_id = chat.id
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None or not is_user_allowed(user_id):
-        await update.message.reply_text("Not authorized to use this bot.")
+        await message.reply_text("Not authorized to use this bot.")
         return
     if chat_id in watch_tasks and not watch_tasks[chat_id].done():
-        await update.message.reply_text("Watcher is already running.")
+        await message.reply_text("Watcher is already running.")
         return
-    await update.message.reply_text("👀 Watcher started (checks every 2 hours).", disable_notification=True)
+    await message.reply_text("👀 Watcher started (checks every 2 hours).", disable_notification=True)
     task = asyncio.create_task(watch_loop(chat_id, context))
     watch_tasks[chat_id] = task

@@ -6,10 +6,9 @@ anywhere and unit-tested without starting the bot.
 
 from __future__ import annotations
 
-import logging
-
 import html
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime
@@ -95,6 +94,17 @@ def html_escape(text) -> str:
 def format_hours(minutes: int) -> str:
     hours = minutes / 60
     return f"{int(hours)}h" if hours == int(hours) else f"{hours:.1f}h"
+
+
+def tag_attr(tag, name: str) -> str:
+    """A BeautifulSoup tag attribute as one string, "" when the tag or the
+    attribute is missing (bs4 returns a list for multi-valued ones like class)."""
+    if tag is None:
+        return ""
+    value = tag.get(name)
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else " ".join(value)
 
 
 def redact_url(url) -> str:

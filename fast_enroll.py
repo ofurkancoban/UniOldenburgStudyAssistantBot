@@ -10,11 +10,13 @@ import logging
 import re
 import time
 from datetime import datetime, timedelta
+from typing import Optional
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
 from studip_http import UNSPACED, set_request_priority
+from studip_utils import tag_attr
 
 BASE_URL = "https://elearning.uni-oldenburg.de"
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
@@ -36,7 +38,9 @@ class EnrollError(Exception):
 
 def load_pending() -> dict:
     """Load pending fast-enroll jobs keyed by str(chat_id) -> {sem_id -> {sem_id, target_time_str, target_date_str}}."""
-    from unibot import db  # the bot's SQLite document store (imports the old JSON file once)
+    from unibot import (
+        db,  # the bot's SQLite document store (imports the old JSON file once)
+    )
     if not db.exists(PENDING_FILE):
         return {}
     try:
@@ -78,7 +82,7 @@ def save_pending_job(chat_id, sem_id: str, target_time_str: str, target_date_str
     _save_pending(pending)
 
 
-def clear_pending_job(chat_id, sem_id: str = None):
+def clear_pending_job(chat_id, sem_id: Optional[str] = None):
     """Remove one job (by sem_id) for a chat, or all of that chat's jobs if sem_id is None."""
     pending = load_pending()
     chat_key = str(chat_id)
@@ -180,7 +184,7 @@ async def _fetch_security_token(session, sem_id: str) -> str:
     token_input = apply_form.find("input", attrs={"name": "security_token"})
     if not token_input or not token_input.get("value"):
         raise EnrollError("Could not find security_token in enrolment dialog (course may already be full, closed, or already enrolled).")
-    return token_input["value"]
+    return tag_attr(token_input, "value")
 
 
 async def _submit_enrollment(session, sem_id: str, security_token: str):
@@ -192,7 +196,7 @@ async def _submit_enrollment(session, sem_id: str, security_token: str):
     return status, html
 
 
-def resolve_target(target_time_str: str, target_date_str: str, now: datetime) -> datetime:
+def resolve_target(target_time_str: str, target_date_str: Optional[str], now: datetime) -> datetime:
     """Parse 'HH:MM:SS' and an optional 'DD.MM.YYYY' into a Berlin-time datetime.
 
     If target_date_str is given, that exact date+time is used (may be in the past,
@@ -208,7 +212,7 @@ def resolve_target(target_time_str: str, target_date_str: str, now: datetime) ->
     return candidate
 
 
-async def run_fast_enroll(session, sem_id: str, target_time_str: str, target_date_str: str = None, on_progress=None):
+async def run_fast_enroll(session, sem_id: str, target_time_str: str, target_date_str: Optional[str] = None, on_progress=None):
     """Wait until the target Europe/Berlin date+time then submit the enrollment.
 
     Returns (success: bool, message: str).
@@ -298,7 +302,7 @@ async def get_semester_options(session) -> list:
 
     def starts_before_2022(label: str) -> bool:
         m = re.search(r"\d{4}", label)
-        return bool(m) and int(m.group()) < 2022
+        return m is not None and int(m.group()) < 2022
 
     return [(sid, label) for sid, label in options if not starts_before_2022(label)]
 
@@ -380,7 +384,7 @@ async def _fetch_module_courses(session, verzeichnis_url: str) -> list:
                 component_type = "Component"
             has_open_access = "Uneingeschränkter Zugang" in tds[1].get_text(" ", strip=True)
             for a in tds[1].find_all("a", href=True):
-                m = MODULE_COMPONENT_TYPE_RE.search(a["href"])
+                m = MODULE_COMPONENT_TYPE_RE.search(tag_attr(a, "href"))
                 if m and m.group(1) not in seen:
                     seen.add(m.group(1))
                     results.append((component_type, a.get_text(strip=True), m.group(1), has_open_access))
@@ -401,7 +405,7 @@ async def _is_enrollment_open(session, sem_id: str) -> bool:
         return False
 
 
-async def _get_module_course_candidates(session, semester_id: str = None) -> dict:
+async def _get_module_course_candidates(session, semester_id: Optional[str] = None) -> dict:
     """Walk the student's own degree-programme modules for the given semester
     and return every course component found under them, keyed by sem_id:
     {sem_id: {"modules": [...], "type": "Lecture"/"Exercise"/"Seminar"/...,
@@ -421,7 +425,7 @@ async def _get_module_course_candidates(session, semester_id: str = None) -> dic
     # for more than one module and would otherwise show up once per module it
     # satisfies. Keep every module it's listed under (comma-joined) instead of
     # only the first, so nothing is silently dropped.
-    candidates = {}  # sem_id -> {"modules": [...], "type": ..., "course": ..., "has_open_access": ...}
+    candidates: dict[str, dict] = {}  # sem_id -> {"modules": [...], "type": ..., "course": ..., "has_open_access": ...}
     semaphore = asyncio.Semaphore(3)
 
     async def fetch_one_module(module_label, verzeichnis_url):
@@ -442,7 +446,7 @@ async def _get_module_course_candidates(session, semester_id: str = None) -> dic
     return candidates
 
 
-async def get_course_type_map(session, semester_id: str = None) -> dict:
+async def get_course_type_map(session, semester_id: Optional[str] = None) -> dict:
     """Return {sem_id: "Lecture"/"Exercise"/"Seminar"/...} for every course
     component found under the student's own degree-programme modules for the
     given semester, regardless of whether it's still open for enrolment —
@@ -453,7 +457,7 @@ async def get_course_type_map(session, semester_id: str = None) -> dict:
     return {sem_id: entry["type"] for sem_id, entry in candidates.items()}
 
 
-async def get_open_courses(session, semester_id: str = None) -> list:
+async def get_open_courses(session, semester_id: Optional[str] = None) -> list:
     """Return every course, within the student's own degree-programme modules,
     that offers self-service enrolment for the given semester (or the page's
     default/current semester if omitted) — determined purely by that
@@ -543,7 +547,7 @@ async def decline_course(session, cid: str) -> tuple:
     if form is None:
         return False, "Could not find the sign-out confirmation form (you may already be signed out, or the course doesn't allow self sign-out)."
 
-    action = form["action"]
+    action = tag_attr(form, "action")
     if not action.startswith("http"):
         action = f"{BASE_URL}/{action.lstrip('/')}"
     fields = {inp["name"]: inp.get("value", "") for inp in form.find_all("input") if inp.get("name")}

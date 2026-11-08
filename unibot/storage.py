@@ -15,11 +15,8 @@ from typing import Optional
 import aiohttp
 
 from studip_utils import TZ_BERLIN, berlin_now
-
-from unibot import db
-from unibot import state
+from unibot import db, state
 from unibot.config import ALLOWED_USER_IDS
-
 
 # navigation & cache
 LINK_CACHE_PATH = "link_cache.json"
@@ -38,7 +35,7 @@ class _PersistentLinkCache(dict):
     def __init__(self, path: str):
         super().__init__()
         self._path = path
-        self._flush_handle = None
+        self._flush_handle: Optional[asyncio.TimerHandle] = None
         try:
             data = db.load(path)
             if isinstance(data, dict):

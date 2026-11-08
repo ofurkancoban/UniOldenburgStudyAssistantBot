@@ -8,13 +8,15 @@ transport, cookie storage and session lifecycle.
 
 from __future__ import annotations
 
+import logging
 import re
 import time
+from typing import TYPE_CHECKING, Any, Optional
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from studip_utils import redact_url, unroute_proxy_url
+from studip_utils import redact_url, tag_attr, unroute_proxy_url
 
 
 def _describe_page(soup, text: str) -> str:
@@ -43,7 +45,22 @@ def _describe_page(soup, text: str) -> str:
 class SsoFlowMixin:
     """SSO login steps for StudIPSession (see the class docstring there)."""
 
-    async def sso_handoff(self, entry_url: str, success_host: str, referer: str = None) -> str:
+    if TYPE_CHECKING:
+        # Provided by StudIPSession; declared here for the type checker only.
+        username: str
+        password: str
+        logger: logging.Logger
+        explicitly_logged_out: bool
+        last_interactive_activity: float
+
+        def _s_get(self, url: str, **kwargs: Any) -> Any: ...
+        def _s_post(self, url: str, **kwargs: Any) -> Any: ...
+        def _get_totp_token(self) -> Optional[str]: ...
+        async def ensure_session(self) -> Any: ...
+        async def save_cookies(self) -> None: ...
+        async def is_html_logged_in(self, use_cache: bool = True) -> bool: ...
+
+    async def sso_handoff(self, entry_url: str, success_host: str, referer: Optional[str] = None) -> str:
         """Run the same NetIQ SSO state machine as `login()`, but to reach a different
         relying party (e.g. stums.uni-oldenburg.de) instead of elearning.uni-oldenburg.de.
 
@@ -70,7 +87,7 @@ class SsoFlowMixin:
         await self.save_cookies()
         return final_url
 
-    async def _run_sso_flow(self, entry_url: str, referer: str = None, is_done=None):
+    async def _run_sso_flow(self, entry_url: str, referer: Optional[str] = None, is_done=None):
         """Shared NetIQ SSO redirect + credential-entry state machine.
 
         `is_done(url, text)` decides when the flow has reached its destination;
@@ -94,9 +111,9 @@ class SsoFlowMixin:
                          return await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), tag, depth + 1)
 
                 # 2. Meta Refresh
-                meta = soup.find("meta", attrs={"http-equiv": lambda x: x and x.lower() == "refresh"})
+                meta = soup.find("meta", attrs={"http-equiv": lambda x: (x or "").lower() == "refresh"})
                 if meta:
-                    content = meta.get("content", "")
+                    content = tag_attr(meta, "content")
                     if "url=" in content.lower():
                         nxt = urljoin(url, content.lower().split("url=")[1].strip().strip("'\""))
                         self.logger.info("[%s] Following Meta Refresh: %s", tag, redact_url(nxt))
@@ -128,8 +145,8 @@ class SsoFlowMixin:
                         form = None  # never auto-submit a credential form
                     if form:
                         inputs = {i.get("name"): (i.get("value") or "") for i in form.find_all("input") if i.get("name")}
-                        action = urljoin(url, form.get("action") or "")
-                        method = (form.get("method") or "POST").upper()
+                        action = urljoin(url, tag_attr(form, "action"))
+                        method = (tag_attr(form, "method") or "POST").upper()
                         self.logger.info("[%s] Script-submitting form '%s' to %s", tag, form_name, redact_url(action))
                         if method == "POST":
                             async with self._s_post(action, data=inputs, headers={"Referer": url}) as r:
@@ -141,10 +158,10 @@ class SsoFlowMixin:
                 # 5. OAuth/SAML Auth Handoff Forms (Auto-submit via presence of sensitive keys)
                 for form in soup.find_all("form"):
                     inputs = {i.get("name"): (i.get("value") or "") for i in form.find_all("input") if i.get("name")}
-                    keys = set(k.lower() for k in inputs.keys())
+                    keys = {tag_attr(i, "name").lower() for i in form.find_all("input") if i.get("name")}
                     if keys & {"code", "state", "id_token", "samlresponse", "relaystate", "wa", "wresult"}:
-                        action = urljoin(url, form.get("action") or "")
-                        method = (form.get("method") or "POST").upper()
+                        action = urljoin(url, tag_attr(form, "action"))
+                        method = (tag_attr(form, "method") or "POST").upper()
                         self.logger.info("[%s] Auto-submitting auth handoff form to %s", tag, redact_url(action))
                         if method == "POST":
                             async with self._s_post(action, data=inputs, headers={"Referer": url}) as r:

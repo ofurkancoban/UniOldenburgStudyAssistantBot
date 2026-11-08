@@ -253,6 +253,33 @@ class WorkerFailoverTests(unittest.TestCase):
         self.assertEqual(direct_calls, [])
         self.assertEqual(studip_session._WORKER_HEALTH["failures"], 0)
 
+    def test_missing_worker_session_goes_direct(self):
+        # e.g. CLOUDFLARE_WORKER_URL set after the session was opened
+        worker = FakeWorker()
+        direct_calls = []
+
+        async def scenario(sess):
+            async def direct_request(m, url, **kwargs):
+                direct_calls.append((m, url))
+                return _DirectResp()
+
+            await sess.ensure_session()
+            sess.session.request = direct_request
+            if sess._proxy_http is not None:
+                await sess._proxy_http.close()
+            sess._proxy_http = None
+
+            async def keep_closed():
+                return sess.session
+
+            sess.ensure_session = keep_closed  # it would reopen the worker session
+            async with await sess.request("GET", f"https://{LOGIN}/nidp/app") as r:
+                return r.status, await r.text()
+
+        self.assertEqual(_run_with_worker(worker, scenario), (200, "direct ok"))
+        self.assertEqual(len(direct_calls), 1)
+        self.assertEqual(worker.seen, [])
+
     def test_post_is_never_resent_after_a_worker_error(self):
         worker = FakeWorker(platform_error=503)
         results, direct_calls = self._run(worker, method="POST")

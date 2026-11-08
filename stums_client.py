@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
+from studip_utils import tag_attr
 from stums_parsers import (
     _extract_action_params,
     _parse_candidate_units,
@@ -242,7 +243,7 @@ async def get_open_exam_registrations(session, failed_codes: Optional[set] = Non
     e.g. two parallel groups each with their own open registration window).
 
     Each unit's detail page is fetched independently, so one unit's fetch can
-    fail (network blip, StuMS hiccup) without the others — that unit is just
+    fail (network blip, StuMS hiccup) without the others; that unit is just
     silently skipped from the result rather than raising. If `failed_codes`
     is given (a set), such units' codes are added to it, so a caller that
     treats "missing from this result" as "no longer open" (e.g.
@@ -342,7 +343,7 @@ async def get_registered_exam_schedule(session) -> list[dict]:
             details_link = actions_cell.find("a", href=lambda x: x and "detailView-flow" in x) if actions_cell else None
             unit_id = None
             if details_link:
-                m = re.search(r"unitId=(\d+)", details_link["href"])
+                m = re.search(r"unitId=(\d+)", tag_attr(details_link, "href"))
                 unit_id = m.group(1) if m else None
 
             if not unit_id or not schedule["date"]:
@@ -412,7 +413,7 @@ async def _submit_action(session, soup, page_url: str, action: dict) -> tuple[st
     payload[action["source_id"]] = action["source_id"]
     payload.update(action["params"])
 
-    form_action_url = urljoin(page_url, form.get("action") or "")
+    form_action_url = urljoin(page_url, tag_attr(form, "action"))
     async with await session.post(form_action_url, data=payload, headers={"Referer": page_url}) as r:
         result_text = await r.text()
         result_url = str(r.url)
@@ -431,7 +432,7 @@ def _find_confirm_action(html_text: str, expected_aktion: str) -> Optional[dict]
     if not form:
         return None
     for btn in form.find_all("button"):
-        action = _extract_action_params(btn.get("onclick", ""))
+        action = _extract_action_params(tag_attr(btn, "onclick"))
         if action and action["params"].get("belegungsAktion") == expected_aktion:
             return action
     return None
@@ -475,7 +476,7 @@ async def submit_exam_action(session, unit_id: str, action_type: str) -> dict:
             btn = node.find("button", id=lambda x: x and x.endswith(f":{action_type}"))
             if not btn:
                 continue
-            action = _extract_action_params(btn.get("onclick", ""))
+            action = _extract_action_params(tag_attr(btn, "onclick"))
             title_div = node.find("div", class_="unit-title-container")
             title = title_div.get_text(" ", strip=True) if title_div else None
             break
@@ -516,7 +517,7 @@ async def submit_exam_action(session, unit_id: str, action_type: str) -> dict:
     result_unit = next((u for u in result_units if u["unit_id"] == str(unit_id)), None)
 
     expected_action = "deregister" if action_type == "anmelden" else "register"
-    success = bool(result_unit) and result_unit["action_type"] == expected_action
+    success = result_unit is not None and result_unit["action_type"] == expected_action
 
     return {
         "success": success,
@@ -555,14 +556,14 @@ async def _expand_grades_tree(session, page_url: str, soup: BeautifulSoup) -> Op
     if not form or not expand_btn:
         return None
 
-    onclick = expand_btn.get("onclick", "")
+    onclick = tag_attr(expand_btn, "onclick")
     m = JSF_AJAX_CALL_RE.search(onclick)
-    execute = m.group(1).strip() if m else expand_btn["id"]
+    execute = m.group(1).strip() if m else tag_attr(expand_btn, "id")
     render = m.group(2).strip() if m else ""
     # "@this" is a client-side jsf.ajax.js keyword resolved to the triggering
-    # component before the real request is sent — resolve it ourselves too.
-    execute = execute.replace("@this", expand_btn["id"])
-    render = render.replace("@this", expand_btn["id"])
+    # component before the real request is sent; resolve it ourselves too.
+    execute = execute.replace("@this", tag_attr(expand_btn, "id"))
+    render = render.replace("@this", tag_attr(expand_btn, "id"))
     tree_render_id = next(
         (rid for rid in render.split() if rid.endswith(":ExamOverviewForPersonTreeReadonly")),
         None,
@@ -583,7 +584,7 @@ async def _expand_grades_tree(session, page_url: str, soup: BeautifulSoup) -> Op
         expand_btn["id"]: expand_btn["id"],
     })
 
-    form_action_url = urljoin(page_url, form.get("action") or "")
+    form_action_url = urljoin(page_url, tag_attr(form, "action"))
     headers = {"Referer": page_url, "Faces-Request": "partial/ajax"}
     async with await session.post(form_action_url, data=payload, headers=headers) as r:
         xml_text = await r.text()
@@ -627,7 +628,7 @@ async def get_grades(session) -> list[dict]:
             continue
 
         icon = row.find("img")
-        level = (icon.get("alt") or "").strip().lower() if icon else ""
+        level = tag_attr(icon, "alt").strip().lower()
         if level not in ("module", "examination"):
             continue  # programme/module-group rows carry no individual result
 
@@ -768,7 +769,7 @@ async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
             raise RuntimeError("Could not find the reports form on StuMS.")
 
         payload = _build_jsf_form_payload(form, spec["button_id"], spec.get("label_match"))
-        action_url = urljoin(page_url, form.get("action") or "")
+        action_url = urljoin(page_url, tag_attr(form, "action"))
         async with await session.post(action_url, data=payload, allow_redirects=True, headers={"Referer": page_url}) as r2:
             raw = await r2.read()
             ctype = (r2.headers.get("Content-Type") or "").lower()
@@ -789,7 +790,7 @@ async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
         # Step 1: Switch to the Reports tab if the report button isn't already rendered
         if not form.find(id=spec["button_id"]):
             tab_payload = _build_jsf_form_payload(form, "studyserviceForm:report_TabBtn", "reports")
-            tab_action_url = urljoin(page_url, form.get("action") or "")
+            tab_action_url = urljoin(page_url, tag_attr(form, "action"))
             async with await session.post(tab_action_url, data=tab_payload, allow_redirects=True, headers={"Referer": page_url}) as r_tab:
                 html_text = await r_tab.text()
                 page_url = str(r_tab.url)
@@ -799,7 +800,7 @@ async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
                 raise RuntimeError("Could not switch to the Reports tab on StuMS.")
 
         payload = _build_jsf_form_payload(form, spec["button_id"], spec.get("label_match"))
-        action_url = urljoin(page_url, form.get("action") or "")
+        action_url = urljoin(page_url, tag_attr(form, "action"))
         async with await session.post(action_url, data=payload, allow_redirects=True, headers={"Referer": page_url}) as r2:
             raw = await r2.read()
             ctype = (r2.headers.get("Content-Type") or "").lower()
@@ -841,7 +842,7 @@ async def get_tuition_status(session) -> dict:
 
     # Switch to the Payments tab (`studyserviceForm:billsAndPayment_TabBtn`)
     tab_payload = _build_jsf_form_payload(form, "studyserviceForm:billsAndPayment_TabBtn", "payments")
-    action_url = urljoin(page_url, form.get("action") or "")
+    action_url = urljoin(page_url, tag_attr(form, "action"))
     async with await session.post(action_url, data=tab_payload, allow_redirects=True, headers={"Referer": page_url}) as r2:
         pay_html = await r2.text()
 

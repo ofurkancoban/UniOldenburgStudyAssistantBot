@@ -1,18 +1,19 @@
-import aiohttp
 import asyncio
-from dataclasses import dataclass, field
-from typing import Optional
+import base64
+import hashlib
+import hmac
+import json
 import logging
 import os
-import hmac
-import hashlib
-import time
-import struct
-import base64
-import json
 import random
+import struct
+import time
+from dataclasses import dataclass, field
 from http.cookies import CookieError, SimpleCookie
+from typing import Optional
 from urllib.parse import urljoin, urlsplit
+
+import aiohttp
 from yarl import URL
 
 import studip_oauth
@@ -163,7 +164,7 @@ class StudIPSession(SsoFlowMixin):
         self.session = None
         # Cookie-less twin of `session` for requests sent through the
         # Cloudflare Worker: their cookies are managed by hand (see request()).
-        self._proxy_http = None
+        self._proxy_http: Optional[aiohttp.ClientSession] = None
         self.headers = {
             'User-Agent': user_agent(),
             'Accept-Encoding': 'gzip, deflate',
@@ -203,6 +204,13 @@ class StudIPSession(SsoFlowMixin):
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+
+    @property
+    def _client(self) -> aiohttp.ClientSession:
+        """The open aiohttp session; callers run after ensure_session()."""
+        if self.session is None:
+            raise RuntimeError("HTTP session is not open (call ensure_session first)")
+        return self.session
 
     async def ensure_session(self):
         if self.session is None or self.session.closed:
@@ -266,24 +274,25 @@ class StudIPSession(SsoFlowMixin):
                 self.logger.debug("Skipping unparsable cookie from %s", redact_url(real_url))
                 continue
             if jar_entry:
-                self.session.cookie_jar.update_cookies(jar_entry, response_url=URL(real_url))
+                self._client.cookie_jar.update_cookies(jar_entry, response_url=URL(real_url))
 
     async def _send_once(self, method: str, url: str, headers: dict, body: dict, timeout, extra: dict):
         host = (urlsplit(url).hostname or "").lower()
         hdrs = dict(headers)
-        if self._via_worker(host):
+        # Without an open worker session (worker configured after start) go direct.
+        if self._via_worker(host) and self._proxy_http is not None:
             # The worker's hostname differs from the target, so aiohttp would
             # not attach the target's cookies itself: send them explicitly,
             # matched against the full URL (path-scoped cookies included).
-            cookies = self.session.cookie_jar.filter_cookies(URL(url))
+            cookies = self._client.cookie_jar.filter_cookies(URL(url))
             if cookies:
                 injected = "; ".join(f"{k}={m.value}" for k, m in cookies.items())
                 existing = hdrs.pop("Cookie", None) or hdrs.pop("cookie", None)
                 hdrs["Cookie"] = f"{existing}; {injected}" if existing else injected
             routed, hdrs = route_proxy_url(url, hdrs)
-            http = self._proxy_http
+            http: aiohttp.ClientSession = self._proxy_http
         else:
-            routed, http = url, self.session
+            routed, http = url, self._client
         via_worker = http is self._proxy_http
         async with THROTTLE.slot(host):
             try:
@@ -406,7 +415,7 @@ class StudIPSession(SsoFlowMixin):
     async def save_cookies(self):
         if not self.session:
             return
-        jar = self.session.cookie_jar
+        jar = self._client.cookie_jar
         host_only = getattr(jar, "_host_only_cookies", None)
         worker_host = (urlsplit(_worker_url()).hostname or "").lower() if _worker_url() else ""
 
@@ -466,7 +475,7 @@ class StudIPSession(SsoFlowMixin):
         morsel["path"] = path or "/"
         if not host_only:
             morsel["domain"] = dom
-        self.session.cookie_jar.update_cookies(morsel_holder, response_url=URL(f"https://{dom}/"))
+        self._client.cookie_jar.update_cookies(morsel_holder, response_url=URL(f"https://{dom}/"))
 
     async def load_cookies(self):
         data = None
@@ -733,7 +742,7 @@ class StudIPSession(SsoFlowMixin):
         stums_start = "https://stums.uni-oldenburg.de/qisserver/pages/cs/sys/portal/hisinoneStartPage.faces"
         # Touch StuMS only when this user has a StuMS session to keep warm;
         # without one the request would just open an anonymous session.
-        if self.session.cookie_jar.filter_cookies(URL(stums_start)):
+        if self._client.cookie_jar.filter_cookies(URL(stums_start)):
             keepalive_urls.append(stums_start)
         for sso_url in keepalive_urls:
             try:
@@ -774,7 +783,7 @@ class StudIPSession(SsoFlowMixin):
                             pass
                     except Exception as exc:
                         self.logger.debug("Upstream logout request skipped for %s: %s", redact_url(url), exc)
-                self.session.cookie_jar.clear()
+                self._client.cookie_jar.clear()
 
             if getattr(self, "user_id", None):
                 try:

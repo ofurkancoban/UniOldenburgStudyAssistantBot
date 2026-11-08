@@ -69,7 +69,7 @@ class QuickTunnel:
     def __init__(self, port: int, binary: Optional[str] = None,
                  on_url_change: Optional[UrlCallback] = None):
         self.port = port
-        self.binary = binary or os.getenv("CLOUDFLARED_BIN", "cloudflared")
+        self.binary: str = binary or os.getenv("CLOUDFLARED_BIN") or "cloudflared"
         self.on_url_change = on_url_change
         self._url = ""
         self._pid: Optional[int] = None
