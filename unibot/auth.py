@@ -30,6 +30,7 @@ from unibot.config import (
     ALLOWED_USER_IDS,
     CLOUDFLARE_TUNNEL,
     LOGIN_PUBLIC_URL,
+    PRIMARY_ADMIN_ID,
     TELEGRAM_TOKEN,
 )
 from unibot.db import (
@@ -252,6 +253,43 @@ SELECTORS = {
 
 
 # ── Stud.IP login ──────────────────────────────────────────────────────────────
+def _admin_candidates() -> list[int]:
+    ids: list[int] = []
+    if PRIMARY_ADMIN_ID is not None:
+        ids.append(PRIMARY_ADMIN_ID)
+    ids += sorted(ALLOWED_USER_IDS)
+    try:
+        ids += [u["telegram_id"] for u in db.get_all_users() if u.get("role") == "admin"]
+    except Exception:
+        pass
+    return [uid for i, uid in enumerate(ids) if uid not in ids[:i] and is_user_admin(uid)]
+
+
+def pick_watcher_session(exclude: Optional[int] = None) -> StudIPSession:
+    """The session the background watcher uses: a signed-in admin's own session.
+
+    Prefers an admin session already open in this process, then an admin with
+    a stored login. Without any, an unbound session that stays logged out
+    until an admin signs in (it adopts the first admin who does)."""
+    candidates = [uid for uid in _admin_candidates() if uid != exclude]
+    for uid in candidates:
+        sess = state.user_sessions.get(uid)
+        if sess is not None and not sess.explicitly_logged_out:
+            return sess
+    for uid in candidates:
+        try:
+            has_login = bool(db.load_user_credential(uid, "cookies"))
+        except Exception:
+            has_login = False
+        if has_login or os.path.exists(f"studip_cookies_{uid}.json"):
+            sess = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET,
+                                 cookie_file=f"studip_cookies_{uid}.json", user_id=uid)
+            state.user_sessions[uid] = sess
+            logging.info("🔐 Watcher session uses the stored login of admin %s", uid)
+            return sess
+    return StudIPSession(USERNAME, PASSWORD, TOTP_SECRET, cookie_file=None)
+
+
 def get_user_session(user_id: Optional[int] = None) -> StudIPSession:
     """Retrieve or initialize the StudIPSession for a specific Telegram user.
 
@@ -261,7 +299,7 @@ def get_user_session(user_id: Optional[int] = None) -> StudIPSession:
         user_id = current_user_id()
     if user_id is None:
         if state.global_session is None:
-            state.global_session = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
+            state.global_session = pick_watcher_session()
         return state.global_session
 
     if user_id in state.user_sessions:
@@ -269,12 +307,13 @@ def get_user_session(user_id: Optional[int] = None) -> StudIPSession:
 
     if is_user_admin(user_id) and state.global_session is not None and not state.global_session.user_id:
         state.global_session.user_id = user_id
+        state.global_session.cookie_file = f"studip_cookies_{user_id}.json"
         state.user_sessions[user_id] = state.global_session
         return state.global_session
 
+    # Always the user's own file: the single-user era studip_cookies.json is
+    # migrated to the primary admin at startup and never shared between admins.
     cookie_file = f"studip_cookies_{user_id}.json"
-    if is_user_admin(user_id) and os.path.exists("studip_cookies.json"):
-        cookie_file = "studip_cookies.json"
 
     sess = StudIPSession(
         USERNAME, PASSWORD, TOTP_SECRET,
@@ -596,8 +635,9 @@ async def _perform_logout(user_id: Optional[int] = None) -> None:
             studip_oauth.clear_tokens(user_id=user_id)
         db.update_user_studip(user_id, "")
         state.user_courses_map.pop(user_id, None)
-        if is_user_admin(user_id) and state.global_session is sess:
-            state.global_session = None
+        if state.global_session is sess:
+            # keep the watcher running on another signed-in admin, if any
+            state.global_session = pick_watcher_session(exclude=user_id)
             state._studip_api_user_id = None
             state._studip_user_profile = None
             state._last_notified_studip_cookie = None

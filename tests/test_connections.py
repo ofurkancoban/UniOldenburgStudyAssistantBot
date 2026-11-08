@@ -363,3 +363,46 @@ class SsoChainTests(unittest.TestCase):
     def test_telegram_web_iframe_counts_as_page_load(self):
         self.assertEqual(self.target({"idp_seen": True}, studip=True,
                                      headers={"Sec-Fetch-Dest": "iframe"}), self.ls.STUMS_SSO_ENTRY_PATH)
+
+
+class WatcherSessionTests(unittest.TestCase):
+    """Admins never share a login, and the watcher survives an admin's logout."""
+
+    def setUp(self):
+        from unibot import auth, state
+        self.auth, self.state = auth, state
+        self.saved = (dict(state.user_sessions), state.global_session)
+        state.user_sessions.clear()
+        state.global_session = None
+        self.patches = [
+            mock.patch.object(auth, "is_user_admin", lambda uid: uid in (1, 2)),
+            mock.patch.object(auth, "PRIMARY_ADMIN_ID", 1),
+            mock.patch.object(auth, "ALLOWED_USER_IDS", {1, 2}),
+            mock.patch.object(auth.db, "get_all_users", lambda: []),
+            mock.patch.object(auth.db, "load_user_credential", lambda uid, kind: None),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.state.user_sessions.clear()
+        self.state.user_sessions.update(self.saved[0])
+        self.state.global_session = self.saved[1]
+
+    def test_admin_session_never_uses_the_shared_legacy_file(self):
+        with mock.patch("os.path.exists", lambda path: path == "studip_cookies.json"):
+            self.state.global_session = object.__new__(studip_session.StudIPSession)
+            self.state.global_session.user_id = 9  # already bound elsewhere
+            sess = self.auth.get_user_session(2)
+        self.assertEqual(sess.cookie_file, "studip_cookies_2.json")
+
+    def test_watcher_moves_to_another_signed_in_admin(self):
+        one, two = self.auth.get_user_session(1), self.auth.get_user_session(2)
+        self.assertIs(self.auth.pick_watcher_session(), one)
+        self.assertIs(self.auth.pick_watcher_session(exclude=1), two)
+        two.explicitly_logged_out = True
+        fallback = self.auth.pick_watcher_session(exclude=1)
+        self.assertIsNone(fallback.user_id)
+        self.assertIsNone(fallback.cookie_file)

@@ -49,6 +49,21 @@ if not ADMIN_USER_IDS and ALLOWED_USER_IDS:
     ADMIN_USER_IDS = set(ALLOWED_USER_IDS)
 
 
+def _first_user_id(*env_values: str):
+    for env_value in env_values:
+        for p in env_value.replace(";", ",").split(","):
+            try:
+                return int(p.strip())
+            except ValueError:
+                continue
+    return None
+
+
+# The account the single-user era files (studip_cookies.json, ...) belong to:
+# the first admin listed in the environment, which keeps its order.
+PRIMARY_ADMIN_ID = _first_user_id(ADMIN_USER_IDS_ENV, ALLOWED_USER_IDS_ENV)
+
+
 # ── logging setup ──────────────────────────────────────────────────────────────
 # BOT_LOG_FILE lets tests and one-off scripts keep their output out of the live log
 LOG_FILE = os.getenv("BOT_LOG_FILE", "watch_log.txt")

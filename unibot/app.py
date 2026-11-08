@@ -26,7 +26,6 @@ from telegram.ext import (
 )
 from telegram.error import TelegramError
 
-from studip_session import StudIPSession
 
 from unibot import db, state
 from unibot.config import (
@@ -45,6 +44,7 @@ from unibot.auth import (
     _authorization_gate,
     _start_login_infra,
     acquire_instance_lock,
+    pick_watcher_session,
     login_command,
     login_studip,
     logout_command,
@@ -379,29 +379,6 @@ def register_handlers(app) -> None:
 
 
 
-def _startup_admin_session() -> StudIPSession:
-    """The watcher's session, bound to the primary admin's stored login.
-
-    It used to be created without a user id or cookie file, so after every
-    restart the watcher ran logged out until somebody signed in again."""
-    candidates = list(ALLOWED_USER_IDS)
-    try:
-        candidates += [u["telegram_id"] for u in db.get_all_users() if u.get("role") == "admin"]
-    except Exception:
-        pass
-    for aid in candidates:
-        try:
-            has_login = bool(db.load_user_credential(aid, "cookies"))
-        except Exception:
-            has_login = False
-        if has_login or os.path.exists(f"studip_cookies_{aid}.json"):
-            sess = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET,
-                                 cookie_file=f"studip_cookies_{aid}.json", user_id=aid)
-            state.user_sessions[aid] = sess
-            logging.info("🔐 Watcher session uses the stored login of admin %s", aid)
-            return sess
-    return StudIPSession(USERNAME, PASSWORD, TOTP_SECRET)
-
 async def main():
     logging.info("Telegram bot running (100% browser-less Stud.IP automation)...")
 
@@ -416,23 +393,24 @@ async def main():
             from unibot.config import ADMIN_USER_IDS
             from unibot import db
             db.bootstrap_admins(ADMIN_USER_IDS)
-            for aid in ADMIN_USER_IDS:
-                if not db.load_user_credential(aid, "cookies") and os.path.exists("studip_cookies.json"):
-                    from studip_vault import load_vault_json
-                    cookies = load_vault_json("studip_cookies.json")
-                    if cookies:
-                        db.save_user_credential(aid, "cookies", cookies)
-                        logging.info("Migrated studip_cookies.json into DB for admin %s", aid)
-                if not db.load_user_credential(aid, "oauth_tokens") and os.path.exists("studip_oauth_tokens.json"):
-                    from studip_vault import load_vault_json
-                    tokens = load_vault_json("studip_oauth_tokens.json")
-                    if tokens:
-                        db.save_user_credential(aid, "oauth_tokens", tokens)
-                        logging.info("Migrated studip_oauth_tokens.json into DB for admin %s", aid)
+            # The single-user era files belong to one account only: move them
+            # to the primary admin once and retire them, never copy them to
+            # every admin (that signed other admins in as the primary one).
+            from unibot.config import PRIMARY_ADMIN_ID
+            from studip_vault import load_vault_json
+            for legacy, kind in (("studip_cookies.json", "cookies"), ("studip_oauth_tokens.json", "oauth_tokens")):
+                if PRIMARY_ADMIN_ID is None or not os.path.exists(legacy):
+                    continue
+                if not db.load_user_credential(PRIMARY_ADMIN_ID, kind):
+                    data = load_vault_json(legacy)
+                    if data:
+                        db.save_user_credential(PRIMARY_ADMIN_ID, kind, data)
+                        logging.info("Migrated %s into DB for admin %s", legacy, PRIMARY_ADMIN_ID)
+                os.replace(legacy, legacy + ".migrated")
         except Exception as exc:
             logging.debug("Credentials DB bootstrap skipped: %s", exc)
 
-        state.global_session = _startup_admin_session()
+        state.global_session = pick_watcher_session()
 
         logging.info("🔐 Checking Stud.IP session...")
         if not await state.global_session.login():
