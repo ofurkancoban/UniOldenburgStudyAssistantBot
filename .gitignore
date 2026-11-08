@@ -66,3 +66,4 @@ whatsapp_service/baileys_auth.broken-*/
 .cloudflared/
 reminders_cache.json
 watch_log.txt.*
+.deploy.env
