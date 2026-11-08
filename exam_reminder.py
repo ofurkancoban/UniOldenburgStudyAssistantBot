@@ -192,6 +192,11 @@ def save_exam_cache(data: dict, user_id=None) -> None:
         logging.error("Could not save exam reminder cache: %s", e)
 
 
+# How long an announced exam registration must be missing from successful
+# checks before it counts as closed (and a later reopening is announced again).
+OPEN_CLOSED_GRACE_SECONDS = 6 * 3600
+
+
 def _stums_lock(session) -> asyncio.Lock:
     """One StuMS sign-in at a time per user session (the watcher, a button
     press and parallel detail fetches would otherwise each start their own
@@ -1163,17 +1168,34 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
     # closed — purging it here would make the next successful check treat it
     # as newly-opened again and resend the "registration open" notification
     # for an exam that was never actually closed.
+    # A unit can also drop out of one result without an error (a StuMS detail
+    # page that comes back without its periods), so a key is only forgotten
+    # after it has been missing for OPEN_CLOSED_GRACE_SECONDS.
+    missing_since = cache.get("open_missing_since", {})
     for key in list(notified_open.keys()):
         if key in still_open_keys:
+            missing_since.pop(key, None)
             continue
         key_code = key.split(":", 1)[0]
         if key_code in failed_codes:
             continue
+        first_missing = missing_since.setdefault(key, now.isoformat())
+        try:
+            missing_for = (now - datetime.fromisoformat(first_missing)).total_seconds()
+        except ValueError:
+            missing_for = OPEN_CLOSED_GRACE_SECONDS
+        if missing_for < OPEN_CLOSED_GRACE_SECONDS:
+            continue
         notified_open.pop(key, None)
         notified_deadline.pop(key, None)
+        missing_since.pop(key, None)
+    for key in list(missing_since):
+        if key not in notified_open:
+            missing_since.pop(key, None)
 
     cache["notified_open"] = notified_open
     cache["notified_deadline"] = notified_deadline
+    cache["open_missing_since"] = missing_since
     save_exam_cache(cache)
 
 

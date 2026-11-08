@@ -374,3 +374,26 @@ class WatcherSessionTests(unittest.TestCase):
         fallback = self.auth.pick_watcher_session(exclude=1)
         self.assertIsNone(fallback.user_id)
         self.assertIsNone(fallback.cookie_file)
+
+
+class ExamOpenDedupTests(unittest.TestCase):
+    """A registration that vanishes from one check is not re-announced."""
+
+    def test_brief_absence_does_not_reannounce(self):
+        import exam_reminder as er
+        exam = {"code": "inf007_P", "start_date": None, "end_date": None, "unit_id": "u",
+                "title": "Course", "raw": "window"}
+        cache, sent, results = {}, [], [[exam], [], [exam]]
+
+        async def fake_open(session, failed_codes=None):
+            return results.pop(0)
+
+        async def send(bot, text, reply_markup=None):
+            sent.append(text)
+
+        with mock.patch.object(er, "get_open_exam_registrations", fake_open), \
+                mock.patch.object(er, "load_exam_cache", lambda *a, **k: cache), \
+                mock.patch.object(er, "save_exam_cache", lambda data, *a, **k: cache.update(data)):
+            for _ in range(3):
+                asyncio.run(er.check_exam_reminders(object(), None, send, {}))
+        self.assertEqual(len(sent), 1)
