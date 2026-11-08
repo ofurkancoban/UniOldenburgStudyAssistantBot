@@ -353,4 +353,13 @@ class SsoChainTests(unittest.TestCase):
         self.assertIsNone(self.target({"idp_seen": True}, studip=True,
                                       headers={"X-Requested-With": "XMLHttpRequest"}))
         self.assertIsNone(self.target({"idp_seen": True}, studip=True,
-                                      headers={"Sec-Fetch-Dest": "iframe"}))
+                                      headers={"Sec-Fetch-Dest": "empty"}))
+
+    def test_pending_chain_from_entry_runs_on_the_next_studip_page(self):
+        sess = {"pending_chain": self.ls.STUMS_SSO_ENTRY_PATH}
+        self.assertEqual(self.target(sess, studip=True), self.ls.STUMS_SSO_ENTRY_PATH)
+        self.assertNotIn("pending_chain", sess)
+
+    def test_telegram_web_iframe_counts_as_page_load(self):
+        self.assertEqual(self.target({"idp_seen": True}, studip=True,
+                                     headers={"Sec-Fetch-Dest": "iframe"}), self.ls.STUMS_SSO_ENTRY_PATH)

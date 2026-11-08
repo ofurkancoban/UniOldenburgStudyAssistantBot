@@ -60,8 +60,7 @@ STUDIP_SSO_LOGIN_PATH = "/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
 SSO_CHAIN_SECONDS = 120.0
 
 _CHAIN_SNIPPET = """
-<div style="position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,0.75);display:flex;align-items:center;justify-content:center;color:#f8fafc;font:15px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;text-align:center;padding:20px;">__TEXT__</div>
-<script>setTimeout(function(){location.replace("__TARGET__");},300);</script>
+<iframe id="_bot_chain" src="__TARGET__" aria-hidden="true" tabindex="-1" style="position:absolute;width:1px;height:1px;left:-9999px;top:-9999px;border:0;visibility:hidden;"></iframe>
 """
 
 LoginCallback = Callable[[str, str, str], Awaitable[tuple[bool, str]]]
@@ -246,7 +245,7 @@ _CONNECTED_BANNER_SNIPPET = """
   </div>
 </div>
 <script>
-function _botCloseApp() {
+function _botReallyClose() {
   try {
     if (window.Telegram && Telegram.WebApp && Telegram.WebApp.initData) {
       Telegram.WebApp.close();
@@ -255,7 +254,26 @@ function _botCloseApp() {
     }
   } catch(e){}
 }
+// The second service (StuMS or Stud.IP) signs in inside a hidden iframe;
+// closing waits for it (at most 25 s) so the Mini App never cuts it off.
+function _botChainDone() {
+  var f = document.getElementById('_bot_chain');
+  if (!f) return true;
+  try {
+    // the proxy marks signed-in pages with the success banner
+    return !!f.contentDocument.getElementById('_bot_modal_backdrop');
+  } catch(e) { return false; }
+}
+var _botCloseStarted = 0;
+function _botCloseApp() {
+  if (!_botCloseStarted) _botCloseStarted = Date.now();
+  if (_botChainDone() || Date.now() - _botCloseStarted > 25000) { _botReallyClose(); return; }
+  setTimeout(_botCloseApp, 400);
+}
 (function(){
+  if (window.frameElement && window.frameElement.id === '_bot_chain') return;
+  // close automatically once signed in
+  setTimeout(_botCloseApp, 1500);
   try {
     var b = document.getElementById('_bot_bar');
     if (b) b.style.display = 'none';
@@ -535,10 +553,8 @@ class LoginServer:
                 if not proxy_sess.get("chained") and not await self._stums_signed_in(studip_sess):
                     # Stud.IP is still signed in but StuMS is not: connect
                     # StuMS through the browser in the same Mini App visit.
-                    proxy_sess["chained"] = True
-                    studip_sess._sso_chain_until = time.time() + SSO_CHAIN_SECONDS
-                    studip_sess.last_interactive_activity = time.time()
-                    raise web.HTTPFound(STUMS_SSO_ENTRY_PATH)
+                    # The next Stud.IP page signs in to StuMS in the background.
+                    proxy_sess["pending_chain"] = STUMS_SSO_ENTRY_PATH
                 self._schedule_auth_hook(user_id)
                 raise web.HTTPFound("/dispatch.php/my_courses")
             else:
@@ -589,9 +605,14 @@ class LoginServer:
         other service once, so a single university login connects both Stud.IP
         and StuMS (the fresh SSO session makes the second sign-in silent).
         Only top-level page loads qualify, never AJAX fragments."""
-        if request.method != "GET" or proxy_sess.get("chained") or not proxy_sess.get("idp_seen"):
+        if request.method != "GET" or proxy_sess.get("chained"):
             return None
-        if request.headers.get("X-Requested-With") or request.headers.get("Sec-Fetch-Dest", "document") != "document":
+        # Telegram Web hosts the Mini App in an iframe, so "iframe" counts as a page load.
+        if request.headers.get("X-Requested-With") or request.headers.get("Sec-Fetch-Dest", "document") not in ("document", "iframe"):
+            return None
+        if is_studip_auth and proxy_sess.get("pending_chain"):
+            return proxy_sess.pop("pending_chain")
+        if not proxy_sess.get("idp_seen"):
             return None
         if is_studip_auth and not proxy_sess.get("stums_seen"):
             return STUMS_SSO_ENTRY_PATH
@@ -756,15 +777,13 @@ class LoginServer:
                         asyncio.create_task(studip_sess.save_cookies())
                     else:
                         self._schedule_auth_hook(user_id)
-            if chain_to:
-                label = "StuMS" if chain_to == STUMS_SSO_ENTRY_PATH else "Stud.IP"
+            if is_studip_auth or is_stums_auth:
+                chain_frame = ""
+                if chain_to:
+                    chain_frame = _CHAIN_SNIPPET.replace("__TARGET__", chain_to)
                 bar = (
-                    _CHAIN_SNIPPET.replace("__TARGET__", chain_to)
-                    .replace("__TEXT__", f"✅ Signed in. Connecting {label} too…")
-                )
-            elif is_studip_auth or is_stums_auth:
-                bar = (
-                    _CONNECTED_BANNER_SNIPPET
+                    chain_frame
+                    + _CONNECTED_BANNER_SNIPPET
                     + _STATUS_BAR_SNIPPET.replace("__STATUS_TEXT__", "✅ Bot connected")
                 )
             else:
