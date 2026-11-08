@@ -33,13 +33,16 @@ check_untyped_defs = true
 # modules get annotations. Imported modules are analysed but not reported.
 follow_imports = "silent"
 files = [
+    "studip_http.py",
+    "stums_parsers.py",
     "studip_utils.py",
     "unibot/__init__.py",
     "unibot/config.py",
     "unibot/db.py",
     "unibot/state.py",
+    "unibot/diagnostics.py",
     "unibot/watcher.py",
 ]
 
 [tool.coverage.run]
-source = ["unibot", "studip_utils", "studip_session", "studip_oauth", "studip_vault"]
+source = ["unibot", "studip_utils", "studip_session", "studip_oauth", "studip_vault", "studip_http", "stums_parsers"]

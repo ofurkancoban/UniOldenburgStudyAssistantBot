@@ -510,7 +510,7 @@ class LoginServer:
         if studip_sess is not None and self._entry_target(request) == "stums" and not relogin:
             studip_sess.last_interactive_activity = time.time()
             await studip_sess.ensure_session()
-            studip_sess._stums_verified_at = 0.0
+            studip_sess.stums.verified_at = 0.0
             raise web.HTTPFound(STUMS_SSO_ENTRY_PATH)
         if studip_sess is not None:
             studip_sess.last_interactive_activity = time.time()
@@ -581,7 +581,7 @@ class LoginServer:
         if studip_sess is None:
             return web.Response(text="Bot session not initialized", status=503)
         await studip_sess.ensure_session()
-        stums_signed_in = time.time() - (vars(studip_sess).get("_stums_verified_at", 0.0) or 0.0) < 120
+        stums_signed_in = time.time() - studip_sess.stums.verified_at < 120
         if request.path.startswith(("/nidp", "/osp", "/sso.php", "/dispatch.php/login")) or (
                 request.path.startswith("/qisserver") and not stums_signed_in):
             # a sign-in is in progress: background SSO handoffs wait for it.
@@ -682,9 +682,9 @@ class LoginServer:
                 and ("abmelden" in lowered or "logout" in lowered)
             )
             if is_stums_auth:
-                studip_sess._stums_verified_at = time.time()
-                studip_sess._stums_referer = f"{STUMS_ORIGIN}{request.path}"
-                studip_sess.stums_blocked_until = 0.0  # interactive sign-in lifts the pause
+                studip_sess.stums.verified_at = time.time()
+                studip_sess.stums.referer = f"{STUMS_ORIGIN}{request.path}"
+                studip_sess.stums.blocked_until = 0.0  # interactive sign-in lifts the pause
 
             if is_studip_auth or is_stums_auth:
                 studip_sess.explicitly_logged_out = False

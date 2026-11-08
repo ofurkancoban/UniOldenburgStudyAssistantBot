@@ -16,12 +16,12 @@ def _session_line(uid, sess) -> str:
     jar = getattr(getattr(sess, "session", None), "cookie_jar", None)
     hosts = {c["domain"].lstrip(".") for c in jar} if jar is not None else set()
     studip = "✅" if any(h.startswith("elearning.") for h in hosts) else "—"
-    verified_at = vars(sess).get("_stums_verified_at", 0.0) or 0.0
+    verified_at = sess.stums.verified_at
     if verified_at:
         stums = f"✅ {int((time.time() - verified_at) // 60)} min ago"
     else:
         stums = "—"
-    paused = (vars(sess).get("stums_blocked_until", 0.0) or 0.0) - time.time()
+    paused = sess.stums.blocked_until - time.time()
     if paused > 0:
         stums += f" (paused {int(paused // 60) + 1} min)"
     state_label = "signed out" if getattr(sess, "explicitly_logged_out", False) else "active"

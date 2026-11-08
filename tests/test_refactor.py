@@ -595,8 +595,7 @@ class StumsHandoffTests(unittest.TestCase):
     def session(self, planner_pages, has_stums_cookie=False):
         s = mock.MagicMock()
         s.explicitly_logged_out = False
-        s._stums_verified_at = 0.0
-        s.stums_blocked_until = 0.0
+        s.stums = __import__("studip_session").StumsState()
         s.sso_handoff = mock.AsyncMock(return_value="https://stums.uni-oldenburg.de/start")
         s.session.cookie_jar.filter_cookies.return_value = {"JSESSIONID": "x"} if has_stums_cookie else {}
         pages = iter(planner_pages)
@@ -631,14 +630,14 @@ class StumsHandoffTests(unittest.TestCase):
         s = self.session(["Login notwendig", "Login notwendig"])
         with self.assertRaisesRegex(RuntimeError, "still shows you as logged out"):
             asyncio.run(self.er._establish_stums_session(s))
-        self.assertEqual(s._stums_verified_at, 0.0)
+        self.assertEqual(s.stums.verified_at, 0.0)
 
     def test_expired_sso_asks_for_a_sign_in(self):
         s = self.session([])
         s.sso_handoff = mock.AsyncMock(side_effect=RuntimeError("Interactive login required (no stored username)"))
         with self.assertRaisesRegex(self.er.StumsLoginUnavailable, "/login"):
             asyncio.run(self.er._establish_stums_session(s))
-        self.assertGreater(s.stums_blocked_until, __import__("time").time())
+        self.assertGreater(s.stums.blocked_until, __import__("time").time())
 
     def test_stuck_at_university_login_asks_for_sign_in_and_pauses(self):
         s = self.session([])
@@ -655,14 +654,14 @@ class StumsHandoffTests(unittest.TestCase):
         s.sso_handoff = mock.AsyncMock(side_effect=RuntimeError("SSO flow did not complete; stuck at https://x.example/"))
         with self.assertRaises(RuntimeError):
             asyncio.run(self.er._establish_stums_session(s))
-        self.assertGreater(s.stums_blocked_until, __import__("time").time())
+        self.assertGreater(s.stums.blocked_until, __import__("time").time())
 
     def test_pauses_after_refusal_and_logs_once(self):
         s = self.session(["Login notwendig", "Login notwendig"])
         with self.assertRaises(self.er.StumsLoginUnavailable) as first:
             asyncio.run(self.er._establish_stums_session(s))
         self.assertFalse(first.exception.quiet)
-        self.assertGreater(s.stums_blocked_until, __import__("time").time() + 25 * 60)
+        self.assertGreater(s.stums.blocked_until, __import__("time").time() + 25 * 60)
         with self.er.background_stums(), self.assertRaises(self.er.StumsLoginUnavailable) as second:
             asyncio.run(self.er._establish_stums_session(s))
         self.assertTrue(second.exception.quiet)
@@ -679,7 +678,7 @@ class StumsHandoffTests(unittest.TestCase):
         # a button press right after the refusal tries StuMS again at once
         asyncio.run(self.er._establish_stums_session(s))
         self.assertEqual(s.sso_handoff.await_count, 3)
-        self.assertEqual(s.stums_blocked_until, 0.0)
+        self.assertEqual(s.stums.blocked_until, 0.0)
 
     def test_background_checks_are_marked(self):
         seen = {}
@@ -697,9 +696,9 @@ class StumsHandoffTests(unittest.TestCase):
     def test_new_login_ends_the_pause(self):
         import studip_session
         sess = studip_session.StudIPSession("u", "p", "JBSWY3DPEHPK3PXP", cookie_file="/nonexistent")
-        sess.stums_blocked_until = __import__("time").time() + 600
+        sess.stums.blocked_until = __import__("time").time() + 600
         sess.reset_login_backoff()
-        self.assertEqual(sess.stums_blocked_until, 0.0)
+        self.assertEqual(sess.stums.blocked_until, 0.0)
 
     def test_forget_forces_a_new_check(self):
         s = self.session(["ok", "ok"])

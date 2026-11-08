@@ -596,7 +596,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(throttle.stats[STUMS], {"requests": 5, "ok": 2, "client_errors": 0, "throttled": 1,
                                                  "server_errors": 1, "network_errors": 1})
         sess = studip_session.StudIPSession("", "", "", cookie_file=None, user_id=7)
-        sess._stums_verified_at = time.time() - 120
+        sess.stums.verified_at = time.time() - 120
         saved = (dict(state.user_sessions), state.global_session)
         state.user_sessions.clear()
         state.user_sessions[7] = sess
@@ -868,10 +868,11 @@ class CourseWatchPlanTests(unittest.TestCase):
             listed.append(user_id)
             state.user_courses_map[user_id] = {1: {"c1": "Math", "c2": "Stats"}, 2: {"c2": "Stats", "c3": "AI"}}[user_id]
 
+        from unibot import auth
         with mock.patch.object(m, "list_courses", fake_list), \
-                mock.patch.object(m, "has_stored_login", lambda s: True), \
-                mock.patch.object(m.db, "get_all_users", lambda: [{"telegram_id": 1}, {"telegram_id": 2}]), \
-                mock.patch.object(m, "ALLOWED_USER_IDS", {1}):
+                mock.patch.object(auth, "has_stored_login", lambda s: True), \
+                mock.patch.object(auth.db, "get_all_users", lambda: [{"telegram_id": 1}, {"telegram_id": 2}]), \
+                mock.patch.object(auth, "ALLOWED_USER_IDS", {1}):
             plan = asyncio.run(m.watched_courses())
             again = asyncio.run(m.watched_courses())
         self.assertEqual(sorted((cid, sess is s1) for _n, cid, sess in plan),
@@ -898,3 +899,47 @@ class CourseWatchPlanTests(unittest.TestCase):
             sent.clear()
             asyncio.run(telegram_ui.broadcast(Bot(), "x", cid="c3"))
             self.assertEqual(sorted(sent), [1, 2])  # unknown participants: old rules
+
+
+class AccountRegistryTests(unittest.TestCase):
+    def test_all_sessions_and_signed_in_accounts(self):
+        from unibot import auth, state
+        saved = (dict(state.user_sessions), state.global_session)
+        a, b = object(), object()
+        state.user_sessions.clear()
+        state.user_sessions.update({1: a, 2: b})
+        state.global_session = a  # the watcher is also user 1
+        try:
+            self.assertEqual(auth.all_sessions(), [a, b])  # each session once, watcher first
+            with mock.patch.object(auth, "has_stored_login", lambda s: s is b), \
+                    mock.patch.object(auth.db, "get_all_users", lambda: [{"telegram_id": 2}, {"telegram_id": 3, "is_active": 0}]), \
+                    mock.patch.object(auth, "ALLOWED_USER_IDS", {1}):
+                self.assertEqual(auth.signed_in_accounts(), [(2, b)])
+        finally:
+            state.user_sessions.clear()
+            state.user_sessions.update(saved[0])
+            state.global_session = saved[1]
+
+
+class LayeringTests(unittest.TestCase):
+    """stums_parsers is the pure parsing layer: no network, state or bot imports."""
+
+    def test_parsers_import_nothing_stateful(self):
+        import ast
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "stums_parsers.py"), encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        forbidden = {"aiohttp", "studip_session", "studip_http", "unibot", "exam_reminder", "telegram"}
+        self.assertFalse(imported & forbidden, imported & forbidden)
+        self.assertFalse([n for n in ast.walk(tree) if isinstance(n, (ast.AsyncFunctionDef, ast.Await))])
+
+    def test_exam_reminder_reexports_the_parsers(self):
+        import exam_reminder
+        import stums_parsers
+        self.assertIs(exam_reminder._parse_examination_periods, stums_parsers._parse_examination_periods)

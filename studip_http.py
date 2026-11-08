@@ -289,7 +289,7 @@ class UniResponse:
 
 def rewrite_headers(headers: CIMultiDictProxy, location: Optional[str]) -> CIMultiDictProxy:
     """Copy of `headers` with Location replaced (and proxy-only headers removed)."""
-    out = CIMultiDict()
+    out: CIMultiDict[str] = CIMultiDict()
     for k, v in headers.items():
         kl = k.lower()
         if kl == "location":

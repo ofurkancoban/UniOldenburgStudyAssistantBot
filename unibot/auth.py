@@ -387,8 +387,8 @@ def is_new_login_for(session: StudIPSession) -> bool:
             if c.key == "Studip_Session":
                 current = c.value
                 break
-    previous = vars(session).get("_last_seen_studip_cookie")
-    session._last_seen_studip_cookie = current
+    previous = session.last_seen_studip_cookie
+    session.last_seen_studip_cookie = current
     return bool(current) and current != previous
 
 
@@ -461,7 +461,7 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
     # the server while the NetIQ SSO session from the Mini App is fresh.
     try:
         from exam_reminder import _establish_stums_session
-        session.stums_blocked_until = 0.0  # a fresh login lifts the background pause
+        session.stums.blocked_until = 0.0  # a fresh login lifts the background pause
         await _establish_stums_session(session)
         await session.save_cookies()
         logging.info("🎓 StuMS session established during login for user %s", user_id)
@@ -633,12 +633,44 @@ async def _send_login_prompt(reply_target, user_id: int) -> None:
         )
 
 
-async def close_all_sessions() -> None:
-    """Close every user's HTTP connections (on shutdown)."""
-    sessions = {id(s): s for s in state.user_sessions.values() if s is not None}
+# ── account registry ──────────────────────────────────────────────────────────
+# The one place that answers "which accounts exist / are signed in": the
+# watcher, the course plan, the keep-alive loop and diagnostics all ask here.
+
+def all_sessions() -> list:
+    """Every open session once: the watcher's first, then each user's."""
+    sessions = {}
     if state.global_session is not None:
         sessions[id(state.global_session)] = state.global_session
-    for sess in sessions.values():
+    for sess in state.user_sessions.values():
+        if sess is not None:
+            sessions.setdefault(id(sess), sess)
+    return list(sessions.values())
+
+
+def signed_in_accounts() -> list:
+    """(telegram_id, session) of every active user with a stored login,
+    admins from the environment first."""
+    try:
+        active = [u["telegram_id"] for u in db.get_all_users() if u.get("is_active", 1)]
+    except Exception:
+        logging.debug("User list unavailable", exc_info=True)
+        active = []
+    accounts = []
+    for uid in dict.fromkeys(sorted(ALLOWED_USER_IDS) + active):
+        try:
+            sess = state.user_sessions.get(uid) or get_user_session(uid)
+        except Exception:
+            logging.debug("No session for %s", uid, exc_info=True)
+            continue
+        if has_stored_login(sess):
+            accounts.append((uid, sess))
+    return accounts
+
+
+async def close_all_sessions() -> None:
+    """Close every user's HTTP connections (on shutdown)."""
+    for sess in all_sessions():
         try:
             await sess.close()
         except Exception:

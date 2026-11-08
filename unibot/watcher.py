@@ -37,7 +37,7 @@ from unibot.storage import (
     update_general_cache,
 )
 from unibot.telegram_ui import broadcast
-from unibot.auth import act_as_bot, acting_as, get_user_session, has_stored_login, login_studip
+from unibot.auth import act_as_bot, acting_as, all_sessions, get_user_session, has_stored_login, login_studip, signed_in_accounts
 from unibot.schedule import (
     check_calendar_reminders,
     check_course_schedule_changes,
@@ -210,16 +210,7 @@ def _user_sender(user_id: int):
 
 def _stums_users() -> list:
     """(telegram_id, session) of every active student with a stored login."""
-    users = []
-    for uid in _get_active_user_ids():
-        try:
-            sess = get_user_session(uid)
-        except Exception as e:
-            logging.debug("No session for %s: %s", uid, e)
-            continue
-        if has_stored_login(sess):
-            users.append((uid, sess))
-    return users
+    return signed_in_accounts()
 
 
 async def _run_stums_checks(bot, session, now: datetime, cache_suffix: str = "", send=None):
@@ -420,11 +411,7 @@ async def session_keepalive_loop():
     act_as_bot()  # this task acts for the bot itself, never for a user
     while True:
         await asyncio.sleep(SESSION_KEEPALIVE_SECONDS + random.uniform(0, 60))
-        sessions = []
-        if state.global_session is not None:
-            sessions.append(state.global_session)
-        sessions += [s for s in state.user_sessions.values() if s is not None and s is not state.global_session]
-        for index, sess in enumerate(sessions):
+        for index, sess in enumerate(all_sessions()):
             if index:
                 await asyncio.sleep(random.uniform(2.0, 6.0))  # never all users at once
             try:

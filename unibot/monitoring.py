@@ -35,7 +35,16 @@ from unibot.formatting import (
     parse_date_safe,
 )
 from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, broadcast
-from unibot.auth import act_as_bot, acting_as, current_user_id, get_user_session, has_stored_login, is_user_allowed, login_studip
+from unibot.auth import (
+    act_as_bot,
+    acting_as,
+    current_user_id,
+    get_user_session,
+    has_stored_login,
+    is_user_allowed,
+    login_studip,
+    signed_in_accounts,
+)
 from unibot.studip_api import (
     BASE_URL,
     STUDIP_API_URL,
@@ -225,21 +234,6 @@ COURSE_LIST_REFRESH_SECONDS = 6 * 3600
 _course_list_fetched: dict[int, float] = {}
 
 
-def _signed_in_users() -> list:
-    """(telegram_id, session) of every active user with a stored login."""
-    users = []
-    try:
-        uids = [u["telegram_id"] for u in db.get_all_users() if u.get("is_active", 1)]
-    except Exception:
-        logging.debug("User list unavailable", exc_info=True)
-        uids = []
-    for uid in dict.fromkeys(list(ALLOWED_USER_IDS) + uids):
-        sess = state.user_sessions.get(uid) or get_user_session(uid)
-        if has_stored_login(sess):
-            users.append((uid, sess))
-    return users
-
-
 async def watched_courses() -> list:
     """[(course name, cid, session)], one entry per course across all users.
 
@@ -255,7 +249,7 @@ async def watched_courses() -> list:
             plan.setdefault(cid, (name, cid, watcher))
             if getattr(watcher, "user_id", None):
                 members.setdefault(cid, set()).add(watcher.user_id)
-    for uid, sess in _signed_in_users():
+    for uid, sess in signed_in_accounts():
         if time.time() - _course_list_fetched.get(uid, 0.0) > COURSE_LIST_REFRESH_SECONDS \
                 or uid not in state.user_courses_map:
             try:
