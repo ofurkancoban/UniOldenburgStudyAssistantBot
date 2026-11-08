@@ -62,7 +62,8 @@ set -euo pipefail
 [ -n "$NODE_BIN" ] && export PATH="$NODE_BIN:$PATH"
 cd "$DEPLOY_DIR"
 PREVIOUS="$(git rev-parse --short HEAD)"
-LOG="$(pm2 jlist | python3 -c 'import json,os,sys; print(next(p["pm2_env"]["pm_out_log_path"] for p in json.load(sys.stdin) if p["name"] == os.environ["PM2_APP"]))')"
+# the bot logs to stderr, PM2 keeps that in the error log: read both
+LOGS="$(pm2 jlist | python3 -c 'import json,os,sys; e=next(p["pm2_env"] for p in json.load(sys.stdin) if p["name"] == os.environ["PM2_APP"]); print(e["pm_out_log_path"], e["pm_err_log_path"])')"
 
 healthy() {
   # the bot is up once the watcher reports a successful start after `since`
@@ -70,7 +71,8 @@ healthy() {
   while [ $SECONDS -lt $deadline ]; do
     sleep 5
     pm2 jlist | python3 -c 'import json,os,sys; sys.exit(0 if any(p["name"] == os.environ["PM2_APP"] and p["pm2_env"]["status"] == "online" for p in json.load(sys.stdin)) else 1)' || continue
-    if tail -c 200000 "$LOG" | awk -v s="$since" '$1" "$2 >= s' | grep -q "Unified watcher controller started successfully"; then
+    # shellcheck disable=SC2086
+    if for f in $LOGS; do tail -c 200000 "$f"; done | awk -v s="$since" '$1" "$2 >= s' | grep -q "Unified watcher controller started successfully"; then
       return 0
     fi
   done
