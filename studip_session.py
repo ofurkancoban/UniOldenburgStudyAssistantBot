@@ -672,6 +672,8 @@ class StudIPSession:
         async with self._lock:
             self.explicitly_logged_out = True
             self.invalidate_login_cache()
+            self._stums_verified_at = 0.0
+            self._stums_referer = None
             self.reset_login_backoff()
             self.username = ""
             self.password = ""

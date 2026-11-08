@@ -644,7 +644,7 @@ class StumsHandoffTests(unittest.TestCase):
         s = self.session([])
         s.sso_handoff = mock.AsyncMock(side_effect=RuntimeError(
             "SSO flow did not complete; stuck at https://auth.uni-oldenburg.de/osp/a/TOP/auth/oauth2/grant?x=1"))
-        with self.assertRaisesRegex(self.er.StumsLoginUnavailable, "Sign In to StuMS"):
+        with self.assertRaisesRegex(self.er.StumsLoginUnavailable, "university login"):
             asyncio.run(self.er._establish_stums_session(s))
         with self.er.background_stums(), self.assertRaises(self.er.StumsLoginUnavailable):
             asyncio.run(self.er._establish_stums_session(s))

@@ -363,7 +363,7 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
         server = state.login_server
         kb_rows = []
         if server:
-            kb_rows.append([InlineKeyboardButton("🎓 Sign In to StuMS", web_app=WebAppInfo(url=server.app_url("stums")))])
+            kb_rows.append([InlineKeyboardButton("🎓 Reconnect StuMS", web_app=WebAppInfo(url=server.app_url("stums")))])
         kb_rows.append([InlineKeyboardButton("🔄 Retry", callback_data=f"stums_doc|{doc_key}")])
         await status_msg.edit_text(
             f"❌ Unable to download <b>{html.escape(spec['label'])}</b> via StuMS:\n"
@@ -405,7 +405,7 @@ async def build_tuition_status_text(session=None, user_id=None) -> tuple[str, In
         server = state.login_server
         kb_rows = []
         if server:
-            kb_rows.append([InlineKeyboardButton("🎓 Sign In to StuMS", web_app=WebAppInfo(url=server.app_url("stums")))])
+            kb_rows.append([InlineKeyboardButton("🎓 Reconnect StuMS", web_app=WebAppInfo(url=server.app_url("stums")))])
         kb_rows.append([InlineKeyboardButton("🔄 Retry", callback_data="tuition_status")])
         kb = InlineKeyboardMarkup(kb_rows)
         return "\n".join(lines), kb

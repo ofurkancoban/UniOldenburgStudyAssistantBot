@@ -320,3 +320,37 @@ class PerUserStumsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SsoChainTests(unittest.TestCase):
+    """One university sign-in in the Mini App connects Stud.IP and StuMS."""
+
+    def setUp(self):
+        import studip_login_server as ls
+        from aiohttp.test_utils import make_mocked_request
+        self.ls = ls
+        self.req = lambda method="GET", headers=None: make_mocked_request(method, "/x", headers=headers or {})
+
+    def target(self, sess, studip=False, stums=False, **kw):
+        return self.ls.LoginServer._chain_target(self.req(**kw), sess, studip, stums)
+
+    def test_studip_login_chains_to_stums_once(self):
+        sess = {"idp_seen": True}
+        self.assertEqual(self.target(sess, studip=True), self.ls.STUMS_SSO_ENTRY_PATH)
+        sess["chained"] = True
+        self.assertIsNone(self.target(sess, studip=True))
+
+    def test_stums_login_chains_to_studip(self):
+        self.assertEqual(self.target({"idp_seen": True}, stums=True), self.ls.STUDIP_SSO_LOGIN_PATH)
+
+    def test_no_chain_when_other_service_already_seen(self):
+        self.assertIsNone(self.target({"idp_seen": True, "stums_seen": True}, studip=True))
+        self.assertIsNone(self.target({"idp_seen": True, "studip_seen": True}, stums=True))
+
+    def test_no_chain_without_a_fresh_sign_in_or_for_ajax(self):
+        self.assertIsNone(self.target({}, studip=True))
+        self.assertIsNone(self.target({"idp_seen": True}, studip=True, method="POST"))
+        self.assertIsNone(self.target({"idp_seen": True}, studip=True,
+                                      headers={"X-Requested-With": "XMLHttpRequest"}))
+        self.assertIsNone(self.target({"idp_seen": True}, studip=True,
+                                      headers={"Sec-Fetch-Dest": "iframe"}))

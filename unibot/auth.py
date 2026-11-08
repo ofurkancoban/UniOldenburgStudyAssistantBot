@@ -9,6 +9,7 @@ import errno
 import html
 import logging
 import os
+import time
 from typing import Optional
 
 import psutil
@@ -409,14 +410,20 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
         if studip_user or display_name:
             db.upsert_user(telegram_id=user_id, studip_username=studip_user)
 
-    # Seamless StuMS SSO handoff while NetIQ SSO session is warm
-    try:
-        from exam_reminder import _establish_stums_session
-        await _establish_stums_session(session)
-        await session.save_cookies()
-        logging.info("🎓 StuMS session established successfully during login for user %s", user_id)
-    except Exception as exc:
-        logging.debug("StuMS SSO handoff after proxy login skipped/failed: %s", exc)
+    # Seamless StuMS SSO handoff while the NetIQ SSO session is warm. When the
+    # Mini App is already chaining the browser on to StuMS, leave it to that
+    # chain: a parallel server-side handoff would replace its JSESSIONID.
+    if time.time() < (vars(session).get("_sso_chain_until", 0.0) or 0.0):
+        logging.info("🎓 StuMS sign-in for user %s continues in the Mini App", user_id)
+    else:
+        try:
+            from exam_reminder import _establish_stums_session
+            session.stums_blocked_until = 0.0  # a fresh login lifts the background pause
+            await _establish_stums_session(session)
+            await session.save_cookies()
+            logging.info("🎓 StuMS session established during login for user %s", user_id)
+        except Exception as exc:
+            logging.info("StuMS SSO handoff after proxy login failed for user %s: %s", user_id, exc)
 
     if is_new_session and (user_id is None or is_user_admin(user_id)):
         state._last_notified_studip_cookie = studip_cookie
@@ -554,11 +561,11 @@ async def _send_login_prompt(reply_target, user_id: int) -> None:
     if public.startswith("https://"):
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔐 Open Stud.IP (Mini App)", web_app=WebAppInfo(url=server.app_url()))],
-            [InlineKeyboardButton("🎓 Sign In to StuMS (exams, grades)", web_app=WebAppInfo(url=server.app_url("stums")))],
         ])
         await reply_target.reply_text(
-            "Tap the button below to open Stud.IP and sign in.\n"
-            "Once signed in, your session and OAuth2 token will be kept alive automatically.",
+            "Tap the button below to sign in once with your university account.\n"
+            "The same sign-in connects Stud.IP and StuMS (exams, grades), and both "
+            "sessions are kept alive automatically.",
             reply_markup=keyboard,
             disable_web_page_preview=True,
         )

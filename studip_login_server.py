@@ -54,6 +54,15 @@ STUMS_ORIGIN = "https://stums.uni-oldenburg.de"
 # StuMS' own "log in via university SSO" entry; through this proxy it runs the
 # NetIQ login in the bot's cookie jar and lands back on StuMS signed in.
 STUMS_SSO_ENTRY_PATH = "/qisserver/api/identityprovider/redirect/2/login"
+# Stud.IP's OIDC sign-in, started from the proxied Mini App.
+STUDIP_SSO_LOGIN_PATH = "/dispatch.php/login?again=yes&sso=oidc&cancel_login=1"
+# How long the hook leaves the second sign-in to the browser chain.
+SSO_CHAIN_SECONDS = 120.0
+
+_CHAIN_SNIPPET = """
+<div style="position:fixed;inset:0;z-index:2147483647;background:rgba(15,23,42,0.75);display:flex;align-items:center;justify-content:center;color:#f8fafc;font:15px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;text-align:center;padding:20px;">__TEXT__</div>
+<script>setTimeout(function(){location.replace("__TARGET__");},300);</script>
+"""
 
 LoginCallback = Callable[[str, str, str], Awaitable[tuple[bool, str]]]
 
@@ -509,6 +518,9 @@ class LoginServer:
             studip_sess.last_interactive_activity = time.time()
             await studip_sess.ensure_session()
             studip_sess._stums_verified_at = 0.0
+            proxy_sess.pop("chained", None)
+            if await studip_sess.is_html_logged_in():
+                proxy_sess["studip_seen"] = True  # no Stud.IP detour after StuMS
             raise web.HTTPFound(STUMS_SSO_ENTRY_PATH)
         if studip_sess is not None:
             studip_sess.last_interactive_activity = time.time()
@@ -519,6 +531,14 @@ class LoginServer:
             elif await studip_sess.is_html_logged_in(use_cache=False):
                 studip_sess.explicitly_logged_out = False
                 studip_sess.last_interactive_activity = 0.0
+                proxy_sess["studip_seen"] = True
+                if not proxy_sess.get("chained") and not await self._stums_signed_in(studip_sess):
+                    # Stud.IP is still signed in but StuMS is not: connect
+                    # StuMS through the browser in the same Mini App visit.
+                    proxy_sess["chained"] = True
+                    studip_sess._sso_chain_until = time.time() + SSO_CHAIN_SECONDS
+                    studip_sess.last_interactive_activity = time.time()
+                    raise web.HTTPFound(STUMS_SSO_ENTRY_PATH)
                 self._schedule_auth_hook(user_id)
                 raise web.HTTPFound("/dispatch.php/my_courses")
             else:
@@ -545,6 +565,39 @@ class LoginServer:
 
         # Start the real Uni Oldenburg OIDC SSO flow
         raise web.HTTPFound("/dispatch.php/login?again=yes&sso=oidc&cancel_login=1")
+
+    @staticmethod
+    async def _stums_signed_in(studip_sess) -> bool:
+        """Cheap check whether this session is already signed in to StuMS."""
+        try:
+            from exam_reminder import _has_stums_cookie, _stums_logged_in, _stums_verified, STUMS_START_URL
+            if _stums_verified(studip_sess):
+                return True
+            if not _has_stums_cookie(studip_sess):
+                return False
+            referer = vars(studip_sess).get("_stums_referer") or STUMS_START_URL
+            with interactive_requests():
+                return await _stums_logged_in(studip_sess, referer)
+        except Exception as exc:
+            logger.debug("StuMS sign-in check failed: %s", exc)
+            return True  # unknown: do not force a detour
+
+    @staticmethod
+    def _chain_target(request: web.Request, proxy_sess: dict,
+                      is_studip_auth: bool, is_stums_auth: bool) -> Optional[str]:
+        """After a sign-in in this Mini App session, send the browser on to the
+        other service once, so a single university login connects both Stud.IP
+        and StuMS (the fresh SSO session makes the second sign-in silent).
+        Only top-level page loads qualify, never AJAX fragments."""
+        if request.method != "GET" or proxy_sess.get("chained") or not proxy_sess.get("idp_seen"):
+            return None
+        if request.headers.get("X-Requested-With") or request.headers.get("Sec-Fetch-Dest", "document") != "document":
+            return None
+        if is_studip_auth and not proxy_sess.get("stums_seen"):
+            return STUMS_SSO_ENTRY_PATH
+        if is_stums_auth and not proxy_sess.get("studip_seen"):
+            return STUDIP_SSO_LOGIN_PATH
+        return None
 
     def _schedule_auth_hook(self, user_id: Optional[int] = None) -> None:
         now = time.time()
@@ -580,6 +633,10 @@ class LoginServer:
         await studip_sess.ensure_session()
         if request.path.startswith(("/nidp", "/osp", "/sso.php", "/dispatch.php/login", "/qisserver")):
             studip_sess.last_interactive_activity = time.time()
+        if request.path.startswith(("/nidp", "/osp")):
+            # The user went through the university login in this Mini App
+            # session, so the other service can reuse that fresh SSO session.
+            proxy_sess["idp_seen"] = True
 
         path_qs = request.rel_url.path_qs
         upstream_origin = _upstream_for_path(request.path)
@@ -673,16 +730,39 @@ class LoginServer:
                 and 'name="asdf"' not in text
                 and ("abmelden" in lowered or "logout" in lowered)
             )
+            chain_to = self._chain_target(request, proxy_sess, is_studip_auth, is_stums_auth)
+            if is_studip_auth:
+                proxy_sess["studip_seen"] = True
             if is_stums_auth:
+                proxy_sess["stums_seen"] = True
                 studip_sess._stums_verified_at = time.time()
                 studip_sess._stums_referer = f"{STUMS_ORIGIN}{request.path}"
-                self._schedule_auth_hook(user_id)
+                studip_sess.stums_blocked_until = 0.0  # interactive sign-in lifts the pause
+            if chain_to:
+                proxy_sess["chained"] = True
+                # the browser signs in to the second service; the auth hook
+                # must not start a competing server-side handoff meanwhile
+                studip_sess._sso_chain_until = time.time() + SSO_CHAIN_SECONDS
 
             if is_studip_auth or is_stums_auth:
                 studip_sess.explicitly_logged_out = False
                 studip_sess.last_interactive_activity = 0.0
                 if is_studip_auth:
                     self._schedule_auth_hook(user_id)
+                elif chain_to is None:
+                    if proxy_sess.get("studip_seen"):
+                        # end of a Stud.IP -> StuMS chain: just persist the StuMS cookies
+                        studip_sess._sso_chain_until = 0.0
+                        asyncio.create_task(studip_sess.save_cookies())
+                    else:
+                        self._schedule_auth_hook(user_id)
+            if chain_to:
+                label = "StuMS" if chain_to == STUMS_SSO_ENTRY_PATH else "Stud.IP"
+                bar = (
+                    _CHAIN_SNIPPET.replace("__TARGET__", chain_to)
+                    .replace("__TEXT__", f"✅ Signed in. Connecting {label} too…")
+                )
+            elif is_studip_auth or is_stums_auth:
                 bar = (
                     _CONNECTED_BANNER_SNIPPET
                     + _STATUS_BAR_SNIPPET.replace("__STATUS_TEXT__", "✅ Bot connected")
