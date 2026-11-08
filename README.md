@@ -290,7 +290,7 @@ graph TD
 
 Shared runtime state (the Stud.IP session, the login server, watcher flags) lives in `unibot/state.py` and is always read as `state.<name>`, so every module sees the current value.
 
-**Persistent data** (caches, settings, tasks, wardrobe, study progress) is stored in one SQLite database, `bot_data.sqlite3` (`unibot/db.py`), one row per document, each save a single transaction. Existing JSON files from older versions are imported automatically the first time they are read and then renamed to `.imported`. Back up `bot_data.sqlite3` (together with `.env` and `.vault_key`) to back up the bot.
+**Persistent data** (caches, settings, tasks, wardrobe, study progress) is stored in one SQLite database, `bot_data.sqlite3` (`unibot/db.py`), one row per document, each save a single transaction. Existing JSON files from older versions are imported automatically the first time they are read and then renamed to `.imported`. Every night (from 03:00) the bot writes a consistent, gzipped copy to `backups/bot_data_<date>.sqlite3.gz` and keeps the last 7; the daily admin digest shows the newest one. Logins inside stay encrypted, so a restore also needs `.vault_key` (and `.env`): stop the bot, `gunzip -c backups/bot_data_<date>.sqlite3.gz > bot_data.sqlite3`, start it again. Keep a copy of `.vault_key` and `.env` somewhere other than the server.
 
 > **exam_reminder.py** shares the same authenticated session as the bot (Stud.IP's SSO trust extends to the StuMS/HISinOne exam portal) to track registrations, exam dates, and grades, so no separate login is required.
 >

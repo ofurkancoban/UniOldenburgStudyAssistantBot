@@ -5,6 +5,7 @@ state of every user session. Read-only: nothing here sends a request."""
 from __future__ import annotations
 
 import html
+import os
 import re
 import time
 from collections import Counter
@@ -13,7 +14,8 @@ from typing import Iterable, Optional
 
 from studip_http import THROTTLE
 from studip_session import worker_status
-from unibot import state
+from unibot import db, state
+from unibot.config import PROJECT_ROOT
 
 
 def _session_line(uid, sess) -> str:
@@ -129,6 +131,22 @@ def _delta(now: dict, before: dict) -> dict:
     return out
 
 
+def backup_line(backup_dir: Optional[str] = None, now: Optional[float] = None) -> str:
+    """The newest database backup, flagged when it is older than two days."""
+    backup_dir = backup_dir or os.path.join(PROJECT_ROOT, db.BACKUP_DIR)
+    try:
+        names = sorted(f for f in os.listdir(backup_dir) if f.startswith("bot_data_") and f.endswith(".sqlite3.gz"))
+    except OSError:
+        names = []
+    if not names:
+        return "💾 Database backup: ⚠️ none yet"
+    path = os.path.join(backup_dir, names[-1])
+    age_hours = ((now or time.time()) - os.path.getmtime(path)) / 3600
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    flag = "⚠️" if age_hours > 48 else "✅"
+    return f"💾 Database backup: {flag} {names[-1]} ({size_mb:.1f} MB, {len(names)} kept)"
+
+
 def daily_digest(now: datetime, log_paths: Iterable[str], previous: Optional[dict] = None) -> list[str]:
     """HTML lines of the admin daily digest. `now` is naive local time, like
     the log timestamps; `previous` is the traffic_snapshot() of the last digest."""
@@ -165,6 +183,8 @@ def daily_digest(now: datetime, log_paths: Iterable[str], previous: Optional[dic
     if worker["configured"]:
         state_label = "⚠️ down" if worker["down_for"] > 0 else "✅ up"
         lines.append(f"☁️ Cloudflare Worker: {state_label}, {failovers} failovers since the last digest")
+
+    lines.append(backup_line())
 
     sessions = {uid: s for uid, s in state.user_sessions.items() if s is not None}
     lines.append(f"👥 <b>Sessions</b> ({len(sessions)})")

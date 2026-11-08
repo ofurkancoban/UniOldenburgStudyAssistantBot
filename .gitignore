@@ -16,6 +16,7 @@ yarn-error.log*
 bot_data.sqlite3
 bot_data.sqlite3-wal
 bot_data.sqlite3-shm
+backups/
 announcement_cache.json
 files_cache.json
 study_plan_cache.json

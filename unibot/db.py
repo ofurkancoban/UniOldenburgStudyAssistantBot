@@ -21,9 +21,11 @@ removes both, so a cleared setting cannot come back from the old file).
 Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
+import gzip
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -198,6 +200,49 @@ def close() -> None:
             _conn.close()
         _conn = None
         _conn_path = None
+
+
+
+BACKUP_DIR = "backups"
+BACKUP_KEEP = 7
+
+
+def backup(dest_dir: Optional[str] = None, keep: int = BACKUP_KEEP, stamp: Optional[str] = None) -> str:
+    """Write a consistent, gzipped copy of the database to
+    <dest_dir>/bot_data_<stamp>.sqlite3.gz and keep only the newest `keep`.
+
+    Uses SQLite's online backup, so it is safe while the bot keeps writing
+    (blocking work: call it from a thread).
+    Logins in the copy stay encrypted; restoring also needs .vault_key.
+    Returns the path of the new backup."""
+    dest_dir = dest_dir or os.path.join(PROJECT_ROOT, BACKUP_DIR)
+    os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+    stamp = stamp or time.strftime("%Y-%m-%d")
+    final = os.path.join(dest_dir, f"bot_data_{stamp}.sqlite3.gz")
+    raw = final[:-3] + ".tmp"
+    try:
+        with _lock:
+            _connection()  # make sure the file and schema exist
+        # its own read connection: with WAL the bot keeps reading and writing
+        source = sqlite3.connect(_db_path())
+        target = sqlite3.connect(raw)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        with open(raw, "rb") as src, gzip.open(final + ".tmp", "wb", compresslevel=6) as dst:
+            shutil.copyfileobj(src, dst, 1024 * 1024)
+        os.chmod(final + ".tmp", 0o600)
+        os.replace(final + ".tmp", final)
+    finally:
+        for leftover in (raw, final + ".tmp"):
+            if os.path.exists(leftover):
+                os.remove(leftover)
+    backups = sorted(f for f in os.listdir(dest_dir) if f.startswith("bot_data_") and f.endswith(".sqlite3.gz"))
+    for old in backups[:-keep] if keep > 0 else []:
+        os.remove(os.path.join(dest_dir, old))
+    return final
 
 
 # ── User & Credential Multi-Tenancy helpers ───────────────────────────────────

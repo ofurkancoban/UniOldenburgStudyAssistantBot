@@ -893,6 +893,61 @@ class CookieStorageTests(unittest.TestCase):
         finally:
             db.delete_user_credentials(4343)
 
+
+class DatabaseBackupTests(unittest.TestCase):
+    def test_backup_is_a_readable_copy_and_old_ones_are_pruned(self):
+        import gzip
+        import sqlite3
+        import stat
+        from unibot import db
+        tmp = tempfile.mkdtemp()
+        db.save(os.path.join(tmp, "backup_probe.json"), {"kept": 1})
+        for day in ("2026-11-01", "2026-11-02", "2026-11-03"):
+            db.backup(tmp, keep=2, stamp=day)
+        names = sorted(os.listdir(tmp))
+        self.assertEqual([n for n in names if n.endswith(".gz")],
+                         ["bot_data_2026-11-02.sqlite3.gz", "bot_data_2026-11-03.sqlite3.gz"])
+        self.assertFalse([n for n in names if n.endswith(".tmp")])
+        newest = os.path.join(tmp, "bot_data_2026-11-03.sqlite3.gz")
+        self.assertEqual(stat.S_IMODE(os.stat(newest).st_mode), 0o600)
+        restored = os.path.join(tmp, "restored.sqlite3")
+        with gzip.open(newest, "rb") as src, open(restored, "wb") as dst:
+            dst.write(src.read())
+        conn = sqlite3.connect(restored)
+        try:
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            keys = [r[0] for r in conn.execute("SELECT key FROM documents")]
+        finally:
+            conn.close()
+        self.assertTrue(any("backup_probe" in k for k in keys), keys)
+
+    def test_digest_line_flags_missing_and_old_backups(self):
+        from unibot import diagnostics
+        tmp = tempfile.mkdtemp()
+        self.assertIn("none yet", diagnostics.backup_line(tmp))
+        path = os.path.join(tmp, "bot_data_2026-11-09.sqlite3.gz")
+        with open(path, "wb") as fh:
+            fh.write(b"x" * 2048)
+        self.assertIn("✅ bot_data_2026-11-09", diagnostics.backup_line(tmp))
+        self.assertIn("⚠️", diagnostics.backup_line(tmp, now=time.time() + 3 * 86400))
+
+    def test_watcher_backs_up_once_a_night(self):
+        from datetime import datetime
+        from unibot import watcher
+        calls = []
+        cache: dict = {}
+
+        async def fake_backup():
+            calls.append(1)
+
+        with mock.patch.object(watcher, "_backup_database", fake_backup), \
+                mock.patch.object(watcher, "load_general_cache", lambda: cache), \
+                mock.patch.object(watcher, "save_general_cache", lambda c: cache.update(c)):
+            asyncio.run(watcher._run_daily_backup(datetime(2026, 11, 9, 2, 0, tzinfo=watcher.TZ_BERLIN)))
+            for _ in range(2):
+                asyncio.run(watcher._run_daily_backup(datetime(2026, 11, 9, 3, 5, tzinfo=watcher.TZ_BERLIN)))
+        self.assertEqual(calls, [1])
+
 class RetireImportedFilesTests(unittest.TestCase):
     def test_files_already_in_the_database_are_renamed(self):
         from unibot import db

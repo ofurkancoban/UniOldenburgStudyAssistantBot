@@ -6,6 +6,7 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 import asyncio
 import html
 import logging
+import os
 import random
 import time
 from datetime import datetime
@@ -82,6 +83,8 @@ TUITION_ATTEMPT_INTERVAL_SECONDS = 60 * 60  # check_tuition_reminders itself run
 HEALTH_CHECK_INTERVAL_SECONDS = 30 * 60
 # Admin daily digest: sent on the first watcher cycle from this hour on.
 DAILY_DIGEST_HOUR = 9
+# Daily database backup, at night when the bot is quiet.
+BACKUP_HOUR = 3
 # Pause between two students' StuMS checks, so N users never hit StuMS as
 # one burst from the server's IP.
 STUMS_USER_GAP_SECONDS = (4.0, 10.0)
@@ -326,6 +329,19 @@ async def _send_daily_digest(bot):
     await broadcast(bot, "\n".join(lines), parse_mode="HTML", members=set(ADMIN_USER_IDS))
 
 
+async def _backup_database():
+    path = await asyncio.to_thread(db.backup)
+    logging.info("💾 Database backup written: %s", os.path.basename(path))
+
+
+async def _run_daily_backup(now: datetime):
+    """Once a day, the first watcher cycle after BACKUP_HOUR (see db.backup)."""
+    if now.hour < BACKUP_HOUR:
+        return
+    await _run_once_per_period("last_db_backup", now.date().isoformat(), "Database backup",
+                               "💾 Backing up the database...", _backup_database)
+
+
 async def _run_daily_digest(bot, now: datetime):
     """Once a day the admins get a summary of errors, university traffic,
     worker failovers and session state (see diagnostics.daily_digest)."""
@@ -416,6 +432,7 @@ async def unified_watcher_controller(app):
             await _run_reminder_checks(bot, session, now)
             await _run_exam_date_checks(bot, session, now)
             await _run_health_check(bot, now)
+            await _run_daily_backup(now)
             await _run_daily_digest(bot, now)
             await _run_content_watchers(bot, admin_id, cycle_count, now)
 
