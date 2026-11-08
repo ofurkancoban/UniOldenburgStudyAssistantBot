@@ -494,7 +494,7 @@ def _format_time_range_24h(time_range_text: str) -> Optional[str]:
         return None
 
 
-def _parse_examination_periods(body_text: str) -> list[dict]:
+def _parse_examination_periods(body_text: str, now: Optional[datetime] = None) -> list[dict]:
     """Parse the detail page's flattened text into one entry per offered exam sitting.
 
     A single exam unit can be offered as several parallel groups (different weekday,
@@ -600,6 +600,13 @@ def _parse_examination_periods(body_text: str) -> list[dict]:
         end_dt = stamps[1] if len(stamps) > 1 else None
         if end_dt is None:
             logging.info("exam_reminder: no enrollment window dates in %r", window_text[:200])
+        # "Enrollment feasible from ..." is also shown for a window that only
+        # opens later (e.g. the resit), so the dates decide whether it is open now.
+        current = now or berlin_now()
+        if is_open and start_dt and current < start_dt:
+            is_open = False
+        if is_open and end_dt and current > end_dt:
+            is_open = False
         if len(window_lines) > 1 and start_dt:
             enroll_line = window_text
 
@@ -1109,19 +1116,22 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
 
     now = berlin_now()
     still_open_keys = set()
+    # Keys from before the window dates were parsed read "code:None:None" and
+    # stood for the whole unit: every sitting of such a unit was announced.
+    legacy_announced = {key.split(":", 1)[0]: notified_open.pop(key) for key in list(notified_open)
+                        if key.endswith(":None:None")}
+    legacy_deadlines = {key.split(":", 1)[0]: notified_deadline.pop(key) for key in list(notified_deadline)
+                        if key.endswith(":None:None")}
 
     for exam in open_exams:
         code = exam["code"]
         # A unit can have several parallel groups open at once (each its own sitting),
         # so the notification/dedup key has to include the sitting, not just the code.
         occurrence_key = f"{code}:{exam['start_date']}:{exam['end_date']}"
-        # Keys from before the window dates were parsed read "code:None:None";
-        # carry their state over instead of announcing the exam a second time.
-        legacy_key = f"{code}:None:None"
-        if occurrence_key != legacy_key and occurrence_key not in notified_open and legacy_key in notified_open:
-            notified_open[occurrence_key] = notified_open.pop(legacy_key)
-            if legacy_key in notified_deadline:
-                notified_deadline[occurrence_key] = notified_deadline.pop(legacy_key)
+        if code in legacy_announced and occurrence_key not in notified_open:
+            notified_open[occurrence_key] = legacy_announced[code]
+            if code in legacy_deadlines:
+                notified_deadline[occurrence_key] = list(legacy_deadlines[code])
         # Still tracked even when muted, so the cache-cleanup pass below doesn't
         # treat "muted" as "closed" and purge its notification state.
         still_open_keys.add(occurrence_key)
@@ -1207,6 +1217,13 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
     # closed — purging it here would make the next successful check treat it
     # as newly-opened again and resend the "registration open" notification
     # for an exam that was never actually closed.
+    # a legacy unit whose sittings were not in this result keeps its old key
+    for code, stamp in legacy_announced.items():
+        if not any(key.startswith(f"{code}:") for key in still_open_keys):
+            notified_open[f"{code}:None:None"] = stamp
+            if code in legacy_deadlines:
+                notified_deadline[f"{code}:None:None"] = legacy_deadlines[code]
+
     # A unit can also drop out of one result without an error (a StuMS detail
     # page that comes back without its periods), so a key is only forgotten
     # after it has been missing for OPEN_CLOSED_GRACE_SECONDS.

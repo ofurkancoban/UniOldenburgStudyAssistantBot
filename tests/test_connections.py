@@ -512,7 +512,8 @@ class ExamWindowParsingTests(unittest.TestCase):
             "Examination period: 1\nEnrollment feasible from\n10/19/26, 12:00 AM\nuntil\n11/20/26, 11:59 PM",
             "Examination period: 1\nEnrollment possible from 19.10.2026, 00:00 until 20.11.2026, 23:59",
         ):
-            (period,) = er._parse_examination_periods(body)
+            (period,) = er._parse_examination_periods(body, now=er.datetime(2026, 11, 8, 12, 0))
+            self.assertTrue(period["is_open"])
             self.assertEqual((period["start_date"], period["end_date"]),
                              ("2026-10-19T00:00:00", "2026-11-20T23:59:00"))
 
@@ -608,3 +609,41 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("not configured", text)
         self.assertIn("<code>7</code> 👁: active", text)
         self.assertIn("StuMS ✅ 2 min ago", text)
+
+
+class ExamWindowStateTests(unittest.TestCase):
+    BODY = ("Examination period: 1\nEnrollment feasible from 10/20/26, 12:00 AM until 2/5/27, 11:59 PM\n"
+            "Examination period: 2\nEnrollment feasible from 2/15/27, 12:00 AM until 3/14/27, 11:59 PM")
+
+    def test_only_the_current_window_is_open(self):
+        import exam_reminder as er
+        main, resit = er._parse_examination_periods(self.BODY, now=er.datetime(2026, 11, 8, 12, 0))
+        self.assertTrue(main["is_open"])
+        self.assertFalse(resit["is_open"])  # opens in February
+        main, resit = er._parse_examination_periods(self.BODY, now=er.datetime(2027, 2, 20, 12, 0))
+        self.assertFalse(main["is_open"])
+        self.assertTrue(resit["is_open"])
+
+    def test_legacy_key_covers_every_sitting_of_the_unit(self):
+        import exam_reminder as er
+        sittings = [{"code": "wir874_P1", "start_date": "2026-10-28T00:00:00", "end_date": end,
+                     "unit_id": "u", "title": "Course", "raw": "w"}
+                    for end in ("2027-02-05T23:59:00", "2027-03-03T23:59:00")]
+        cache = {"notified_open": {"wir874_P1:None:None": "2026-11-08T20:21:09"}}
+        sent = []
+
+        async def fake_open(session, failed_codes=None):
+            return sittings
+
+        async def send(bot, text, reply_markup=None):
+            sent.append(text)
+
+        with mock.patch.object(er, "get_open_exam_registrations", fake_open), \
+                mock.patch.object(er, "load_exam_cache", lambda *a, **k: cache), \
+                mock.patch.object(er, "save_exam_cache", lambda data, *a, **k: cache.update(data)), \
+                mock.patch.object(er, "berlin_now", lambda: er.datetime(2026, 11, 8, 22, 0)):
+            asyncio.run(er.check_exam_reminders(object(), None, send, {}))
+        self.assertFalse([t for t in sent if "REGISTRATION OPEN" in t])
+        self.assertEqual(sorted(cache["notified_open"]),
+                         ["wir874_P1:2026-10-28T00:00:00:2027-02-05T23:59:00",
+                          "wir874_P1:2026-10-28T00:00:00:2027-03-03T23:59:00"])
