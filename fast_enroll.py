@@ -6,9 +6,7 @@ target time) without a browser, reusing an authenticated StudIPSession.
 """
 
 import asyncio
-import json
 import logging
-import os
 import re
 import time
 from datetime import datetime, timedelta
@@ -38,12 +36,12 @@ class EnrollError(Exception):
 
 def load_pending() -> dict:
     """Load pending fast-enroll jobs keyed by str(chat_id) -> {sem_id -> {sem_id, target_time_str, target_date_str}}."""
-    if not os.path.exists(PENDING_FILE):
+    from unibot import db  # the bot's SQLite document store (imports the old JSON file once)
+    if not db.exists(PENDING_FILE):
         return {}
     try:
-        with open(PENDING_FILE, "r") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+        data = db.load(PENDING_FILE)
+    except (ValueError, OSError):
         logging.warning("fast_enroll: could not read %s, starting empty", PENDING_FILE, exc_info=True)
         return {}
 
@@ -61,10 +59,8 @@ def load_pending() -> dict:
 
 
 def _save_pending(pending: dict):
-    tmp_path = PENDING_FILE + ".tmp"
-    with open(tmp_path, "w") as f:
-        json.dump(pending, f)
-    os.replace(tmp_path, PENDING_FILE)
+    from unibot import db
+    db.save(PENDING_FILE, pending)
 
 
 def list_pending_jobs(chat_id) -> dict:

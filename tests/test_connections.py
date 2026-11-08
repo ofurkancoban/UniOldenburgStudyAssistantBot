@@ -3,9 +3,14 @@
 import asyncio
 import os
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
+
+# never touch the live log or database (set before unibot is imported)
+os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
+os.environ.setdefault("BOT_DB_FILE", os.path.join(tempfile.mkdtemp(prefix="unibot-tests-"), "bot_data.sqlite3"))
 
 from aiohttp import web
 from yarl import URL
@@ -690,3 +695,54 @@ class NamedTunnelTests(unittest.TestCase):
         self.assertIn("tunnel --no-autoupdate run", recorded)
         self.assertIn("token=tok123", recorded)
         self.assertNotIn("tok123 ", recorded.split("token=")[0])  # not on the command line
+
+
+class SqliteStoreTests(unittest.TestCase):
+    def test_exam_cache_and_pending_jobs_live_in_sqlite(self):
+        import json
+        import exam_reminder as er
+        import fast_enroll
+        from unibot import db
+        tmp = tempfile.mkdtemp()
+        legacy = os.path.join(tmp, "exam_reminder_cache_42.json")
+        with open(legacy, "w") as fh:
+            json.dump({"notified_open": {"x:None:None": "t"}}, fh)
+        with mock.patch.object(er, "exam_cache_path", lambda uid=None: legacy):
+            self.assertEqual(er.load_exam_cache(42)["notified_open"], {"x:None:None": "t"})
+            self.assertFalse(os.path.exists(legacy))  # imported once, then renamed
+            self.assertTrue(os.path.exists(legacy + ".imported"))
+            er.save_exam_cache({"notified_open": {}, "known_grades": {"a": 1}}, 42)
+            self.assertEqual(er.load_exam_cache(42)["known_grades"], {"a": 1})
+            self.assertFalse(os.path.exists(legacy))  # saves never write a file
+        pending = os.path.join(tmp, "fastenroll_pending.json")
+        with mock.patch.object(fast_enroll, "PENDING_FILE", pending):
+            fast_enroll.save_pending_job(7, "sem1", "10:00", "2026-11-09")
+            self.assertEqual(fast_enroll.list_pending_jobs(7)["sem1"]["target_time_str"], "10:00")
+            self.assertFalse(os.path.exists(pending))
+        self.assertTrue(db.exists(legacy) and db.exists(pending))
+
+
+class CookieStorageTests(unittest.TestCase):
+    def test_user_login_moves_from_file_into_the_database(self):
+        from studip_vault import write_vault_file
+        from unibot import db
+        tmp = tempfile.mkdtemp()
+        cookie_file = os.path.join(tmp, "studip_cookies_4242.json")
+        write_vault_file(cookie_file, [{"key": "Studip_Session", "value": "abc", "domain": "elearning.uni-oldenburg.de",
+                                        "path": "/", "host_only": True}])
+        db.delete_user_credentials(4242)
+
+        async def scenario():
+            sess = studip_session.StudIPSession("", "", "", cookie_file=cookie_file, user_id=4242)
+            try:
+                await sess.ensure_session()
+                return {c.key: c.value for c in sess.session.cookie_jar}
+            finally:
+                await sess.close()
+
+        jar = asyncio.run(scenario())
+        self.assertEqual(jar.get("Studip_Session"), "abc")
+        stored = db.load_user_credential(4242, "cookies")
+        self.assertEqual([c["value"] for c in stored if c["key"] == "Studip_Session"], ["abc"])
+        self.assertFalse(os.path.exists(cookie_file))
+        db.delete_user_credentials(4242)

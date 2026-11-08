@@ -19,7 +19,6 @@ import contextlib
 import contextvars
 import functools
 import html
-import json
 import logging
 import os
 import re
@@ -178,28 +177,35 @@ def exam_cache_path(user_id=None) -> str:
     return f"{root}_{int(uid)}{ext or '.json'}"
 
 
+def _exam_store():
+    # SQLite document store of the bot; imported lazily so this module stays
+    # importable on its own. A cache still on disk as JSON is imported into
+    # it on first read (db.load) and lives in the database from then on.
+    from unibot import db
+    return db
+
+
 def adopt_legacy_exam_cache(user_id) -> None:
     """Give the original single-user cache to `user_id` (the account it was
     built for) the first time per-user caches are used, so nothing is
     re-notified after the switch."""
+    db = _exam_store()
     target = exam_cache_path(user_id)
-    if user_id is None or os.path.exists(target) or not os.path.exists(EXAM_CACHE_PATH):
+    if user_id is None or db.exists(target) or not db.exists(EXAM_CACHE_PATH):
         return
     try:
-        with open(EXAM_CACHE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        save_exam_cache(data, user_id=user_id)
+        save_exam_cache(db.load(EXAM_CACHE_PATH), user_id=user_id)
         logging.info("exam_reminder: adopted %s for user %s", EXAM_CACHE_PATH, user_id)
     except Exception as e:
         logging.warning("Could not adopt the legacy exam cache for %s: %s", user_id, e)
 
 
 def load_exam_cache(user_id=None) -> dict:
+    db = _exam_store()
     path = exam_cache_path(user_id)
-    if os.path.exists(path):
+    if db.exists(path):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            return db.load(path)
         except Exception as e:
             logging.warning("Could not load exam reminder cache: %s", e)
     return {
@@ -209,12 +215,8 @@ def load_exam_cache(user_id=None) -> dict:
 
 
 def save_exam_cache(data: dict, user_id=None) -> None:
-    path = exam_cache_path(user_id)
     try:
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)
+        _exam_store().save(exam_cache_path(user_id), data)
     except Exception as e:
         logging.error("Could not save exam reminder cache: %s", e)
 

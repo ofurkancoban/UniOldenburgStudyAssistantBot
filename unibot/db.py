@@ -138,6 +138,12 @@ def load(path: str):
             text = fh.read()
         data = json.loads(text)
         _write(key, json.dumps(data, ensure_ascii=False))
+        # the database is the only copy from now on; the renamed file stays as
+        # a backup but can never be read (or edited) by mistake again
+        try:
+            os.replace(path, path + ".imported")
+        except OSError:
+            logging.debug("Could not rename imported %s", path, exc_info=True)
         logging.info("Imported %s into %s", key, os.path.basename(_db_path()))
         return data
 

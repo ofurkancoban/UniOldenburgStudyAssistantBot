@@ -424,20 +424,17 @@ class StudIPSession:
                 "host_only": (dom, cookie.key) in host_only if host_only is not None else True,
             })
         if getattr(self, "user_id", None):
+            # A user's login lives only in the encrypted credentials table; a
+            # cookie file from before is removed once the database has it.
             try:
                 from unibot import db
                 db.save_user_credential(self.user_id, "cookies", entries)
                 self.logger.debug("Encrypted cookies saved to DB for user %s", self.user_id)
             except Exception as exc:
                 self.logger.error("Failed to save cookies to DB for user %s: %s", self.user_id, exc)
-
-            user_cookie_file = f"studip_cookies_{self.user_id}.json"
-            if self.cookie_file != user_cookie_file and os.path.exists(user_cookie_file):
-                try:
-                    from studip_vault import write_vault_file
-                    write_vault_file(user_cookie_file, entries, mode=0o600)
-                except Exception:
-                    logging.debug("Ignored a non-critical error", exc_info=True)
+                return
+            self._remove_cookie_files()
+            return
 
         if self.cookie_file:
             try:
@@ -446,6 +443,17 @@ class StudIPSession:
                 self.logger.debug("Encrypted cookies saved to %s (mode 0600)", self.cookie_file)
             except Exception as exc:
                 self.logger.error("Failed to save encrypted cookies to %s: %s", self.cookie_file, exc)
+
+    def _remove_cookie_files(self) -> None:
+        paths = {self.cookie_file, f"studip_cookies_{self.user_id}.json"} - {None, "", "studip_cookies.json"}
+        for path in paths:
+            for candidate in (path, f"{path}.tmp"):
+                try:
+                    if os.path.exists(candidate):
+                        os.remove(candidate)
+                        self.logger.info("Removed %s: the login now lives in the database", candidate)
+                except OSError:
+                    self.logger.debug("Could not remove %s", candidate, exc_info=True)
 
     def _restore_cookie(self, key: str, val: str, dom: str, path: str, host_only: bool) -> None:
         morsel_holder = SimpleCookie()
@@ -458,6 +466,7 @@ class StudIPSession:
 
     async def load_cookies(self):
         data = None
+        migrate_to_db = False
         if getattr(self, "user_id", None):
             try:
                 from unibot import db
@@ -476,6 +485,7 @@ class StudIPSession:
                         data = json.load(f)
                 if data:
                     self.logger.info("Encrypted cookies loaded from %s", self.cookie_file)
+                    migrate_to_db = bool(getattr(self, "user_id", None))
             except Exception as e:
                 self.logger.error("Failed to load cookies: %s", e)
 
@@ -507,6 +517,8 @@ class StudIPSession:
                             self._restore_cookie(key, val, dom, "/", True)
                         except (CookieError, ValueError):
                             self.logger.debug("Skipping unrestorable cookie %s", key)
+                if migrate_to_db:
+                    await self.save_cookies()  # into the database, then the file goes
                 return True
             except Exception as e:
                 self.logger.error("Failed to apply cookies to session: %s", e)
