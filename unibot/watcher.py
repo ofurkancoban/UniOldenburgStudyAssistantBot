@@ -27,9 +27,12 @@ from studip_utils import TZ_BERLIN, berlin_now
 from unibot import db
 from unibot import state
 from unibot.config import (
+    ADMIN_USER_IDS,
     ALLOWED_USER_IDS,
     GWDG_API_KEY,
+    LOG_FILE,
 )
+from unibot.diagnostics import daily_digest, traffic_snapshot
 from unibot.storage import (
     get_weekly_study_plan_enabled,
     load_general_cache,
@@ -77,6 +80,8 @@ EXAM_REGISTRATION_CHECK_INTERVAL_SECONDS = 60 * 60
 EXAM_REGISTRATION_OPEN_INTERVAL_SECONDS = 30 * 60  # while a registration window is open
 TUITION_ATTEMPT_INTERVAL_SECONDS = 60 * 60  # check_tuition_reminders itself runs once a day
 HEALTH_CHECK_INTERVAL_SECONDS = 30 * 60
+# Admin daily digest: sent on the first watcher cycle from this hour on.
+DAILY_DIGEST_HOUR = 9
 # Pause between two students' StuMS checks, so N users never hit StuMS as
 # one burst from the server's IP.
 STUMS_USER_GAP_SECONDS = (4.0, 10.0)
@@ -312,6 +317,26 @@ async def _run_health_check(bot, now: datetime):
     update_general_cache({"last_health_check": now.isoformat()})
 
 
+async def _send_daily_digest(bot):
+    previous = load_general_cache().get("daily_digest_snapshot") or {}
+    log_paths = [f"{LOG_FILE}.1", LOG_FILE]  # the rotated file covers a rollover
+    # Log timestamps are the server's naive local time, so compare in that clock.
+    lines = daily_digest(datetime.now(), log_paths, previous)
+    update_general_cache({"daily_digest_snapshot": traffic_snapshot()})
+    await broadcast(bot, "\n".join(lines), parse_mode="HTML", members=set(ADMIN_USER_IDS))
+
+
+async def _run_daily_digest(bot, now: datetime):
+    """Once a day the admins get a summary of errors, university traffic,
+    worker failovers and session state (see diagnostics.daily_digest)."""
+    if now.hour < DAILY_DIGEST_HOUR or not ADMIN_USER_IDS:
+        return
+    await _run_once_per_period(
+        "last_daily_digest", now.date().isoformat(), "Daily digest",
+        "🩺 Sending the daily health digest...", _send_daily_digest, bot,
+    )
+
+
 async def _run_content_watchers(bot, admin_id, cycle_count: int, now: datetime):
     """Announcements, files and forum posts. Messages are polled separately
     every MESSAGE_POLL_SECONDS by message_poll_loop, not once per cycle."""
@@ -391,6 +416,7 @@ async def unified_watcher_controller(app):
             await _run_reminder_checks(bot, session, now)
             await _run_exam_date_checks(bot, session, now)
             await _run_health_check(bot, now)
+            await _run_daily_digest(bot, now)
             await _run_content_watchers(bot, admin_id, cycle_count, now)
 
             logging.info("✅ Watcher cycle #%s completed", cycle_count)

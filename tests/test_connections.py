@@ -616,6 +616,86 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("StuMS ✅ 2 min ago", text)
 
 
+class DailyDigestTests(unittest.TestCase):
+    def _log(self, lines):
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".log")
+        with os.fdopen(fd, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+        self.addCleanup(os.remove, path)
+        return path
+
+    def test_scan_groups_recent_problems(self):
+        from datetime import datetime
+        from unibot import diagnostics
+        path = self._log([
+            "2026-11-07 08:00:00 | ERROR | too old 1",
+            "2026-11-08 10:00:00 | ERROR | ❌ Login error in watcher: timeout 12",
+            "Traceback (most recent call last):",
+            "2026-11-08 11:00:00 | ERROR | ❌ Login error in watcher: timeout 34",
+            "2026-11-08 12:00:00 | WARNING | slow host",
+            "2026-11-08 12:30:00 | INFO | all good",
+            "2026-11-08 13:00:00 | CRITICAL | disk full",
+        ])
+        counts = diagnostics.scan_log_problems([path, path + ".missing"], datetime(2026, 11, 8, 0, 0))
+        self.assertEqual(counts["ERROR"]["❌ Login error in watcher: timeout #"], 2)
+        self.assertEqual(counts["ERROR"]["disk full"], 1)
+        self.assertEqual(sum(counts["ERROR"].values()), 3)
+        self.assertEqual(dict(counts["WARNING"]), {"slow host": 1})
+
+    def test_digest_shows_deltas_since_the_last_one(self):
+        from datetime import datetime
+        from unibot import diagnostics, state
+        throttle = studip_http.HostThrottle(min_interval=0)
+        for _ in range(5):
+            throttle.report(STUMS, 200)
+        throttle.report(STUMS, 502)
+        previous = {"hosts": {STUMS: {"requests": 2, "server_errors": 0}}, "failovers": 0}
+        path = self._log(["2026-11-08 08:00:00 | WARNING | <b>x</b>"])
+        saved = dict(state.user_sessions)
+        state.user_sessions.clear()
+        try:
+            with mock.patch.object(diagnostics, "THROTTLE", throttle), \
+                    mock.patch.dict(os.environ, {"CLOUDFLARE_WORKER_URL": ""}):
+                text = "\n".join(diagnostics.daily_digest(datetime(2026, 11, 8, 9, 0), [path], previous))
+                snapshot = diagnostics.traffic_snapshot()
+        finally:
+            state.user_sessions.update(saved)
+        self.assertIn(f"{STUMS}: 4 req, 0 throttled, 1 5xx", text)
+        self.assertIn("0 errors, 1 warnings", text)
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;", text)  # log text is escaped
+        self.assertEqual(snapshot["hosts"][STUMS]["requests"], 6)
+
+    def test_counter_reset_after_restart(self):
+        from unibot import diagnostics
+        self.assertEqual(diagnostics._delta({"requests": 3}, {"requests": 50}), {"requests": 3})
+
+    def test_watcher_sends_once_a_day_to_admins_only(self):
+        import asyncio
+        from datetime import datetime
+        from unibot import watcher
+        sent = []
+
+        async def fake_broadcast(bot, text, **kwargs):
+            sent.append(kwargs.get("members"))
+
+        cache: dict = {}
+        with mock.patch.object(watcher, "broadcast", fake_broadcast), \
+                mock.patch.object(watcher, "ADMIN_USER_IDS", {1}), \
+                mock.patch.object(watcher, "load_general_cache", lambda: cache), \
+                mock.patch.object(watcher, "save_general_cache", lambda c: cache.update(c)), \
+                mock.patch.object(watcher, "update_general_cache", lambda d: cache.update(d)):
+            early = datetime(2026, 11, 8, 8, 0, tzinfo=watcher.TZ_BERLIN)
+            asyncio.run(watcher._run_daily_digest(None, early))
+            self.assertEqual(sent, [])
+            later = datetime(2026, 11, 8, 9, 5, tzinfo=watcher.TZ_BERLIN)
+            asyncio.run(watcher._run_daily_digest(None, later))
+            asyncio.run(watcher._run_daily_digest(None, later))
+        self.assertEqual(sent, [{1}])
+        self.assertEqual(cache["last_daily_digest"], "2026-11-08")
+        self.assertIn("daily_digest_snapshot", cache)
+
+
 class ExamWindowStateTests(unittest.TestCase):
     BODY = ("Examination period: 1\nEnrollment feasible from 10/20/26, 12:00 AM until 2/5/27, 11:59 PM\n"
             "Examination period: 2\nEnrollment feasible from 2/15/27, 12:00 AM until 3/14/27, 11:59 PM")
