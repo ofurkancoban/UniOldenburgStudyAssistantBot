@@ -397,3 +397,37 @@ class ExamOpenDedupTests(unittest.TestCase):
             for _ in range(3):
                 asyncio.run(er.check_exam_reminders(object(), None, send, {}))
         self.assertEqual(len(sent), 1)
+
+
+class ExamWindowParsingTests(unittest.TestCase):
+    def test_window_dates_in_every_layout(self):
+        import exam_reminder as er
+        for body in (
+            "Examination period: 1\nEnrollment feasible from 10/19/26, 12:00 AM until 11/20/26, 11:59 PM",
+            "Examination period: 1\nEnrollment feasible from\n10/19/26, 12:00 AM\nuntil\n11/20/26, 11:59 PM",
+            "Examination period: 1\nEnrollment possible from 19.10.2026, 00:00 until 20.11.2026, 23:59",
+        ):
+            (period,) = er._parse_examination_periods(body)
+            self.assertEqual((period["start_date"], period["end_date"]),
+                             ("2026-10-19T00:00:00", "2026-11-20T23:59:00"))
+
+    def test_old_undated_key_is_not_reannounced(self):
+        import exam_reminder as er
+        exam = {"code": "inf007_P", "start_date": "2026-10-19T00:00:00", "end_date": "2026-11-20T23:59:00",
+                "unit_id": "u", "title": "Course", "raw": "window"}
+        cache = {"notified_open": {"inf007_P:None:None": "2026-11-08T20:21:09"}}
+        sent = []
+
+        async def fake_open(session, failed_codes=None):
+            return [exam]
+
+        async def send(bot, text, reply_markup=None):
+            sent.append(text)
+
+        with mock.patch.object(er, "get_open_exam_registrations", fake_open), \
+                mock.patch.object(er, "load_exam_cache", lambda *a, **k: cache), \
+                mock.patch.object(er, "save_exam_cache", lambda data, *a, **k: cache.update(data)), \
+                mock.patch.object(er, "berlin_now", lambda: er.datetime(2026, 11, 8, 22, 0)):
+            asyncio.run(er.check_exam_reminders(object(), None, send, {}))
+        self.assertFalse([t for t in sent if "REGISTRATION OPEN" in t])
+        self.assertIn("inf007_P:2026-10-19T00:00:00:2026-11-20T23:59:00", cache["notified_open"])

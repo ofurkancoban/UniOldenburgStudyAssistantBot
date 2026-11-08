@@ -110,6 +110,33 @@ EXAM_DATE_THRESHOLDS_DAYS = [3, 1, 0]
 EXAM_HOURS_BEFORE_THRESHOLD = 3
 
 ENROLLMENT_LINE_RE = re.compile(r"from\s+([\d/]+),\s*([\d:]+\s*[AP]M).*?until\s+([\d/]+),\s*([\d:]+\s*[AP]M)")
+# One date + time of an enrollment window, in the formats StuMS uses for the
+# English ("10/19/26, 12:00 AM") and German ("19.10.2026, 00:00") interface.
+WINDOW_DATETIME_RE = re.compile(
+    r"(\d{1,2}/\d{1,2}/\d{2,4}),?\s*(\d{1,2}:\d{2}\s*[AaPp][Mm])"
+    r"|(\d{1,2}\.\d{1,2}\.\d{2,4}),?\s*(\d{1,2}:\d{2})"
+)
+
+
+def _parse_window_datetimes(text: str) -> list[datetime]:
+    """Every enrollment-window timestamp in `text`, in page order."""
+    found = []
+    for m in WINDOW_DATETIME_RE.finditer(text):
+        if m.group(1):
+            date_s, time_s = m.group(1), re.sub(r"\s+", " ", m.group(2).upper())
+            if " " not in time_s:
+                time_s = time_s[:-2] + " " + time_s[-2:]
+            fmts = ("%m/%d/%y %I:%M %p", "%m/%d/%Y %I:%M %p")
+        else:
+            date_s, time_s = m.group(3), m.group(4)
+            fmts = ("%d.%m.%Y %H:%M", "%d.%m.%y %H:%M")
+        for fmt in fmts:
+            try:
+                found.append(datetime.strptime(f"{date_s} {time_s}", fmt))
+                break
+            except ValueError:
+                continue
+    return found
 PERIOD_HEADER_RE = re.compile(r"^Examination period:\s*\d+$")
 EXAM_DATE_RE = re.compile(r"^[A-Z][a-z]{2} \d{1,2}, \d{4}$")
 EXAM_TIME_RANGE_RE = re.compile(r"^\d{1,2}:\d{2}\s*[AP]M\s*-\s*\d{1,2}:\d{2}\s*[AP]M$")
@@ -559,17 +586,22 @@ def _parse_examination_periods(body_text: str) -> list[dict]:
             break
 
         is_open = "was feasible" not in enroll_line and "was possible" not in enroll_line
-        start_dt = end_dt = None
-        m = ENROLLMENT_LINE_RE.search(enroll_line)
-        if m:
-            try:
-                start_dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%m/%d/%y %I:%M %p")
-            except ValueError:
-                pass
-            try:
-                end_dt = datetime.strptime(f"{m.group(3)} {m.group(4)}", "%m/%d/%y %I:%M %p")
-            except ValueError:
-                pass
+        # The page renders the window's dates in their own elements, so the
+        # flattened text can spread "from ... until ..." over several lines:
+        # read the enrollment line together with the lines that follow it.
+        window_lines = [enroll_line]
+        for follow in block[enroll_idx + 1: enroll_idx + 6]:
+            if PERIOD_HEADER_RE.match(follow) or "Disenrollment" in follow or "Prüfer" in follow:
+                break
+            window_lines.append(follow)
+        window_text = " ".join(window_lines)
+        stamps = _parse_window_datetimes(window_text)
+        start_dt = stamps[0] if stamps else None
+        end_dt = stamps[1] if len(stamps) > 1 else None
+        if end_dt is None:
+            logging.info("exam_reminder: no enrollment window dates in %r", window_text[:200])
+        if len(window_lines) > 1 and start_dt:
+            enroll_line = window_text
 
         if start_dt and end_dt:
             # Day/month/year + 24h, built from the already-parsed datetimes
@@ -1083,6 +1115,13 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
         # A unit can have several parallel groups open at once (each its own sitting),
         # so the notification/dedup key has to include the sitting, not just the code.
         occurrence_key = f"{code}:{exam['start_date']}:{exam['end_date']}"
+        # Keys from before the window dates were parsed read "code:None:None";
+        # carry their state over instead of announcing the exam a second time.
+        legacy_key = f"{code}:None:None"
+        if occurrence_key != legacy_key and occurrence_key not in notified_open and legacy_key in notified_open:
+            notified_open[occurrence_key] = notified_open.pop(legacy_key)
+            if legacy_key in notified_deadline:
+                notified_deadline[occurrence_key] = notified_deadline.pop(legacy_key)
         # Still tracked even when muted, so the cache-cleanup pass below doesn't
         # treat "muted" as "closed" and purge its notification state.
         still_open_keys.add(occurrence_key)
