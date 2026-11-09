@@ -193,10 +193,10 @@ def _format_exam_dates_message(header: str, exams: list[dict], show_status: bool
         title = e["title"]
         if e.get("group_label"):
             title += f" ({e['group_label']})"
-        lines.append(f"📘 <b>{title}</b>")
-        lines.append(f"📅 {e['exam_date_display']}")
+        lines.append(f"📘 <b>{html.escape(title)}</b>")
+        lines.append(f"📅 {html.escape(str(e['exam_date_display']))}")
         if e.get("room"):
-            lines.append(f"📍 {e['room']}")
+            lines.append(f"📍 {html.escape(str(e['room']))}")
         period_line = _registration_period_line(e)
         if period_line:
             lines.append(period_line)

@@ -8,6 +8,7 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import asyncio
+import contextlib
 import html
 import json
 import logging
@@ -1365,6 +1366,10 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         logging.warning("Voice message transcription failed", exc_info=True)
         await status_msg.edit_text(f"⚠️ {e}")
         return
+    finally:
+        # the student's recording never stays on the server
+        with contextlib.suppress(OSError):
+            os.remove(ogg_path)
 
     # Google's free STT can mishear things, so confirm before it's actually used
     # to answer the wizard step (or classified as a fresh command) - nothing is

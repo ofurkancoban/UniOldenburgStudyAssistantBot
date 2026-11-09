@@ -4,6 +4,7 @@ the proxy refuses cross-site form posts, invite code guessing is capped and
 a Stud.IP reply is always sent from the replying student's own account."""
 
 import asyncio
+import contextlib
 import os
 import sys
 import tempfile
@@ -139,6 +140,53 @@ class ReplySenderTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 asyncio.run(monitoring.send_studip_message("r1", "Re: x", "hi"))
         login.assert_not_called()
+
+
+class MoreEscapingTests(unittest.TestCase):
+    def test_dashboard_escapes_task_and_exam_text(self):
+        from unibot import schedule
+
+        tasks = [{"text": EVIL, "course": EVIL, "due_time": "2099-01-01T10:00:00+01:00"}, {"text": EVIL}]
+        exams = [{"title": EVIL, "date": "2099-01-02"}]
+        with mock.patch.object(schedule, "get_open_exam_registrations", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(schedule, "get_registered_exam_schedule", mock.AsyncMock(return_value=exams)), \
+                mock.patch.object(schedule, "user_tasks", return_value=tasks):
+            text = asyncio.run(schedule.build_upcoming_dashboard(object(), 5))
+        self.assertNotIn("<a href", text)
+        self.assertEqual(text.count("&lt;a href"), 4)
+
+    def test_exam_list_escapes_title_and_room(self):
+        from unibot import monitoring_alerts
+
+        lines = monitoring_alerts._format_exam_dates_message(
+            "h", [{"title": EVIL, "room": EVIL, "exam_date_display": "x"}], show_status=False)
+        self.assertNotIn("<a href", "\n".join(lines))
+
+
+class VoiceRecordingTests(unittest.TestCase):
+    def test_recording_is_deleted_after_a_whisper_transcript(self):
+        created = []
+
+        async def download(path):
+            with open(path, "wb") as fh:
+                fh.write(b"ogg")
+            created.append(path)
+
+        update = mock.MagicMock()
+        update.effective_user.id = 5
+        update.message.voice.file_unique_id = "unit-test-voice"
+        update.message.reply_text = mock.AsyncMock(return_value=mock.MagicMock(edit_text=mock.AsyncMock(), delete=mock.AsyncMock()))
+        context = mock.MagicMock()
+        context.user_data = {}
+        context.bot.send_chat_action = mock.AsyncMock()
+        context.bot.get_file = mock.AsyncMock(return_value=mock.MagicMock(download_to_drive=download))
+        with mock.patch.object(monitoring, "is_user_allowed", return_value=True), \
+                mock.patch.object(monitoring, "transcribe_voice_message", mock.AsyncMock(return_value="hello")), \
+                mock.patch("unibot.voice.classify_voice_intent", mock.AsyncMock(side_effect=RuntimeError("stop"))):
+            with contextlib.suppress(RuntimeError):
+                asyncio.run(monitoring.handle_voice_message(update, context))
+        self.assertTrue(created)
+        self.assertFalse(os.path.exists(created[0]))
 
 
 if __name__ == "__main__":

@@ -210,9 +210,9 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                 text = (
                     "🔔 <b>LECTURE REMINDER</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    f"📘 <b>{title}</b>\n"
+                    f"📘 <b>{html.escape(title)}</b>\n"
                     f"🕒 Starting in <b>{int(minutes_left)} minutes</b>\n"
-                    f"📍 {location}"
+                    f"📍 {html.escape(str(location))}"
                     f"{weather_line}"
                     f"{switch_line}\n"
                     "━━━━━━━━━━━━━━━━━━"
@@ -1877,7 +1877,7 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
             end_dt = datetime.fromisoformat(e["end_date"])
             if end_dt.tzinfo is None:
                 end_dt = end_dt.replace(tzinfo=TZ_BERLIN)
-            items.append((end_dt, f"🔴 <b>Registration closes:</b> {e['title']} – {_format_relative(end_dt, now, show_time=False)}"))
+            items.append((end_dt, f"🔴 <b>Registration closes:</b> {html.escape(e['title'])} – {_format_relative(end_dt, now, show_time=False)}"))
     except Exception as e:
         logging.warning("Upcoming dashboard: exam registration fetch failed: %s", e)
 
@@ -1894,18 +1894,19 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
                     dt = dt.replace(tzinfo=TZ_BERLIN)
             else:
                 dt = datetime(exam_date.year, exam_date.month, exam_date.day, tzinfo=TZ_BERLIN)
-            items.append((dt, f"📚 <b>Exam:</b> {exam['title']} – {_format_relative(dt, now)}"))
+            items.append((dt, f"📚 <b>Exam:</b> {html.escape(exam['title'])} – {_format_relative(dt, now)}"))
     except Exception as e:
         logging.warning("Upcoming dashboard: exam date fetch failed: %s", e)
 
     todos = []
     for t in user_tasks(user_id):
-        course_suffix = f" [{t['course']}]" if t.get("course") else ""
+        # task text can come from an announcement or a forum post
+        course_suffix = f" [{html.escape(t['course'])}]" if t.get("course") else ""
         if t.get("due_time"):
             dt = datetime.fromisoformat(t["due_time"])
-            items.append((dt, f"✅ <b>Task:</b> {t['text']}{course_suffix} – {_format_relative(dt, now)}"))
+            items.append((dt, f"✅ <b>Task:</b> {html.escape(t['text'])}{course_suffix} – {_format_relative(dt, now)}"))
         else:
-            todos.append(f"{t['text']}{course_suffix}")
+            todos.append(f"{html.escape(t['text'])}{course_suffix}")
 
     items.sort(key=lambda x: x[0])
 
