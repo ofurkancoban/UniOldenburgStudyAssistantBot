@@ -60,6 +60,7 @@ from unibot.mensa import (
     handle_foodpref_remove,
     handle_foodpref_toggle,
     handle_menu_photos_button,
+    handle_mensa_location_button,
     handle_menu_preferences_button,
     handle_menu_recommend_button,
     menu_command,
@@ -122,6 +123,7 @@ from unibot.exams import (
     tuition_command,
 )
 from unibot.study_plan import (
+    handle_study_block_feedback,
     handle_study_plan_toggle,
     handle_study_progress_menu,
     handle_study_track_menu,
@@ -343,6 +345,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_calendar_week, pattern=r"^calendar_week\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_calendar_weekly_voice, pattern="^calendar_weekly_voice\\|.*$"))
     app.add_handler(CallbackQueryHandler(menu_button_handler, pattern=r"^menu_nav\|.*$"))
+    app.add_handler(CallbackQueryHandler(handle_mensa_location_button, pattern=r"^mensa_loc\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_menu_preferences_button, pattern="^menu_prefs$"))
     app.add_handler(CallbackQueryHandler(handle_menu_recommend_button, pattern="^menu_recommend$"))
     app.add_handler(CallbackQueryHandler(handle_menu_photos_button, pattern=r"^menu_photos\|.*$"))
@@ -357,6 +360,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_outfit_menu, pattern="^(outfit_menu|outfit_menu_toggle)$"))
     app.add_handler(CallbackQueryHandler(handle_status_group, pattern=r"^(status_group|status_group_toggle)\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_study_plan_toggle, pattern=r"^sp_plan\|\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_study_block_feedback, pattern=r"^sp_block\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_study_progress_menu, pattern=r"^(sp_progress|sp_progress_refresh|sp_course\|.*|sp_unit\|.*)$"))
     app.add_handler(CallbackQueryHandler(handle_study_track_menu, pattern=r"^(sp_track_menu|sp_track_auto|sp_track\|.*)$"))
     app.add_handler(CallbackQueryHandler(handle_wardrobe_menu, pattern="^wardrobe_menu$"))

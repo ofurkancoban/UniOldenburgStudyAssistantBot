@@ -80,8 +80,29 @@ except (PermissionError, OSError):
 # an extra StreamHandler used to print every line twice in two formats).
 _LOG_FORMAT = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
 _console_handler = logging.StreamHandler()
+
+
+class TransientTelegramErrorFilter(logging.Filter):
+    """python-telegram-bot logs a dropped long poll (httpx.ReadError, a 502
+    from Telegram, a timeout) as an ERROR with a full traceback, then simply
+    retries. Those are expected on a long running bot: keep them as a one
+    line WARNING so real errors stand out in the log and the daily digest."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        exc = record.exc_info[1] if record.exc_info else None
+        if record.levelno >= logging.ERROR and exc is not None and record.name.startswith("telegram"):
+            from telegram.error import NetworkError  # TimedOut is a NetworkError too
+            if isinstance(exc, NetworkError):
+                record.levelno, record.levelname = logging.WARNING, "WARNING"
+                record.msg = f"{record.getMessage()} ({type(exc).__name__}: {exc}); retrying"
+                record.args = None
+                record.exc_info = record.exc_text = None
+        return True
+
+
 for _handler in (_file_handler, _console_handler):
     _handler.setFormatter(_LOG_FORMAT)
+    _handler.addFilter(TransientTelegramErrorFilter())
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 for _old_handler in list(root_logger.handlers):

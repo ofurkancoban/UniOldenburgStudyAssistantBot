@@ -39,7 +39,7 @@ from unibot.ai import _ai_patience, _call_openrouter, _pcm_to_ogg_voice, synthes
 from unibot.weather import build_weather_text_line, get_weather_snapshot
 from unibot.mensa import _friendly_menu_category_label, build_food_recommendation, fetch_dish_photo_url
 from unibot.wardrobe import generate_outfit_tryon_image, outfit_caption, pick_outfit_from_wardrobe
-from unibot.study_day import switch_warning, tight_campus_switches
+from unibot.study_day import WECHLOY, campus_of, switch_warning, tight_campus_switches
 from unibot.schedule import (
     _lunch_menu_highlight,
     _week_tasks_for_range,
@@ -290,9 +290,10 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     # Per student: their own timetable, study windows, tasks, exams and voice.
     texts: dict[int, str] = {}
     voice_paths: dict[int, str] = {}
+    menu_buttons: dict[int, str] = {}
     for uid in user_ids:
         with acting_as(uid):
-            texts[uid], voice = await _prepare_user_summary(uid, today_date, weather, food)
+            texts[uid], voice, menu_buttons[uid] = await _prepare_user_summary(uid, today_date, weather, food)
         if voice:
             voice_paths[uid] = voice
 
@@ -302,12 +303,24 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
         "photo_caption": photo_caption,
         "outfits": await _prepare_outfits(bot, user_ids, weather),
         "voice_paths": voice_paths,
+        "menu_buttons": menu_buttons,
     }
 
 
-async def _prepare_user_summary(uid: int, today_date, weather, food) -> tuple[str, Optional[str]]:
-    """(summary text, voice file or None) for one student, built from their
-    own session: never another student's classes, tasks or exams."""
+def _menu_button_for(plan: dict, today_events: list) -> str:
+    """The "Today's Menu" callback for the mensa of the student's campus
+    today: the lunch break's, else the first class's; Uhlhornsweg by default."""
+    lunch = plan.get("lunch")
+    campus = lunch.get("campus") if lunch else None
+    if campus is None:
+        campus = next((campus_of(e.get("location")) for e in today_events if campus_of(e.get("location"))), None)
+    return "mensa_loc|3|today|new" if campus == WECHLOY else "menu_nav|2/|new"
+
+
+async def _prepare_user_summary(uid: int, today_date, weather, food) -> tuple[str, Optional[str], str]:
+    """(summary text, voice file or None, menu button callback) for one
+    student, built from their own session: never another student's classes,
+    tasks or exams."""
     # like the calendar reminders: no stored login, no timetable (a fresh
     # session must not sign in on anyone else's behalf)
     own = get_user_session(uid)
@@ -326,15 +339,13 @@ async def _prepare_user_summary(uid: int, today_date, weather, food) -> tuple[st
     ])
     voice = await _prepare_morning_voice(today_events, today_date, today_tasks, weather, food,
                                          name=get_user_name(uid))
-    return text, voice
+    return text, voice, _menu_button_for(plan, today_events)
 
 
 async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
     """Send a prepare_morning_summary result: text (pinned), lunch photo,
     outfit, voice message, back to back."""
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🍴 Today's Menu", callback_data="menu_nav|2/|new")]
-    ])
+    menu_buttons = prepared.get("menu_buttons") or {}
 
     # Pinning isn't automatic in Telegram - a pinned message stays pinned
     # forever until explicitly unpinned, so keeping only "today's" summary
@@ -355,7 +366,8 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
                 chat_id=uid,
                 text=texts[uid],
                 parse_mode="HTML",
-                reply_markup=keyboard
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "🍴 Today's Menu", callback_data=menu_buttons.get(uid, "menu_nav|2/|new"))]])
             )
         except Exception as e:
             logging.error("Failed to send summary to %s: %s", uid, e)

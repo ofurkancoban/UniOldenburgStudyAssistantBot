@@ -22,6 +22,8 @@ from studip_utils import TZ_BERLIN, berlin_now, format_hours as _format_hours, m
 
 from unibot import state
 from unibot.storage import (
+    get_travel_mode,
+    record_study_block,
     load_general_cache,
     load_reminders_cache,
     load_tasks,
@@ -49,9 +51,9 @@ from unibot.studip_api import (
     studip_api_get_all,
     studip_api_user_id,
 )
-from unibot.weather import build_weather_text_line, get_weather_snapshot
+from unibot.weather import build_weather_text_line, cached_weather_snapshot, get_weather_snapshot
 from unibot.mensa import fetch_menu_titles, fetch_todays_menu_items
-from unibot.study_day import CAMPUS_INFO, menu_highlight, plan_day, switch_warning, tight_campus_switches
+from unibot.study_day import menu_highlight, plan_day, switch_warning, tight_campus_switches, travel_for, travel_note
 
 
 fastenroll_tasks: dict[int, dict[str, asyncio.Task]] = {}  # chat_id -> {sem_id -> asyncio.Task}
@@ -130,7 +132,8 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
 
         # classes reached from the other campus with too little time to travel
         tight_arrivals = {id(s["to_event"]): s for s in tight_campus_switches(
-            [e for e in events if e.get("start_dt") and e["start_dt"].date() == now.date()])}
+            [e for e in events if e.get("start_dt") and e["start_dt"].date() == now.date()],
+            user_travel(now.date(), chat_id))}
 
         for event in events:
             if not event.get("start_dt") or not event.get("title") or event["title"] == "Untitled":
@@ -166,6 +169,16 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                         weather_line = f"\n{first_class_weather['emoji']} {first_class_weather['description'].capitalize()} out there, should be a fine walk over."
                 switch = tight_arrivals.get(id(event))
                 switch_line = f"\n{html.escape(switch_warning(switch))}" if switch else ""
+                markup = None
+                if switch:
+                    # arriving late: the newest recording and slides to catch up on the start
+                    from unibot.study_plan import build_catch_up_buttons
+                    try:
+                        markup = await build_catch_up_buttons(event, chat_id)
+                    except Exception as e:
+                        logging.warning("Catch-up files unavailable for %s: %s", title, e)
+                    if markup:
+                        switch_line += "\n📎 Catch up on what you miss:"
                 text = (
                     "🔔 <b>LECTURE REMINDER</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
@@ -177,7 +190,7 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                     "━━━━━━━━━━━━━━━━━━"
                 )
                 try:
-                    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+                    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
                     logging.info("🔔 Sent reminder for %s to %s", title, chat_id)
                     reminders[event_key] = int(now.timestamp())
                     updated = True
@@ -185,7 +198,7 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                     logging.error("Failed to send reminder for %s: %s", title, e)
 
         # Study window reminders (30 minutes before, window: 25-35 minutes)
-        today_windows = find_study_windows_for_day(events, now.date())
+        today_windows = find_study_windows_for_day(events, now.date(), user_id=chat_id)
         for w in today_windows:
             start_dt = w.get("start_dt")
             if not start_dt:
@@ -205,8 +218,8 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                 extra = ""
                 if kind:
                     extra += f"{kind['emoji']} <b>{kind['label']}</b>: {html.escape(kind['hint'])}\n"
-                if w.get("travel_minutes"):
-                    extra += f"🚌 {w['travel_minutes']} min to {CAMPUS_INFO[w['travel_to']]['name']} first\n"
+                if travel_note(w):
+                    extra += f"{html.escape(travel_note(w) or '')}\n"
                 if w.get("study_spot"):
                     extra += f"📍 {html.escape(w['study_spot'])}\n"
                 text = (
@@ -240,13 +253,15 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                 start_key = f"study_start|{w['date_key']}|{int(start_dt.timestamp())}"
                 if start_key in reminders:
                     continue
-                from unibot.study_plan import build_study_pack
+                from unibot.study_plan import build_study_pack, study_pack_course
                 try:
                     pack_text, pack_markup = await build_study_pack(w, chat_id, now)
                     await bot.send_message(chat_id=chat_id, text=pack_text, parse_mode="HTML", reply_markup=pack_markup)
                     logging.info("📚 Sent study pack for the %s block to %s", f"{start_dt:%H:%M}", chat_id)
                     reminders[start_key] = int(now.timestamp())
                     updated = True
+                    course = study_pack_course(w, chat_id, now)
+                    record_study_block(chat_id, int(start_dt.timestamp()), "sent", course[1] if course else None)
                 except Exception as e:
                     logging.error("Failed to send study pack: %s", e)
 
@@ -712,8 +727,9 @@ def _plan_entry_lines(entry: dict, indent: str = "", menu: Optional[str] = None,
     details = []
     if kind:
         details.append(f"{kind['emoji']} {kind['label']}")
-    if entry.get("travel_minutes"):
-        details.append(f"🚌 {entry['travel_minutes']} min to {CAMPUS_INFO[entry['travel_to']]['name']} first")
+    note = travel_note(entry)
+    if note:
+        details.append(note)
     if entry.get("study_spot"):
         details.append(f"📍 {entry['study_spot']}")
     if details:
@@ -748,7 +764,7 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
         lines = [header]
         course_blocks = [_format_event_markdown_block(ev) for ev in today_events]
         lines.append("\n\n".join(course_blocks))
-        for switch in tight_campus_switches(today_events):
+        for switch in tight_campus_switches(today_events, user_travel(target_date)):
             lines.append("\n" + _md(switch_warning(switch)))
         lines.append("━━━━━━━━━━━━━━━━━━")
         text = "\n".join(lines) + weather_block
@@ -829,12 +845,23 @@ FREE_DAY_SESSIONS = [
 ]
 
 
-def find_study_windows_for_day(events: list, target_date: date, reference_now: Optional[datetime] = None) -> list[dict]:
+def find_study_windows_for_day(events: list, target_date: date, reference_now: Optional[datetime] = None,
+                               user_id: Optional[int] = None) -> list[dict]:
     """The day's study windows (see plan_study_day, which also returns the lunch break)."""
-    return plan_study_day(events, target_date, reference_now)["windows"]
+    return plan_study_day(events, target_date, reference_now, user_id)["windows"]
 
 
-def plan_study_day(events: list, target_date: date, reference_now: Optional[datetime] = None) -> dict:
+def user_travel(day: date, user_id: Optional[int] = None) -> dict:
+    """How long the student (default: the user the update acts for) needs
+    between the campuses on `day`: their bike/bus setting, by bus when the
+    bot has seen a wet forecast for that day."""
+    uid = user_id if user_id is not None else current_user_id()
+    weather = cached_weather_snapshot(day)
+    return travel_for(get_travel_mode(uid) if uid is not None else "bus", bool(weather and weather.get("is_wet")))
+
+
+def plan_study_day(events: list, target_date: date, reference_now: Optional[datetime] = None,
+                   user_id: Optional[int] = None) -> dict:
     """Find good study windows for a single day:
       - Divided focus sessions (Mon-Fri) if no classes are scheduled.
       - Free time before the first class (09:00 to first class start, if >= 60 mins).
@@ -955,7 +982,8 @@ def plan_study_day(events: list, target_date: date, reference_now: Optional[date
                     "is_remaining": False,
                 })
 
-    planned = plan_day(day_events, windows, target_date, STUDY_WINDOW_DAY_START, STUDY_WINDOW_DAY_END)
+    planned = plan_day(day_events, windows, target_date, STUDY_WINDOW_DAY_START, STUDY_WINDOW_DAY_END,
+                       travel=user_travel(target_date, user_id))
     windows, lunch = planned["windows"], planned["lunch"]
 
     if reference_now and reference_now.date() == target_date:

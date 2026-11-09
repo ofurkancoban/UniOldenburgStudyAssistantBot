@@ -487,6 +487,52 @@ def set_weekly_study_plan_enabled(enabled: bool) -> None:
     save_general_cache(cache)
 
 
+STUDY_BLOCK_LOG_DAYS = 35  # how long sent study blocks and their feedback are kept
+STUDY_BLOCK_STATUSES = ("sent", "done", "skipped")
+
+
+def record_study_block(user_id, start_ts: int, status: str, course: Optional[str] = None) -> None:
+    """Log a study block: "sent" when its pack goes out, then "done" or
+    "skipped" from the student's answer (the course is kept from "sent")."""
+    if status not in STUDY_BLOCK_STATUSES:
+        raise ValueError(status)
+    cache = load_general_cache()
+    log = cache.setdefault("study_blocks", {}).setdefault(str(user_id), {})
+    entry = log.get(str(start_ts), {})
+    entry["status"] = status
+    if course is not None:
+        entry["course"] = course
+    log[str(start_ts)] = entry
+    cutoff = time.time() - STUDY_BLOCK_LOG_DAYS * 86400
+    for key in [k for k in log if int(k) < cutoff]:
+        del log[key]
+    save_general_cache(cache)
+
+
+def study_block_log(user_id, since_ts: float, until_ts: float) -> list[dict]:
+    """[{"ts", "status", "course"}] of the student's blocks in [since, until), oldest first."""
+    log = (load_general_cache().get("study_blocks") or {}).get(str(user_id)) or {}
+    return [{"ts": int(k), **v} for k, v in sorted(log.items(), key=lambda kv: int(kv[0]))
+            if since_ts <= int(k) < until_ts]
+
+
+TRAVEL_MODES = ("bike", "bus")
+
+
+def get_travel_mode(user_id) -> str:
+    """How the student gets between Haarentor and Wechloy: "bike" (default) or "bus"."""
+    mode = (load_general_cache().get("travel_modes") or {}).get(str(user_id))
+    return mode if mode in TRAVEL_MODES else "bike"
+
+
+def set_travel_mode(user_id, mode: str) -> None:
+    if mode not in TRAVEL_MODES:
+        raise ValueError(mode)
+    cache = load_general_cache()
+    cache.setdefault("travel_modes", {})[str(user_id)] = mode
+    save_general_cache(cache)
+
+
 WARDROBE_OUTFIT_HISTORY_DAYS = 7  # how far back record_worn_items prunes to
 WARDROBE_RECENT_WORN_DAYS = 2  # how far back get_recently_worn_item_ids looks when deprioritizing repeats
 

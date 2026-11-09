@@ -28,6 +28,8 @@ from unibot.config import (
 )
 from unibot.storage import (
     cleanup_link_cache,
+    get_travel_mode,
+    set_travel_mode,
     get_primary_user_name,
     get_watch_previous_semester_enabled,
     get_weekly_study_plan_enabled,
@@ -91,7 +93,7 @@ user_courses: dict[int, str] = {}  # user_id -> cid
 START_MENU_DEDUP_SECONDS = 30
 
 
-def _status_group_view(group: str) -> tuple:
+def _status_group_view(group: str, user_id: Optional[int] = None) -> tuple:
     """One /status submenu. The buttons reuse the existing callbacks, except
     the on/off toggles, which go through status_group_toggle so the
     submenu redraws in place instead of being replaced by a confirmation."""
@@ -103,11 +105,16 @@ def _status_group_view(group: str) -> tuple:
         ]
     elif group == "semester":
         watch_prev = get_watch_previous_semester_enabled()
-        title = f"📆 <b>Semester &amp; Calendar</b>\n\nWatch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
+        travel = get_travel_mode(user_id)
+        travel_label = "🚲 Bike (15 min, bus when it rains)" if travel == "bike" else "🚌 Bus (20 min)"
+        title = (f"📆 <b>Semester &amp; Calendar</b>\n\nWatch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
+                 f"\nBetween Haarentor and Wechloy: {travel_label}")
         rows = [
             [InlineKeyboardButton("🗓️ Timetable", callback_data="calendar_timetable"), InlineKeyboardButton("📅 Weekly View", callback_data="calendar_weekly")],
             [InlineKeyboardButton("📆 Default Semester", callback_data="set_default_semester")],
             [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="status_group_toggle|semester|watch_prev")],
+            [InlineKeyboardButton("🚌 Switch to Bus" if travel == "bike" else "🚲 Switch to Bike",
+                                  callback_data="status_group_toggle|semester|travel")],
         ]
     else:
         title = "📄 <b>Official Documents &amp; Tuition</b>\n\nDownload official StuMS PDF certificates, transcript, and semester fee status:"
@@ -142,10 +149,12 @@ async def handle_status_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             state.courses_map = {}  # same as handle_toggle_watch_prev_sem: rebuild on the next watcher cycle
         elif feature == "study_plan":
             set_weekly_study_plan_enabled(not get_weekly_study_plan_enabled())
-        text, keyboard = _status_group_view(group)
+        elif feature == "travel":
+            set_travel_mode(query.from_user.id, "bus" if get_travel_mode(query.from_user.id) == "bike" else "bike")
+        text, keyboard = _status_group_view(group, query.from_user.id)
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
         return
-    text, keyboard = _status_group_view(group)
+    text, keyboard = _status_group_view(group, query.from_user.id)
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 

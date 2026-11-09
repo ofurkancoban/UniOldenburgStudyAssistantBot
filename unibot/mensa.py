@@ -7,7 +7,7 @@ import html
 import logging
 import random
 import re
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 import aiohttp
@@ -793,6 +793,104 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
         return "❌ Menu could not be loaded. Please try again later.", None, None, None, [], None
 
 
+# ── the Studierendenwerk's own widget (Mensa Wechloy) ──────────────────────────
+# The Stud.IP mensa widget only covers Uhlhornsweg; the other canteens come
+# from the Studierendenwerk's public Speiseplan, by locationId.
+SPEISEPLAN_LOCATIONS = {"3": "Mensa Wechloy"}
+
+
+def parse_speiseplan_meals(html_text: str) -> list[dict]:
+    """Meals of a Speiseplan widget page: name, allergens_text (the codes,
+    comma separated as on the Stud.IP menu), price (students) and labels
+    (vegan, vegetarian, ...), in menu order."""
+    meals = []
+    for meal in BeautifulSoup(html_text, "html.parser").select(".splMeal"):
+        span = meal.select_one("span[style*='font-size:24px']")
+        name = str(span.contents[0]).strip() if span is not None and span.contents else ""
+        if not name:
+            continue
+        codes = meal.select_one(".kennz")
+        allergens = codes.get_text(strip=True).strip("()") if codes else ""
+        price_el = meal.select_one(".preise span")
+        price = price_el.get_text(strip=True).split("/")[0].strip() if price_el else ""
+        if price and "€" not in price:
+            price += " €"
+        labels = []
+        for icon in meal.select("img.iconLarge"):
+            title = tag_attr(icon, "title")
+            if title and title not in labels:
+                labels.append(title)
+        meals.append({"name": re.sub(r"^\s*limited\s*-\s*", "", name, flags=re.IGNORECASE),
+                      "is_limited": bool(re.match(r"^\s*limited\s*-", name, re.IGNORECASE)),
+                      "allergens_text": ", ".join(c.strip() for c in allergens.split(",") if c.strip()),
+                      "description": "", "price": price, "labels": labels})
+    return meals
+
+
+def speiseplan_menu_keyboard(loc_id: str, day: date) -> InlineKeyboardMarkup:
+    prev_day, next_day = day - timedelta(days=1), day + timedelta(days=1)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Previous", callback_data=f"mensa_loc|{loc_id}|{prev_day.isoformat()}"),
+         InlineKeyboardButton("Today", callback_data=f"mensa_loc|{loc_id}|today"),
+         InlineKeyboardButton("Next ➡️", callback_data=f"mensa_loc|{loc_id}|{next_day.isoformat()}")],
+        [InlineKeyboardButton("🏛️ Mensa Uhlhornsweg", callback_data="menu_nav|2/")],
+        [InlineKeyboardButton("⚙️ Food Preferences", callback_data="menu_prefs")],
+    ])
+
+
+async def build_speiseplan_menu(loc_id: str, day: date, avoid_codes=None, avoid_keywords=None) -> str:
+    """HTML menu of a Speiseplan canteen for one day, with the user's food
+    preferences applied like on the Stud.IP menu."""
+    name = SPEISEPLAN_LOCATIONS.get(loc_id, "Mensa")
+    header = f"🍽️ <b>{day:%A, %d.%m.%Y}</b> 🍽️\n🌲 {html.escape(name)}"
+    page = await _fetch_speiseplan_html(loc_id, day)
+    if page is None:
+        return f"{header}\n\n❌ Menu could not be loaded. Please try again later."
+    meals = parse_speiseplan_meals(page)
+    if not meals:
+        return f"{header}\n\n❌ No dishes found for this date. The Mensa might be closed."
+    avoid = set(avoid_codes or [])
+    keywords = [kw.lower() for kw in (avoid_keywords or [])]
+    shown, codes_used, hidden = [], set(), 0
+    for meal in meals:
+        codes_used |= {c.strip() for c in meal["allergens_text"].split(",") if c.strip()}
+        if _is_dish_hidden(meal, avoid, keywords):
+            hidden += 1
+            continue
+        shown.append(meal)
+    text = header + "\n\n" + _MENU_SEPARATOR
+    for meal in shown:
+        labels = f"🏷️ {', '.join(meal['labels'])}" if meal["labels"] else ""
+        text += _format_menu_dish(meal["name"], labels, meal["allergens_text"], meal["price"], meal["is_limited"])
+    return text + _format_allergen_guide(codes_used, hidden)
+
+
+async def handle_mensa_location_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """mensa_loc|<locationId>|<YYYY-MM-DD or today>[|new]: a Speiseplan canteen's menu."""
+    query = update.callback_query
+    if not is_user_allowed(query.from_user.id):
+        await query.answer("Not authorized.")
+        return
+    parts = query.data.split("|")
+    loc_id = parts[1] if len(parts) > 1 and parts[1] in SPEISEPLAN_LOCATIONS else "3"
+    try:
+        day = date.fromisoformat(parts[2]) if len(parts) > 2 and parts[2] != "today" else berlin_now().date()
+    except ValueError:
+        day = berlin_now().date()
+    await query.answer("Loading...")
+    prefs = load_food_preferences()
+    text = await build_speiseplan_menu(loc_id, day, prefs["avoid_codes"], prefs["avoid_keywords"])
+    markup = speiseplan_menu_keyboard(loc_id, day)
+    if len(parts) > 3 and parts[3] == "new":
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+        return
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+    except TelegramError as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
 # ── menu commands ────────────────────────────────────────────────────────────
 
 def get_menu_navigation_keyboard(prev_path=None, next_path=None, current_path="2/"):
@@ -812,8 +910,9 @@ def get_menu_navigation_keyboard(prev_path=None, next_path=None, current_path="2
     photos_row = [InlineKeyboardButton("📸 Show Dish Photos", callback_data=f"menu_photos|{current_path}")]
     prefs_row = [InlineKeyboardButton("⚙️ Food Preferences", callback_data="menu_prefs")]
     recommend_row = [InlineKeyboardButton("🍽️ What should I eat?", callback_data="menu_recommend")]
+    wechloy_row = [InlineKeyboardButton("🌲 Mensa Wechloy", callback_data="mensa_loc|3|today")]
 
-    return InlineKeyboardMarkup([row, photos_row, prefs_row, recommend_row])
+    return InlineKeyboardMarkup([row, photos_row, prefs_row, recommend_row, wechloy_row])
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

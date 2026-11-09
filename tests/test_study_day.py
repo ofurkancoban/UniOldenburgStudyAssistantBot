@@ -311,8 +311,11 @@ class StudyPackTests(unittest.TestCase):
         self.assertIn("Deep work", text)
         self.assertIn("Problem Set 2", text)
         self.assertNotIn("someone else", text)
-        buttons = [row[0] for row in markup.inline_keyboard]
+        *file_rows, feedback = markup.inline_keyboard
+        buttons = [row[0] for row in file_rows]
         self.assertEqual([b.text for b in buttons], ["📝 Problem_Set_2.pdf", "📊 Lecture_4.pdf"])
+        start_ts = int(window["start_dt"].timestamp())
+        self.assertEqual([b.callback_data for b in feedback], [f"sp_block|{start_ts}|done", f"sp_block|{start_ts}|skipped"])
         sid = buttons[0].callback_data.split("|", 1)[1]
         self.assertTrue(buttons[0].callback_data.startswith("file|"))
         self.assertEqual((cache[sid]["cid"], cache[sid]["url"], cache[sid]["user_id"]), ("c1", "p2", self.UID))
@@ -322,7 +325,8 @@ class StudyPackTests(unittest.TestCase):
         with mock.patch.object(study_plan, "load_tasks", lambda: []):
             text, markup = asyncio.run(study_plan.build_study_pack(window, self.UID, window["start_dt"]))
         self.assertIn("Study block", text)
-        self.assertIsNone(markup)
+        self.assertEqual(len(markup.inline_keyboard), 1)  # just the Studied / Skipped answer
+        self.assertTrue(markup.inline_keyboard[0][0].callback_data.startswith("sp_block|"))
 
 
 class _FrozenDateTime(datetime):
@@ -447,3 +451,239 @@ class PerUserMorningSummaryTests(unittest.TestCase):
         self.assertIn("No classes today", texts[3])
         self.assertEqual(prepared["voice_paths"][2], "/tmp/voice-['Lab report']")
         self.assertIn("Lunch at", texts[1])  # the study day plan is part of it
+
+
+SPEISEPLAN_HTML = (
+    '<div class="row splMeal"><span style="font-size:24px">Chili sin carne<div class="kennz">(2, Kn, Sl, So)</div></span>'
+    '<div class="preise"><span>2,75 / 4,65 / 4,85 €</span></div><img class="iconLarge" title="vegan" src="V+.png"/></div>'
+    '<div class="row splMeal"><span style="font-size:24px">Limited - Pork schnitzel<div class="kennz">(S, Gl)</div></span>'
+    '<div class="preise"><span>3,90 / 5,80 / 6,10 €</span></div></div>'
+)
+
+
+class WechloyMenuTests(unittest.TestCase):
+    def test_meals_are_parsed_with_codes_price_and_labels(self):
+        from unibot.mensa import parse_speiseplan_meals
+        chili, schnitzel = parse_speiseplan_meals(SPEISEPLAN_HTML)
+        self.assertEqual((chili["name"], chili["allergens_text"], chili["price"], chili["labels"]),
+                         ("Chili sin carne", "2, Kn, Sl, So", "2,75 €", ["vegan"]))
+        self.assertEqual((schnitzel["name"], schnitzel["is_limited"]), ("Pork schnitzel", True))
+
+    def test_menu_applies_food_preferences(self):
+        from unibot import mensa
+        with mock.patch.object(mensa, "_fetch_speiseplan_html", mock.AsyncMock(return_value=SPEISEPLAN_HTML)):
+            text = asyncio.run(mensa.build_speiseplan_menu("3", WED, avoid_codes=["S"]))
+        self.assertIn("Mensa Wechloy", text)
+        self.assertIn("Chili sin carne", text)
+        self.assertIn("vegan", text)
+        self.assertNotIn("schnitzel", text.lower())
+        self.assertIn("1 dish(es) hidden", text)
+
+    def test_closed_or_unreachable(self):
+        from unibot import mensa
+        with mock.patch.object(mensa, "_fetch_speiseplan_html", mock.AsyncMock(return_value=None)):
+            self.assertIn("could not be loaded", asyncio.run(mensa.build_speiseplan_menu("3", WED)))
+        with mock.patch.object(mensa, "_fetch_speiseplan_html", mock.AsyncMock(return_value="<html></html>")):
+            self.assertIn("No dishes found", asyncio.run(mensa.build_speiseplan_menu("3", WED)))
+
+    def test_navigation_and_cross_links(self):
+        from unibot import mensa
+        rows = mensa.speiseplan_menu_keyboard("3", WED).inline_keyboard
+        self.assertEqual([b.callback_data for b in rows[0]], ["mensa_loc|3|2026-11-03", "mensa_loc|3|today", "mensa_loc|3|2026-11-05"])
+        self.assertEqual(rows[1][0].callback_data, "menu_nav|2/")
+        studip_rows = mensa.get_menu_navigation_keyboard("p", "n").inline_keyboard
+        self.assertIn("mensa_loc|3|today", [b.callback_data for row in studip_rows for b in row])
+
+    def test_morning_menu_button_follows_the_campus(self):
+        from unibot import morning
+        wechloy = [_event("09:00", "11:30", location="W02 1-148"), _event("14:00", "16:00", location="W04 1-162")]
+        haarentor = [_event("09:00", "11:30"), _event("14:00", "16:00")]
+        self.assertEqual(morning._menu_button_for(schedule.plan_study_day(wechloy, WED), wechloy), "mensa_loc|3|today|new")
+        self.assertEqual(morning._menu_button_for(schedule.plan_study_day(haarentor, WED), haarentor), "menu_nav|2/|new")
+        self.assertEqual(morning._menu_button_for({"lunch": None}, []), "menu_nav|2/|new")
+
+
+class TravelModeTests(unittest.TestCase):
+    UID = 5151
+
+    def setUp(self):
+        from unibot import weather
+        weather._SNAPSHOTS.pop(WED, None)
+        self.addCleanup(weather._SNAPSHOTS.pop, WED, None)
+
+    def test_bike_bus_and_rain(self):
+        self.assertEqual(study_day.travel_for("bike"), {"minutes": 15, "mode": "bike", "reason": None})
+        self.assertEqual(study_day.travel_for("bus"), {"minutes": 20, "mode": "bus", "reason": None})
+        self.assertEqual(study_day.travel_for("bike", wet=True), {"minutes": 20, "mode": "bus", "reason": "rain"})
+
+    def test_the_students_setting_and_the_forecast_set_the_buffer(self):
+        from unibot import storage, weather
+        events = [_event("09:00", "10:00", location="W14 0-001"), _event("12:00", "14:00", location="A05 1-161")]
+        storage.set_travel_mode(self.UID, "bike")
+        bike = schedule.plan_study_day(events, WED, user_id=self.UID)["windows"][0]
+        self.assertEqual((bike["start_dt"].strftime("%H:%M"), bike["travel_mode"]), ("10:15", "bike"))
+        self.assertIn("🚲 15 min to Campus Haarentor first", study_day.travel_note(bike))
+        weather._SNAPSHOTS[WED] = {"is_wet": True}
+        rain = schedule.plan_study_day(events, WED, user_id=self.UID)["windows"][0]
+        self.assertEqual(rain["start_dt"].strftime("%H:%M"), "10:20")
+        self.assertEqual(study_day.travel_note(rain), "🚌 20 min to Campus Haarentor first (rain)")
+        storage.set_travel_mode(self.UID, "bus")
+        weather._SNAPSHOTS.pop(WED)
+        self.assertEqual(schedule.user_travel(WED, self.UID)["minutes"], 20)
+
+    def test_a_bike_makes_a_short_switch_possible_unless_it_rains(self):
+        from unibot import weather
+        events = [_event("08:00", "09:42", location="W14 0-001"), _event("10:00", "12:00", location="A05 1-161")]
+        self.assertEqual(study_day.tight_campus_switches(events, study_day.travel_for("bike")), [])
+        weather._SNAPSHOTS[WED] = {"is_wet": True}
+        (switch,) = study_day.tight_campus_switches(events, study_day.travel_for("bike", wet=True))
+        self.assertIn("~20 min by bus (rain)", study_day.switch_warning(switch))
+
+    def test_settings_toggle(self):
+        from unibot import menus, storage
+        storage.set_travel_mode(self.UID, "bike")
+        text, markup = menus._status_group_view("semester", self.UID)
+        self.assertIn("Bike (15 min, bus when it rains)", text)
+        self.assertEqual(markup.inline_keyboard[-1][0].callback_data, "status_group_toggle|semester|travel")
+        query = mock.MagicMock()
+        query.data = "status_group_toggle|semester|travel"
+        query.from_user.id = self.UID
+        query.answer = mock.AsyncMock()
+        query.edit_message_text = mock.AsyncMock()
+        update = mock.MagicMock(callback_query=query)
+        with mock.patch.object(menus, "is_user_allowed", lambda uid: True):
+            asyncio.run(menus.handle_status_group(update, None))
+        self.assertEqual(storage.get_travel_mode(self.UID), "bus")
+        self.assertIn("Bus (20 min)", query.edit_message_text.await_args.args[0])
+        with self.assertRaises(ValueError):
+            storage.set_travel_mode(self.UID, "car")
+
+
+class CatchUpTests(unittest.TestCase):
+    def test_lecture_reminder_after_a_tight_switch_offers_recording_and_slides(self):
+        files = mock.AsyncMock(return_value=[
+            ("Recordings", {"name": "Lecture_5.webm", "url": "v5", "modified_iso": "2026-11-03T10:00:00+01:00"}),
+            (None, {"name": "Lecture_5.pdf", "url": "s5", "modified_iso": "2026-11-03T09:00:00+01:00"}),
+            ("Problem Sets", {"name": "Problem_Set_3.pdf", "url": "p3", "modified_iso": "2026-11-03T08:00:00+01:00"}),
+        ])
+        sent = []
+
+        async def send_message(**kwargs):
+            sent.append(kwargs)
+        bot = mock.MagicMock()
+        bot.send_message = send_message
+        _FrozenDateTime.frozen = _at(WED, "09:30")
+        cache: dict = {}
+        with mock.patch.object(schedule, "datetime", _FrozenDateTime), \
+                mock.patch.object(schedule, "get_calendar_events", mock.AsyncMock(return_value=CampusSwitchTests.EVENTS)), \
+                mock.patch.object(schedule, "get_user_session", lambda uid=None: None), \
+                mock.patch.object(schedule, "get_weather_snapshot", mock.AsyncMock(return_value=None)), \
+                mock.patch.object(schedule, "load_reminders_cache", lambda user_id=None: {}), \
+                mock.patch.object(schedule, "save_reminders_cache", lambda data, user_id=None: None), \
+                mock.patch.object(study_plan, "_list_course_files_deep", files), \
+                mock.patch.object(study_plan, "link_cache", cache):
+            asyncio.run(schedule.check_calendar_reminders(bot, 4242, silent=True))
+        (lecture,) = [m for m in sent if "LECTURE REMINDER" in m["text"]]
+        self.assertIn("Catch up on what you miss", lecture["text"])
+        labels = [row[0].text for row in lecture["reply_markup"].inline_keyboard]
+        self.assertEqual(labels, ["🎥 Lecture_5.webm", "📊 Lecture_5.pdf"])
+        self.assertEqual({e["user_id"] for e in cache.values()}, {4242})
+        files.assert_awaited_once_with("c1")
+
+    def test_no_files_no_buttons(self):
+        with mock.patch.object(study_plan, "_list_course_files_deep", mock.AsyncMock(side_effect=RuntimeError("down"))):
+            self.assertIsNone(asyncio.run(study_plan.build_catch_up_buttons({"course_id": "c1"}, 1)))
+        self.assertIsNone(asyncio.run(study_plan.build_catch_up_buttons({}, 1)))
+
+
+class StudyBlockFeedbackTests(unittest.TestCase):
+    UID = 6161
+
+    def setUp(self):
+        from unibot import storage
+        cache = storage.load_general_cache()
+        (cache.get("study_blocks") or {}).pop(str(self.UID), None)
+        storage.save_general_cache(cache)
+
+    def _press(self, data, markup=None):
+        query = mock.MagicMock()
+        query.data = data
+        query.from_user.id = self.UID
+        query.answer = mock.AsyncMock()
+        query.edit_message_reply_markup = mock.AsyncMock()
+        query.message.reply_markup = markup
+        asyncio.run(study_plan.handle_study_block_feedback(mock.MagicMock(callback_query=query), None))
+        return query
+
+    def test_answers_are_logged_and_summarised(self):
+        from unibot import storage
+        now = _at(WED, "18:00")
+        for hour, status in ((9, "done"), (11, "skipped"), (14, None), (16, "done")):
+            ts = int(_at(WED, f"{hour:02d}:00").timestamp())
+            storage.record_study_block(self.UID, ts, "sent", "Econometrics")
+            if status:
+                self._press(f"sp_block|{ts}|{status}")
+        self.assertEqual(study_plan.study_block_summary_line(self.UID, now),
+                         "📊 <b>Study blocks last week:</b> 2 of 4 used (1 skipped, 1 unanswered)")
+        self.assertEqual(study_plan.study_block_summary_line(999, now), "")
+        self.assertEqual(storage.study_block_log(self.UID, 0, now.timestamp())[1]["course"], "Econometrics")
+
+    def test_the_answer_replaces_the_buttons_and_keeps_the_files(self):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Lecture_4.pdf", callback_data="file|abc")],
+                                       [InlineKeyboardButton("✅ Studied", callback_data="sp_block|1|done"),
+                                        InlineKeyboardButton("⏭ Skipped", callback_data="sp_block|1|skipped")]])
+        query = self._press("sp_block|1|done", markup)
+        rows = query.edit_message_reply_markup.await_args.args[0].inline_keyboard
+        self.assertEqual([[b.callback_data for b in r] for r in rows], [["file|abc"], ["sp_block|answered"]])
+        self._press("sp_block|answered")  # tapping the answer again does nothing
+
+    def test_repeated_skips_are_mentioned_in_the_next_pack(self):
+        from unibot import storage
+        for hour in (9, 11):
+            ts = int(_at(WED, f"{hour:02d}:00").timestamp())
+            storage.record_study_block(self.UID, ts, "sent", "Econometrics")
+            storage.record_study_block(self.UID, ts, "skipped")
+        events = [_event("09:00", "10:00", "Statistics", cid="c2"), _event("16:00", "18:00", "Econometrics", cid="c1")]
+        window = schedule.find_study_windows_for_day(events, WED)[-2]
+        with mock.patch.object(study_plan, "_list_course_files_deep", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(study_plan, "load_tasks", lambda: []), \
+                mock.patch.object(study_plan.state, "user_courses_map", {self.UID: {"c1": "Econometrics"}}):
+            text, _ = asyncio.run(study_plan.build_study_pack(window, self.UID, _at(WED, "14:00")))
+        self.assertIn("skipped the last 2 blocks", text)
+
+    def test_reminder_logs_the_sent_pack(self):
+        from unibot import storage
+        events = [_event("09:00", "10:00", "Statistics"), _event("12:00", "14:00", "Econometrics")]
+        StudyReminderTests()._run_at(_at(WED, "10:04"), events)  # uses its own user 4242
+        log = storage.study_block_log(4242, 0, _at(WED, "23:00").timestamp())
+        self.assertEqual([b["status"] for b in log if b["ts"] == int(_at(WED, "10:00").timestamp())], ["sent"])
+
+
+class TransientTelegramErrorLogTests(unittest.TestCase):
+    def _record(self, exc, name="telegram.ext.Updater", level=40):
+        import logging
+        try:
+            raise exc
+        except Exception:
+            import sys
+            info = sys.exc_info()
+        return logging.LogRecord(name, level, __file__, 1, "Exception happened while polling for updates.", None, info)
+
+    def test_polling_network_errors_become_one_line_warnings(self):
+        from telegram.error import NetworkError, TimedOut
+        from unibot.config import TransientTelegramErrorFilter
+        for exc in (NetworkError("httpx.ReadError: "), NetworkError("Bad Gateway"), TimedOut()):
+            record = self._record(exc)
+            self.assertTrue(TransientTelegramErrorFilter().filter(record))
+            self.assertEqual(record.levelname, "WARNING")
+            self.assertIsNone(record.exc_info)
+            self.assertIn("retrying", record.getMessage())
+
+    def test_other_errors_keep_their_traceback(self):
+        from telegram.error import NetworkError
+        from unibot.config import TransientTelegramErrorFilter
+        for record in (self._record(ValueError("bug")), self._record(NetworkError("x"), name="unibot")):
+            TransientTelegramErrorFilter().filter(record)
+            self.assertEqual(record.levelname, "ERROR")
+            self.assertIsNotNone(record.exc_info)

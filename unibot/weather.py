@@ -117,6 +117,15 @@ WEATHER_CODE_DESCRIPTIONS = {
 WEATHER_WET_CODE_THRESHOLD = 51
 
 
+_SNAPSHOTS: dict = {}  # date -> the last snapshot fetched for it
+
+
+def cached_weather_snapshot(day) -> Optional[dict]:
+    """The last get_weather_snapshot result for `day`, without a request
+    (None when it wasn't fetched in this process)."""
+    return _SNAPSHOTS.get(day)
+
+
 async def get_weather_snapshot(target_date=None) -> Optional[dict]:
     """Fetch a concise weather snapshot for the location set via /status's
     "📍 Set Location" (see load_weather_location), falling back to
@@ -180,7 +189,7 @@ async def get_weather_snapshot(target_date=None) -> Optional[dict]:
         code = max(morning_codes)  # worst-case in the window
         desc, emoji = WEATHER_CODE_DESCRIPTIONS.get(code, ("unknown conditions", "🌡️"))
         day_index = data["daily"]["time"].index(target_iso)
-        return {
+        snapshot = {
             "description": desc,
             "emoji": emoji,
             "is_wet": code >= WEATHER_WET_CODE_THRESHOLD,
@@ -189,6 +198,8 @@ async def get_weather_snapshot(target_date=None) -> Optional[dict]:
             "temp_max": data["daily"]["temperature_2m_max"][day_index],
             "location_name": location["name"] if location else "Oldenburg",
         }
+        _SNAPSHOTS[target_date] = snapshot
+        return snapshot
     except (KeyError, IndexError, ValueError) as e:
         logging.warning("get_weather_snapshot: parse failed: %s", e)
         return None

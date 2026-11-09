@@ -39,8 +39,22 @@ CAMPUS_INFO: dict[str, dict[str, Any]] = {
     },
 }
 
-# Haarentor <-> Wechloy by bus or bike, door to door.
-CAMPUS_TRAVEL_MINUTES = 20
+# Haarentor <-> Wechloy door to door; a bike rider takes the bus when it rains.
+TRAVEL_MINUTES = {"bike": 15, "bus": 20}
+TRAVEL_ICONS = {"bike": "🚲", "bus": "🚌"}
+CAMPUS_TRAVEL_MINUTES = TRAVEL_MINUTES["bus"]  # when nothing is known about the student
+
+
+def travel_for(mode: str = "bus", wet: bool = False) -> dict:
+    """{"minutes", "mode", "reason"} for getting between the campuses."""
+    reason = None
+    if mode == "bike" and wet:
+        mode, reason = "bus", "rain"
+    mode = mode if mode in TRAVEL_MINUTES else "bus"
+    return {"minutes": TRAVEL_MINUTES[mode], "mode": mode, "reason": reason}
+
+
+DEFAULT_TRAVEL = travel_for()
 
 # ── lunch ─────────────────────────────────────────────────────────────────────
 LUNCH_EARLIEST = dtime(11, 30)
@@ -86,17 +100,27 @@ def _at(day: date, t: dtime) -> datetime:
     return datetime.combine(day, t, tzinfo=TZ_BERLIN)
 
 
-def _apply_travel(window: dict) -> Optional[dict]:
+def _apply_travel(window: dict, travel: dict = DEFAULT_TRAVEL) -> Optional[dict]:
     """Shift a window between classes on different campuses by the travel
     time; None when too little is left to study."""
     origin, destination = campus_of(window.get("after_location")), campus_of(window.get("before_location"))
     if not origin or not destination or origin == destination:
         return window
-    start = window["start_dt"] + timedelta(minutes=CAMPUS_TRAVEL_MINUTES)
+    start = window["start_dt"] + timedelta(minutes=travel["minutes"])
     if _minutes(start, window["end_dt"]) < MIN_STUDY_PIECE_MINUTES:
         return None
     return {**window, "start_dt": start, "duration_minutes": _minutes(start, window["end_dt"]),
-            "travel_minutes": CAMPUS_TRAVEL_MINUTES, "travel_from": origin, "travel_to": destination}
+            "travel_minutes": travel["minutes"], "travel_mode": travel["mode"], "travel_reason": travel["reason"],
+            "travel_from": origin, "travel_to": destination}
+
+
+def travel_note(entry: dict) -> Optional[str]:
+    """ "🚌 20 min to Campus Wechloy first (rain)" for a window that starts with a ride."""
+    if not entry.get("travel_minutes"):
+        return None
+    icon = TRAVEL_ICONS.get(entry.get("travel_mode") or "bus", "🚌")
+    why = f" ({entry['travel_reason']})" if entry.get("travel_reason") else ""
+    return f"{icon} {entry['travel_minutes']} min to {CAMPUS_INFO[entry['travel_to']]['name']} first{why}"
 
 
 def _window_campus(window: dict) -> Optional[str]:
@@ -105,7 +129,7 @@ def _window_campus(window: dict) -> Optional[str]:
     return campus_of(window.get("before_location")) or campus_of(window.get("after_location"))
 
 
-def tight_campus_switches(day_events: list) -> list[dict]:
+def tight_campus_switches(day_events: list, travel: dict = DEFAULT_TRAVEL) -> list[dict]:
     """Back to back classes on different campuses with less than the travel
     time between them: [{"from_event", "to_event", "gap_minutes",
     "from_campus", "to_campus"}], in day order. Cancelled classes and
@@ -118,9 +142,9 @@ def tight_campus_switches(day_events: list) -> list[dict]:
     for prev, nxt in zip(classes, classes[1:]):
         origin, destination = campus_of(prev.get("location")), campus_of(nxt.get("location"))
         gap = _minutes(prev["end_dt"], nxt["start_dt"])
-        if origin != destination and 0 <= gap < CAMPUS_TRAVEL_MINUTES:
+        if origin != destination and 0 <= gap < travel["minutes"]:
             switches.append({"from_event": prev, "to_event": nxt, "gap_minutes": gap,
-                             "from_campus": origin, "to_campus": destination})
+                             "from_campus": origin, "to_campus": destination, "travel": travel})
     return switches
 
 
@@ -133,7 +157,8 @@ def switch_warning(switch: dict) -> str:
     gap_text = f"{gap} min" if gap else "no time"
     return (f"⚠️ {prev['end_dt']:%H:%M} {room_from} → {nxt['start_dt']:%H:%M} {room_to}: "
             f"{CAMPUS_INFO[switch['from_campus']]['name']} to {CAMPUS_INFO[switch['to_campus']]['name']} "
-            f"with {gap_text} between, the ride takes ~{CAMPUS_TRAVEL_MINUTES} min. "
+            f"with {gap_text} between, the ride takes ~{switch.get('travel', DEFAULT_TRAVEL)['minutes']} min"
+            f"{' by bus (rain)' if switch.get('travel', DEFAULT_TRAVEL)['reason'] == 'rain' else ''}. "
             f"Leave right away; expect to arrive late.")
 
 
@@ -177,7 +202,8 @@ def _campus_near(day_events: list, moment: datetime) -> Optional[str]:
 
 
 def plan_day(day_events: list, windows: list[dict], day: date,
-             day_start: dtime = dtime(9, 0), day_end: dtime = dtime(19, 0)) -> dict[str, Any]:
+             day_start: dtime = dtime(9, 0), day_end: dtime = dtime(19, 0),
+             travel: dict = DEFAULT_TRAVEL) -> dict[str, Any]:
     """Refine one day's study windows: travel time between campuses comes off
     the start, a 45-minute lunch break is placed between 11:30 and 14:00 (in
     free time outside the windows when there is any, else cut out of a
@@ -187,7 +213,7 @@ def plan_day(day_events: list, windows: list[dict], day: date,
     Returns {"windows": [...], "lunch": {...} or None}; windows stay sorted."""
     refined = []
     for w in windows:
-        moved = _apply_travel(w)
+        moved = _apply_travel(w, travel)
         if moved is not None:
             refined.append(moved)
 
@@ -236,7 +262,7 @@ def plan_day(day_events: list, windows: list[dict], day: date,
                                    "before": "lunch", "description": f"{target.get('description') or 'study window'}, before lunch"})
                 if _minutes(end, target["end_dt"]) >= MIN_STUDY_PIECE_MINUTES:
                     # the travel note stays with the first study piece of the window
-                    travel_keys = ("travel_minutes", "travel_from", "travel_to") if pieces else ()
+                    travel_keys = ("travel_minutes", "travel_mode", "travel_reason", "travel_from", "travel_to") if pieces else ()
                     after = {k: v for k, v in target.items() if k not in travel_keys}
                     pieces.append({**after, "start_dt": end, "duration_minutes": _minutes(end, target["end_dt"]),
                                    "after": "lunch", "description": f"{target.get('description') or 'study window'}, after lunch"})

@@ -19,6 +19,7 @@ import struct
 from datetime import time as _dtime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
+from telegram.error import TelegramError
 
 from exam_reminder import get_registered_exam_schedule
 from fast_enroll import get_course_type_map, get_open_courses, get_semester_options
@@ -36,6 +37,8 @@ from unibot.storage import (
     get_scan_previous_semester_enabled,
     link_cache,
     load_tasks,
+    record_study_block,
+    study_block_log,
     get_weekly_study_plan_enabled,
     load_study_plan_cache,
     save_study_plan_cache,
@@ -65,7 +68,7 @@ from unibot.ai import (
     _record_gwdg_quota,
 )
 from unibot.documents import extract_text_from_file, extract_text_from_file_async, summarize_lecture_file
-from unibot.schedule import STUDY_PLAN_EXAM_WINDOW_DAYS, get_calendar_events, schedule_study_sessions
+from unibot.schedule import STUDY_PLAN_EXAM_WINDOW_DAYS, get_calendar_events, schedule_study_sessions, user_travel
 from unibot.monitoring import render_weekly_study_plan_message
 from unibot.exams import STUDY_PLAN_MAX_FILE_MB, STUDY_PLAN_SUPPORTED_EXTENSIONS, get_file_exam_events
 
@@ -1205,7 +1208,8 @@ def find_free_study_windows(events: list, week_start) -> list:
                 after = clean_course_title(ev.get("title", "")) or "your previous class"
                 after_location = ev.get("location")
         # travel between campuses and the lunch break are not study time
-        planned = plan_day(busy, day_windows, day, _dtime(STUDY_DAY_START_HOUR, 0), _dtime(STUDY_DAY_END_HOUR, 0))
+        planned = plan_day(busy, day_windows, day, _dtime(STUDY_DAY_START_HOUR, 0), _dtime(STUDY_DAY_END_HOUR, 0),
+                           travel=user_travel(day))
         windows.extend(w for w in planned["windows"]
                        if w["duration_minutes"] >= STUDY_GAP_MIN_MINUTES
                        or ("lunch" in (w["after"], w["before"]) and w["duration_minutes"] >= STUDY_LUNCH_PIECE_MIN_MINUTES))
@@ -1342,8 +1346,10 @@ async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None, use
 
     text = render_weekly_study_plan_message(plan, inputs["gaps"], inputs["exams"], inputs["rows"])
     reply_markup = build_study_plan_keyboard(plan["sessions"], []) if plan["sessions"] else None
-    chunks = _split_message(text)
+    now = datetime.now(TZ_BERLIN)
     for uid in user_ids:
+        summary = study_block_summary_line(uid, now)
+        chunks = _split_message(f"{text}\n\n{summary}" if summary else text)
         try:
             for i, chunk in enumerate(chunks):
                 await bot.send_message(chat_id=uid, text=chunk, parse_mode="HTML", reply_markup=reply_markup if i == len(chunks) - 1 else None)
@@ -1693,18 +1699,54 @@ STUDY_PACK_DUE_DAYS = 7  # tasks due within this many days are listed with the p
 STUDY_PACK_KINDS = ("problem_set", "slides")  # newest file of each kind is offered
 
 
-def pick_study_pack_files(files: list) -> list[dict]:
-    """The newest problem set and the newest slides among a course's
-    (folder, item) files, problem set first."""
+def pick_study_pack_files(files: list, kinds: tuple[str, ...] = STUDY_PACK_KINDS) -> list[dict]:
+    """The newest file of each of `kinds` among a course's (folder, item)
+    files, in the order of `kinds` (default: problem set, then slides)."""
     newest: dict[str, tuple[datetime, dict]] = {}
     for folder, item in files:
         kind = classify_workload_file(item.get("name") or "", folder)
-        if kind not in STUDY_PACK_KINDS or not item.get("url"):
+        if kind not in kinds or not item.get("url"):
             continue
         dt = _parse_file_date_v2(item.get("modified"), item.get("modified_iso"))
         if kind not in newest or dt > newest[kind][0]:
             newest[kind] = (dt, {**item, "kind": kind})
-    return [newest[k][1] for k in STUDY_PACK_KINDS if k in newest]
+    return [newest[k][1] for k in kinds if k in newest]
+
+
+_FILE_KIND_ICONS = {"problem_set": "📝", "slides": "📊", "video": "🎥"}
+
+
+async def course_file_buttons(cid: str, course_name: str, user_id: int,
+                              kinds: tuple[str, ...] = STUDY_PACK_KINDS) -> list[list[InlineKeyboardButton]]:
+    """Download buttons (the file|<sid> handler) for the newest file of each
+    kind in a course; [] when none is found or the listing fails."""
+    try:
+        picked = pick_study_pack_files(await _list_course_files_deep(cid), kinds)
+    except Exception as e:
+        logging.warning("Course files: listing failed for %s: %s", cid, e)
+        return []
+    buttons = []
+    for item in picked:
+        sid = _short_id()
+        link_cache[sid] = {"cid": cid, "name": item["name"], "course": course_name, "url": item.get("url"),
+                           "ts": time.time(), "user_id": user_id}
+        icon = _FILE_KIND_ICONS.get(item["kind"], "📄")
+        buttons.append([InlineKeyboardButton(f"{icon} {item['name'][:40]}", callback_data=f"file|{sid}")])
+    return buttons
+
+
+CATCH_UP_KINDS = ("video", "slides")
+
+
+async def build_catch_up_buttons(event: dict, user_id: int) -> Optional[InlineKeyboardMarkup]:
+    """For a class the student reaches late (a tight campus switch): the
+    newest recording and slides of that course, to catch up on the start."""
+    cid = event.get("course_id")
+    if not cid:
+        return None
+    courses = state.user_courses_map.get(user_id) or state.courses_map
+    buttons = await course_file_buttons(cid, courses.get(cid) or event.get("title") or "your course", user_id, CATCH_UP_KINDS)
+    return InlineKeyboardMarkup(buttons) if buttons else None
 
 
 def _due_tasks(user_id: int, now: datetime, course: Optional[str] = None) -> list[dict]:
@@ -1758,20 +1800,68 @@ async def build_study_pack(window: dict, user_id: int, now: datetime) -> tuple[s
     for task in _due_tasks(user_id, now, course[1] if course else None)[:2]:
         lines.append(f"⏰ Due {task['due_dt']:%a %d.%m %H:%M}: {html.escape(str(task['text']))}")
 
-    buttons = []
     if course:
-        try:
-            picked = pick_study_pack_files(await _list_course_files_deep(course[0]))
-        except Exception as e:
-            logging.warning("Study pack: listing files failed for %s: %s", course[0], e)
-            picked = []
-        for item in picked:
-            sid = _short_id()
-            link_cache[sid] = {"cid": course[0], "name": item["name"], "course": course[1], "url": item.get("url"),
-                               "ts": time.time(), "user_id": user_id}
-            icon = "📝" if item["kind"] == "problem_set" else "📊"
-            buttons.append([InlineKeyboardButton(f"{icon} {item['name'][:40]}", callback_data=f"file|{sid}")])
-        if picked:
-            lines.append("📎 Ready for you:")
+        skipped = _recent_skips(user_id, course[1], now)
+        if skipped >= STUDY_SKIP_NUDGE:
+            lines.append(f"↩️ <i>You skipped the last {skipped} blocks for this course; even a short session today keeps it on track.</i>")
+
+    buttons = await course_file_buttons(course[0], course[1], user_id) if course else []
+    if buttons:
+        lines.append("📎 Ready for you:")
+    start_ts = int(window["start_dt"].timestamp())
+    buttons.append([InlineKeyboardButton("✅ Studied", callback_data=f"sp_block|{start_ts}|done"),
+                    InlineKeyboardButton("⏭ Skipped", callback_data=f"sp_block|{start_ts}|skipped")])
     lines.append("━━━━━━━━━━━━━━━━━━")
-    return "\n".join(lines), (InlineKeyboardMarkup(buttons) if buttons else None)
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+STUDY_SKIP_NUDGE = 2  # skipped blocks in a row (per course) before the pack mentions it
+STUDY_BLOCK_WEEK_SECONDS = 7 * 86400
+
+
+def _recent_skips(user_id: int, course: str, now: datetime) -> int:
+    """How many of the course's latest answered blocks in the past week were
+    skipped in a row (newest first)."""
+    answered = [b for b in study_block_log(user_id, now.timestamp() - STUDY_BLOCK_WEEK_SECONDS, now.timestamp())
+                if b.get("course") == course and b["status"] in ("done", "skipped")]
+    count = 0
+    for block in reversed(answered):
+        if block["status"] != "skipped":
+            break
+        count += 1
+    return count
+
+
+def study_block_summary_line(user_id: int, now: datetime) -> str:
+    """ "📊 Study blocks last week: 3 of 5 used (1 skipped, 1 unanswered)",
+    or "" when no block was sent in the past seven days."""
+    blocks = study_block_log(user_id, now.timestamp() - STUDY_BLOCK_WEEK_SECONDS, now.timestamp())
+    if not blocks:
+        return ""
+    done = sum(b["status"] == "done" for b in blocks)
+    skipped = sum(b["status"] == "skipped" for b in blocks)
+    open_ = len(blocks) - done - skipped
+    parts = [f"{skipped} skipped"] if skipped else []
+    if open_:
+        parts.append(f"{open_} unanswered")
+    extra = f" ({', '.join(parts)})" if parts else ""
+    return f"📊 <b>Study blocks last week:</b> {done} of {len(blocks)} used{extra}"
+
+
+async def handle_study_block_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """sp_block|<start ts>|done|skipped: the student's answer on a study pack."""
+    query = update.callback_query
+    parts = query.data.split("|")
+    if len(parts) != 3 or parts[2] not in ("done", "skipped") or not parts[1].isdigit():
+        await query.answer()
+        return
+    record_study_block(query.from_user.id, int(parts[1]), parts[2])
+    await query.answer("Nice work! 💪" if parts[2] == "done" else "Noted, next time then.")
+    # keep the download buttons, swap the answer row for the answer
+    rows = [row for row in (query.message.reply_markup.inline_keyboard if query.message.reply_markup else [])
+            if not any((b.callback_data or "").startswith("sp_block|") for b in row)]
+    rows.append([InlineKeyboardButton("✅ Studied" if parts[2] == "done" else "⏭ Skipped", callback_data="sp_block|answered")])
+    try:
+        await query.edit_message_reply_markup(InlineKeyboardMarkup(rows))
+    except TelegramError as e:
+        logging.debug("Study block feedback: keyboard not updated: %s", e)
