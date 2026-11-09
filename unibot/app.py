@@ -25,7 +25,7 @@ from telegram.ext import (
     TypeHandler,
     filters,
 )
-from telegram.error import TelegramError
+from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 
 
 from unibot import state
@@ -389,6 +389,36 @@ def register_handlers(app) -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+
+    app.add_error_handler(_handle_error)
+
+
+HANDLER_ERROR_TEXT = "⚠️ Something went wrong. Please try again in a moment."
+
+
+async def _handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Every exception a handler doesn't catch ends here: harmless Telegram
+    replies are dropped, the rest is logged and the student is told, instead
+    of the tap or message silently doing nothing."""
+    error = context.error
+    if isinstance(error, BadRequest) and "not modified" in str(error).lower():
+        return  # the same view was rendered again (a double tap)
+    if isinstance(error, Forbidden):
+        logging.info("Telegram refused a reply (the student blocked the bot): %s", error)
+        return
+    if isinstance(error, NetworkError):  # includes TimedOut; PTB retries on its own
+        logging.warning("Telegram network error in a handler: %s", error)
+        return
+    logging.error("Unhandled error in a handler", exc_info=error)
+    if not isinstance(update, Update):
+        return
+    try:
+        if update.callback_query:
+            await update.callback_query.answer(HANDLER_ERROR_TEXT, show_alert=False)
+        elif update.effective_message and update.effective_chat and update.effective_chat.type == "private":
+            await update.effective_message.reply_text(HANDLER_ERROR_TEXT)
+    except TelegramError:
+        pass  # e.g. the callback was already answered
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────

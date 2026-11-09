@@ -33,6 +33,7 @@ from telegram.ext import ContextTypes
 from studip_utils import TZ_BERLIN
 from unibot import db, state
 from unibot.auth import ACTIVE, has_stored_login, is_user_allowed, lifecycle_state
+from unibot.formatting import TELEGRAM_HTML_LIMIT, truncate_html
 from unibot.preferences import DIGEST_HOUR, get_pref, in_quiet_hours, morning_send_time
 from unibot.storage import load_default_semester
 from unibot.studip_api import BASE_URL
@@ -314,6 +315,11 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
     Returns {"full"|"title"|"silent"|"skipped"|"queued": count}."""
     counts = {"full": 0, "title": 0, "silent": 0, "skipped": 0, "queued": 0}
     now = now or datetime.now(TZ_BERLIN)
+    # last line of defence against "message is too long" for every alert kind
+    if parse_mode == "HTML":
+        text, title_text = truncate_html(text), truncate_html(title_text)
+    else:
+        text, title_text = text[:TELEGRAM_HTML_LIMIT], title_text[:TELEGRAM_HTML_LIMIT]
     for uid in sorted(recipients if recipients is not None else broadcast_targets(cid, members)):
         fmt = delivery_format(uid, cid, kind)
         if fmt is None:

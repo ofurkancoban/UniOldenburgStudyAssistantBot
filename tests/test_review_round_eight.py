@@ -118,5 +118,56 @@ class BusyTimeoutTests(unittest.TestCase):
         self.assertEqual(timeout, 30000)
 
 
+class FanOutLengthTests(unittest.TestCase):
+    def test_an_oversized_alert_is_cut_to_fit(self):
+        from unibot import course_registry, formatting
+        sent = []
+
+        async def send_message(**kwargs):
+            sent.append(kwargs["text"])
+
+        bot = mock.MagicMock()
+        bot.send_message = send_message
+        with mock.patch.object(course_registry, "delivery_format", return_value="full"), \
+                mock.patch.object(course_registry, "_hold_reason", return_value=None), \
+                mock.patch.object(course_registry, "get_pref", return_value="card"), \
+                mock.patch.object(course_registry.asyncio, "sleep", mock.AsyncMock()):
+            asyncio.run(course_registry.fan_out(bot, "c1", "exams", "<b>" + "x &amp; y " * 900 + "</b>",
+                                                "t", recipients={5}))
+        self.assertLessEqual(len(sent[0]), formatting.TELEGRAM_HTML_LIMIT)
+        self.assertTrue(sent[0].endswith("</b>"))
+
+
+class ErrorHandlerTests(unittest.TestCase):
+    def _run(self, error, with_update=True):
+        from telegram import CallbackQuery, Update, User
+        from unibot import app
+        update = Update(1, callback_query=CallbackQuery("1", User(1, "a", False), "x", data="d")) \
+            if with_update else None
+        context = mock.MagicMock()
+        context.error = error
+        answer = mock.AsyncMock()
+        with mock.patch.object(CallbackQuery, "answer", answer), \
+                mock.patch.object(app.logging, "error") as log_error:
+            asyncio.run(app._handle_error(update, context))
+        return log_error.call_count, answer
+
+    def test_double_tap_is_silent(self):
+        errors, answer = self._run(BadRequest("Message is not modified"))
+        self.assertEqual(errors, 0)
+        answer.assert_not_awaited()
+
+    def test_a_real_bug_is_logged_and_the_student_told(self):
+        from unibot import app
+        errors, answer = self._run(KeyError("boom"))
+        self.assertEqual(errors, 1)
+        self.assertEqual(answer.await_args.args[0], app.HANDLER_ERROR_TEXT)
+
+    def test_job_errors_without_an_update_are_only_logged(self):
+        errors, answer = self._run(RuntimeError("job"), with_update=False)
+        self.assertEqual(errors, 1)
+        answer.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()
