@@ -50,7 +50,8 @@ from unibot.studip_api import (
     studip_api_user_id,
 )
 from unibot.weather import build_weather_text_line, get_weather_snapshot
-from unibot.study_day import CAMPUS_INFO, menu_highlight, plan_day
+from unibot.mensa import fetch_menu_titles, fetch_todays_menu_items
+from unibot.study_day import CAMPUS_INFO, menu_highlight, plan_day, switch_warning, tight_campus_switches
 
 
 fastenroll_tasks: dict[int, dict[str, asyncio.Task]] = {}  # chat_id -> {sem_id -> asyncio.Task}
@@ -127,6 +128,10 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
             except Exception as e:
                 logging.warning("check_calendar_reminders: weather fetch failed: %s", e)
 
+        # classes reached from the other campus with too little time to travel
+        tight_arrivals = {id(s["to_event"]): s for s in tight_campus_switches(
+            [e for e in events if e.get("start_dt") and e["start_dt"].date() == now.date()])}
+
         for event in events:
             if not event.get("start_dt") or not event.get("title") or event["title"] == "Untitled":
                 continue
@@ -159,13 +164,16 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                         weather_line = f"\n{first_class_weather['emoji']} {first_class_weather['description'].capitalize()} expected – grab an umbrella and leave a bit early!"
                     else:
                         weather_line = f"\n{first_class_weather['emoji']} {first_class_weather['description'].capitalize()} out there, should be a fine walk over."
+                switch = tight_arrivals.get(id(event))
+                switch_line = f"\n{html.escape(switch_warning(switch))}" if switch else ""
                 text = (
                     "🔔 <b>LECTURE REMINDER</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     f"📘 <b>{title}</b>\n"
                     f"🕒 Starting in <b>{int(minutes_left)} minutes</b>\n"
                     f"📍 {location}"
-                    f"{weather_line}\n"
+                    f"{weather_line}"
+                    f"{switch_line}\n"
                     "━━━━━━━━━━━━━━━━━━"
                 )
                 try:
@@ -665,19 +673,26 @@ _MENU_HIGHLIGHT_CACHE: dict[tuple, Optional[str]] = {}  # (date, menu_path) -> "
 
 
 async def _lunch_menu_highlight(lunch: Optional[dict], session) -> Optional[str]:
-    """Today's main dishes at the lunch break's mensa (only today's menu is
-    published, and only for the mensas the Stud.IP widget covers)."""
-    if not lunch or not lunch.get("menu_path") or lunch["date_key"] != berlin_now().date() or session is None:
+    """Today's main dishes at the lunch break's mensa: the Stud.IP widget
+    (with categories) where it covers the mensa, else the Studierendenwerk's
+    public Speiseplan (Wechloy). Only today's menu is shown."""
+    if not lunch or lunch["date_key"] != berlin_now().date():
         return None
-    key = (lunch["date_key"], lunch["menu_path"])
-    if key not in _MENU_HIGHLIGHT_CACHE:
-        from unibot.mensa import fetch_todays_menu_items
+    key = (lunch["date_key"], lunch.get("menu_path") or lunch.get("menu_loc_id"))
+    if key in _MENU_HIGHLIGHT_CACHE:
+        return _MENU_HIGHLIGHT_CACHE[key]
+    highlight = None
+    if lunch.get("menu_path") and session is not None:
         try:
-            _MENU_HIGHLIGHT_CACHE[key] = menu_highlight(await fetch_todays_menu_items(session, lunch["menu_path"]))
+            highlight = menu_highlight(await fetch_todays_menu_items(session, lunch["menu_path"]))
         except Exception as e:
-            logging.warning("Lunch menu highlight unavailable: %s", e)
-            return None
-    return _MENU_HIGHLIGHT_CACHE[key]
+            logging.warning("Stud.IP mensa menu unavailable: %s", e)
+    if not highlight and lunch.get("menu_loc_id"):
+        titles = await fetch_menu_titles(lunch["menu_loc_id"], lunch["date_key"])
+        highlight = menu_highlight([{"name": t} for t in titles])
+    if highlight:  # failures are retried on the next view
+        _MENU_HIGHLIGHT_CACHE[key] = highlight
+    return highlight
 
 
 def _plan_entry_lines(entry: dict, indent: str = "", menu: Optional[str] = None, remaining: bool = False) -> list[str]:
@@ -733,6 +748,8 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
         lines = [header]
         course_blocks = [_format_event_markdown_block(ev) for ev in today_events]
         lines.append("\n\n".join(course_blocks))
+        for switch in tight_campus_switches(today_events):
+            lines.append("\n" + _md(switch_warning(switch)))
         lines.append("━━━━━━━━━━━━━━━━━━")
         text = "\n".join(lines) + weather_block
 

@@ -27,12 +27,15 @@ CAMPUS_INFO: dict[str, dict[str, Any]] = {
         "mensa": "Mensa Uhlhornsweg",
         # the Stud.IP mensa widget's sub path for this mensa's menu
         "menu_path": "2/",
+        # the Studierendenwerk Speiseplan widget's locationId
+        "menu_loc_id": "2",
     },
     WECHLOY: {
         "name": "Campus Wechloy",
         "study_spot": "BIS Wechloy branch library or the W3 tables",
         "mensa": "Mensa Wechloy",
-        "menu_path": None,  # not offered by the Stud.IP widget the bot reads
+        "menu_path": None,  # not offered by the Stud.IP widget
+        "menu_loc_id": "3",
     },
 }
 
@@ -100,6 +103,38 @@ def _window_campus(window: dict) -> Optional[str]:
     """Where the student is during the window: the next class's campus
     (after any travel), else the previous class's."""
     return campus_of(window.get("before_location")) or campus_of(window.get("after_location"))
+
+
+def tight_campus_switches(day_events: list) -> list[dict]:
+    """Back to back classes on different campuses with less than the travel
+    time between them: [{"from_event", "to_event", "gap_minutes",
+    "from_campus", "to_campus"}], in day order. Cancelled classes and
+    classes without a known room don't count."""
+    classes = sorted((ev for ev in day_events
+                      if not ev.get("is_cancelled") and ev.get("start_dt") and ev.get("end_dt")
+                      and campus_of(ev.get("location"))),
+                     key=lambda e: e["start_dt"])
+    switches = []
+    for prev, nxt in zip(classes, classes[1:]):
+        origin, destination = campus_of(prev.get("location")), campus_of(nxt.get("location"))
+        gap = _minutes(prev["end_dt"], nxt["start_dt"])
+        if origin != destination and 0 <= gap < CAMPUS_TRAVEL_MINUTES:
+            switches.append({"from_event": prev, "to_event": nxt, "gap_minutes": gap,
+                             "from_campus": origin, "to_campus": destination})
+    return switches
+
+
+def switch_warning(switch: dict) -> str:
+    """A plain text line for a tight campus switch (callers escape it)."""
+    prev, nxt = switch["from_event"], switch["to_event"]
+    room_from = (prev.get("location") or "").split()[0]
+    room_to = (nxt.get("location") or "").split()[0]
+    gap = switch["gap_minutes"]
+    gap_text = f"{gap} min" if gap else "no time"
+    return (f"⚠️ {prev['end_dt']:%H:%M} {room_from} → {nxt['start_dt']:%H:%M} {room_to}: "
+            f"{CAMPUS_INFO[switch['from_campus']]['name']} to {CAMPUS_INFO[switch['to_campus']]['name']} "
+            f"with {gap_text} between, the ride takes ~{CAMPUS_TRAVEL_MINUTES} min. "
+            f"Leave right away; expect to arrive late.")
 
 
 def _free_intervals(day_events: list, day: date, day_start: dtime, day_end: dtime) -> list[tuple[datetime, datetime]]:
@@ -192,7 +227,8 @@ def plan_day(day_events: list, windows: list[dict], day: date,
             info = CAMPUS_INFO[campus or HAARENTOR]
             lunch = {"kind": "lunch", "date_key": day, "start_dt": start, "end_dt": end,
                      "duration_minutes": _minutes(start, end), "campus": campus,
-                     "mensa": info["mensa"], "menu_path": info["menu_path"]}
+                     "mensa": info["mensa"], "menu_path": info["menu_path"],
+                     "menu_loc_id": info["menu_loc_id"]}
             if target is not None:
                 pieces = []
                 if _minutes(target["start_dt"], start) >= MIN_STUDY_PIECE_MINUTES:
@@ -222,13 +258,13 @@ def menu_highlight(items: list, limit: int = 2) -> Optional[str]:
     mains, has_dessert = [], False
     for item in items:
         category = (item.get("category") or "").lower()
-        # the mensa page marks dishes in short supply with a "Limited - " prefix
+        # the mensa pages mark dishes in short supply with "Limited - " / "LIMITED-"
         name = re.sub(r"^\s*limited\s*-\s*", "", item.get("name") or "", flags=re.IGNORECASE).strip()
         if not name:
             continue
         if "dessert" in category or "nachtisch" in category or "nachspeise" in category:
             has_dessert = True
-        elif not any(word in category for word in ("beilage", "side", "salat", "suppe", "soup")):
+        elif not any(word in f"{category} {name.lower()}" for word in ("beilage", "side", "salat", "suppe", "soup")):
             if name not in mains:
                 mains.append(name)
     if not mains:

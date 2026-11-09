@@ -305,25 +305,8 @@ async def fetch_dish_photo_candidates(target_date=None, loc_id: str = "2") -> li
     result rather than looking each dish up individually.
     Returns a list of (title, absolute_image_url) tuples, or [] on any
     failure (unreachable, no photos for that day, parse error)."""
-    date_str = (target_date or berlin_now().date()).strftime("%Y-%m-%d")
-    try:
-        async with shared_http() as session:
-            async with session.post(
-                MENSA_PHOTO_AJAX_URL,
-                data={
-                    "func": "make_spl",
-                    "locId": loc_id,
-                    "date": date_str,
-                    "lang": "en",
-                    "startThisWeek": date_str,
-                    "startNextWeek": date_str,
-                },
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as resp:
-                html = await resp.text()
-    except Exception as e:
-        logging.warning("fetch_dish_photo_candidates: request failed: %s", e)
+    html = await _fetch_speiseplan_html(loc_id, target_date)
+    if html is None:
         return []
 
     try:
@@ -345,6 +328,53 @@ async def fetch_dish_photo_candidates(target_date=None, loc_id: str = "2") -> li
     except Exception as e:
         logging.warning("fetch_dish_photo_candidates: parse failed: %s", e)
         return []
+
+
+def parse_speiseplan_titles(html: str) -> list[str]:
+    """Dish titles of a Speiseplan widget page, in menu order."""
+    titles = []
+    for meal in BeautifulSoup(html, "html.parser").select(".splMeal"):
+        span = meal.select_one("span[style*='font-size:24px']")
+        title = str(span.contents[0]).strip() if span is not None and span.contents else ""
+        if title:
+            titles.append(title)
+    return titles
+
+
+async def fetch_menu_titles(loc_id: str, target_date=None) -> list[str]:
+    """Today's dish titles of a canteen on the Studierendenwerk widget
+    (locationId 2: Uhlhornsweg, 3: Wechloy, as on studierendenwerk-oldenburg.de).
+    [] on any failure."""
+    html = await _fetch_speiseplan_html(loc_id, target_date)
+    try:
+        return parse_speiseplan_titles(html) if html else []
+    except Exception as e:
+        logging.warning("fetch_menu_titles: parse failed: %s", e)
+        return []
+
+
+async def _fetch_speiseplan_html(loc_id: str, target_date=None) -> Optional[str]:
+    """The Studierendenwerk Speiseplan widget HTML for one canteen and day, or None."""
+    date_str = (target_date or berlin_now().date()).strftime("%Y-%m-%d")
+    try:
+        async with shared_http() as session:
+            async with session.post(
+                MENSA_PHOTO_AJAX_URL,
+                data={
+                    "func": "make_spl",
+                    "locId": loc_id,
+                    "date": date_str,
+                    "lang": "en",
+                    "startThisWeek": date_str,
+                    "startNextWeek": date_str,
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                return await resp.text()
+    except Exception as e:
+        logging.warning("Speiseplan widget request failed: %s", e)
+        return None
 
 
 async def fetch_dish_photo_url(dish_name: str, loc_id: str = "2", target_date=None) -> Optional[str]:

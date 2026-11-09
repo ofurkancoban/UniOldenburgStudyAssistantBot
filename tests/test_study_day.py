@@ -173,6 +173,82 @@ class MenuHighlightTests(unittest.TestCase):
         self.assertIn("BIS library, 2nd floor quiet room", deep[1])
 
 
+    def test_wechloy_menu_comes_from_the_studierendenwerk_widget(self):
+        events = [_event("09:00", "11:30", "Biology", location="W02 1-148"),
+                  _event("14:00", "16:00", "Ecology", location="W04 1-162")]
+        plan = schedule.plan_study_day(events, WED)
+        lunch = plan["lunch"]
+        self.assertEqual((lunch["mensa"], lunch["menu_path"], lunch["menu_loc_id"]), ("Mensa Wechloy", None, "3"))
+        titles = mock.AsyncMock(return_value=["Chili sin carne", "LIMITED-Fried vegetables", "Vegetable soup"])
+        schedule._MENU_HIGHLIGHT_CACHE.clear()
+        with mock.patch.object(schedule, "berlin_now", lambda: _at(WED, "08:00")), \
+                mock.patch.object(schedule, "fetch_menu_titles", titles):
+            menu = asyncio.run(schedule._lunch_menu_highlight(lunch, session=None))
+        titles.assert_awaited_once_with("3", WED)
+        self.assertEqual(menu, "Chili sin carne / Fried vegetables")
+
+    def test_haarentor_falls_back_to_the_public_widget(self):
+        events = [_event("09:00", "11:30"), _event("14:00", "16:00")]
+        lunch = schedule.plan_study_day(events, WED)["lunch"]
+        titles = mock.AsyncMock(return_value=["Tortelloni"])
+        schedule._MENU_HIGHLIGHT_CACHE.clear()
+        with mock.patch.object(schedule, "berlin_now", lambda: _at(WED, "08:00")), \
+                mock.patch.object(schedule, "fetch_todays_menu_items", mock.AsyncMock(side_effect=RuntimeError("down"))), \
+                mock.patch.object(schedule, "fetch_menu_titles", titles):
+            menu = asyncio.run(schedule._lunch_menu_highlight(lunch, session=object()))
+        titles.assert_awaited_once_with("2", WED)
+        self.assertEqual(menu, "Tortelloni")
+
+    def test_speiseplan_titles_are_parsed(self):
+        from unibot.mensa import parse_speiseplan_titles
+        html = ('<div class="splMeal"><span style="font-size:24px">Chili sin carne<sup>a</sup></span></div>'
+                '<div class="splMeal"><span style="font-size:24px">Vegetable soup</span></div>'
+                '<div class="splMeal"><span>no title</span></div>')
+        self.assertEqual(parse_speiseplan_titles(html), ["Chili sin carne", "Vegetable soup"])
+
+
+class CampusSwitchTests(unittest.TestCase):
+    EVENTS = [_event("08:00", "10:00", "Biology", location="W14 0-001"),
+              _event("10:00", "12:00", "Statistics", location="A05 1-161"),
+              _event("14:00", "16:00", "Econometrics", location="A05 1-161")]
+
+    def test_back_to_back_classes_on_different_campuses_are_flagged(self):
+        switches = study_day.tight_campus_switches(self.EVENTS)
+        self.assertEqual(len(switches), 1)
+        s = switches[0]
+        self.assertEqual((s["from_campus"], s["to_campus"], s["gap_minutes"]), (study_day.WECHLOY, study_day.HAARENTOR, 0))
+        line = study_day.switch_warning(s)
+        self.assertIn("10:00 W14 → 10:00 A05", line)
+        self.assertIn("no time between", line)
+        self.assertIn("~20 min", line)
+
+    def test_enough_time_or_same_campus_is_fine(self):
+        ok = [_event("08:00", "09:30", location="W14 0-001"), _event("10:00", "12:00", location="A05 1-161"),
+              _event("12:00", "13:00", location="A06 0-009"), _event("13:10", "14:00", location="Online")]
+        self.assertEqual(study_day.tight_campus_switches(ok), [])
+        cancelled = [{**self.EVENTS[0], "is_cancelled": True}, self.EVENTS[1]]
+        self.assertEqual(study_day.tight_campus_switches(cancelled), [])
+        short = [_event("08:00", "09:50", location="W14 0-001"), _event("10:00", "12:00", location="A05 1-161")]
+        self.assertIn("10 min between", study_day.switch_warning(study_day.tight_campus_switches(short)[0]))
+
+    def test_morning_schedule_section_warns(self):
+        from unibot import morning
+        evs = [{**e, "time": f"{e['start_dt']:%H:%M} - {e['end_dt']:%H:%M}"} for e in self.EVENTS]
+        text = morning._format_schedule_section(evs)
+        self.assertIn("⚠️ 10:00 W14 → 10:00 A05", text)
+
+    def test_daily_view_warns(self):
+        sender = mock.MagicMock()
+        sender.edit_message_text = mock.AsyncMock()
+        with mock.patch.object(schedule, "get_weather_snapshot", mock.AsyncMock(return_value=None)), \
+                mock.patch.object(schedule, "_lunch_menu_highlight", mock.AsyncMock(return_value=None)):
+            evs = [{**e, "time": f"{e['start_dt']:%H:%M} - {e['end_dt']:%H:%M}"} for e in self.EVENTS]
+            asyncio.run(schedule.send_daily_calendar(sender, evs, WED, WED - timedelta(days=2)))
+        text = sender.edit_message_text.await_args.args[0]
+        self.assertIn("W14 → 10:00 A05", text)
+        self.assertIn("Campus Wechloy to Campus Haarentor", text)
+
+
 class StudyPackTests(unittest.TestCase):
     UID = 4242
 
@@ -294,6 +370,17 @@ class StudyReminderTests(unittest.TestCase):
         self.assertEqual(len(reminder), 1)
         self.assertIn("Deep work", reminder[0])
         self.assertIn("BIS library", reminder[0])
+
+
+    def test_lecture_reminder_warns_about_a_tight_campus_switch(self):
+        events = CampusSwitchTests.EVENTS
+        texts = self._run_at(_at(WED, "09:30"), events)  # Statistics at 10:00 starts in 30 minutes
+        lecture = [t for t in texts if "LECTURE REMINDER" in t]
+        self.assertEqual(len(lecture), 1)
+        self.assertIn("Statistics", lecture[0])
+        self.assertIn("Campus Wechloy to Campus Haarentor", lecture[0])
+        later = self._run_at(_at(WED, "13:30"), events)  # Econometrics: no switch before it
+        self.assertNotIn("⚠️", "".join(t for t in later if "LECTURE REMINDER" in t))
 
 
 class TaskPrivacyTests(unittest.TestCase):

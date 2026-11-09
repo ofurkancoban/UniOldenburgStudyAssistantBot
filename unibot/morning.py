@@ -39,6 +39,7 @@ from unibot.ai import _ai_patience, _call_openrouter, _pcm_to_ogg_voice, synthes
 from unibot.weather import build_weather_text_line, get_weather_snapshot
 from unibot.mensa import _friendly_menu_category_label, build_food_recommendation, fetch_dish_photo_url
 from unibot.wardrobe import generate_outfit_tryon_image, outfit_caption, pick_outfit_from_wardrobe
+from unibot.study_day import switch_warning, tight_campus_switches
 from unibot.schedule import (
     _lunch_menu_highlight,
     _week_tasks_for_range,
@@ -77,7 +78,9 @@ def _format_schedule_section(today_events: list) -> str:
             f"   🕒 <code>{ev['time']}</code>\n"
             f"   {loc_icon} {_h(_safe_loc(ev['location']))}"
         )
-    return "\n".join(["📅 <b>Today's Schedule:</b>", "\n\n".join(course_blocks)])
+    warnings = [_h(switch_warning(s)) for s in tight_campus_switches(today_events)]
+    return "\n".join(["📅 <b>Today's Schedule:</b>", "\n\n".join(course_blocks)]
+                     + (["", *warnings] if warnings else []))
 
 
 def _format_study_windows_section(events: list, today_date, menu: Optional[str] = None) -> str:
