@@ -316,7 +316,7 @@ class PersonalRecordTests(SharedCacheMixin, unittest.TestCase):
         self.assertIn("725", self.cache["travel_modes"])  # other students untouched until they are read
         raw = self._raw(724, "cache.travel_modes")
         self.assertTrue(raw)
-        self.assertNotIn("bus", raw)
+        self.assertNotIn('"bus"', raw)  # quotes never occur in the base64 ciphertext
 
     def test_new_personal_data_never_lands_in_the_shared_cache(self):
         storage.record_study_block(726, int(time.time()), "sent", course="Secret course", minutes=30)

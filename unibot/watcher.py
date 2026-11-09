@@ -468,6 +468,9 @@ async def _run_weekly_report(bot, now: datetime):
 async def _backup_database():
     path = await asyncio.to_thread(db.backup)
     logging.info("💾 Database backup written: %s", os.path.basename(path))
+    pruned = await asyncio.to_thread(db.prune_activity)
+    if pruned:
+        logging.info("🧹 %s activity rows older than %s days removed", pruned, db.ACTIVITY_KEEP_DAYS)
 
 
 async def _run_daily_backup(now: datetime):

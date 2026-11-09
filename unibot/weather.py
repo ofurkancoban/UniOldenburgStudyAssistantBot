@@ -163,6 +163,17 @@ def snapshot_key(day, user_id=None) -> tuple:
     return (day, round(lat, 3), round(lon, 3))
 
 
+def forget_weather_place(user_id, place: Optional[dict]) -> None:
+    """Drop the in-memory snapshots of a deleted student's own place (only a
+    cache: anyone else at that place simply fetches it again)."""
+    if not place:
+        return
+    lat, lon = (round(c, 3) for c in _coords(place))
+    for key in [k for k in _SNAPSHOTS if k[1:] == (lat, lon)]:
+        _SNAPSHOTS.pop(key, None)
+        _FETCHED_AT.pop(key, None)
+
+
 def cached_weather_snapshot(day, user_id=None) -> Optional[dict]:
     """The last get_weather_snapshot result for `day` at the student's place,
     without a request (None when it wasn't fetched in this process)."""

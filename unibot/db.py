@@ -394,6 +394,28 @@ def update_user_activity(telegram_id: int, action: Optional[str] = None) -> None
             )
 
 
+ACTIVITY_KEEP_DAYS = 30  # the admin panel only shows the latest few actions
+
+
+def prune_activity(keep_days: float = ACTIVITY_KEEP_DAYS, now: Optional[float] = None) -> int:
+    """Drop activity rows older than keep_days (they hold what students
+    typed); returns how many went."""
+    cutoff = (now if now is not None else time.time()) - keep_days * 86400
+    with _lock:
+        cur = _connection().execute("DELETE FROM user_activity WHERE created_at < ?", (cutoff,))
+        return cur.rowcount or 0
+
+
+def forget_user_identity(telegram_id: int) -> None:
+    """A student's own data deletion: their activity log and the Telegram
+    name and username kept with their account row (the row itself stays, it
+    holds their access and role)."""
+    with _lock:
+        _connection().execute("DELETE FROM user_activity WHERE telegram_id = ?", (telegram_id,))
+        _connection().execute("UPDATE users SET username = NULL, full_name = NULL WHERE telegram_id = ?",
+                              (telegram_id,))
+
+
 def set_user_active(telegram_id: int, is_active: bool) -> None:
     with _lock:
         _connection().execute(

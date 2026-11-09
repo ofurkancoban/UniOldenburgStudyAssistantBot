@@ -418,5 +418,45 @@ class AiBudgetTests(unittest.TestCase):
         context.bot.get_file.assert_not_called()
 
 
+class DataDeletionTests(unittest.TestCase):
+    UID, OTHER = 9701, 9702
+
+    def setUp(self):
+        from unibot import db
+        self.db = db
+        for uid in (self.UID, self.OTHER):
+            db.upsert_user(telegram_id=uid, username=f"user{uid}", full_name=f"Name {uid}")
+            db.update_user_activity(uid, action="cmd:/secret-typed")
+
+    def _activity(self, uid):
+        return self.db._connection().execute(
+            "SELECT COUNT(*) FROM user_activity WHERE telegram_id = ?", (uid,)).fetchone()[0]
+
+    def test_deleting_my_data_removes_my_activity_and_telegram_name(self):
+        from unibot import privacy, weather
+
+        weather.save_weather_location("Bremen", "DE", 53.08, 8.8, user_id=self.UID)
+        key = weather.snapshot_key(WED_DAY, self.UID)
+        weather._SNAPSHOTS[key] = {"is_wet": False}
+        with mock.patch.object(privacy, "_perform_logout", mock.AsyncMock()):
+            asyncio.run(privacy.delete_personal_data(self.UID))
+        user = self.db.get_user(self.UID)
+        self.assertIsNone(user["username"])
+        self.assertIsNone(user["full_name"])
+        self.assertEqual(self._activity(self.UID), 0)
+        self.assertNotIn(key, weather._SNAPSHOTS)  # their coordinates leave memory too
+        # other students are untouched
+        self.assertEqual(self.db.get_user(self.OTHER)["full_name"], f"Name {self.OTHER}")
+        self.assertGreater(self._activity(self.OTHER), 0)
+
+    def test_old_activity_is_pruned(self):
+        old = time.time() - (self.db.ACTIVITY_KEEP_DAYS + 1) * 86400
+        self.db._connection().execute(
+            "INSERT INTO user_activity (telegram_id, action, created_at) VALUES (?, ?, ?)", (self.OTHER, "cmd:/old", old))
+        before = self._activity(self.OTHER)
+        self.assertGreaterEqual(self.db.prune_activity(), 1)
+        self.assertEqual(self._activity(self.OTHER), before - 1)  # recent rows stay
+
+
 if __name__ == "__main__":
     unittest.main()

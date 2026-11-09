@@ -259,7 +259,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         default_semester = load_default_semester(user_id)
         default_semester_label = default_semester.get("label") or "Not set"
         weather_location = load_weather_location(user_id)
-        weather_location_label = f"{weather_location['name']}, {weather_location['country']}" if weather_location else "Uni Oldenburg (default)"
+        weather_location_label = (html.escape(f"{weather_location['name']}, {weather_location['country']}")
+                                  if weather_location else "Uni Oldenburg (default)")
         study_plan_enabled = get_pref(user_id, "weekly_study_plan")
 
         text = (
@@ -397,7 +398,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n👤 Name: {html.escape(studip_name or 'Not connected')} (from Stud.IP)"
 
     weather_location = load_weather_location(user_id)
-    weather_location_label = f"{weather_location['name']}, {weather_location['country']}" if weather_location else "Uni Oldenburg (default)"
+    weather_location_label = (html.escape(f"{weather_location['name']}, {weather_location['country']}")
+                              if weather_location else "Uni Oldenburg (default)")
     text += f"\n📍 Weather Location: {weather_location_label}"
 
     wardrobe_enabled = get_wardrobe_feature_enabled()

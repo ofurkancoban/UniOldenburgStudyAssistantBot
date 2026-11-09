@@ -207,7 +207,8 @@ class EncryptedRecordTests(unittest.TestCase):
         self.assertFalse(db.exists("study_progress_912.json"))
         study_plan.save_study_progress({"tracked": ["c8"]}, user_id=912)
         self.assertEqual(storage.load_student_progress(912), {"tracked": ["c8"]})
-        self.assertNotIn("c8", _raw_private(912, storage.PERSONAL_RECORD_PREFIX + storage.STUDY_PROGRESS_RECORD))
+        # quotes never occur in the base64 ciphertext, so this only fails on plain JSON
+        self.assertNotIn('"c8"', _raw_private(912, storage.PERSONAL_RECORD_PREFIX + storage.STUDY_PROGRESS_RECORD))
 
     def test_the_shared_admin_mirror_goes_only_to_the_primary_admin(self):
         db.save(storage.LEGACY_SHARED_PROGRESS, {"tracked": ["admin"]})

@@ -17,6 +17,7 @@ from unibot import db, stagger, state
 from unibot.auth import _perform_logout, acting_as, has_stored_login, is_user_allowed, personal_session
 from unibot.exams import exam_action_cache
 from unibot.schedule import fastenroll_tasks
+from unibot.weather import forget_weather_place, load_weather_location
 from unibot.storage import (
     forget_personal_cache,
     get_ai_grades_enabled,
@@ -87,7 +88,8 @@ def delete_confirm_view() -> tuple:
         "• your saved Stud.IP and StuMS login (you are signed out)\n"
         "• your stored grades, exam registration and fee data\n"
         "• your course alert settings, study block log, deadline streak, calendar link, "
-        "Study Buddy and assistant settings\n\n"
+        "Study Buddy and assistant settings, name, weather place and default semester\n"
+        "• your activity log and the Telegram name kept with your account\n\n"
         "Your own tasks stay. Signing in again starts fresh. This cannot be undone."
     )
     rows = [[InlineKeyboardButton("🗑️ Yes, delete everything", callback_data="privacy|delete_yes")],
@@ -113,6 +115,7 @@ def _delete_plain_documents(user_id: int) -> list[str]:
 async def delete_personal_data(user_id: int) -> dict:
     """Remove everything personal the bot keeps about the student."""
     removed: dict = {"private": db.get_user_scope(user_id).has_private(PRIVATE_EXAM_KIND)}
+    place = load_weather_location(user_id)  # read before the record goes
     db.get_user_scope(user_id).delete_private()
     await _perform_logout(user_id)  # session, cookies, tokens, StuMS state
     db.get_user_scope(user_id).sync_courses(set())
@@ -125,6 +128,8 @@ async def delete_personal_data(user_id: int) -> dict:
         exam_action_cache.pop(sid, None)
     for members in (getattr(state, "course_members", None) or {}).values():
         members.discard(user_id)
+    db.forget_user_identity(user_id)  # activity log, Telegram name and username
+    forget_weather_place(user_id, place)
     db.set_lifecycle(user_id, "inactive", "deleted their data")  # no background work until /start
     logging.info("Personal data deleted for user %s", user_id)
     return removed
