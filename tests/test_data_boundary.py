@@ -218,7 +218,8 @@ class PrivacyScreenTests(unittest.TestCase):
         with mock.patch.object(voice, "login_studip", login), \
                 mock.patch.object(voice, "get_grades", grades), \
                 mock.patch.object(voice, "get_registered_exam_schedule", empty), \
-                mock.patch.object(voice, "get_ai_grades_enabled", lambda uid: False):
+                mock.patch.object(voice, "get_ai_grades_enabled", lambda uid: False), \
+                mock.patch.object(voice, "load_tasks", lambda: []):
             context = asyncio.run(voice.build_qa_context(user_id=505))
         self.assertEqual(fetched, [])
         self.assertIn("not shared with the assistant", context)
