@@ -124,6 +124,8 @@ CREATE TABLE IF NOT EXISTS user_private_data (
 );
 """
 
+DB_BUSY_TIMEOUT = 30.0
+
 _lock = threading.RLock()
 _conn = None
 _conn_path = None
@@ -142,7 +144,11 @@ def _connection() -> sqlite3.Connection:
         if _conn is None or _conn_path != path:
             if _conn is not None:
                 _conn.close()
-            _conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+            # 30 s instead of the 5 s default, so a backup or a slow disk
+            # makes writers wait rather than fail with "database is locked"
+            _conn = sqlite3.connect(path, timeout=DB_BUSY_TIMEOUT, check_same_thread=False,
+                                    isolation_level=None)
+            _conn.execute(f"PRAGMA busy_timeout = {int(DB_BUSY_TIMEOUT * 1000)}")
             _conn.execute("PRAGMA journal_mode=WAL")
             _conn.execute("PRAGMA synchronous=FULL")
             _conn.executescript(_SCHEMA)

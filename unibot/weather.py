@@ -237,8 +237,11 @@ async def get_weather_snapshot(target_date=None, user_id=None) -> Optional[dict]
         morning_precip = []
         for t, code, precip in zip(data["hourly"]["time"], data["hourly"]["weathercode"], data["hourly"]["precipitation_probability"]):
             if t.startswith(target_iso) and 8 <= int(t[11:13]) <= 11:
-                morning_codes.append(code)
-                morning_precip.append(precip)
+                # Open-Meteo sends null for hours a station has no value for
+                if isinstance(code, (int, float)):
+                    morning_codes.append(int(code))
+                if isinstance(precip, (int, float)):
+                    morning_precip.append(precip)
         if not morning_codes:
             return None
 
@@ -249,7 +252,7 @@ async def get_weather_snapshot(target_date=None, user_id=None) -> Optional[dict]
             "description": desc,
             "emoji": emoji,
             "is_wet": code >= WEATHER_WET_CODE_THRESHOLD,
-            "precip_chance": max(morning_precip),
+            "precip_chance": max(morning_precip) if morning_precip else 0,
             "temp_min": data["daily"]["temperature_2m_min"][day_index],
             "temp_max": data["daily"]["temperature_2m_max"][day_index],
             "location_name": location["name"] if location else "Oldenburg",
@@ -257,7 +260,7 @@ async def get_weather_snapshot(target_date=None, user_id=None) -> Optional[dict]
         _SNAPSHOTS[key] = snapshot
         _FETCHED_AT[key] = time.time()
         return snapshot
-    except (KeyError, IndexError, ValueError) as e:
+    except (KeyError, IndexError, ValueError, TypeError) as e:
         logging.warning("get_weather_snapshot: parse failed: %s", e)
         return None
 

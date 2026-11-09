@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from exam_reminder import PRIVATE_EXAM_KIND, exam_cache_user, load_exam_cache
@@ -200,6 +201,11 @@ async def handle_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
     text, markup = privacy_view(user_id, note=note)
     if action:
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except BadRequest as e:
+            # a second tap inside the cooldown renders the same view again
+            if "not modified" not in str(e).lower():
+                raise
     else:
         await query.message.reply_text(text, parse_mode="HTML", reply_markup=markup)

@@ -521,20 +521,38 @@ async def generate_outfit_tryon_gwdg(reference_bytes: bytes, garments: list) -> 
 
 
 def _extract_json_object(raw: Optional[str]) -> Optional[dict]:
-    """Parse the first JSON object out of a model response, tolerating any
-    prose the model wraps it in despite being asked for strict JSON."""
+    """Parse the JSON object out of a model response, tolerating any prose
+    the model wraps it in despite being asked for strict JSON. A fenced
+    ```json block wins; otherwise the first object that parses on its own,
+    so an example in braces before the answer doesn't spoil it."""
     if not raw:
         return None
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed
     except (json.JSONDecodeError, TypeError):
         pass
-    match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if match:
+    decoder = json.JSONDecoder()
+    for fence in re.finditer(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL):
+        found = _first_json_object(decoder, fence.group(1))
+        if found is not None:
+            return found
+    return _first_json_object(decoder, raw)
+
+
+def _first_json_object(decoder: json.JSONDecoder, text: str) -> Optional[dict]:
+    """First top-level JSON object in free text (nested braces are fine)."""
+    start = text.find("{")
+    while start != -1:
         try:
-            return json.loads(match.group(0))
+            parsed, _end = decoder.raw_decode(text, start)
         except json.JSONDecodeError:
-            pass
+            start = text.find("{", start + 1)
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+        start = text.find("{", start + 1)
     return None
 
 

@@ -1,0 +1,122 @@
+"""Fixes from an outside review: null values from Open-Meteo, a repeated
+tap on the privacy check, model answers with an example object before the
+real one, and a longer SQLite busy timeout."""
+
+import asyncio
+import contextlib
+import os
+import sys
+import tempfile
+import unittest
+from datetime import datetime
+from unittest import mock
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
+from tests.testenv import use_temp_db  # noqa: E402
+use_temp_db()
+
+from telegram.error import BadRequest  # noqa: E402
+
+from studip_utils import TZ_BERLIN  # noqa: E402
+from unibot import ai, db, privacy, weather  # noqa: E402
+
+
+class _Response:
+    status = 200
+
+    def __init__(self, data):
+        self._data = data
+
+    async def json(self):
+        return self._data
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+class WeatherNullTests(unittest.TestCase):
+    def _fetch(self, codes, precip):
+        day = datetime.now(TZ_BERLIN).date().isoformat()
+        data = {"hourly": {"time": [f"{day}T{h:02d}:00" for h in range(8, 12)],
+                           "weathercode": codes, "precipitation_probability": precip},
+                "daily": {"time": [day], "temperature_2m_min": [3], "temperature_2m_max": [9]}}
+        session = mock.MagicMock()
+        session.get = mock.MagicMock(return_value=_Response(data))
+
+        @contextlib.asynccontextmanager
+        async def shared_http():
+            yield session
+
+        weather._SNAPSHOTS.clear()
+        weather._FETCHED_AT.clear()
+        self.addCleanup(weather._SNAPSHOTS.clear)
+        with mock.patch.object(weather, "shared_http", shared_http), \
+                mock.patch.object(weather, "load_weather_location", return_value=None):
+            return asyncio.run(weather.get_weather_snapshot())
+
+    def test_null_hours_are_skipped(self):
+        snap = self._fetch([3, None, 61, 2], [10, None, 20, None])
+        self.assertEqual(snap["precip_chance"], 20)
+        self.assertTrue(snap["is_wet"])
+
+    def test_all_null_precipitation_reads_as_zero(self):
+        snap = self._fetch([1, 2, 3, 1], [None, None, None, None])
+        self.assertEqual(snap["precip_chance"], 0)
+
+    def test_all_null_codes_give_no_snapshot_instead_of_crashing(self):
+        self.assertIsNone(self._fetch([None] * 4, [None] * 4))
+
+
+class PrivacyRepeatTapTests(unittest.TestCase):
+    def _tap(self, error):
+        query = mock.MagicMock()
+        query.from_user.id = 4401
+        query.data = "privacy|check"
+        query.answer = mock.AsyncMock()
+        query.edit_message_text = mock.AsyncMock(side_effect=error)
+        with mock.patch.object(privacy, "is_user_allowed", return_value=True), \
+                mock.patch.object(privacy, "run_manual_check", mock.AsyncMock(return_value="⏳ wait")), \
+                mock.patch.object(privacy, "privacy_view", return_value=("same", None)):
+            asyncio.run(privacy.handle_privacy(mock.MagicMock(callback_query=query), mock.MagicMock()))
+
+    def test_unchanged_view_is_ignored(self):
+        self._tap(BadRequest("Message is not modified: specified new message content and reply "
+                             "markup are exactly the same"))
+
+    def test_other_errors_still_surface(self):
+        with self.assertRaises(BadRequest):
+            self._tap(BadRequest("Message to edit not found"))
+
+
+class JsonExtractionTests(unittest.TestCase):
+    def test_example_object_before_the_answer(self):
+        raw = 'Example: {"type": "test"} - Output: {"task": "HW1"}'
+        self.assertEqual(ai._extract_json_object(raw), {"type": "test"})
+
+    def test_fenced_block_wins(self):
+        raw = 'Example: {"type": "test"}\n```json\n{"task": "HW1", "due": {"d": 1}}\n```\nDone {x}'
+        self.assertEqual(ai._extract_json_object(raw), {"task": "HW1", "due": {"d": 1}})
+
+    def test_braces_inside_strings_and_nesting(self):
+        raw = 'Sure! {"title": "a } b", "items": [{"n": 1}]} hope that helps {'
+        self.assertEqual(ai._extract_json_object(raw), {"title": "a } b", "items": [{"n": 1}]})
+
+    def test_garbage_and_non_objects(self):
+        self.assertIsNone(ai._extract_json_object("no json {here"))
+        self.assertIsNone(ai._extract_json_object("[1, 2]"))
+        self.assertIsNone(ai._extract_json_object(None))
+
+
+class BusyTimeoutTests(unittest.TestCase):
+    def test_connection_waits_thirty_seconds_for_a_lock(self):
+        timeout = db._connection().execute("PRAGMA busy_timeout").fetchone()[0]
+        self.assertEqual(timeout, 30000)
+
+
+if __name__ == "__main__":
+    unittest.main()
