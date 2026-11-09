@@ -203,13 +203,15 @@ def _campus_near(day_events: list, moment: datetime) -> Optional[str]:
 
 def plan_day(day_events: list, windows: list[dict], day: date,
              day_start: dtime = dtime(9, 0), day_end: dtime = dtime(19, 0),
-             travel: dict = DEFAULT_TRAVEL) -> dict[str, Any]:
+             travel: dict = DEFAULT_TRAVEL, anchor: Optional[str] = None) -> dict[str, Any]:
     """Refine one day's study windows: travel time between campuses comes off
     the start, a 45-minute lunch break is placed between 11:30 and 14:00 (in
     free time outside the windows when there is any, else cut out of a
     window), and each window gets its campus, a study spot and a work type.
 
     `day_events` are the day's classes (not cancelled, with start_dt/end_dt).
+    `anchor` is the student's home campus, used where the classes don't say
+    which campus they are on (None: Haarentor for the mensa, no study spot).
     Returns {"windows": [...], "lunch": {...} or None}; windows stay sorted."""
     refined = []
     for w in windows:
@@ -249,7 +251,7 @@ def plan_day(day_events: list, windows: list[dict], day: date,
                 target, slot = min(candidates, key=lambda c: abs(_minutes(_at(day, LUNCH_PREFERRED_START), c[1][0])))
         if slot:
             start, end = slot
-            campus = (target and _window_campus(target)) or _campus_near(day_events, start)
+            campus = (target and _window_campus(target)) or _campus_near(day_events, start) or anchor
             info = CAMPUS_INFO[campus or HAARENTOR]
             lunch = {"kind": "lunch", "date_key": day, "start_dt": start, "end_dt": end,
                      "duration_minutes": _minutes(start, end), "campus": campus,
@@ -270,7 +272,7 @@ def plan_day(day_events: list, windows: list[dict], day: date,
                 refined[index:index + 1] = pieces
 
     for w in refined:
-        campus = _window_campus(w)
+        campus = _window_campus(w) or anchor
         w["campus"] = campus
         w["study_spot"] = CAMPUS_INFO[campus]["study_spot"] if campus else None
         w["study_type"] = study_type(w["duration_minutes"])

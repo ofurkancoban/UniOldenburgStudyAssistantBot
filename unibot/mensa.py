@@ -19,7 +19,6 @@ from telegram.error import TelegramError
 
 from studip_utils import TZ_BERLIN, berlin_now, tag_attr
 
-from unibot import db
 from unibot import state
 from unibot.storage import shared_http
 from unibot.telegram_ui import (
@@ -28,7 +27,8 @@ from unibot.telegram_ui import (
     _stop_loading_animation,
     get_main_keyboard,
 )
-from unibot.auth import is_user_allowed, login_studip
+from unibot.auth import current_user_id, is_user_allowed, login_studip
+from unibot.preferences import DIETS, food_filter, get_prefs, set_pref
 from unibot.studip_api import BASE_URL
 from unibot.ai import _call_openrouter, _extract_json_object
 
@@ -36,25 +36,25 @@ from unibot.ai import _call_openrouter, _extract_json_object
 FOOD_PREFERENCES_CACHE_PATH = "food_preferences.json"
 
 
-def load_food_preferences() -> dict:
-    """Return {"avoid_codes": [...], "avoid_keywords": [...]} describing
-    ingredients/allergen codes the user doesn't eat, or empty lists if none
-    have been set — in which case the Mensa menu shows everything as before."""
-    if db.exists(FOOD_PREFERENCES_CACHE_PATH):
-        try:
-            data = db.load(FOOD_PREFERENCES_CACHE_PATH)
-            return {
-                "avoid_codes": data.get("avoid_codes", []),
-                "avoid_keywords": data.get("avoid_keywords", []),
-            }
-        except Exception as e:
-            logging.warning("Could not load food preferences: %s", e)
-    return {"avoid_codes": [], "avoid_keywords": []}
+def load_food_preferences(user_id: Optional[int] = None) -> dict:
+    """{"avoid_codes": [...], "avoid_keywords": [...]}: the ingredients and
+    allergen codes the student (default: the one the current update acts for)
+    doesn't eat, from their own preferences. Empty without a student."""
+    uid = user_id if user_id is not None else current_user_id()
+    if uid is None:
+        return {"avoid_codes": [], "avoid_keywords": []}
+    prefs = get_prefs(uid)
+    return {"avoid_codes": list(prefs["food_avoid_codes"]), "avoid_keywords": list(prefs["food_avoid_keywords"])}
 
 
-def save_food_preferences(avoid_codes: list, avoid_keywords: list) -> None:
+def save_food_preferences(avoid_codes: list, avoid_keywords: list, user_id: Optional[int] = None) -> None:
+    uid = user_id if user_id is not None else current_user_id()
+    if uid is None:
+        logging.warning("Food preferences need a student; nothing saved")
+        return
     try:
-        db.save(FOOD_PREFERENCES_CACHE_PATH, {"avoid_codes": avoid_codes, "avoid_keywords": avoid_keywords})
+        set_pref(uid, "food_avoid_codes", list(avoid_codes))
+        set_pref(uid, "food_avoid_keywords", list(avoid_keywords))
     except Exception as e:
         logging.error("Could not save food preferences: %s", e)
 
@@ -281,8 +281,7 @@ async def fetch_todays_menu_items(session, sub_path="2/") -> list:
 
 
 MEAT_CODES = {"G", "R", "L", "W", "F", "Fi"}  # Poultry (incl. turkey — no separate code for it), Beef, Lamb, Game, Fish (F and Fi both mean Fish in this Mensa's code table) — used to flag/prioritize meat/fish dishes
-MEAL_RECOMMENDATION_BASE_AVOID_CODES = {"S", "Sch", "Su", "A", "RG", "SG"}  # Pork (all 3 codes), Alcohol, Beef/Pork Gelatin
-MEAL_RECOMMENDATION_BASE_AVOID_KEYWORDS = {"wine"}
+# What a diet leaves out (pork, alcohol, gelatine for halal, ...) is in preferences.diet_filter.
 
 MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only — everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Weigh three things together: (1) prioritize a meat, chicken, turkey, or fish dish when one is available — the [tag] next to a candidate flags this; (2) how nutritious/filling it likely is, judged from its name and description (lean protein, vegetables, a balanced plate > something clearly just a light side or dessert-like); (3) price — a student budget, so don't default to the most expensive option without reason. None of these mechanically overrides the others; weigh the actual tradeoff for today's specific candidates.
 
@@ -485,7 +484,7 @@ async def _speiseplan_main_items(loc_id: str) -> list:
     return items
 
 
-async def build_food_recommendation(loc_id: str = "2") -> Optional[dict]:
+async def build_food_recommendation(loc_id: str = "2", user_id: Optional[int] = None) -> Optional[dict]:
     """Fetch today's Mensa menu, filter out anything the student avoids
     (their food_preferences.json settings, unioned with a fixed
     pork/alcohol/wine/gelatine floor per their stated restriction), keep
@@ -514,9 +513,10 @@ async def build_food_recommendation(loc_id: str = "2") -> Optional[dict]:
     if not items:
         return None
 
-    prefs = load_food_preferences()
-    avoid_codes = set(prefs["avoid_codes"]) | MEAL_RECOMMENDATION_BASE_AVOID_CODES
-    avoid_keywords = {k.lower() for k in prefs["avoid_keywords"]} | MEAL_RECOMMENDATION_BASE_AVOID_KEYWORDS
+    # the student's diet (vegetarian, vegan, halal, fish, budget) plus their own avoided codes and words
+    uid = user_id if user_id is not None else current_user_id()
+    food = food_filter(uid)
+    avoid_codes, avoid_keywords, max_price = food["avoid_codes"], food["avoid_keywords"], food["max_price"]
 
     candidates = []
     for it in items:
@@ -528,13 +528,17 @@ async def build_food_recommendation(loc_id: str = "2") -> Optional[dict]:
         haystack = f"{it['name']} {it['description']}".lower()
         if any(kw in haystack for kw in avoid_keywords):
             continue
+        if max_price is not None:
+            price = _speiseplan_price(str(it.get("price") or ""))
+            if price is None or price > max_price:
+                continue
         candidates.append(it)
 
     if not candidates:
         return {
             "dish": None,
             "category": None,
-            "reasoning": "Couldn't find anything on today's Counter or Culinarium menu that fits your preferences — check the full menu instead, there might be something elsewhere on it.",
+            "reasoning": f"Couldn't find anything on today's menu that fits your diet ({DIETS.get(food['diet'], food['diet'])}) and preferences. Check the full menu, there might be something elsewhere on it.",
         }
 
     lines = []

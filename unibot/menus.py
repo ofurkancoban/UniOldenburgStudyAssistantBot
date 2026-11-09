@@ -26,18 +26,17 @@ from unibot.config import (
     WA_SERVICE_URL,
     get_wa_group_id,
 )
+from unibot.preferences import get_pref, set_pref
 from unibot.storage import (
     cleanup_link_cache,
     get_travel_mode,
     set_travel_mode,
     get_primary_user_name,
-    get_watch_previous_semester_enabled,
     get_weekly_study_plan_enabled,
     link_cache,
     load_default_semester,
     user_tasks,
     save_user_name,
-    set_watch_previous_semester_enabled,
     set_weekly_study_plan_enabled,
     shared_http,
 )
@@ -104,7 +103,7 @@ def _status_group_view(group: str, user_id: Optional[int] = None) -> tuple:
             [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
         ]
     elif group == "semester":
-        watch_prev = get_watch_previous_semester_enabled()
+        watch_prev = get_pref(user_id, "watch_previous_semester")
         travel = get_travel_mode(user_id)
         travel_label = "🚲 Bike (15 min, bus when it rains)" if travel == "bike" else "🚌 Bus (20 min)"
         title = (f"📆 <b>Semester &amp; Calendar</b>\n\nWatch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
@@ -117,7 +116,8 @@ def _status_group_view(group: str, user_id: Optional[int] = None) -> tuple:
                                   callback_data="status_group_toggle|semester|travel")],
             [InlineKeyboardButton("📅 Calendar Sync", callback_data="cal_sync"),
              InlineKeyboardButton("👥 Study Buddy", callback_data="buddy")],
-            [InlineKeyboardButton("🔔 Course Alerts", callback_data="calert")],
+            [InlineKeyboardButton("🔔 Course Alerts", callback_data="calert"),
+             InlineKeyboardButton("⚙️ Settings", callback_data="settings")],
         ]
     else:
         title = "📄 <b>Official Documents &amp; Tuition</b>\n\nDownload official StuMS PDF certificates, transcript, and semester fee status:"
@@ -149,7 +149,8 @@ async def handle_status_group(update: Update, context: ContextTypes.DEFAULT_TYPE
     if parts[0] == "status_group_toggle":
         feature = parts[2] if len(parts) > 2 else ""
         if feature == "watch_prev":
-            set_watch_previous_semester_enabled(not get_watch_previous_semester_enabled())
+            uid = query.from_user.id
+            set_pref(uid, "watch_previous_semester", not get_pref(uid, "watch_previous_semester"))
             state.courses_map = {}  # same as handle_toggle_watch_prev_sem: rebuild on the next watcher cycle
         elif feature == "study_plan":
             set_weekly_study_plan_enabled(not get_weekly_study_plan_enabled())

@@ -281,6 +281,8 @@ def _single_account_owner(session) -> Optional[int]:
 
 async def _run_reminder_checks(bot, session, now: datetime):
     """Calendar, schedule change, task, exam, grade and tuition reminders."""
+    # course alerts held for quiet hours or the evening digest go out when due
+    await _guarded("Course digest", course_registry.flush_alert_queues, bot, now)
     await _guarded("Calendar reminder check", _send_calendar_reminders, bot)
     # Automatic course cancellation & room change alerts
     await _guarded("Course schedule change check", check_course_schedule_changes, session, bot)

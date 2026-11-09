@@ -33,10 +33,12 @@ from unibot import state
 from unibot.auth import current_user_id, get_user_session, is_user_admin, login_studip
 from unibot.formatting import clean_html_text
 from unibot.storage import (
-    get_watch_previous_semester_enabled,
     load_default_semester,
     save_studip_user_name,
 )
+
+from unibot.config import ALLOWED_USER_IDS  # noqa: E402
+from unibot.preferences import get_pref  # noqa: E402
 
 BASE_URL = "https://elearning.uni-oldenburg.de"
 
@@ -273,7 +275,8 @@ async def _ensure_watched_courses_map(session) -> None:
     depends on whatever semester some unrelated browsing interaction
     (Files/Enroll/Sign Out's own semester pickers) last left the shared
     session's filter pointed at, which isn't reliable here."""
-    want_prev = get_watch_previous_semester_enabled()
+    owner = getattr(session, "user_id", None) or next(iter(ALLOWED_USER_IDS), None)
+    want_prev = bool(get_pref(owner, "watch_previous_semester"))
     if state.courses_map and state._courses_map_built_with_prev == want_prev:
         return
 

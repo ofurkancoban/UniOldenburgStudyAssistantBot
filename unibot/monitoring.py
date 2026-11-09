@@ -78,7 +78,9 @@ from unibot.monitoring_fetch import (  # noqa: F401 - the fetch layer, re-export
     _post_author_id,
     fetch_message_body,
 )
-from unibot.storage import link_cache, load_files_cache, save_files_cache, single_flight
+from fast_enroll import get_semester_options
+from unibot.preferences import get_pref
+from unibot.storage import link_cache, load_default_semester, load_files_cache, save_files_cache, single_flight
 from unibot.studip_api import (
     BASE_URL,
     STUDIP_API_URL,
@@ -87,6 +89,7 @@ from unibot.studip_api import (
     _api_rel_id,
     _ensure_watched_courses_map,
     list_courses,
+    _list_courses_api,
     _list_files_api,
     _list_files_html,
     studip_api_get,
@@ -231,6 +234,29 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 COURSE_LIST_REFRESH_SECONDS = 6 * 3600
 _course_list_fetched: dict[int, float] = {}
+# students' previous-semester courses (only for those who opted in), {uid: {cid: name}}
+_prev_semester_courses: dict[int, dict] = {}
+_prev_semester_fetched: dict[int, float] = {}
+
+
+async def _previous_semester_courses(uid: int, sess) -> dict:
+    """{cid: name} of the student's courses in the semester before their
+    current one, fetched with their own session through the JSON:API (no
+    my_courses filter switching) and cached for COURSE_LIST_REFRESH_SECONDS."""
+    if uid in _prev_semester_courses and \
+            time.time() - _prev_semester_fetched.get(uid, 0.0) < COURSE_LIST_REFRESH_SECONDS:
+        return _prev_semester_courses[uid]
+    options = await get_semester_options(sess)
+    anchor = load_default_semester().get("id") or (options[0][0] if options else None)
+    index = next((i for i, (sid, _label) in enumerate(options) if sid == anchor), None)
+    courses: dict = {}
+    if index is not None and index + 1 < len(options):
+        with acting_as(uid):
+            listed = await _list_courses_api(options[index + 1][0], session=sess, user_id=uid)
+        courses = {cid: name for name, cid in listed}
+    _prev_semester_courses[uid] = courses
+    _prev_semester_fetched[uid] = time.time()
+    return courses
 
 
 async def watched_courses() -> list:
@@ -248,9 +274,9 @@ async def watched_courses() -> list:
     candidates: dict = {}
     known_uids: set = set()
     watcher = state.global_session
+    watcher_uid = getattr(watcher, "user_id", None) if watcher is not None else None
     if watcher is not None and has_stored_login(watcher):
         await _ensure_watched_courses_map(watcher)
-        watcher_uid = getattr(watcher, "user_id", None)
         for cid, name in state.courses_map.items():
             titles.setdefault(cid, name)
             candidates.setdefault(cid, []).append((watcher_uid, watcher))
@@ -268,7 +294,13 @@ async def watched_courses() -> list:
                 logging.warning("Course list for user %s unavailable: %s", uid, e)
         if uid in state.user_courses_map:
             known_uids.add(uid)
-        for cid, name in (state.user_courses_map.get(uid) or {}).items():
+        previous: dict = {}
+        if uid != watcher_uid and get_pref(uid, "watch_previous_semester"):
+            try:
+                previous = await _previous_semester_courses(uid, sess)
+            except Exception as e:
+                logging.warning("Previous semester courses for user %s unavailable: %s", uid, e)
+        for cid, name in {**previous, **(state.user_courses_map.get(uid) or {})}.items():
             titles.setdefault(cid, name)
             candidates.setdefault(cid, []).append((uid, sess))
             members.setdefault(cid, set()).add(uid)

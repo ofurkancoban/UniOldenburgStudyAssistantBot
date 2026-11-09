@@ -163,13 +163,16 @@ class FanOutTests(unittest.TestCase):
         counts = asyncio.run(cr.fan_out(self.bot, "c1", "files", "FULL", "TITLE", members={1, 2, 3, 4, 5, 6}))
         self.assertEqual(sorted(self.sent), [(1, "FULL", False), (2, "TITLE", False), (3, "FULL", True),
                                              (6, "FULL", True)])
-        self.assertEqual(counts, {"full": 1, "title": 1, "silent": 2, "skipped": 2})
+        self.assertEqual(counts, {"full": 1, "title": 1, "silent": 2, "skipped": 2, "queued": 0})
 
     def test_kind_switches_only_affect_that_kind(self):
         asyncio.run(cr.fan_out(self.bot, "c1", "announcements", "FULL", "TITLE", members={5}))
         self.assertEqual(self.sent, [(5, "FULL", True)])
 
-    def test_full_format_uses_the_rich_sender(self):
+    def test_upload_file_delivery_uses_the_rich_sender(self):
+        from unibot import preferences
+        preferences.set_pref(1, "file_delivery", "upload")
+        self.addCleanup(preferences.set_pref, 1, "file_delivery", "card")
         used = []
 
         async def send_full(bot, uid):
@@ -186,6 +189,63 @@ class FanOutTests(unittest.TestCase):
 
         asyncio.run(cr.fan_out(self.bot, "c1", "files", "FULL", "TITLE", members={1}, send_full=send_full))
         self.assertEqual(self.sent, [(1, "FULL", False)])
+
+
+class QuietHoursAndDigestTests(unittest.TestCase):
+    """Held course alerts (quiet hours, evening digest) and link-only files."""
+
+    def setUp(self):
+        from unibot import preferences
+        self.prefs = preferences
+        _clear_tables()
+        for uid in (21, 22, 23):
+            db.get_user_scope(uid).sync_courses({"c1"})
+            db.get_user_scope(uid).delete_private("alert_queue")
+        preferences.set_pref(21, "quiet_hours", {"start": "23:00", "end": "08:00"})
+        preferences.set_pref(22, "delivery_mode", "digest")
+        preferences.set_pref(23, "file_delivery", "link")
+        self.sent = []
+        outer = self
+
+        class Bot:
+            async def send_message(self, chat_id, text, disable_notification=None, reply_markup=None, **kw):
+                outer.sent.append((chat_id, text, reply_markup))
+
+        self.bot = Bot()
+        for p in (mock.patch.object(cr, "broadcast_targets", lambda cid, members: set(members)),
+                  mock.patch.object(cr.asyncio, "sleep", mock.AsyncMock())):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _at(self, hh, mm=0):
+        from datetime import datetime
+        return datetime(2026, 11, 10, hh, mm, tzinfo=cr.TZ_BERLIN)
+
+    def test_alerts_wait_for_quiet_hours_and_the_digest(self):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        card = InlineKeyboardMarkup([[InlineKeyboardButton("📥 Download", callback_data="file|abc")]])
+        counts = asyncio.run(cr.fan_out(self.bot, "c1", "files", "FULL", "📄 Stats: sheet.pdf", reply_markup=card,
+                                        members={21, 22, 23}, now=self._at(23, 30)))
+        self.assertEqual(counts["queued"], 2)           # 21 is asleep, 22 wants the digest
+        self.assertEqual([c for c, _t, _m in self.sent], [23])
+        self.assertEqual(self.sent[0][2].inline_keyboard[0][0].url,
+                         "https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid=c1")  # link only
+        self.sent.clear()
+        self.assertEqual(asyncio.run(cr.flush_alert_queues(self.bot, self._at(6, 0))), 0)   # still quiet
+        self.assertEqual(asyncio.run(cr.flush_alert_queues(self.bot, self._at(8, 5))), 1)   # 21 after 07:00 + quiet end
+        uid, text, markup = self.sent[0]
+        self.assertEqual(uid, 21)
+        self.assertIn("📄 Stats: sheet.pdf", text)
+        self.assertEqual(markup.inline_keyboard[0][0].callback_data, "file|abc")  # download kept
+        self.assertEqual(asyncio.run(cr.flush_alert_queues(self.bot, self._at(12, 0))), 0)  # 22 waits for 18:00
+        self.assertEqual(asyncio.run(cr.flush_alert_queues(self.bot, self._at(18, 1))), 1)
+        self.assertEqual(self.sent[-1][0], 22)
+        self.assertEqual(asyncio.run(cr.flush_alert_queues(self.bot, self._at(18, 30))), 0)  # sent once
+
+    def test_muted_course_is_not_queued_either(self):
+        db.get_user_scope(21).set_course_pref("c1", "is_muted", True)
+        counts = asyncio.run(cr.fan_out(self.bot, "c1", "files", "FULL", "T", members={21}, now=self._at(23, 30)))
+        self.assertEqual((counts["queued"], counts["skipped"]), (0, 1))
 
 
 class CourseAlertsUiTests(unittest.TestCase):

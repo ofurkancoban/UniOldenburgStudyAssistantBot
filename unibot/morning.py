@@ -18,6 +18,7 @@ from telegram.ext import ContextTypes
 from studip_utils import TZ_BERLIN, berlin_now, format_hours as _format_hours, html_escape as _h
 
 from unibot import state
+from unibot.preferences import campus_anchor, food_filter, get_pref
 from unibot.storage import (
     get_cached_outfit_today,
     get_primary_user_name,
@@ -183,12 +184,12 @@ async def _fetch_today_events(session, today_date, user_id: Optional[int] = None
     return events, [ev for ev in events if ev["date_key"] == today_date]
 
 
-async def _fetch_lunch_pick(loc_id: str = "2") -> Optional[dict]:
+async def _fetch_lunch_pick(loc_id: str = "2", user_id: Optional[int] = None) -> Optional[dict]:
     """Same AI-judged pick as the "🍽️ What should I eat?" button, at the
     mensa with Speiseplan `loc_id` ("2" Uhlhornsweg, "3" Wechloy). A failure
     just omits the section rather than blocking the rest of the summary."""
     try:
-        return await build_food_recommendation(loc_id)
+        return await build_food_recommendation(loc_id, user_id=user_id)
     except Exception as e:
         logging.error("Summary food recommendation error: %s", e)
         return None
@@ -225,7 +226,7 @@ async def _prepare_outfits(bot, user_ids, weather) -> dict:
     if not get_wardrobe_feature_enabled():
         return outfits
     for uid in user_ids:
-        if not is_user_admin(uid):
+        if not is_user_admin(uid) or not get_pref(uid, "outfit"):
             continue
         try:
             # A manual "Suggest Outfit Now" tap may have already run
@@ -287,13 +288,17 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     weather = await get_weather_snapshot(today_date)
     # The lunch pick and its photo are per mensa: made once for each mensa
     # someone has lunch at today (one AI call each), shared by its students.
-    picks: dict[str, tuple] = {}
+    # One pick per mensa and diet: students with the same filter share it.
+    picks: dict[tuple, tuple] = {}
 
-    async def lunch_at(loc_id: str) -> tuple:
-        if loc_id not in picks:
-            food = await _fetch_lunch_pick(loc_id)
-            picks[loc_id] = (food, *await _prepare_lunch_photo(food))
-        return picks[loc_id]
+    async def lunch_at(loc_id: str, uid: Optional[int] = None) -> tuple:
+        food_rules = food_filter(uid)
+        key = (loc_id, food_rules["diet"], tuple(sorted(food_rules["avoid_codes"])),
+               tuple(sorted(food_rules["avoid_keywords"])), food_rules["max_price"])
+        if key not in picks:
+            food = await _fetch_lunch_pick(loc_id, user_id=uid)
+            picks[key] = (food, *await _prepare_lunch_photo(food))
+        return picks[key]
 
     # Per student: their own timetable, study windows, tasks, exams, lunch and voice.
     texts: dict[int, str] = {}
@@ -322,6 +327,8 @@ def _menu_button_for(plan: dict, today_events: list) -> str:
     campus = lunch.get("campus") if lunch else None
     if campus is None:
         campus = next((campus_of(e.get("location")) for e in today_events if campus_of(e.get("location"))), None)
+    if campus is None:
+        campus = campus_anchor(current_user_id())
     return "mensa_loc|3|today|new" if campus == WECHLOY else "menu_nav|2/|new"
 
 
@@ -338,18 +345,22 @@ async def _prepare_user_summary(uid: int, today_date, weather, lunch_at) -> tupl
     today_tasks = _load_today_tasks(today_date, user_id=uid)
     plan = plan_study_day(events, today_date)
     menu_button = _menu_button_for(plan, today_events)
-    food, photo_url, photo_caption = await lunch_at("3" if menu_button.startswith("mensa_loc|3") else "2")
-    menu = await _lunch_menu_highlight(plan["lunch"], session)
+    # the student picks what the summary contains (preferences.morning_sections)
+    show = get_pref(uid, "morning_sections")
+    food, photo_url, photo_caption = (await lunch_at("3" if menu_button.startswith("mensa_loc|3") else "2", uid)
+                                      if show["mensa"] else (None, None, None))
+    menu = await _lunch_menu_highlight(plan["lunch"], session) if show["mensa"] else None
+    weather_shown = weather if show["weather"] else None
     text = _compose_morning_text(today_date, [
-        _format_schedule_section(today_events),
-        _format_study_windows_section(events, today_date, menu=menu),
-        f"\n\n{build_weather_text_line(weather)}" if weather else "",
+        _format_schedule_section(today_events) if show["classes"] else "",
+        _format_study_windows_section(events, today_date, menu=menu) if show["study"] else "",
+        f"\n\n{build_weather_text_line(weather_shown)}" if weather_shown else "",
         _format_tasks_section(today_tasks),
-        _format_lunch_section(food),
-        await _fetch_exam_countdown(session, today_date) if session else "",
+        _format_lunch_section(food) if show["mensa"] else "",
+        await _fetch_exam_countdown(session, today_date) if session and show["exams"] else "",
     ])
-    voice = await _prepare_morning_voice(today_events, today_date, today_tasks, weather, food,
-                                         name=get_user_name(uid))
+    voice = await _prepare_morning_voice(today_events if show["classes"] else [], today_date, today_tasks,
+                                         weather_shown, food, name=get_user_name(uid))
     return text, voice, menu_button, (photo_url, photo_caption)
 
 
@@ -411,7 +422,7 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
 
     if get_wardrobe_feature_enabled():
         for uid in user_ids:
-            if not is_user_admin(uid):
+            if not is_user_admin(uid) or not get_pref(uid, "outfit"):
                 continue
             try:
                 # Checked again at delivery: a manual "Suggest Outfit Now"
@@ -458,30 +469,45 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
                 pass
 
 
-def _mark_morning_summary_sent(today_str: str) -> None:
+def morning_summary_sent(today_str: str, slot: str) -> bool:
+    cache = load_general_cache()
+    sent = cache.get("morning_summary_sent") or {}
+    if sent.get("date") == today_str:
+        return slot in (sent.get("slots") or [])
+    # before per-student times there was one 07:00 summary, marked by date only
+    return slot == "07:00" and cache.get("last_morning_summary") == today_str
+
+
+def _mark_morning_summary_sent(today_str: str, slot: str) -> None:
     # Re-load rather than reusing a cache loaded earlier - deliver_morning_summary
     # does its own separate load/save of general_cache.json (to track which
     # message is currently pinned), and saving a stale copy would silently
     # overwrite that, breaking the unpin-before-pin logic every day.
     cache = load_general_cache()
+    sent = cache.get("morning_summary_sent") or {}
+    slots = list(sent.get("slots") or []) if sent.get("date") == today_str else []
+    if slot not in slots:
+        slots.append(slot)
+    cache["morning_summary_sent"] = {"date": today_str, "slots": slots}
     cache["last_morning_summary"] = today_str
     save_general_cache(cache)
 
 
-async def _deliver_morning_summary_at(bot, user_ids, prepared: dict, send_at: datetime, today_str: str) -> None:
+async def _deliver_morning_summary_at(bot, user_ids, prepared: dict, send_at: datetime, today_str: str,
+                                      slot: str = "07:00") -> None:
     """Background task: wait until send_at, then deliver."""
     try:
         delay = (send_at - datetime.now(TZ_BERLIN)).total_seconds()
         if delay > 0:
             await asyncio.sleep(delay)
-        logging.info("🌞 Delivering prepared morning summary...")
+        logging.info("🌞 Delivering the %s morning summary...", slot)
         await deliver_morning_summary(bot, user_ids, prepared)
     except Exception as e:
         logging.error("❌ Morning summary delivery failed: %s", e)
     finally:
         # Marked even on failure, like the old inline send: a broken
         # delivery shouldn't repeat on every watcher cycle all day.
-        _mark_morning_summary_sent(today_str)
+        _mark_morning_summary_sent(today_str, slot)
 
 
 async def handle_calendar_today_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):

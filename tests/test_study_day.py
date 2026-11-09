@@ -767,17 +767,22 @@ class CampusLunchPickTests(unittest.TestCase):
                 mock.patch.object(mensa, "_call_openrouter", llm), \
                 mock.patch.object(mensa, "load_food_preferences", lambda: {"avoid_codes": [], "avoid_keywords": []}), \
                 mock.patch.object(mensa, "login_studip", mock.AsyncMock(side_effect=AssertionError("no Stud.IP for Wechloy"))):
-            pick = asyncio.run(mensa.build_food_recommendation("3"))
+            from unibot import preferences
+            preferences.set_pref(9901, "diet", "halal")
+            preferences.set_pref(9902, "diet", "vegetarian")
+            pick = asyncio.run(mensa.build_food_recommendation("3", user_id=9901))
+            asyncio.run(mensa.build_food_recommendation("3", user_id=9903))  # default diet: everything
         self.assertEqual((pick["dish"], pick["category"], pick["loc_id"]), ("Chili sin carne", "Mensa Wechloy", "3"))
         self.assertIn("Fried vegetables in vegan cream", prompts[0])   # "max. 2,50*" is a meal price
         self.assertNotIn("rice", prompts[0])                           # a 0,50 side is not
-        self.assertNotIn("schnitzel", prompts[0].lower())              # pork is always filtered out
+        self.assertNotIn("schnitzel", prompts[0].lower())              # a halal student never gets pork
+        self.assertIn("schnitzel", prompts[1].lower())                 # "everything" keeps it
 
     def test_morning_picks_per_campus_once_each(self):
         from unibot import morning, state
         calls = []
 
-        async def pick(loc_id="2"):
+        async def pick(loc_id="2", user_id=None):
             calls.append(loc_id)
             return {"dish": f"dish-{loc_id}", "category": "Mensa Wechloy" if loc_id == "3" else "COUNTER ONE", "loc_id": loc_id}
         wechloy = [_event("09:00", "11:30", "Biology", location="W02 1-148", day=WED),

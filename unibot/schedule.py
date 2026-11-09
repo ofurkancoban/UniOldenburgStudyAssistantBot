@@ -21,6 +21,8 @@ from fast_enroll import load_pending, save_pending_job
 from studip_utils import TZ_BERLIN, berlin_now, format_hours as _format_hours, md_escape as _md
 
 from unibot import state
+from unibot.preferences import campus_anchor
+from unibot.preferences import morning_send_time
 from unibot.storage import (
     get_travel_mode,
     record_study_block,
@@ -64,22 +66,45 @@ MORNING_PREPARE_LEAD_MINUTES = 30  # AI parts (lunch pick, outfit image, voice) 
 
 
 async def run_morning_summary_schedule(bot, user_ids, now: datetime) -> None:
-    """Called every watcher cycle. From MORNING_PREPARE_LEAD_MINUTES before
-    MORNING_SUMMARY_HOUR, prepares today's summary once, then hands it to a
-    task that sends it exactly at MORNING_SUMMARY_HOUR. If that time has
-    already passed (bot started late), prepares and sends right away."""
-    from unibot.morning import _deliver_morning_summary_at, _mark_morning_summary_sent, prepare_morning_summary
+    """Called every watcher cycle. Students are grouped by their own morning
+    time (preferences.morning_time, 07:00 to 09:30, or off); each group's
+    summary is prepared from MORNING_PREPARE_LEAD_MINUTES before that time,
+    once, and handed to a task that sends it exactly then. If the time has
+    already passed (bot started late), it is prepared and sent right away."""
+    groups: dict = {}
+    for uid in user_ids:
+        try:
+            send_time = morning_send_time(uid)
+        except Exception:
+            logging.warning("Morning time of a student unavailable; using %02d:00", MORNING_SUMMARY_HOUR)
+            send_time = dtime(MORNING_SUMMARY_HOUR, 0)
+        if send_time is not None:
+            groups.setdefault(send_time, []).append(uid)
+    for send_time in sorted(groups):
+        await _run_morning_slot(bot, groups[send_time], now, send_time)
+
+
+async def _run_morning_slot(bot, user_ids, now: datetime, send_time) -> None:
+    from unibot.morning import (
+        _deliver_morning_summary_at,
+        _mark_morning_summary_sent,
+        morning_summary_sent,
+        prepare_morning_summary,
+    )
     today_str = now.strftime("%Y-%m-%d")
-    send_at = now.replace(hour=MORNING_SUMMARY_HOUR, minute=0, second=0, microsecond=0)
+    slot = send_time.strftime("%H:%M")
+    key = f"{today_str}#{slot}"
+    send_at = now.replace(hour=send_time.hour, minute=send_time.minute, second=0, microsecond=0)
     if now < send_at - timedelta(minutes=MORNING_PREPARE_LEAD_MINUTES):
         return
-    if load_general_cache().get("last_morning_summary") == today_str:
+    if morning_summary_sent(today_str, slot):
         return
-    if state._morning_delivery_task and not state._morning_delivery_task.done():
+    task = state._morning_delivery_tasks.get(key)
+    if task is not None and not task.done():
         return  # prepared and waiting for send_at
 
-    if state._prepared_morning.get("date") != today_str:
-        logging.info("🌞 Preparing morning summary...")
+    if key not in state._prepared_morning:
+        logging.info("🌞 Preparing the %s morning summary for %s student(s)...", slot, len(user_ids))
         try:
             data = await prepare_morning_summary(bot, user_ids)
         except Exception as e:
@@ -87,14 +112,13 @@ async def run_morning_summary_schedule(bot, user_ids, now: datetime) -> None:
             data = None
         if not data:
             if datetime.now(TZ_BERLIN) >= send_at:
-                _mark_morning_summary_sent(today_str)  # same no-retry-all-day rule as before
+                _mark_morning_summary_sent(today_str, slot)  # same no-retry-all-day rule as before
             return
-        state._prepared_morning = {"date": today_str, "data": data}
+        state._prepared_morning[key] = data
 
-    state._morning_delivery_task = asyncio.create_task(
-        _deliver_morning_summary_at(bot, user_ids, state._prepared_morning["data"], send_at, today_str)
+    state._morning_delivery_tasks[key] = asyncio.create_task(
+        _deliver_morning_summary_at(bot, user_ids, state._prepared_morning.pop(key), send_at, today_str, slot)
     )
-    state._prepared_morning = {}
 
 
 @single_flight
@@ -984,7 +1008,8 @@ def plan_study_day(events: list, target_date: date, reference_now: Optional[date
                 })
 
     planned = plan_day(day_events, windows, target_date, STUDY_WINDOW_DAY_START, STUDY_WINDOW_DAY_END,
-                       travel=user_travel(target_date, user_id))
+                       travel=user_travel(target_date, user_id),
+                       anchor=campus_anchor(user_id if user_id is not None else current_user_id()))
     windows, lunch = planned["windows"], planned["lunch"]
 
     if reference_now and reference_now.date() == target_date:

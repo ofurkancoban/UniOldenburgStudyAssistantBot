@@ -119,8 +119,26 @@ def _log_stums_failure(context: str, exc: Exception) -> None:
 
 EXAM_CACHE_PATH = "exam_reminder_cache.json"
 DEADLINE_THRESHOLDS_DAYS = [7, 3, 1]
-EXAM_DATE_THRESHOLDS_DAYS = [3, 1, 0]
+EXAM_DATE_THRESHOLDS_DAYS = [3, 1, 0]  # without a student (single-account setup)
 EXAM_HOURS_BEFORE_THRESHOLD = 3
+
+
+def _exam_thresholds() -> tuple:
+    """(days before, hours-before heads-up or None) from the student's
+    preferences (unibot.preferences); the old fixed ones without a student."""
+    owner = _exam_cache_user.get()
+    if owner is None:
+        return list(EXAM_DATE_THRESHOLDS_DAYS), EXAM_HOURS_BEFORE_THRESHOLD
+    from unibot.preferences import exam_thresholds
+    return exam_thresholds(int(owner))
+
+
+def _tuition_mode() -> str:
+    owner = _exam_cache_user.get()
+    if owner is None:
+        return "smart"
+    from unibot.preferences import get_pref
+    return get_pref(int(owner), "tuition_reminders")
 
 
 # Whose StuMS data a check is about. Each student has their own registrations,
@@ -246,6 +264,7 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
     now = berlin_now()
     today = now.date()
     still_upcoming_keys = set()
+    threshold_days, hours_before = _exam_thresholds()
 
     for exam in exams:
         exam_date = datetime.fromisoformat(exam["date"]).date()
@@ -257,7 +276,7 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
         still_upcoming_keys.add(key)
 
         sent_days = set(notified_days.get(key, []))
-        for threshold in EXAM_DATE_THRESHOLDS_DAYS:
+        for threshold in threshold_days:
             if days_left == threshold and threshold not in sent_days:
                 when_line = "🔴 <b>Exam is TODAY!</b>" if threshold == 0 else f"⏳ <b>{threshold} day(s) left</b>"
                 form_line = f"🎯 <b>Form:</b> {exam['exam_form']}\n" if exam.get("exam_form") else ""
@@ -283,10 +302,10 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
                 save_exam_cache(cache)
         notified_days[key] = sorted(sent_days)
 
-        if exam.get("start_datetime") and not notified_hours.get(key):
+        if hours_before is not None and exam.get("start_datetime") and not notified_hours.get(key):
             start_dt = datetime.fromisoformat(exam["start_datetime"])
             hours_left = (start_dt - now).total_seconds() / 3600
-            if 0 <= hours_left <= EXAM_HOURS_BEFORE_THRESHOLD:
+            if 0 <= hours_left <= hours_before:
                 form_line = f"🎯 <b>Form:</b> {exam['exam_form']}\n" if exam.get("exam_form") else ""
                 text = (
                     "⏰ <b>EXAM STARTING SOON</b>\n"
@@ -640,19 +659,13 @@ async def check_tuition_reminders(session, bot, broadcast_fn, force: bool = Fals
                 except ValueError:
                     pass
 
-        should_alert = False
-        if not was_open:
-            should_alert = True
-        elif last_alert_date != today_str:
-            if days_left is not None:
-                if days_left <= 14:
-                    should_alert = True
-                else:
-                    last_alert_dt = datetime.fromisoformat(last_alert_date).date() if last_alert_date else None
-                    if not last_alert_dt or (today - last_alert_dt).days >= 3:
-                        should_alert = True
-            else:
-                should_alert = True
+        from unibot.preferences import tuition_should_remind
+        last_alert_dt = datetime.fromisoformat(last_alert_date).date() if last_alert_date else None
+        should_alert = tuition_should_remind(
+            _tuition_mode(), days_left,
+            (today - last_alert_dt).days if last_alert_dt else None,
+            first_time=not was_open,
+        )
 
         if should_alert:
             days_badge = ""

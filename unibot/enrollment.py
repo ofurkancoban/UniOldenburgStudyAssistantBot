@@ -17,14 +17,13 @@ from telegram.error import TelegramError
 from fast_enroll import clear_pending_job, decline_course, enroll_now, get_semester_options, load_pending
 
 from unibot import state
+from unibot.preferences import get_pref, set_pref
 from unibot.storage import (
     clear_default_semester,
     get_scan_previous_semester_enabled,
-    get_watch_previous_semester_enabled,
     load_default_semester,
     save_default_semester,
     set_scan_previous_semester_enabled,
-    set_watch_previous_semester_enabled,
 )
 from unibot.telegram_ui import (
     user_data,
@@ -497,8 +496,8 @@ async def handle_toggle_watch_prev_sem(update: Update, context: ContextTypes.DEF
     if not is_user_allowed(user_id):
         return
 
-    new_state = not get_watch_previous_semester_enabled()
-    set_watch_previous_semester_enabled(new_state)
+    new_state = not get_pref(user_id, "watch_previous_semester")
+    set_pref(user_id, "watch_previous_semester", new_state)
     state.courses_map = {}  # force _ensure_watched_courses_map to rebuild on the next watcher cycle
 
     if new_state:

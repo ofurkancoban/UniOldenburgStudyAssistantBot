@@ -55,6 +55,7 @@ from unibot.documents import handle_file_audio_summary
 from unibot.weather import handle_set_weather_location
 from unibot.course_registry import handle_course_alerts
 from unibot.privacy import handle_privacy
+from unibot.settings_menu import handle_settings, settings_command
 from unibot.study_week import handle_calendar_sync, handle_study_buddy, register_calendar_feed
 from unibot.mensa import (
     handle_foodpref_category,
@@ -271,6 +272,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(fastenroll_cancel_callback, pattern="^fastenroll_cancel\\|.*$"))
     app.add_handler(CommandHandler("watch", watch))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("settings", settings_command))
     app.add_handler(CommandHandler("healthcheck", healthcheck_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("timetable", timetable_command))
@@ -369,6 +371,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_study_buddy, pattern=r"^buddy(\|.*)?$"))
     app.add_handler(CallbackQueryHandler(handle_course_alerts, pattern=r"^calert(\|.*)?$"))
     app.add_handler(CallbackQueryHandler(handle_privacy, pattern=r"^privacy(\|.*)?$"))
+    app.add_handler(CallbackQueryHandler(handle_settings, pattern=r"^settings(\|.*)?$"))
     app.add_handler(CallbackQueryHandler(handle_study_progress_menu, pattern=r"^(sp_progress|sp_progress_refresh|sp_course\|.*|sp_unit\|.*)$"))
     app.add_handler(CallbackQueryHandler(handle_study_track_menu, pattern=r"^(sp_track_menu|sp_track_auto|sp_track\|.*)$"))
     app.add_handler(CallbackQueryHandler(handle_wardrobe_menu, pattern="^wardrobe_menu$"))

@@ -29,10 +29,10 @@ from unibot.config import (
     WA_SERVICE_URL,
     get_wa_group_id,
 )
+from unibot.preferences import get_pref
 from unibot.storage import (
     get_primary_user_name,
     get_wardrobe_feature_enabled,
-    get_watch_previous_semester_enabled,
     get_weekly_study_plan_enabled,
     link_cache,
     load_default_semester,
@@ -359,7 +359,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     default_semester_label = default_semester.get("label") or "Not set (always asks)"
     text += f"\n\n📆 Default Semester: {default_semester_label}"
 
-    watch_prev = get_watch_previous_semester_enabled()
+    watch_prev = get_pref(user_id, "watch_previous_semester")
     text += f"\n👀 Watch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
 
     studip_name = None

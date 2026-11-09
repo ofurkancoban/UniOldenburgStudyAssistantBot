@@ -22,14 +22,18 @@ import html
 import json
 import logging
 import time
+from datetime import datetime
 from typing import Awaitable, Callable, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from studip_utils import TZ_BERLIN
 from unibot import db, state
 from unibot.auth import has_stored_login, is_user_allowed
+from unibot.preferences import DIGEST_HOUR, get_pref, in_quiet_hours, morning_send_time
 from unibot.storage import load_default_semester
+from unibot.studip_api import BASE_URL
 from unibot.telegram_ui import broadcast_targets
 
 SCANNER_FAILURE_COOLDOWN = 3600
@@ -229,22 +233,79 @@ def delivery_format(uid: int, cid: Optional[str], kind: str) -> Optional[str]:
     return fmt if fmt in FORMAT_LABELS else DEFAULT_FORMAT
 
 
+ALERT_QUEUE_KIND = "alert_queue"
+QUEUE_BUTTON_LIMIT = 8
+
+
+def files_link_markup(cid: Optional[str]) -> Optional[InlineKeyboardMarkup]:
+    """"Link only" file delivery: open the course's file area in Stud.IP."""
+    if not cid:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🔗 Open in Stud.IP", url=f"{BASE_URL}/dispatch.php/course/files?cid={cid}")]])
+
+
+def _first_button(markup) -> Optional[dict]:
+    """The alert's main button (download, link) kept for the digest."""
+    try:
+        button = markup.inline_keyboard[0][0]
+    except (AttributeError, IndexError, TypeError):
+        return None
+    if getattr(button, "url", None):
+        return {"text": button.text, "url": button.url}
+    if getattr(button, "callback_data", None):
+        return {"text": button.text, "callback_data": button.callback_data}
+    return None
+
+
+def _hold_reason(uid: int, now: datetime) -> Optional[str]:
+    """Why an alert waits instead of going out now: "quiet" (the student's
+    quiet hours) or "digest" (they get one evening digest), else None."""
+    if in_quiet_hours(uid, now):
+        return "quiet"
+    if get_pref(uid, "delivery_mode") == "digest":
+        return "digest"
+    return None
+
+
+def queue_alert(uid: int, kind: str, cid: Optional[str], title_text: str, markup, reason: str,
+                now: Optional[datetime] = None) -> None:
+    scope = db.get_user_scope(uid)
+    queue = list(scope.private(ALERT_QUEUE_KIND) or [])
+    queue.append({"kind": kind, "cid": cid, "title": title_text, "button": _first_button(markup),
+                  "reason": reason, "ts": (now or datetime.now(TZ_BERLIN)).timestamp()})
+    scope.save_private(ALERT_QUEUE_KIND, queue)
+
+
 async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str, *,
                   reply_markup=None, members=None, parse_mode: str = "HTML",
-                  send_full: Optional[Callable[..., Awaitable[bool]]] = None) -> dict:
-    """Deliver one alert to the course's followers in their own format.
+                  send_full: Optional[Callable[..., Awaitable[bool]]] = None,
+                  now: Optional[datetime] = None) -> dict:
+    """Deliver one alert to the course's followers in their own way.
 
-    send_full(bot, uid), when given, sends the rich version (a file itself)
-    to "full" users and returns False to fall back to the card. Returns
-    {"full"|"title"|"silent"|"skipped": count}."""
-    counts = {"full": 0, "title": 0, "silent": 0, "skipped": 0}
+    Per course: muted, kind switched off, or the format (full card with
+    sound, title line, silent card). Per student: during their quiet hours
+    or in evening digest mode the alert is queued (see flush_alert_queues);
+    for new files, their file delivery picks the file itself (send_full,
+    which returns False to fall back to the card), the card with its
+    download button, or a Stud.IP link only.
+    Returns {"full"|"title"|"silent"|"skipped"|"queued": count}."""
+    counts = {"full": 0, "title": 0, "silent": 0, "skipped": 0, "queued": 0}
+    now = now or datetime.now(TZ_BERLIN)
     for uid in sorted(broadcast_targets(cid, members)):
         fmt = delivery_format(uid, cid, kind)
         if fmt is None:
             counts["skipped"] += 1
             continue
+        files_mode = get_pref(uid, "file_delivery") if kind == "files" else "card"
+        markup = files_link_markup(cid) if files_mode == "link" else reply_markup
         try:
-            if fmt == "full" and send_full is not None and await send_full(bot, uid):
+            reason = _hold_reason(uid, now)
+            if reason is not None:
+                queue_alert(uid, kind, cid, title_text, markup, reason, now)
+                counts["queued"] += 1
+                continue
+            if files_mode == "upload" and send_full is not None and await send_full(bot, uid):
                 counts[fmt] += 1
                 await asyncio.sleep(0.3)
                 continue
@@ -253,13 +314,69 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
                 text=title_text if fmt == "title" else text,
                 parse_mode=parse_mode,
                 disable_notification=fmt == "silent",
-                reply_markup=reply_markup,
+                reply_markup=markup,
             )
             counts[fmt] += 1
             await asyncio.sleep(0.3)  # Telegram rate limit safety
         except Exception as e:
             logging.warning("Failed to deliver a %s alert to %s: %s", kind, uid, e)
     return counts
+
+
+def _queue_due(uid: int, item: dict, now: datetime) -> bool:
+    """A held alert goes out once the reason is over: quiet hours ended and
+    the student's morning summary time passed (or quiet end without one);
+    digest items at DIGEST_HOUR, never inside quiet hours."""
+    if in_quiet_hours(uid, now):
+        return False
+    local = now.astimezone(TZ_BERLIN)
+    if item.get("reason") == "digest" and get_pref(uid, "delivery_mode") == "digest":
+        return local.hour >= DIGEST_HOUR
+    morning = morning_send_time(uid)
+    return morning is None or local.time() >= morning or local.hour >= DIGEST_HOUR
+
+
+def digest_text(items: list) -> str:
+    kinds = {"files": "📄", "announcements": "📢", "forum": "💬"}
+    lines = [f"🗞️ <b>Course updates</b> ({len(items)})", ""]
+    for item in items:
+        lines.append(item.get("title") or f"{kinds.get(item.get('kind'), '•')} update")
+    return "\n".join(lines)[:4000]
+
+
+def digest_markup(items: list) -> Optional[InlineKeyboardMarkup]:
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in items:
+        button = item.get("button")
+        if not button or len(rows) >= QUEUE_BUTTON_LIMIT:
+            continue
+        if button.get("url"):
+            rows.append([InlineKeyboardButton(button["text"], url=button["url"])])
+        elif button.get("callback_data"):
+            rows.append([InlineKeyboardButton(button["text"], callback_data=button["callback_data"])])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+async def flush_alert_queues(bot, now: Optional[datetime] = None) -> int:
+    """Send each student's due held alerts as one digest message; returns
+    how many students got one."""
+    now = now or datetime.now(TZ_BERLIN)
+    sent = 0
+    for uid in db.private_owner_ids(ALERT_QUEUE_KIND):
+        scope = db.get_user_scope(uid)
+        queue = list(scope.private(ALERT_QUEUE_KIND) or [])
+        due = [item for item in queue if _queue_due(uid, item, now)]
+        if not due:
+            continue
+        try:
+            await bot.send_message(chat_id=uid, text=digest_text(due), parse_mode="HTML",
+                                   disable_notification=False, reply_markup=digest_markup(due))
+        except Exception as e:
+            logging.warning("Course digest for %s failed: %s", uid, e)
+            continue
+        scope.save_private(ALERT_QUEUE_KIND, [item for item in queue if item not in due])
+        sent += 1
+    return sent
 
 
 def course_title(cid: str) -> str:
@@ -331,7 +448,7 @@ def course_alerts_course_view(user_id: int, cid: str) -> tuple:
         [InlineKeyboardButton("⬅️ All courses", callback_data="calert")],
     ]
     fmt_help = {
-        "full": "the whole alert with sound; new files arrive as the file itself",
+        "full": "the whole alert with sound",
         "title": "one line with the course and the title, with sound",
         "silent": "the whole alert without sound",
     }[prefs["format"]]

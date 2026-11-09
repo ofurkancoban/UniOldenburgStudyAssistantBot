@@ -394,32 +394,51 @@ def save_user_name(user_id, name: str) -> None:
         logging.error("Could not save user name: %s", e)
 
 
-WARDROBE_CACHE_PATH = "wardrobe.json"
+WARDROBE_CACHE_PATH = "wardrobe.json"  # the old shared document, moved into private records
+WARDROBE_KIND = "wardrobe"
 
 
-def load_wardrobe() -> dict:
-    """Return {"<user_id>": {"items": [...], "reference_photo_file_id": ...}}
-    for the "👔 My Wardrobe" feature. Stores Telegram file_ids, not local image
-    copies - they're free to re-resolve via bot.get_file() whenever an item or
-    the reference photo needs to be downloaded transiently for a tagging/
-    try-on API call, so this cache never needs its own media directory."""
-    if db.exists(WARDROBE_CACHE_PATH):
-        try:
-            return db.load(WARDROBE_CACHE_PATH)
-        except Exception as e:
-            logging.warning("Could not load wardrobe: %s", e)
-    return {}
+def _empty_wardrobe() -> dict:
+    return {"items": [], "reference_photo_file_id": None}
 
 
-def save_wardrobe(data: dict) -> None:
+def _migrate_shared_wardrobe() -> None:
+    """Move the old shared {"<user_id>": entry} document into each owner's
+    encrypted private record once (database row only, never a disk file)."""
     try:
-        db.save(WARDROBE_CACHE_PATH, data)
+        if not db.exists(WARDROBE_CACHE_PATH):
+            return
+        shared = db.load(WARDROBE_CACHE_PATH) or {}
+        if not shared:
+            return
     except Exception as e:
-        logging.error("Could not save wardrobe: %s", e)
+        logging.warning("Could not read the shared wardrobe: %s", e)
+        return
+    for key, entry in shared.items():
+        try:
+            scope = db.get_user_scope(int(key))
+        except ValueError:
+            continue
+        if not scope.has_private(WARDROBE_KIND):
+            scope.save_private(WARDROBE_KIND, entry)
+    db.save(WARDROBE_CACHE_PATH, {})
+    logging.info("Moved %s wardrobe(s) into private records", len(shared))
 
 
 def get_wardrobe_entry(user_id) -> dict:
-    return load_wardrobe().get(str(user_id), {"items": [], "reference_photo_file_id": None})
+    """The student's own wardrobe: Telegram file_ids and tags, never image
+    copies on disk; kept in their encrypted private record, so no other
+    student's code path can read it."""
+    _migrate_shared_wardrobe()
+    entry = db.get_user_scope(user_id).private(WARDROBE_KIND)
+    return entry if isinstance(entry, dict) else _empty_wardrobe()
+
+
+def _save_wardrobe_entry(user_id, entry: dict) -> None:
+    try:
+        db.get_user_scope(user_id).save_private(WARDROBE_KIND, entry)
+    except Exception as e:
+        logging.error("Could not save wardrobe: %s", e)
 
 
 def add_wardrobe_item(user_id, tags: dict, file_id: Optional[str] = None, image_url: Optional[str] = None) -> dict:
@@ -429,8 +448,7 @@ def add_wardrobe_item(user_id, tags: dict, file_id: Optional[str] = None, image_
     e.g. an order history page) - exactly one of the two should be set.
     See _fetch_wardrobe_item_bytes for how either is resolved back to
     bytes when the item is actually needed for tagging/try-on."""
-    wardrobe = load_wardrobe()
-    entry = wardrobe.setdefault(str(user_id), {"items": [], "reference_photo_file_id": None})
+    entry = get_wardrobe_entry(user_id)
     item = {
         "id": f"w_{uuid.uuid4().hex[:10]}",
         "file_id": file_id,
@@ -444,41 +462,41 @@ def add_wardrobe_item(user_id, tags: dict, file_id: Optional[str] = None, image_
         "added_at": berlin_now().isoformat(),
     }
     entry["items"].append(item)
-    save_wardrobe(wardrobe)
+    _save_wardrobe_entry(user_id, entry)
     return item
 
 
 def save_wardrobe_item_descriptions(descriptions: dict) -> None:
-    """Store {item_id: description} on the matching items, any user."""
-    wardrobe = load_wardrobe()
-    for entry in wardrobe.values():
+    """Store {item_id: description} on the matching items, in whichever
+    student's wardrobe holds them (each opened in its own scope)."""
+    _migrate_shared_wardrobe()
+    for uid in db.private_owner_ids(WARDROBE_KIND):
+        entry = get_wardrobe_entry(uid)
+        changed = False
         for it in entry.get("items", []):
             if it["id"] in descriptions:
                 it["description"] = descriptions[it["id"]]
-    save_wardrobe(wardrobe)
+                changed = True
+        if changed:
+            _save_wardrobe_entry(uid, entry)
 
 
 def remove_wardrobe_item(user_id, item_id: str) -> None:
-    wardrobe = load_wardrobe()
-    entry = wardrobe.get(str(user_id))
-    if entry:
-        entry["items"] = [it for it in entry["items"] if it["id"] != item_id]
-        save_wardrobe(wardrobe)
+    entry = get_wardrobe_entry(user_id)
+    entry["items"] = [it for it in entry["items"] if it["id"] != item_id]
+    _save_wardrobe_entry(user_id, entry)
 
 
 def clear_wardrobe_items(user_id) -> None:
-    wardrobe = load_wardrobe()
-    entry = wardrobe.get(str(user_id))
-    if entry:
-        entry["items"] = []
-        save_wardrobe(wardrobe)
+    entry = get_wardrobe_entry(user_id)
+    entry["items"] = []
+    _save_wardrobe_entry(user_id, entry)
 
 
 def set_wardrobe_reference_photo(user_id, file_id: str) -> None:
-    wardrobe = load_wardrobe()
-    entry = wardrobe.setdefault(str(user_id), {"items": [], "reference_photo_file_id": None})
+    entry = get_wardrobe_entry(user_id)
     entry["reference_photo_file_id"] = file_id
-    save_wardrobe(wardrobe)
+    _save_wardrobe_entry(user_id, entry)
 
 
 def get_wardrobe_feature_enabled() -> bool:

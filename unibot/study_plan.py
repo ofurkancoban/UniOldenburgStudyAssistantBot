@@ -33,6 +33,7 @@ from unibot.config import (
 )
 from unibot import state
 from unibot.study_day import plan_day
+from unibot.preferences import campus_anchor
 from unibot.storage import (
     get_scan_previous_semester_enabled,
     link_cache,
@@ -54,7 +55,7 @@ from unibot.telegram_ui import (
     _start_loading_animation,
     _stop_loading_animation,
 )
-from unibot.auth import get_user_session, is_user_admin, is_user_allowed, login_studip
+from unibot.auth import current_user_id, get_user_session, is_user_admin, is_user_allowed, login_studip
 from unibot.studip_api import (
     _ensure_watched_courses_map,
     _parse_file_date_v2,
@@ -1216,7 +1217,7 @@ def find_free_study_windows(events: list, week_start) -> list:
                 after_location = ev.get("location")
         # travel between campuses and the lunch break are not study time
         planned = plan_day(busy, day_windows, day, _dtime(STUDY_DAY_START_HOUR, 0), _dtime(STUDY_DAY_END_HOUR, 0),
-                           travel=user_travel(day))
+                           travel=user_travel(day), anchor=campus_anchor(current_user_id()))
         windows.extend(w for w in planned["windows"]
                        if w["duration_minutes"] >= STUDY_GAP_MIN_MINUTES
                        or ("lunch" in (w["after"], w["before"]) and w["duration_minutes"] >= STUDY_LUNCH_PIECE_MIN_MINUTES))

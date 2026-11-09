@@ -53,8 +53,8 @@ _studip_api_current_semester: Optional[str] = None
 # Today's prepared summary ({"date": "YYYY-MM-DD", "data": <prepare_morning_summary result>})
 # and the task that delivers it at MORNING_SUMMARY_HOUR. In memory only: if
 # the bot restarts in between, the watcher just prepares it again.
-_prepared_morning: dict = {}
-_morning_delivery_task: Optional[asyncio.Task] = None
+_prepared_morning: dict = {}  # "YYYY-MM-DD#HH:MM" -> prepared summary of that morning slot
+_morning_delivery_tasks: dict = {}  # "YYYY-MM-DD#HH:MM" -> task sending that slot at its time
 
 
 # ──────────────────────────────────────────────────────────────────────────────

@@ -21,6 +21,7 @@ MODULE_ORDER = (
     "state",        # mutable runtime state
     "diagnostics",  # read-only connection report for /healthcheck
     "storage",      # JSON caches, stored settings, shared HTTP session, job locks
+    "preferences",  # per-student profile and preferences (one JSON per student)
     "formatting",   # text/HTML/date helpers
     "stagger",      # per-student personal check times (pure)
     "telegram_ui",  # Telegram message helpers
@@ -50,6 +51,7 @@ MODULE_ORDER = (
     "menus",        # menus, callback router, wizards
     "watcher",      # background watcher loop
     "privacy",      # privacy screen: check times, check now, delete my data
+    "settings_menu",  # /settings: every per-student preference on buttons
     "app",          # startup and handler registration
 )
 
