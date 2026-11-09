@@ -236,10 +236,26 @@ def _personal_due(uid: int, now: datetime) -> Optional[str]:
     return stagger.due_slot(uid, now, done, stagger.is_grade_season(now.date(), registration_open))
 
 
+PERSONAL_LAST_KEY = "personal_check_last"
+
+
+def mark_personal_check(uid: int, slot: Optional[str] = None, ts: Optional[float] = None) -> None:
+    """Record a personal check of the student: the slot it covered (if a
+    scheduled one) and when it ran."""
+    cache = load_general_cache()
+    updates = {}
+    if slot is not None:
+        slots = dict(cache.get(PERSONAL_SLOTS_KEY) or {})
+        slots[str(uid)] = slot
+        updates[PERSONAL_SLOTS_KEY] = slots
+    last = dict(cache.get(PERSONAL_LAST_KEY) or {})
+    last[str(uid)] = ts if ts is not None else time.time()
+    updates[PERSONAL_LAST_KEY] = last
+    update_general_cache(updates)
+
+
 def _mark_personal_slot(uid: int, slot: str) -> None:
-    slots = dict(load_general_cache().get(PERSONAL_SLOTS_KEY) or {})
-    slots[str(uid)] = slot
-    update_general_cache({PERSONAL_SLOTS_KEY: slots})
+    mark_personal_check(uid, slot)
 
 
 async def _for_each_stums_user(job, accounts=None):
@@ -350,11 +366,26 @@ async def _run_health_check(bot, now: datetime):
     update_general_cache({"last_health_check": now.isoformat()})
 
 
+def _privacy_digest_line(now: datetime) -> str:
+    """Counts only: encrypted records and how many students had a personal
+    check in the last 24 h. No names, grades or amounts."""
+    counts = db.privacy_counts()
+    last = load_general_cache().get(PERSONAL_LAST_KEY) or {}
+    recent = sum(1 for ts in last.values() if isinstance(ts, (int, float)) and now.timestamp() - ts < 86400)
+    line = (f"🔒 Privacy: {counts['credentials_own_key']} logins under per-student keys, "
+            f"{counts['private_rows']} private records for {counts['private_students']} students, "
+            f"{recent} students checked in 24 h")
+    if counts["credentials_shared_key"]:
+        line += f", ⚠️ {counts['credentials_shared_key']} logins still on the shared key"
+    return line
+
+
 async def _send_daily_digest(bot):
     previous = load_general_cache().get("daily_digest_snapshot") or {}
     log_paths = [f"{LOG_FILE}.1", LOG_FILE]  # the rotated file covers a rollover
     # Log timestamps are the server's naive local time, so compare in that clock.
     lines = daily_digest(datetime.now(), log_paths, previous)
+    lines.append(_privacy_digest_line(datetime.now(TZ_BERLIN)))
     registry_line = course_registry.savings_line()
     if registry_line:
         lines.append(registry_line)

@@ -595,6 +595,38 @@ def set_study_buddy_enabled(user_id, enabled: bool) -> None:
     save_general_cache(cache)
 
 
+def get_ai_grades_enabled(user_id) -> bool:
+    """Opt in: only then may a free question to the assistant include the
+    student's grade average and module results (they leave the server for the
+    AI provider)."""
+    return bool((load_general_cache().get("ai_grades") or {}).get(str(user_id)))
+
+
+def set_ai_grades_enabled(user_id, enabled: bool) -> None:
+    cache = load_general_cache()
+    cache.setdefault("ai_grades", {})[str(user_id)] = bool(enabled)
+    save_general_cache(cache)
+
+
+# general cache sections keyed by the student's id; "Delete my data" clears them
+PERSONAL_CACHE_SECTIONS = ("study_blocks", "task_outcomes", "calendar_tokens", "study_buddy", "travel_modes",
+                           "ai_grades", "personal_check_slots", "personal_check_last", "personal_check_manual")
+
+
+def forget_personal_cache(user_id) -> list[str]:
+    """Drop the student's entries from every per-student cache section."""
+    cache = load_general_cache()
+    removed = []
+    for section in PERSONAL_CACHE_SECTIONS:
+        entries = cache.get(section)
+        if isinstance(entries, dict) and str(user_id) in entries:
+            entries.pop(str(user_id))
+            removed.append(section)
+    if removed:
+        save_general_cache(cache)
+    return removed
+
+
 TRAVEL_MODES = ("bike", "bus")
 
 

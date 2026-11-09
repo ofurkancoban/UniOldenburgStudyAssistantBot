@@ -49,6 +49,7 @@ MODULE_ORDER = (
     "system",       # health checks, status, restart
     "menus",        # menus, callback router, wizards
     "watcher",      # background watcher loop
+    "privacy",      # privacy screen: check times, check now, delete my data
     "app",          # startup and handler registration
 )
 

@@ -736,3 +736,17 @@ def registry_counts() -> dict:
         courses = conn.execute("SELECT COUNT(DISTINCT course_id) FROM user_courses").fetchone()[0]
         pairs = conn.execute("SELECT COUNT(*) FROM user_courses").fetchone()[0]
     return {"courses": courses, "pairs": pairs}
+
+
+def privacy_counts() -> dict:
+    """Record counts only, never content: credentials under a student's own
+    key, ones still under the old shared key, and private data rows."""
+    with _lock:
+        conn = _connection()
+        own, legacy = conn.execute(
+            "SELECT COALESCE(SUM(encrypted_blob LIKE 'VAULT:u1:%'), 0), "
+            "COALESCE(SUM(encrypted_blob NOT LIKE 'VAULT:u1:%'), 0) FROM user_credentials").fetchone()
+        private, students = conn.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT user_id) FROM user_private_data").fetchone()
+    return {"credentials_own_key": own, "credentials_shared_key": legacy,
+            "private_rows": private, "private_students": students}

@@ -28,6 +28,7 @@ from studip_utils import TZ_BERLIN, berlin_now
 
 from unibot import state
 from unibot.storage import (
+    get_ai_grades_enabled,
     add_wardrobe_item,
     cleanup_link_cache,
     get_primary_user_name,
@@ -201,16 +202,21 @@ async def build_qa_context(user_id=None) -> str:
         except Exception as e:
             logging.warning("build_qa_context: registered exams failed: %s", e)
 
-        try:
-            grades = await get_grades(session)
-            summary = compute_transcript_summary(grades)
-            gpa_text = summary["gpa"] if summary["gpa"] is not None else "not yet available"
-            parts.append(
-                f"Transcript: weighted average grade {gpa_text}, total credits earned {summary['total_credits']}, "
-                f"{len(summary['passed'])} module(s) passed, {len(summary['failed'])} module(s) failed."
-            )
-        except Exception as e:
-            logging.warning("build_qa_context: transcript failed: %s", e)
+        if not get_ai_grades_enabled(user_id):
+            # grades only leave the server for the AI provider when the student allows it
+            parts.append("Transcript: not shared with the assistant. The student can allow it under "
+                         "/status > Official Documents > Privacy.")
+        else:
+            try:
+                grades = await get_grades(session)
+                summary = compute_transcript_summary(grades)
+                gpa_text = summary["gpa"] if summary["gpa"] is not None else "not yet available"
+                parts.append(
+                    f"Transcript: weighted average grade {gpa_text}, total credits earned {summary['total_credits']}, "
+                    f"{len(summary['passed'])} module(s) passed, {len(summary['failed'])} module(s) failed."
+                )
+            except Exception as e:
+                logging.warning("build_qa_context: transcript failed: %s", e)
 
     try:
         tasks = load_tasks()

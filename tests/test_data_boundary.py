@@ -151,5 +151,137 @@ class PersonalSenderTests(unittest.TestCase):
         self.assertNotIn("Notified: grade result for", source)
 
 
+class PrivacyScreenTests(unittest.TestCase):
+    def setUp(self):
+        from unibot import privacy, storage
+        self.privacy, self.storage = privacy, storage
+        self.cache = {}
+        self.patches = [
+            mock.patch.object(privacy, "load_general_cache", lambda: dict(self.cache)),
+            mock.patch.object(privacy, "update_general_cache", lambda d: self.cache.update(d)),
+            mock.patch.object(storage, "load_general_cache", lambda: self.cache),
+            mock.patch.object(storage, "save_general_cache", lambda d: self.cache.update(d)),
+        ]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_view_shows_the_students_own_times(self):
+        from datetime import datetime
+        from unibot import stagger
+        now = datetime(2026, 11, 9, 10, 0, tzinfo=self.privacy.TZ_BERLIN)
+        text, markup = self.privacy.privacy_view(501, now)
+        self.assertIn(stagger.describe_slots(501, now.date(), False), text)
+        self.assertIn("2 a day", text)
+        data = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertEqual(data, ["privacy|check", "privacy|ai", "privacy|delete"])
+
+    def test_check_now_is_rate_limited_and_needs_a_login(self):
+        runs = []
+
+        async def checks(bot, session, send):
+            runs.append(session)
+
+        own = mock.MagicMock()
+        with mock.patch.object(self.privacy, "personal_session", lambda uid: own), \
+                mock.patch.object(self.privacy, "has_stored_login", lambda s: True), \
+                mock.patch.object(self.privacy, "_run_stums_checks", checks), \
+                mock.patch.object(self.privacy, "mark_personal_check", lambda uid: None):
+            first = asyncio.run(self.privacy.run_manual_check(None, 502))
+            second = asyncio.run(self.privacy.run_manual_check(None, 502))
+        self.assertTrue(first.startswith("✅"))
+        self.assertTrue(second.startswith("⏳"))
+        self.assertEqual(runs, [own])
+        with mock.patch.object(self.privacy, "personal_session", lambda uid: own), \
+                mock.patch.object(self.privacy, "has_stored_login", lambda s: False):
+            self.assertIn("Sign in", asyncio.run(self.privacy.run_manual_check(None, 503)))
+
+    def test_ai_grades_are_opt_in(self):
+        self.assertFalse(self.storage.get_ai_grades_enabled(504))
+        self.storage.set_ai_grades_enabled(504, True)
+        self.assertTrue(self.storage.get_ai_grades_enabled(504))
+
+    def test_assistant_context_leaves_grades_out_without_opt_in(self):
+        from unibot import voice
+        fetched = []
+
+        async def grades(session):
+            fetched.append(session)
+            return []
+
+        async def login(user_id=None):
+            return object()
+
+        async def empty(*a, **k):
+            return []
+
+        with mock.patch.object(voice, "login_studip", login), \
+                mock.patch.object(voice, "get_grades", grades), \
+                mock.patch.object(voice, "get_registered_exam_schedule", empty), \
+                mock.patch.object(voice, "get_ai_grades_enabled", lambda uid: False):
+            context = asyncio.run(voice.build_qa_context(user_id=505))
+        self.assertEqual(fetched, [])
+        self.assertIn("not shared with the assistant", context)
+
+    def test_delete_my_data(self):
+        import exam_reminder as er
+        from unibot import exams
+        uid = 506
+        er.save_exam_cache({"known_grades": {"M": "1.0"}}, user_id=uid)
+        db.sync_user_courses(uid, {"c1"})
+        self.cache.update({"study_blocks": {str(uid): {"1": {}}, "9": {"1": {}}}, "ai_grades": {str(uid): True}})
+        exams.exam_action_cache["s1"] = {"user_id": uid}
+        exams.exam_action_cache["s2"] = {"user_id": 9}
+        logged_out = []
+
+        async def logout(user_id=None):
+            logged_out.append(user_id)
+
+        with mock.patch.object(self.privacy, "_perform_logout", logout):
+            asyncio.run(self.privacy.delete_personal_data(uid))
+        self.assertEqual(logged_out, [uid])
+        self.assertFalse(db.has_private(uid, er.PRIVATE_EXAM_KIND))
+        self.assertEqual(db.user_course_ids(uid), [])
+        self.assertNotIn(str(uid), self.cache["study_blocks"])
+        self.assertIn("9", self.cache["study_blocks"])  # other students untouched
+        self.assertNotIn("s1", exams.exam_action_cache)
+        self.assertIn("s2", exams.exam_action_cache)
+        exams.exam_action_cache.pop("s2", None)
+
+    def test_delete_asks_first(self):
+        query = mock.MagicMock()
+        query.from_user.id = 507
+        query.data = "privacy|delete"
+        query.answer = mock.AsyncMock()
+        query.edit_message_text = mock.AsyncMock()
+        update = mock.MagicMock(callback_query=query)
+        deleted = []
+
+        async def delete(uid):
+            deleted.append(uid)
+
+        with mock.patch.object(self.privacy, "is_user_allowed", lambda uid: True), \
+                mock.patch.object(self.privacy, "delete_personal_data", delete):
+            asyncio.run(self.privacy.handle_privacy(update, mock.MagicMock()))
+            self.assertEqual(deleted, [])
+            self.assertIn("cannot be undone", query.edit_message_text.call_args.args[0])
+            query.data = "privacy|delete_yes"
+            asyncio.run(self.privacy.handle_privacy(update, mock.MagicMock()))
+        self.assertEqual(deleted, [507])
+
+
+class PrivacyDigestTests(unittest.TestCase):
+    def test_digest_line_has_counts_only(self):
+        from datetime import datetime
+        from unibot import watcher
+        db.save_user_credential(601, "cookies", [{"value": "x"}])
+        with mock.patch.object(watcher, "load_general_cache",
+                               lambda: {"personal_check_last": {"601": datetime(2026, 11, 9, 9).timestamp()}}):
+            line = watcher._privacy_digest_line(datetime(2026, 11, 9, 12, tzinfo=watcher.TZ_BERLIN))
+        self.assertIn("logins under per-student keys", line)
+        self.assertIn("1 students checked in 24 h", line)
+        self.assertNotIn("601", line)
+
+
 if __name__ == "__main__":
     unittest.main()

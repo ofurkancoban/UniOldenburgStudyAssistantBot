@@ -126,6 +126,7 @@ def _status_group_view(group: str, user_id: Optional[int] = None) -> tuple:
             [InlineKeyboardButton("📈 Studienverlaufsbescheinigung", callback_data="stums_doc|verlauf")],
             [InlineKeyboardButton("🇬🇧 Transcript of Records", callback_data="stums_doc|transcript_en")],
             [InlineKeyboardButton("💶 Tuition & Fees", callback_data="tuition_status"), InlineKeyboardButton("📊 Grades Summary", callback_data="transcript_summary")],
+            [InlineKeyboardButton("🔒 Privacy", callback_data="privacy")],
         ]
     return title, InlineKeyboardMarkup(rows)
 
