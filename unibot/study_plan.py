@@ -68,7 +68,14 @@ from unibot.ai import (
     _record_gwdg_quota,
 )
 from unibot.documents import extract_text_from_file, extract_text_from_file_async, summarize_lecture_file
-from unibot.schedule import STUDY_PLAN_EXAM_WINDOW_DAYS, get_calendar_events, schedule_study_sessions, user_travel
+from unibot.schedule import (
+    STUDY_PLAN_EXAM_WINDOW_DAYS,
+    STUDY_PLAN_SHORT_SESSION_MINUTES,
+    find_study_windows_for_day,
+    get_calendar_events,
+    schedule_study_sessions,
+    user_travel,
+)
 from unibot.monitoring import render_weekly_study_plan_message
 from unibot.exams import STUDY_PLAN_MAX_FILE_MB, STUDY_PLAN_SUPPORTED_EXTENSIONS, get_file_exam_events
 
@@ -1338,13 +1345,18 @@ async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None, use
 
     if status_msg:
         await status_msg.edit_text("📘 Building your weekly study plan...\n\n🧠 Scheduling sessions...")
-    plan = schedule_study_sessions(inputs["gaps"], inputs["rows"], inputs["exams"], inputs["week_start"])
+    short_courses = often_skipped_courses(user_id, datetime.now(TZ_BERLIN)) if user_id is not None else set()
+    plan = schedule_study_sessions(inputs["gaps"], inputs["rows"], inputs["exams"], inputs["week_start"], short_courses)
     progress = load_study_progress(user_id=user_id)
     progress["last_plan"] = plan["sessions"]
     progress["last_plan_done"] = []
     save_study_progress(progress, user_id=user_id)
 
     text = render_weekly_study_plan_message(plan, inputs["gaps"], inputs["exams"], inputs["rows"])
+    if short_courses:
+        names = ", ".join(sorted(html.escape(c) for c in short_courses))
+        text += (f"\n\n⏱️ <i>Shorter sessions (max {STUDY_PLAN_SHORT_SESSION_MINUTES} min) for {names}:"
+                 " most of their recent blocks were skipped.</i>")
     reply_markup = build_study_plan_keyboard(plan["sessions"], []) if plan["sessions"] else None
     now = datetime.now(TZ_BERLIN)
     for uid in user_ids:
@@ -1840,6 +1852,39 @@ async def build_study_pack(window: dict, user_id: int, now: datetime) -> tuple[s
 
 
 STUDY_SKIP_NUDGE = 2  # skipped blocks in a row (per course) before the pack mentions it
+STUDY_SKIP_LOOKBACK_SECONDS = 14 * 86400
+STUDY_SKIP_MIN_ANSWERS = 2
+STUDY_MAKEUP_DAYS = 3  # how far ahead a skipped block's make-up slot is looked for
+
+
+def often_skipped_courses(user_id: int, now: datetime) -> set[str]:
+    """Courses whose answered blocks in the past two weeks were at least half
+    skipped (with STUDY_SKIP_MIN_ANSWERS answers or more): the weekly plan
+    gives them short sessions."""
+    answers: dict[str, list[str]] = {}
+    for b in study_block_log(user_id, now.timestamp() - STUDY_SKIP_LOOKBACK_SECONDS, now.timestamp()):
+        if b.get("course") and b["status"] in ("done", "skipped"):
+            answers.setdefault(b["course"], []).append(b["status"])
+    return {c for c, a in answers.items() if len(a) >= STUDY_SKIP_MIN_ANSWERS and a.count("skipped") * 2 >= len(a)}
+
+
+async def find_makeup_slot(user_id: int, now: datetime) -> Optional[dict]:
+    """The student's next study window starting after `now`, today or in the
+    next STUDY_MAKEUP_DAYS days; None when there is none or the timetable
+    can't be read."""
+    session = get_user_session(user_id)
+    events: list = []
+    fetched: set = set()
+    for offset in range(STUDY_MAKEUP_DAYS + 1):
+        day = (now + timedelta(days=offset)).date()
+        week_start = day - timedelta(days=day.weekday())
+        if week_start not in fetched:
+            fetched.add(week_start)
+            events += await get_calendar_events(session=session, week_start=week_start, user_id=user_id) or []
+        for w in find_study_windows_for_day(events, day, reference_now=now if offset == 0 else None, user_id=user_id):
+            if w["start_dt"] > now:
+                return w
+    return None
 STUDY_BLOCK_WEEK_SECONDS = 7 * 86400
 
 
@@ -1879,13 +1924,31 @@ async def handle_study_block_feedback(update: Update, context: ContextTypes.DEFA
     if len(parts) != 3 or parts[2] not in ("done", "skipped") or not parts[1].isdigit():
         await query.answer()
         return
-    record_study_block(query.from_user.id, int(parts[1]), parts[2])
-    await query.answer("Nice work! 💪" if parts[2] == "done" else "Noted, next time then.")
+    user_id = query.from_user.id
+    record_study_block(user_id, int(parts[1]), parts[2])
+    await query.answer("Nice work! 💪" if parts[2] == "done" else "Noted, let's find another time.")
     # keep the download buttons, swap the answer row for the answer
     rows = [row for row in (query.message.reply_markup.inline_keyboard if query.message.reply_markup else [])
             if not any((b.callback_data or "").startswith("sp_block|") for b in row)]
     rows.append([InlineKeyboardButton("✅ Studied" if parts[2] == "done" else "⏭ Skipped", callback_data="sp_block|answered")])
+    makeup_line = None
+    if parts[2] == "skipped":
+        try:
+            slot = await find_makeup_slot(user_id, datetime.now(TZ_BERLIN))
+        except Exception as e:
+            logging.warning("Study block feedback: no make-up slot (%s)", e)
+            slot = None
+        if slot:
+            spot = f" · 📍 {html.escape(slot['study_spot'])}" if slot.get("study_spot") else ""
+            makeup_line = (f"↪️ <b>Make-up slot:</b> {slot['start_dt']:%a %H:%M}–{slot['end_dt']:%H:%M} "
+                           f"({format_hours(slot['duration_minutes'])}){spot}")
+        else:
+            makeup_line = "↪️ <i>No free study window in the next few days; the weekly plan will make room.</i>"
     try:
-        await query.edit_message_reply_markup(InlineKeyboardMarkup(rows))
+        if makeup_line and query.message.text_html:
+            await query.edit_message_text(f"{query.message.text_html}\n{makeup_line}", parse_mode="HTML",
+                                          reply_markup=InlineKeyboardMarkup(rows))
+        else:
+            await query.edit_message_reply_markup(InlineKeyboardMarkup(rows))
     except TelegramError as e:
-        logging.debug("Study block feedback: keyboard not updated: %s", e)
+        logging.debug("Study block feedback: message not updated: %s", e)

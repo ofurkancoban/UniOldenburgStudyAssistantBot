@@ -1856,7 +1856,10 @@ STUDY_PLAN_MIN_PIECE_MINUTES = 20  # don't start a task in the last few minutes 
 STUDY_PLAN_PREP_URGENT_DAYS = 2  # class prep becomes top priority this many days before the class
 
 
-def schedule_study_sessions(gaps: list, rows: list, exams: list, week_start) -> dict:
+STUDY_PLAN_SHORT_SESSION_MINUTES = 45  # per block for a course the student keeps skipping
+
+
+def schedule_study_sessions(gaps: list, rows: list, exams: list, week_start, short_courses=frozenset()) -> dict:
     """Fill next week's free blocks with concrete tasks (minutes, not whole
     lectures): a long task is split across blocks, short ones share one.
     Work items, per course in teaching order:
@@ -1870,6 +1873,9 @@ def schedule_study_sessions(gaps: list, rows: list, exams: list, week_start) -> 
     Each block takes the most urgent item first; within the same urgency
     it stays with the course it started with (less context switching),
     then prefers the course with the most work left / closest exam.
+    A course in `short_courses` (names: the student skipped most of its
+    recent blocks) gets at most STUDY_PLAN_SHORT_SESSION_MINUTES per block,
+    so its sessions are short enough to actually happen.
     Returns {"sessions": [...], "stats": {...}} where stats has the needed
     vs. scheduled minutes per course and class prep that didn't fit."""
     from unibot.study_plan import _split_gaps_into_blocks, _unit_label
@@ -1923,6 +1929,7 @@ def schedule_study_sessions(gaps: list, rows: list, exams: list, week_start) -> 
         day = start.date()
         left = int((end - start).total_seconds() / 60)
         pieces, block_cid = [], None
+        used: dict[str, int] = {}  # minutes per course in this block
         while left >= STUDY_PLAN_MIN_PIECE_MINUTES:
             pending = sorted(
                 (it for it in items if it["remaining"] > 0),
@@ -1930,7 +1937,12 @@ def schedule_study_sessions(gaps: list, rows: list, exams: list, week_start) -> 
             )
             chosen = None
             for it in pending:
-                take = min(it["remaining"], left)
+                room = left
+                if it["course"] in short_courses:
+                    room = min(left, STUDY_PLAN_SHORT_SESSION_MINUTES - used.get(it["cid"], 0))
+                    if room < STUDY_PLAN_MIN_PIECE_MINUTES:
+                        continue
+                take = min(it["remaining"], room)
                 if 0 < it["remaining"] - take < STUDY_PLAN_MIN_PIECE_MINUTES:
                     take = it["remaining"] - STUDY_PLAN_MIN_PIECE_MINUTES  # don't leave a crumb for later
                 if take >= it["remaining"] or take >= STUDY_PLAN_MIN_PIECE_MINUTES:
@@ -1946,6 +1958,7 @@ def schedule_study_sessions(gaps: list, rows: list, exams: list, week_start) -> 
             })
             it["remaining"] -= take
             left -= take
+            used[it["cid"]] = used.get(it["cid"], 0) + take
             score[it["cid"]] = score.get(it["cid"], 0) - take / 60
             block_cid = block_cid or it["cid"]
         if pieces:

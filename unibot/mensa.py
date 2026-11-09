@@ -405,7 +405,8 @@ def _format_menu_item_html(item: dict) -> str:
     return "\n".join(lines)
 
 
-async def _send_menu_items_individually(sender, dish_items: list, target_date=None, skip_unmatched: bool = False):
+async def _send_menu_items_individually(sender, dish_items: list, target_date=None, skip_unmatched: bool = False,
+                                        loc_id: str = "2"):
     """Send every dish in `dish_items` (see get_todays_menu_enhanced) as
     its own message — name, Counter/Culinarium location, description,
     allergens, and price, with a photo attached when one can be matched
@@ -426,7 +427,7 @@ async def _send_menu_items_individually(sender, dish_items: list, target_date=No
     if not dish_items:
         return
     try:
-        candidates = await fetch_dish_photo_candidates(target_date=target_date)
+        candidates = await fetch_dish_photo_candidates(target_date=target_date, loc_id=loc_id)
     except Exception as e:
         logging.warning("_send_menu_items_individually: photo fetch failed: %s", e)
         candidates = []
@@ -458,7 +459,33 @@ def _friendly_menu_category_label(category: str) -> str:
     return counter_labels.get(category, category)
 
 
-async def build_food_recommendation() -> Optional[dict]:
+# Wechloy's widget has no counters: a main dish is one priced like a meal
+# (sides, soups and desserts cost well under this for students).
+SPEISEPLAN_MAIN_MIN_PRICE = 1.5
+
+
+def _speiseplan_price(price: str) -> Optional[float]:
+    m = re.search(r"(\d+)[,.](\d{2})", price or "")
+    return float(f"{m.group(1)}.{m.group(2)}") if m else None
+
+
+async def _speiseplan_main_items(loc_id: str) -> list:
+    """Today's main dishes at a Speiseplan canteen, in fetch_todays_menu_items' shape."""
+    page = await _fetch_speiseplan_html(loc_id)
+    if not page:
+        return []
+    items = []
+    for meal in parse_speiseplan_meals(page):
+        price = _speiseplan_price(meal["price"])
+        if price is None or price < SPEISEPLAN_MAIN_MIN_PRICE:
+            continue
+        items.append({"name": meal["name"], "category": SPEISEPLAN_LOCATIONS.get(loc_id, "Mensa"),
+                      "description": ", ".join(meal["labels"]), "price": meal["price"],
+                      "codes": {c.strip() for c in meal["allergens_text"].split(",") if c.strip()}})
+    return items
+
+
+async def build_food_recommendation(loc_id: str = "2") -> Optional[dict]:
     """Fetch today's Mensa menu, filter out anything the student avoids
     (their food_preferences.json settings, unioned with a fixed
     pork/alcohol/wine/gelatine floor per their stated restriction), keep
@@ -476,8 +503,11 @@ async def build_food_recommendation() -> Optional[dict]:
     """
     from unibot.voice import _best_title_match
     try:
-        session = await login_studip()
-        items = await fetch_todays_menu_items(session)
+        if loc_id in SPEISEPLAN_LOCATIONS:
+            items = await _speiseplan_main_items(loc_id)
+        else:
+            session = await login_studip()
+            items = await fetch_todays_menu_items(session)
     except Exception as e:
         logging.warning("build_food_recommendation: menu fetch failed: %s", e)
         return None
@@ -491,7 +521,7 @@ async def build_food_recommendation() -> Optional[dict]:
     candidates = []
     for it in items:
         category_lower = it["category"].lower()
-        if "counter" not in category_lower and "culinarium" not in category_lower:
+        if loc_id not in SPEISEPLAN_LOCATIONS and "counter" not in category_lower and "culinarium" not in category_lower:
             continue
         if it["codes"] & avoid_codes:
             continue
@@ -533,7 +563,7 @@ async def build_food_recommendation() -> Optional[dict]:
     reasoning = ((parsed or {}).get("reasoning") or "").strip() if chosen is not None else ""
     reasoning = reasoning or f"I'd recommend the {chosen['name']} today."
 
-    return {"dish": chosen["name"], "category": chosen["category"], "reasoning": reasoning}
+    return {"dish": chosen["name"], "category": chosen["category"], "reasoning": reasoning, "loc_id": loc_id}
 
 
 async def _deliver_food_recommendation(sender, result: dict):
@@ -548,7 +578,7 @@ async def _deliver_food_recommendation(sender, result: dict):
     if result["category"] and result["dish"]:
         await sender.reply_text(f"📍 {_friendly_menu_category_label(result['category'])} — {result['dish']}")
 
-        photo_url = await fetch_dish_photo_url(result["dish"])
+        photo_url = await fetch_dish_photo_url(result["dish"], loc_id=result.get("loc_id") or "2")
         if photo_url:
             try:
                 await sender.reply_photo(photo=photo_url)
@@ -833,8 +863,10 @@ def speiseplan_menu_keyboard(loc_id: str, day: date) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Previous", callback_data=f"mensa_loc|{loc_id}|{prev_day.isoformat()}"),
          InlineKeyboardButton("Today", callback_data=f"mensa_loc|{loc_id}|today"),
          InlineKeyboardButton("Next ➡️", callback_data=f"mensa_loc|{loc_id}|{next_day.isoformat()}")],
-        [InlineKeyboardButton("🏛️ Mensa Uhlhornsweg", callback_data="menu_nav|2/")],
+        [InlineKeyboardButton("📸 Show Dish Photos", callback_data=f"mensa_loc|{loc_id}|{day.isoformat()}|photos")],
         [InlineKeyboardButton("⚙️ Food Preferences", callback_data="menu_prefs")],
+        [InlineKeyboardButton("🍽️ What should I eat?", callback_data=f"menu_recommend|{loc_id}")],
+        [InlineKeyboardButton("🏛️ Mensa Uhlhornsweg", callback_data="menu_nav|2/")],
     ])
 
 
@@ -877,8 +909,19 @@ async def handle_mensa_location_button(update: Update, context: ContextTypes.DEF
         day = date.fromisoformat(parts[2]) if len(parts) > 2 and parts[2] != "today" else berlin_now().date()
     except ValueError:
         day = berlin_now().date()
-    await query.answer("Loading...")
     prefs = load_food_preferences()
+    if len(parts) > 3 and parts[3] == "photos":
+        await query.answer("Loading photos...")
+        page = await _fetch_speiseplan_html(loc_id, day)
+        meals = [m for m in parse_speiseplan_meals(page or "")
+                 if not _is_dish_hidden(m, set(prefs["avoid_codes"]), [k.lower() for k in prefs["avoid_keywords"]])]
+        dish_items = [{**m, "category": SPEISEPLAN_LOCATIONS[loc_id], "description": ", ".join(m["labels"])} for m in meals]
+        if not dish_items:
+            await query.message.reply_text("❌ No dishes to show photos for.")
+            return
+        await _send_menu_items_individually(query.message, dish_items, day, skip_unmatched=True, loc_id=loc_id)
+        return
+    await query.answer("Loading...")
     text = await build_speiseplan_menu(loc_id, day, prefs["avoid_codes"], prefs["avoid_keywords"])
     markup = speiseplan_menu_keyboard(loc_id, day)
     if len(parts) > 3 and parts[3] == "new":
@@ -1196,11 +1239,13 @@ async def handle_menu_recommend_button(update: Update, context: ContextTypes.DEF
     if not is_user_allowed(user_id):
         return
 
+    parts = query.data.split("|")
+    loc_id = parts[1] if len(parts) > 1 and parts[1] in SPEISEPLAN_LOCATIONS else "2"
     await _show_typing(query)
     status_msg = await query.message.reply_text("🍽️ Picking something for you...", disable_notification=True)
     stop_evt, anim_task = _start_loading_animation(status_msg, "Picking something for you...")
     try:
-        result = await build_food_recommendation()
+        result = await build_food_recommendation(loc_id)
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
 

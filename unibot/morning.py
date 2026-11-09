@@ -183,11 +183,12 @@ async def _fetch_today_events(session, today_date, user_id: Optional[int] = None
     return events, [ev for ev in events if ev["date_key"] == today_date]
 
 
-async def _fetch_lunch_pick() -> Optional[dict]:
-    """Same AI-judged pick as the "🍽️ What should I eat?" button. A failure
+async def _fetch_lunch_pick(loc_id: str = "2") -> Optional[dict]:
+    """Same AI-judged pick as the "🍽️ What should I eat?" button, at the
+    mensa with Speiseplan `loc_id` ("2" Uhlhornsweg, "3" Wechloy). A failure
     just omits the section rather than blocking the rest of the summary."""
     try:
-        return await build_food_recommendation()
+        return await build_food_recommendation(loc_id)
     except Exception as e:
         logging.error("Summary food recommendation error: %s", e)
         return None
@@ -209,7 +210,7 @@ async def _prepare_lunch_photo(food: Optional[dict]) -> tuple[Optional[str], Opt
         return None, None
     photo_url = None
     try:
-        photo_url = await fetch_dish_photo_url(food["dish"])
+        photo_url = await fetch_dish_photo_url(food["dish"], loc_id=food.get("loc_id") or "2")
     except Exception as e:
         logging.warning("Summary food photo fetch error: %s", e)
     place = f" ({_friendly_menu_category_label(food['category'])})" if food.get("category") else ""
@@ -284,23 +285,30 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     # Shared by everyone: weather for the morning commute (omitted, not an
     # empty section, if Open-Meteo is unreachable) and the lunch pick.
     weather = await get_weather_snapshot(today_date)
-    food = await _fetch_lunch_pick()
-    photo_url, photo_caption = await _prepare_lunch_photo(food)
+    # The lunch pick and its photo are per mensa: made once for each mensa
+    # someone has lunch at today (one AI call each), shared by its students.
+    picks: dict[str, tuple] = {}
 
-    # Per student: their own timetable, study windows, tasks, exams and voice.
+    async def lunch_at(loc_id: str) -> tuple:
+        if loc_id not in picks:
+            food = await _fetch_lunch_pick(loc_id)
+            picks[loc_id] = (food, *await _prepare_lunch_photo(food))
+        return picks[loc_id]
+
+    # Per student: their own timetable, study windows, tasks, exams, lunch and voice.
     texts: dict[int, str] = {}
     voice_paths: dict[int, str] = {}
     menu_buttons: dict[int, str] = {}
+    photos: dict[int, tuple] = {}
     for uid in user_ids:
         with acting_as(uid):
-            texts[uid], voice, menu_buttons[uid] = await _prepare_user_summary(uid, today_date, weather, food)
+            texts[uid], voice, menu_buttons[uid], photos[uid] = await _prepare_user_summary(uid, today_date, weather, lunch_at)
         if voice:
             voice_paths[uid] = voice
 
     return {
         "texts": texts,
-        "photo_url": photo_url,
-        "photo_caption": photo_caption,
+        "photos": photos,
         "outfits": await _prepare_outfits(bot, user_ids, weather),
         "voice_paths": voice_paths,
         "menu_buttons": menu_buttons,
@@ -317,10 +325,11 @@ def _menu_button_for(plan: dict, today_events: list) -> str:
     return "mensa_loc|3|today|new" if campus == WECHLOY else "menu_nav|2/|new"
 
 
-async def _prepare_user_summary(uid: int, today_date, weather, food) -> tuple[str, Optional[str], str]:
-    """(summary text, voice file or None, menu button callback) for one
-    student, built from their own session: never another student's classes,
-    tasks or exams."""
+async def _prepare_user_summary(uid: int, today_date, weather, lunch_at) -> tuple[str, Optional[str], str, tuple]:
+    """(summary text, voice file or None, menu button callback, (lunch photo
+    url, caption)) for one student, built from their own session: never
+    another student's classes, tasks or exams. `lunch_at(loc_id)` gives the
+    (pick, photo url, caption) of the mensa on the student's campus."""
     # like the calendar reminders: no stored login, no timetable (a fresh
     # session must not sign in on anyone else's behalf)
     own = get_user_session(uid)
@@ -328,6 +337,8 @@ async def _prepare_user_summary(uid: int, today_date, weather, food) -> tuple[st
     events, today_events = (await _fetch_today_events(session, today_date, user_id=uid)) if session else ([], [])
     today_tasks = _load_today_tasks(today_date, user_id=uid)
     plan = plan_study_day(events, today_date)
+    menu_button = _menu_button_for(plan, today_events)
+    food, photo_url, photo_caption = await lunch_at("3" if menu_button.startswith("mensa_loc|3") else "2")
     menu = await _lunch_menu_highlight(plan["lunch"], session)
     text = _compose_morning_text(today_date, [
         _format_schedule_section(today_events),
@@ -339,7 +350,7 @@ async def _prepare_user_summary(uid: int, today_date, weather, food) -> tuple[st
     ])
     voice = await _prepare_morning_voice(today_events, today_date, today_tasks, weather, food,
                                          name=get_user_name(uid))
-    return text, voice, _menu_button_for(plan, today_events)
+    return text, voice, menu_button, (photo_url, photo_caption)
 
 
 async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
@@ -389,12 +400,14 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
     if pin_cache_dirty:
         update_general_cache({"pinned_morning_summary": pinned})
 
-    if prepared.get("photo_url"):
-        for uid in user_ids:
-            try:
-                await bot.send_photo(chat_id=uid, photo=prepared["photo_url"], caption=prepared.get("photo_caption"), parse_mode="HTML")
-            except Exception as e:
-                logging.error("Failed to send lunch photo to %s: %s", uid, e)
+    for uid in user_ids:
+        photo_url, caption = (prepared.get("photos") or {}).get(uid) or (None, None)
+        if not photo_url:
+            continue
+        try:
+            await bot.send_photo(chat_id=uid, photo=photo_url, caption=caption, parse_mode="HTML")
+        except Exception as e:
+            logging.error("Failed to send lunch photo to %s: %s", uid, e)
 
     if get_wardrobe_feature_enabled():
         for uid in user_ids:

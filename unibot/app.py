@@ -347,7 +347,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(menu_button_handler, pattern=r"^menu_nav\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_mensa_location_button, pattern=r"^mensa_loc\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_menu_preferences_button, pattern="^menu_prefs$"))
-    app.add_handler(CallbackQueryHandler(handle_menu_recommend_button, pattern="^menu_recommend$"))
+    app.add_handler(CallbackQueryHandler(handle_menu_recommend_button, pattern=r"^menu_recommend(\|\d+)?$"))
     app.add_handler(CallbackQueryHandler(handle_menu_photos_button, pattern=r"^menu_photos\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_foodpref_category, pattern=r"^foodpref_cat\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_foodpref_toggle, pattern=r"^foodpref_toggle\|.*$"))
@@ -388,6 +388,12 @@ async def main():
     if not acquire_instance_lock():
         logging.error("❌ Another bot instance is already running. Exiting.")
         return
+
+    try:
+        from unibot.diagnostics import record_start
+        record_start()  # the daily digest tells deploys from crashes by this
+    except Exception as exc:
+        logging.warning("Could not log this start: %s", exc)
 
     app = None
     try:

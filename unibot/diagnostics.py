@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
 from studip_http import THROTTLE
+from studip_utils import TZ_BERLIN
 from studip_session import worker_status
 from unibot import db, state
 from unibot.config import PROJECT_ROOT
@@ -147,6 +148,65 @@ def backup_line(backup_dir: Optional[str] = None, now: Optional[float] = None) -
     return f"💾 Database backup: {flag} {names[-1]} ({size_mb:.1f} MB, {len(names)} kept)"
 
 
+# ── restarts ──────────────────────────────────────────────────────────────────
+RESTART_LOG = "restart_log.json"
+RESTART_LOG_KEEP = 200
+
+
+def current_commit(root: Optional[str] = None) -> Optional[str]:
+    """The checked out commit, read from .git without running git; None
+    outside a checkout."""
+    git = os.path.join(root or PROJECT_ROOT, ".git")
+    try:
+        with open(os.path.join(git, "HEAD"), encoding="utf-8") as fh:
+            head = fh.read().strip()
+        if not head.startswith("ref: "):
+            return head or None
+        ref = head[5:]
+        ref_path = os.path.join(git, ref)
+        if os.path.exists(ref_path):
+            with open(ref_path, encoding="utf-8") as fh:
+                return fh.read().strip() or None
+        with open(os.path.join(git, "packed-refs"), encoding="utf-8") as fh:
+            for line in fh:
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == ref:
+                    return parts[0]
+    except OSError:
+        pass
+    return None
+
+
+def _restart_log() -> list:
+    try:
+        return db.load(RESTART_LOG) if db.exists(RESTART_LOG) else []
+    except (OSError, ValueError):
+        return []
+
+
+def record_start(now_ts: Optional[float] = None, commit: Optional[str] = None) -> None:
+    """Log this process start with the commit it runs (see restart_line)."""
+    log = _restart_log()
+    log.append({"ts": int(now_ts or time.time()), "commit": commit if commit is not None else current_commit()})
+    db.save(RESTART_LOG, log[-RESTART_LOG_KEEP:])
+
+
+def restart_line(now_ts: Optional[float] = None) -> str:
+    """Starts in the last 24 h: a start on a new commit is a deploy, one on
+    the same commit as the run before it a crash or a manual restart."""
+    now_ts = now_ts or time.time()
+    log = _restart_log()
+    recent = [(i, e) for i, e in enumerate(log) if e["ts"] >= now_ts - 86400]
+    if not recent:
+        return "🔄 No restarts in the last 24 h"
+    unexpected = [e for i, e in recent if i > 0 and e.get("commit") and e.get("commit") == log[i - 1].get("commit")]
+    if not unexpected:
+        return f"🔄 Restarts (24 h): {len(recent)}, all deploys ✅"
+    times = ", ".join(datetime.fromtimestamp(e["ts"], TZ_BERLIN).strftime("%H:%M") for e in unexpected)
+    return (f"🔄 Restarts (24 h): {len(recent)}, {len(recent) - len(unexpected)} deploys, "
+            f"⚠️ {len(unexpected)} on the same commit (crash or manual restart at {times})")
+
+
 def daily_digest(now: datetime, log_paths: Iterable[str], previous: Optional[dict] = None) -> list[str]:
     """HTML lines of the admin daily digest. `now` is naive local time, like
     the log timestamps; `previous` is the traffic_snapshot() of the last digest."""
@@ -185,6 +245,7 @@ def daily_digest(now: datetime, log_paths: Iterable[str], previous: Optional[dic
         lines.append(f"☁️ Cloudflare Worker: {state_label}, {failovers} failovers since the last digest")
 
     lines.append(backup_line())
+    lines.append(restart_line())
 
     sessions = {uid: s for uid, s in state.user_sessions.items() if s is not None}
     lines.append(f"👥 <b>Sessions</b> ({len(sessions)})")
