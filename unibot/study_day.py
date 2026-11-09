@@ -203,7 +203,7 @@ def plan_day(day_events: list, windows: list[dict], day: date,
                     travel_keys = ("travel_minutes", "travel_from", "travel_to") if pieces else ()
                     after = {k: v for k, v in target.items() if k not in travel_keys}
                     pieces.append({**after, "start_dt": end, "duration_minutes": _minutes(end, target["end_dt"]),
-                                   "after": "lunch", "after_location": None, "description": f"{target.get('description') or 'study window'}, after lunch"})
+                                   "after": "lunch", "description": f"{target.get('description') or 'study window'}, after lunch"})
                 index = refined.index(target)
                 refined[index:index + 1] = pieces
 
@@ -222,7 +222,8 @@ def menu_highlight(items: list, limit: int = 2) -> Optional[str]:
     mains, has_dessert = [], False
     for item in items:
         category = (item.get("category") or "").lower()
-        name = (item.get("name") or "").strip()
+        # the mensa page marks dishes in short supply with a "Limited - " prefix
+        name = re.sub(r"^\s*limited\s*-\s*", "", item.get("name") or "", flags=re.IGNORECASE).strip()
         if not name:
             continue
         if "dessert" in category or "nachtisch" in category or "nachspeise" in category:

@@ -63,6 +63,16 @@ class LunchBreakTests(unittest.TestCase):
         self.assertEqual(after_lunch["study_type"]["key"], "focus")
         self.assertEqual(after_lunch["study_spot"], "BIS library, 2nd floor quiet room")
         self.assertIn("after lunch", after_lunch["description"])
+        self.assertEqual(after_lunch["campus"], study_day.HAARENTOR)
+
+    def test_piece_after_lunch_keeps_the_campus_of_the_last_class(self):
+        # real Wednesday: W14 08-10, A05 10-12, free afternoon -> lunch and study at Haarentor
+        events = [_event("08:00", "10:00", "Biology", "W14 0-001"), _event("10:00", "12:00", "Statistics", "A05 1-161")]
+        plan = schedule.plan_study_day(events, WED)
+        self.assertEqual(_spans([plan["lunch"]]), [("12:00", "12:45")])
+        self.assertEqual(plan["lunch"]["mensa"], "Mensa Uhlhornsweg")
+        self.assertEqual([(w["campus"], w["study_spot"]) for w in plan["windows"]],
+                         [(study_day.HAARENTOR, "BIS library, 2nd floor quiet room")])
         # find_study_windows_for_day is the same plan without the lunch entry
         self.assertEqual(_spans(schedule.find_study_windows_for_day(events, WED)), _spans(plan["windows"]))
 
@@ -149,7 +159,7 @@ class StudyPlanWindowTests(unittest.TestCase):
 class MenuHighlightTests(unittest.TestCase):
     def test_main_dishes_and_dessert(self):
         items = [{"category": "Hauptgericht", "name": "Falafel Bowl"}, {"category": "Beilagen", "name": "Reis"},
-                 {"category": "Dessert", "name": "Pudding"}, {"category": "Pasta", "name": "Penne Arrabiata"}]
+                 {"category": "Dessert", "name": "Pudding"}, {"category": "Pasta", "name": "Limited - Penne Arrabiata"}]
         self.assertEqual(study_day.menu_highlight(items), "Falafel Bowl / Penne Arrabiata & dessert")
         self.assertIsNone(study_day.menu_highlight([]))
 
