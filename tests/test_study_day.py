@@ -687,3 +687,25 @@ class TransientTelegramErrorLogTests(unittest.TestCase):
             TransientTelegramErrorFilter().filter(record)
             self.assertEqual(record.levelname, "ERROR")
             self.assertIsNotNone(record.exc_info)
+
+
+class CompanionCourseTests(unittest.TestCase):
+    COURSES = {"ex": "Applied Economics - Exercise A", "lec": "Applied Economics", "ue1": "Advanced Microeconomics UE1",
+               "am": "Advanced Microeconomics", "tut": "Statistics Tutorial 2", "st": "Statistics", "spat": "Spatial Econometrics"}
+
+    def test_exercise_courses_map_to_their_lecture(self):
+        self.assertEqual(study_plan.companion_courses("ex", self.COURSES), ["lec"])
+        self.assertEqual(study_plan.companion_courses("ue1", self.COURSES), ["am"])
+        self.assertEqual(study_plan.companion_courses("tut", self.COURSES), ["st"])
+        self.assertEqual(study_plan.companion_courses("lec", self.COURSES), [])
+        self.assertEqual(study_plan.companion_courses("spat", self.COURSES), [])
+
+    def test_catch_up_falls_back_to_the_lecture_course(self):
+        listings = {"ex": [], "lec": [(None, {"name": "slides_intro.pdf", "url": "s1", "modified_iso": "2026-11-03T09:00:00+01:00"})]}
+        cache: dict = {}
+        with mock.patch.object(study_plan, "_list_course_files_deep", mock.AsyncMock(side_effect=lambda cid: listings[cid])), \
+                mock.patch.object(study_plan, "link_cache", cache), \
+                mock.patch.object(study_plan.state, "user_courses_map", {7: self.COURSES}):
+            markup = asyncio.run(study_plan.build_catch_up_buttons({"course_id": "ex"}, 7))
+        self.assertEqual(markup.inline_keyboard[0][0].text, "📊 slides_intro.pdf")
+        self.assertEqual([e["cid"] for e in cache.values()], ["lec"])  # the download goes to the course holding the file

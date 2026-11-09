@@ -1716,15 +1716,39 @@ def pick_study_pack_files(files: list, kinds: tuple[str, ...] = STUDY_PACK_KINDS
 _FILE_KIND_ICONS = {"problem_set": "📝", "slides": "📊", "video": "🎥"}
 
 
+# "Applied Economics - Exercise A", "Advanced Microeconomics UE1", "Statistics Tutorial 2"
+_COMPANION_SUFFIX_RE = re.compile(
+    r"\s*(?:[-:,]\s*)?(?:exercises?|übung(?:en)?|uebung(?:en)?|tutorials?|tutorium|ue)\b.*$|\s+ue\d+\b.*$",
+    re.IGNORECASE)
+
+
+def companion_courses(cid: str, courses: dict) -> list[str]:
+    """For an exercise or tutorial course, the lecture course(s) it belongs
+    to among the student's courses (same name without the suffix); the
+    slides and recordings usually live there."""
+    name = courses.get(cid) or ""
+    base = _COMPANION_SUFFIX_RE.sub("", name).strip()
+    if not base or base == name.strip():
+        return []
+    return [other for other, other_name in courses.items() if other != cid and (other_name or "").strip() == base]
+
+
 async def course_file_buttons(cid: str, course_name: str, user_id: int,
                               kinds: tuple[str, ...] = STUDY_PACK_KINDS) -> list[list[InlineKeyboardButton]]:
     """Download buttons (the file|<sid> handler) for the newest file of each
-    kind in a course; [] when none is found or the listing fails."""
-    try:
-        picked = pick_study_pack_files(await _list_course_files_deep(cid), kinds)
-    except Exception as e:
-        logging.warning("Course files: listing failed for %s: %s", cid, e)
-        return []
+    kind in a course, falling back to its lecture course when an exercise
+    course has none; [] when nothing is found or the listing fails."""
+    courses = state.user_courses_map.get(user_id) or state.courses_map
+    picked: list[dict] = []
+    for source in [cid, *companion_courses(cid, courses)]:
+        try:
+            picked = pick_study_pack_files(await _list_course_files_deep(source), kinds)
+        except Exception as e:
+            logging.warning("Course files: listing failed for %s: %s", source, e)
+            continue
+        if picked:
+            cid = source
+            break
     buttons = []
     for item in picked:
         sid = _short_id()
