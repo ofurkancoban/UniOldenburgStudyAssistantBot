@@ -42,6 +42,7 @@ from studip_utils import redact_url
 
 logger = logging.getLogger("StudIPLoginServer")
 
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 TOKEN_TTL = 600          # seconds a link token stays valid
 INITDATA_MAX_AGE = 3600  # seconds a Mini App payload stays valid
 PROXY_COOKIE = "_bot_proxy_auth"
@@ -306,6 +307,8 @@ class LoginServer:
         self.is_allowed_callback = is_allowed_callback
         self._tokens: dict[str, dict] = {}
         self._proxy_sessions: dict[str, dict] = {}
+        # user_id -> the latest cookie expiry revoke_user() refused
+        self._revoked_until: dict[int, int] = {}
         # Mixed into the cookie signing key. A fresh one per process and per
         # revoke_all() invalidates every proxy cookie handed out before.
         self._cookie_salt = secrets.token_bytes(16)
@@ -355,7 +358,22 @@ class LoginServer:
         """Invalidate every link token and proxy cookie (called on /logout)."""
         self._tokens.clear()
         self._proxy_sessions.clear()
+        self._revoked_until.clear()
         self._cookie_salt = secrets.token_bytes(16)
+
+    def revoke_user(self, user_id: int) -> None:
+        """Invalidate one student's link tokens and proxy cookies (their own
+        /logout, an admin revoke, a data deletion). Cookies stay signed, so
+        every cookie of this user issued up to now is refused by its expiry."""
+        for token in [t for t, d in self._tokens.items() if d.get("user_id") == user_id]:
+            self._tokens.pop(token, None)
+        for sid in [s for s, d in self._proxy_sessions.items() if d.get("user_id") == user_id]:
+            self._proxy_sessions.pop(sid, None)
+        self._revoked_until[user_id] = int(time.time() + PROXY_SESSION_TTL)
+
+    def _cookie_revoked(self, user_id, exp) -> bool:
+        cutoff = self._revoked_until.get(user_id)
+        return cutoff is not None and exp <= cutoff
 
     # ── urls / tokens ─────────────────────────────────────────────────────
     def base_url(self) -> str:
@@ -397,6 +415,8 @@ class LoginServer:
     def _create_proxy_session(self, user_id: int) -> str:
         self._purge()
         exp = int(time.time() + PROXY_SESSION_TTL)
+        # a sign-in right after a revoke must not fall under it
+        exp = max(exp, self._revoked_until.get(user_id, 0) + 1)
         payload = f"{user_id}.{exp}"
         sig = hmac.new(self._cookie_key(), payload.encode("utf-8"), hashlib.sha256).hexdigest()
         sid = f"{payload}.{sig}"
@@ -412,8 +432,9 @@ class LoginServer:
         sess = self._proxy_sessions.get(sid)
         if sess:
             # No sliding expiry: a cookie stops working at its signed expiry
-            # however often it is used.
-            if sess["expires"] < time.time():
+            # however often it is used. A student blocked after the cookie was
+            # issued loses it at once.
+            if sess["expires"] < time.time() or not self._is_allowed(sess.get("user_id")):
                 self._proxy_sessions.pop(sid, None)
                 return None
             sess["sid"] = sid
@@ -426,7 +447,7 @@ class LoginServer:
                 exp = int(exp_s)
             except ValueError:
                 return None
-            if exp < time.time():
+            if exp < time.time() or self._cookie_revoked(uid, exp):
                 return None
             expected = hmac.new(
                 self._cookie_key(), f"{uid}.{exp}".encode("utf-8"), hashlib.sha256
@@ -585,6 +606,13 @@ class LoginServer:
             if request.path in ("/", "/app"):
                 return await self._app_gate(request)
             raise web.HTTPFound("/app")
+        if request.method not in _SAFE_METHODS and \
+                request.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
+            # The cookie is SameSite=None (Mini App iframe), so another site
+            # could otherwise post forms through the student's signed-in
+            # proxy; every real form here comes from a proxied page.
+            logger.warning("Cross-site %s to the proxy refused", request.method)
+            return web.Response(text="Cross-site request refused", status=403)
         user_id = proxy_sess.get("user_id")
         relink_href = f"/_bot/entry?relogin=1&csrf={self._csrf_token(proxy_sess.get('sid', ''))}"
 

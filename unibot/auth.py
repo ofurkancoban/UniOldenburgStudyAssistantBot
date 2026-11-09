@@ -281,8 +281,15 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         elif text.upper().startswith("UNI-"):
             code = text.upper()
 
+        if code and _invite_attempts_exhausted(user.id):
+            # Codes are short (24 bits), so guessing is capped per account.
+            # No reply: answering every guess would also burn the bot's
+            # send quota.
+            raise ApplicationHandlerStop
         if code:
             ok, msg = redeem_invite_token(code, user.id, full_name=user.full_name, username=user.username)
+            if not ok:
+                _record_invite_failure(user.id)
             if ok:
                 welcome_text = (
                     "🎉 <b>Welcome to UniOldenburg Assistant!</b>\n"
@@ -329,6 +336,34 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     except TelegramError:
         pass
     raise ApplicationHandlerStop
+
+
+# Failed invite code guesses per Telegram account: at most
+# INVITE_MAX_FAILURES in any INVITE_FAILURE_WINDOW seconds.
+INVITE_MAX_FAILURES = 5
+INVITE_FAILURE_WINDOW = 3600
+_invite_failures: dict[int, list[float]] = {}
+
+
+def _recent_invite_failures(user_id: int, now: float) -> list[float]:
+    recent = [t for t in _invite_failures.get(user_id, []) if now - t < INVITE_FAILURE_WINDOW]
+    if recent:
+        _invite_failures[user_id] = recent
+    else:
+        _invite_failures.pop(user_id, None)
+    return recent
+
+
+def _invite_attempts_exhausted(user_id: int) -> bool:
+    return len(_recent_invite_failures(user_id, time.time())) >= INVITE_MAX_FAILURES
+
+
+def _record_invite_failure(user_id: int) -> None:
+    now = time.time()
+    _recent_invite_failures(user_id, now)
+    _invite_failures.setdefault(user_id, []).append(now)
+    if len(_invite_failures[user_id]) == INVITE_MAX_FAILURES:
+        logging.warning("Invite code guessing capped for a Telegram account for %ss", INVITE_FAILURE_WINDOW)
 
 
 def is_user_allowed(user_id: Optional[int]) -> bool:
@@ -871,6 +906,9 @@ async def _perform_logout(user_id: Optional[int] = None) -> None:
             studip_oauth.clear_tokens(user_id=user_id)
         db.update_user_studip(user_id, "")
         state.user_courses_map.pop(user_id, None)
+        if state.login_server is not None:
+            # an open Mini App must not keep proxying this account
+            state.login_server.revoke_user(user_id)
         if state.global_session is sess:
             # keep the watcher running on another signed-in admin, if any
             state.global_session = pick_watcher_session(exclude=user_id)

@@ -469,11 +469,12 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                 text = (
                     "🔥 <b>NEW ANNOUNCEMENT</b> 🔥\n"
                     "━━━━━━━━━━━━━━━━━\n"
-                    f"🏫 <b>Course:</b> {ann['course']}\n"
-                    f"👤 <b>From:</b> {ann['sender']}\n"
-                    f"📘 <b>Subject:</b> {ann['subject']}\n"
-                    f"🕒 <b>Date:</b> {ann['date']}\n\n"
-                    f"{ann['body']}\n"
+                    f"🏫 <b>Course:</b> {html.escape(str(ann['course']))}\n"
+                    f"👤 <b>From:</b> {html.escape(str(ann['sender']))}\n"
+                    f"📘 <b>Subject:</b> {html.escape(str(ann['subject']))}\n"
+                    f"🕒 <b>Date:</b> {html.escape(str(ann['date']))}\n\n"
+                    # cut before escaping, so the 4000 limit never splits an entity
+                    f"{html.escape(str(ann['body'])[:3300])}\n"
                     "━━━━━━━━━━━━━━━━━"
                 )
                 sid = _short_id()
@@ -483,7 +484,7 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                     [InlineKeyboardButton("📝 Add as Task", callback_data=f"ann_to_task|{sid}")],
                 ]
                 markup = InlineKeyboardMarkup(buttons)
-                await course_registry.fan_out(bot, ann.get("cid"), "announcements", text[:4000],
+                await course_registry.fan_out(bot, ann.get("cid"), "announcements", text,
                                               announcement_title_text(ann), reply_markup=markup,
                                               members=course_members(ann.get("cid")))
         elif not silent:
@@ -831,11 +832,13 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
             text = (
                 "🔥 📩 <b>NEW MESSAGE</b> 🔥\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>From:</b> {msg.get('sender', 'Unknown')}\n"
-                f"📘 <b>Subject:</b> {msg.get('title', '(No subject)')}\n"
-                f"🕒 <b>Date:</b> {msg.get('date', '-')}\n"
+                # anyone on Stud.IP can message a student: never let a
+                # sender, subject or body add markup or links to the alert
+                f"👤 <b>From:</b> {html.escape(str(msg.get('sender', 'Unknown')))}\n"
+                f"📘 <b>Subject:</b> {html.escape(str(msg.get('title', '(No subject)')))}\n"
+                f"🕒 <b>Date:</b> {html.escape(str(msg.get('date', '-')))}\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                f"{body_text}\n"
+                f"{html.escape(body_text[:3300])}\n"
                 "━━━━━━━━━━━━━━━━━"
             )
             # Auto-generated "Enrolment in course" notifications aren't the kind
@@ -857,7 +860,7 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
                 btn_rows.append([InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")])
                 markup = markup_for(chat_id, InlineKeyboardMarkup(btn_rows))
             # a Stud.IP message is private: only its recipient gets it
-            await bot.send_message(chat_id=chat_id, text=text[:4000], parse_mode="HTML", reply_markup=markup)
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
             await asyncio.sleep(0.3)
         return True
     except Exception as e:
@@ -1163,9 +1166,15 @@ async def _run_check_now(update, context):
 
 # ── Feature 3: Direct Stud.IP Message Reply (`POST /jsonapi.php/v1/messages`) ─
 
-async def send_studip_message(recipient_id: str, subject: str, message_body: str, _retry: bool = True) -> dict:
+async def send_studip_message(recipient_id: str, subject: str, message_body: str, _retry: bool = True,
+                              user_id: Optional[int] = None) -> dict:
     """Send a Stud.IP internal message via `POST /jsonapi.php/v1/messages`."""
-    session = await login_studip()  # the acting user sends from their own account
+    # the student sends from their own account, never from the watcher's
+    if user_id is None:
+        user_id = current_user_id()
+    if user_id is None:
+        raise RuntimeError("No student to send this Stud.IP message as.")
+    session = await login_studip(user_id=user_id)
     url = f"{STUDIP_API_URL}/messages"
     payload = {
         "data": {
@@ -1190,13 +1199,14 @@ async def send_studip_message(recipient_id: str, subject: str, message_body: str
         status, resp_text = r.status, await r.text()
     if status == 401 and _retry:
         use_oauth = studip_oauth.oauth_enabled()
-        if use_oauth and studip_oauth.load_tokens() and await studip_oauth.get_access_token(force_refresh=True):
-            return await send_studip_message(recipient_id, subject, message_body, _retry=False)
+        if use_oauth and studip_oauth.load_tokens(user_id=user_id) and \
+                await studip_oauth.get_access_token(force_refresh=True, user_id=user_id):
+            return await send_studip_message(recipient_id, subject, message_body, _retry=False, user_id=user_id)
         # Self-healing silent SSO renewal attempt
         if await session.heal_session():
-            return await send_studip_message(recipient_id, subject, message_body, _retry=False)
+            return await send_studip_message(recipient_id, subject, message_body, _retry=False, user_id=user_id)
         await session.login()  # respects the failed-login backoff
-        return await send_studip_message(recipient_id, subject, message_body, _retry=False)
+        return await send_studip_message(recipient_id, subject, message_body, _retry=False, user_id=user_id)
     if status not in (200, 201, 202, 204):
         raise StudipApiError(f"POST /messages failed: HTTP {status} ({resp_text[:180]})")
     try:
@@ -1227,7 +1237,7 @@ async def handle_studip_message_reply_start(update: Update, context: ContextType
     # If `sender_id` wasn't cached yet, resolve it live from `/messages/{msg_id}?include=sender`
     if not sender_id:
         try:
-            doc = await studip_api_get(f"/messages/{msg_id}", {"include": "sender"})
+            doc = await studip_api_get(f"/messages/{msg_id}", {"include": "sender"}, user_id=query.from_user.id)
             data = doc.get("data") or {}
             sender_id = _api_rel_id(data, "sender")
             names = _api_names(doc.get("included", []))

@@ -1214,6 +1214,7 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
                 recipient_id=target["recipient_id"],
                 subject=target.get("subject") or "Re: Message",
                 message_body=reply_body,
+                user_id=update.effective_user.id,
             )
             await status_msg.edit_text(
                 f"✅ <b>Reply sent on Stud.IP!</b>\n"
