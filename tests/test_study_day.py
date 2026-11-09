@@ -297,3 +297,52 @@ class TaskPrivacyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PerUserMorningSummaryTests(unittest.TestCase):
+    def test_each_student_gets_their_own_summary_and_voice(self):
+        from unibot import morning
+        sessions = {1: mock.MagicMock(name="s1"), 2: mock.MagicMock(name="s2"), 3: mock.MagicMock(name="s3")}
+        logged_in = {1: True, 2: True, 3: False}
+        timetable = {1: [{**_event("09:00", "10:00", "Statistics"), "time": "09:00 - 10:00"}],
+                     2: [{**_event("11:00", "12:00", "Biology", "W14 0-001"), "time": "11:00 - 12:00"}]}
+        tasks = [{"user_id": 1, "text": "PS 1", "due_time": "2026-11-04T18:00:00+01:00"},
+                 {"user_id": 2, "text": "Lab report", "due_time": "2026-11-04T18:00:00+01:00"}]
+        fetched = []
+
+        async def events(session=None, week_start=None, user_id=None):
+            fetched.append(user_id)
+            return timetable[user_id]
+
+        async def voice(today_events, today_date, today_tasks, weather, food, name=None):
+            return f"/tmp/voice-{[t['text'] for t in today_tasks]}"
+
+        _FrozenDateTime.frozen = _at(WED, "06:30")
+        saved = state.global_session
+        state.global_session = sessions[1]
+        try:
+            with mock.patch.object(morning, "datetime", _FrozenDateTime), \
+                    mock.patch.object(morning, "get_user_session", lambda uid=None: sessions[uid]), \
+                    mock.patch.object(morning, "has_stored_login", lambda s: logged_in[next(k for k, v in sessions.items() if v is s)]), \
+                    mock.patch.object(morning, "get_calendar_events", events), \
+                    mock.patch.object(morning, "load_tasks", lambda: tasks), \
+                    mock.patch.object(morning, "get_weather_snapshot", mock.AsyncMock(return_value=None)), \
+                    mock.patch.object(morning, "_fetch_lunch_pick", mock.AsyncMock(return_value=None)), \
+                    mock.patch.object(morning, "_prepare_lunch_photo", mock.AsyncMock(return_value=(None, None))), \
+                    mock.patch.object(morning, "_prepare_outfits", mock.AsyncMock(return_value={})), \
+                    mock.patch.object(morning, "_fetch_exam_countdown", mock.AsyncMock(return_value="")), \
+                    mock.patch.object(morning, "_lunch_menu_highlight", mock.AsyncMock(return_value=None)), \
+                    mock.patch.object(morning, "_prepare_morning_voice", voice):
+                prepared = asyncio.run(morning._prepare_morning_summary(None, [1, 2, 3]))
+        finally:
+            state.global_session = saved
+        texts = prepared["texts"]
+        self.assertEqual(fetched, [1, 2])  # no timetable fetch without the student's own login
+        self.assertIn("Statistics", texts[1])
+        self.assertNotIn("Biology", texts[1])
+        self.assertIn("Biology", texts[2])
+        self.assertIn("PS 1", texts[1])
+        self.assertNotIn("Lab report", texts[1])
+        self.assertIn("No classes today", texts[3])
+        self.assertEqual(prepared["voice_paths"][2], "/tmp/voice-['Lab report']")
+        self.assertIn("Lunch at", texts[1])  # the study day plan is part of it

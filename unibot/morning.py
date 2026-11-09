@@ -34,16 +34,17 @@ from unibot.storage import (
 )
 from unibot.formatting import _get_course_icon, _get_location_emoji, _safe_loc, clean_course_title
 from unibot.telegram_ui import _download_telegram_file, _show_typing
-from unibot.auth import current_user_id, is_user_admin, is_user_allowed
+from unibot.auth import acting_as, current_user_id, get_user_session, has_stored_login, is_user_admin, is_user_allowed
 from unibot.ai import _ai_patience, _call_openrouter, _pcm_to_ogg_voice, synthesize_speech
 from unibot.weather import build_weather_text_line, get_weather_snapshot
 from unibot.mensa import _friendly_menu_category_label, build_food_recommendation, fetch_dish_photo_url
 from unibot.wardrobe import generate_outfit_tryon_image, outfit_caption, pick_outfit_from_wardrobe
 from unibot.schedule import (
+    _lunch_menu_highlight,
     _week_tasks_for_range,
-    find_study_windows_for_day,
     find_weekly_study_gaps,
     get_calendar_events,
+    plan_study_day,
 )
 
 
@@ -79,28 +80,43 @@ def _format_schedule_section(today_events: list) -> str:
     return "\n".join(["📅 <b>Today's Schedule:</b>", "\n\n".join(course_blocks)])
 
 
-def _format_study_windows_section(events: list, today_date) -> str:
-    study_windows = find_study_windows_for_day(events, today_date)
-    if not study_windows:
+def _format_study_windows_section(events: list, today_date, menu: Optional[str] = None) -> str:
+    """The day's study windows with their work type and study spot, and the
+    lunch break (with the mensa's main dishes when `menu` is given)."""
+    plan = plan_study_day(events, today_date)
+    entries = plan["windows"] + ([plan["lunch"]] if plan["lunch"] else [])
+    if not entries:
         return ""
     study_lines = ["📚 <b>Good Times to Study:</b>"]
-    for g in study_windows:
+    for g in sorted(entries, key=lambda e: e["start_dt"]):
+        span = f"<code>{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}</code>"
+        if g.get("kind") == "lunch":
+            dishes = f" ({_h(menu)})" if menu else ""
+            study_lines.append(f"🥗 {span} Lunch at {_h(g['mensa'])}{dishes}")
+            continue
         desc = g.get("description", "")
         desc_formatted = desc[0].upper() + desc[1:] if desc else "Study window"
-        study_lines.append(
-            f"🕒 <code>{g['start_dt']:%H:%M}–{g['end_dt']:%H:%M}</code> "
-            f"({_format_hours(g['duration_minutes'])}) - {_h(desc_formatted)}"
-        )
+        study_lines.append(f"🕒 {span} ({_format_hours(g['duration_minutes'])}) - {_h(desc_formatted)}")
+        kind = g.get("study_type") or {}
+        details = [f"{kind['emoji']} {kind['label']}"] if kind else []
+        if g.get("study_spot"):
+            details.append(f"📍 {g['study_spot']}")
+        if details:
+            study_lines.append("   " + _h(" · ".join(details)))
     return "\n\n" + "\n".join(study_lines)
 
 
-def _load_today_tasks(today_date) -> list:
-    """Reminders due today, regardless of which ALLOWED_USER_IDS entry created
-    them (they're the same person's other devices, see get_primary_user_name)."""
+def _load_today_tasks(today_date, user_id: Optional[int] = None) -> list:
+    """The user's own tasks due today (`user_id` defaults to the user the
+    current update acts for; without one there are none)."""
+    owner = user_id if user_id is not None else current_user_id()
+    if owner is None:
+        return []
     try:
         tasks = [
             t for t in load_tasks()
-            if t.get("due_time") and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == today_date
+            if t.get("user_id") == owner and t.get("due_time")
+            and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == today_date
         ]
         return sorted(tasks, key=lambda t: t["due_time"])
     except Exception as e:
@@ -153,11 +169,11 @@ def _compose_morning_text(today_date, sections: list) -> str:
     return f"{header}{''.join(sections)}\n\n━━━━━━━━━━━━━━━━━━"
 
 
-async def _fetch_today_events(session, today_date) -> tuple[list, list]:
+async def _fetch_today_events(session, today_date, user_id: Optional[int] = None) -> tuple[list, list]:
     """(this week's events, today's events); both empty if the calendar fails."""
     try:
         week_start = today_date - timedelta(days=today_date.weekday())
-        events = await get_calendar_events(session=session, week_start=week_start)
+        events = await get_calendar_events(session=session, week_start=week_start, user_id=user_id)
     except Exception as e:
         logging.error("Summary schedule fetch error: %s", e)
         return [], []
@@ -229,13 +245,14 @@ async def _prepare_outfits(bot, user_ids, weather) -> dict:
     return outfits
 
 
-async def _prepare_morning_voice(today_events, today_date, today_tasks, weather, food) -> Optional[str]:
+async def _prepare_morning_voice(today_events, today_date, today_tasks, weather, food,
+                                 name: Optional[str] = None) -> Optional[str]:
     """AI-narrated voice message, improvised fresh every morning (see
     build_ai_daily_plan_narration) and converted to OGG now, so delivery is
     just an upload. A TTS/ffmpeg hiccup just skips it."""
     try:
         narration = await build_ai_daily_plan_narration(
-            today_events, today_date, name=get_primary_user_name(),
+            today_events, today_date, name=name or get_primary_user_name(),
             today_tasks=today_tasks, weather=weather, food=food,
         ) or build_daily_plan_speech_text(today_events, today_date)
         voice_path = None
@@ -257,35 +274,56 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     AI-narrated voice message (already synthesized to an OGG file). The
     slow AI parts run here, ahead of time, so deliver_morning_summary can
     send everything at once at the scheduled time."""
-    session = state.global_session
-    if not session:
+    if not state.global_session:
         return None
 
     today_date = datetime.now(TZ_BERLIN).date()
-    events, today_events = await _fetch_today_events(session, today_date)
-    # Weather for the morning commute window; omitted (not an empty
-    # section) if Open-Meteo is unreachable.
+    # Shared by everyone: weather for the morning commute (omitted, not an
+    # empty section, if Open-Meteo is unreachable) and the lunch pick.
     weather = await get_weather_snapshot(today_date)
-    today_tasks = _load_today_tasks(today_date)
     food = await _fetch_lunch_pick()
-
-    final_text = _compose_morning_text(today_date, [
-        _format_schedule_section(today_events),
-        _format_study_windows_section(events, today_date),
-        f"\n\n{build_weather_text_line(weather)}" if weather else "",
-        _format_tasks_section(today_tasks),
-        _format_lunch_section(food),
-        await _fetch_exam_countdown(session, today_date),
-    ])
     photo_url, photo_caption = await _prepare_lunch_photo(food)
 
+    # Per student: their own timetable, study windows, tasks, exams and voice.
+    texts: dict[int, str] = {}
+    voice_paths: dict[int, str] = {}
+    for uid in user_ids:
+        with acting_as(uid):
+            texts[uid], voice = await _prepare_user_summary(uid, today_date, weather, food)
+        if voice:
+            voice_paths[uid] = voice
+
     return {
-        "text": final_text,
+        "texts": texts,
         "photo_url": photo_url,
         "photo_caption": photo_caption,
         "outfits": await _prepare_outfits(bot, user_ids, weather),
-        "voice_path": await _prepare_morning_voice(today_events, today_date, today_tasks, weather, food),
+        "voice_paths": voice_paths,
     }
+
+
+async def _prepare_user_summary(uid: int, today_date, weather, food) -> tuple[str, Optional[str]]:
+    """(summary text, voice file or None) for one student, built from their
+    own session: never another student's classes, tasks or exams."""
+    # like the calendar reminders: no stored login, no timetable (a fresh
+    # session must not sign in on anyone else's behalf)
+    own = get_user_session(uid)
+    session = own if has_stored_login(own) else None
+    events, today_events = (await _fetch_today_events(session, today_date, user_id=uid)) if session else ([], [])
+    today_tasks = _load_today_tasks(today_date, user_id=uid)
+    plan = plan_study_day(events, today_date)
+    menu = await _lunch_menu_highlight(plan["lunch"], session)
+    text = _compose_morning_text(today_date, [
+        _format_schedule_section(today_events),
+        _format_study_windows_section(events, today_date, menu=menu),
+        f"\n\n{build_weather_text_line(weather)}" if weather else "",
+        _format_tasks_section(today_tasks),
+        _format_lunch_section(food),
+        await _fetch_exam_countdown(session, today_date) if session else "",
+    ])
+    voice = await _prepare_morning_voice(today_events, today_date, today_tasks, weather, food,
+                                         name=get_user_name(uid))
+    return text, voice
 
 
 async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
@@ -305,11 +343,14 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
     pinned = pin_cache.get("pinned_morning_summary", {})
     pin_cache_dirty = False
 
+    texts = prepared.get("texts") or {}
     for uid in user_ids:
+        if uid not in texts:
+            continue  # joined after the summary was prepared
         try:
             sent_msg = await bot.send_message(
                 chat_id=uid,
-                text=prepared["text"],
+                text=texts[uid],
                 parse_mode="HTML",
                 reply_markup=keyboard
             )
@@ -375,15 +416,13 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
             except Exception as e:
                 logging.warning("Outfit suggestion failed for %s: %s", uid, e)
 
-    voice_path = prepared.get("voice_path")
-    if voice_path:
+    for uid, voice_path in (prepared.get("voice_paths") or {}).items():
         try:
-            for uid in user_ids:
-                try:
-                    with open(voice_path, "rb") as f:
-                        await bot.send_voice(chat_id=uid, voice=f)
-                except Exception as e:
-                    logging.error("Morning voice: failed to send to %s: %s", uid, e)
+            if uid in user_ids:
+                with open(voice_path, "rb") as f:
+                    await bot.send_voice(chat_id=uid, voice=f)
+        except Exception as e:
+            logging.error("Morning voice: failed to send to %s: %s", uid, e)
         finally:
             try:
                 os.remove(voice_path)
@@ -722,7 +761,7 @@ async def send_weekly_plan_voice(sender, events: list, week_start, user_id=None)
     failure."""
     week_end = week_start + timedelta(days=6)
     name = (get_user_name(user_id) if user_id is not None else None) or get_primary_user_name()
-    week_tasks = _week_tasks_for_range(week_start, week_end)
+    week_tasks = _week_tasks_for_range(week_start, week_end, user_id=user_id)
     text = await build_ai_weekly_plan_narration(events, week_start, week_end, name=name, week_tasks=week_tasks) or build_weekly_plan_speech_text(events, week_start, week_end)
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
 

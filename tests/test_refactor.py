@@ -393,11 +393,13 @@ class MorningSummaryTests(unittest.TestCase):
     def test_tasks_are_sorted(self):
         tz = self.morning.TZ_BERLIN
         today = date(2026, 11, 4)
-        tasks = [{"text": "late", "due_time": datetime(2026, 11, 4, 18, tzinfo=tz).isoformat()},
-                 {"text": "early", "due_time": datetime(2026, 11, 4, 8, tzinfo=tz).isoformat()},
-                 {"text": "tomorrow", "due_time": datetime(2026, 11, 5, 8, tzinfo=tz).isoformat()}]
+        tasks = [{"user_id": 1, "text": "late", "due_time": datetime(2026, 11, 4, 18, tzinfo=tz).isoformat()},
+                 {"user_id": 1, "text": "early", "due_time": datetime(2026, 11, 4, 8, tzinfo=tz).isoformat()},
+                 {"user_id": 2, "text": "someone else's", "due_time": datetime(2026, 11, 4, 9, tzinfo=tz).isoformat()},
+                 {"user_id": 1, "text": "tomorrow", "due_time": datetime(2026, 11, 5, 8, tzinfo=tz).isoformat()}]
         with mock.patch.object(self.morning, "load_tasks", return_value=tasks):
-            loaded = self.morning._load_today_tasks(today)
+            loaded = self.morning._load_today_tasks(today, user_id=1)
+            self.assertEqual(self.morning._load_today_tasks(today), [])  # no user: nobody's tasks
         self.assertEqual([t["text"] for t in loaded], ["early", "late"])
         section = self.morning._format_tasks_section(loaded)
         self.assertLess(section.index("early"), section.index("late"))
