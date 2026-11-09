@@ -182,8 +182,8 @@ class BotModuleTests(unittest.TestCase):
 
         # Save and load encrypted credentials in SQLite
         fake_cookies = {"PHPSESSID": "secret123456", "session_user": "anna"}
-        db.save_user_credential(new_user_id, "cookies", fake_cookies)
-        loaded = db.load_user_credential(new_user_id, "cookies")
+        db.get_user_scope(new_user_id).save_credential("cookies", fake_cookies)
+        loaded = db.get_user_scope(new_user_id).credential("cookies")
         self.assertEqual(loaded, fake_cookies)
 
         # Analytics
@@ -405,9 +405,9 @@ class MultiUserSessionTests(unittest.TestCase):
         self.assertEqual(s2.user_id, 1002)
 
         # Save cookies for user 1001
-        self.db.save_user_credential(1001, "cookies", [{"key": "test_cookie", "value": "val_1001"}])
-        self.assertIsNotNone(self.db.load_user_credential(1001, "cookies"))
-        self.assertIsNone(self.db.load_user_credential(1002, "cookies"))
+        self.db.get_user_scope(1001).save_credential("cookies", [{"key": "test_cookie", "value": "val_1001"}])
+        self.assertIsNotNone(self.db.get_user_scope(1001).credential("cookies"))
+        self.assertIsNone(self.db.get_user_scope(1002).credential("cookies"))
 
     def test_oauth_per_user_isolation(self):
         tok1 = {"access_token": "acc_1", "refresh_token": "ref_1", "expires_in": 3600}
@@ -459,8 +459,8 @@ class MultiUserSessionTests(unittest.TestCase):
         get_user_session(3002)
         self.state.user_courses_map[3001] = {"c1": "Math"}
         self.state.user_courses_map[3002] = {"c2": "Physics"}
-        self.db.save_user_credential(3001, "cookies", [{"key": "c1", "value": "v1"}])
-        self.db.save_user_credential(3002, "cookies", [{"key": "c2", "value": "v2"}])
+        self.db.get_user_scope(3001).save_credential("cookies", [{"key": "c1", "value": "v1"}])
+        self.db.get_user_scope(3002).save_credential("cookies", [{"key": "c2", "value": "v2"}])
 
         # Logout user 3001
         asyncio.run(_perform_logout(user_id=3001))
@@ -468,12 +468,12 @@ class MultiUserSessionTests(unittest.TestCase):
         # User 3001 is cleaned up
         self.assertNotIn(3001, self.state.user_sessions)
         self.assertNotIn(3001, self.state.user_courses_map)
-        self.assertIsNone(self.db.load_user_credential(3001, "cookies"))
+        self.assertIsNone(self.db.get_user_scope(3001).credential("cookies"))
 
         # User 3002 is completely untouched
         self.assertIn(3002, self.state.user_sessions)
         self.assertIn(3002, self.state.user_courses_map)
-        self.assertIsNotNone(self.db.load_user_credential(3002, "cookies"))
+        self.assertIsNotNone(self.db.get_user_scope(3002).credential("cookies"))
 
     def test_list_courses_records_in_user_courses_map(self):
         from unibot.studip_api import list_courses

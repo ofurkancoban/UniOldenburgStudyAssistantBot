@@ -428,14 +428,14 @@ class StudIPSession(SsoFlowMixin):
             return
         try:
             from unibot import db
-            db.save_user_credential(self.user_id, "stums_state", self.stums.to_dict())
+            db.get_user_scope(self.user_id).save_credential("stums_state", self.stums.to_dict())
         except Exception as exc:
             self.logger.debug("StuMS state not saved for user %s: %s", self.user_id, exc)
 
     def _load_stums_state(self) -> None:
         try:
             from unibot import db
-            data = db.load_user_credential(self.user_id, "stums_state")
+            data = db.get_user_scope(self.user_id).credential("stums_state")
         except Exception as exc:
             self.logger.debug("StuMS state not loaded for user %s: %s", self.user_id, exc)
             return
@@ -472,7 +472,7 @@ class StudIPSession(SsoFlowMixin):
             # cookie file from before is removed once the database has it.
             try:
                 from unibot import db
-                db.save_user_credential(self.user_id, "cookies", entries)
+                db.get_user_scope(self.user_id).save_credential("cookies", entries)
                 self.logger.debug("Encrypted cookies saved to DB for user %s", self.user_id)
             except Exception as exc:
                 self.logger.error("Failed to save cookies to DB for user %s: %s", self.user_id, exc)
@@ -514,7 +514,7 @@ class StudIPSession(SsoFlowMixin):
         if getattr(self, "user_id", None):
             try:
                 from unibot import db
-                data = db.load_user_credential(self.user_id, "cookies")
+                data = db.get_user_scope(self.user_id).credential("cookies")
                 if data:
                     self.logger.info("Encrypted cookies loaded from DB for user %s", self.user_id)
                     self._load_stums_state()
@@ -633,7 +633,7 @@ class StudIPSession(SsoFlowMixin):
         if getattr(self, "user_id", None):
             try:
                 from unibot import db
-                has_cookies = bool(db.load_user_credential(self.user_id, "cookies"))
+                has_cookies = bool(db.get_user_scope(self.user_id).credential("cookies"))
             except Exception:
                 logging.debug("Ignored a non-critical error", exc_info=True)
         if not has_cookies and (not self.cookie_file or not os.path.exists(self.cookie_file)):
@@ -754,7 +754,7 @@ class StudIPSession(SsoFlowMixin):
         if getattr(self, "user_id", None):
             try:
                 from unibot import db
-                has_cookies = bool(db.load_user_credential(self.user_id, "cookies"))
+                has_cookies = bool(db.get_user_scope(self.user_id).credential("cookies"))
             except Exception:
                 logging.debug("Ignored a non-critical error", exc_info=True)
         has_file = bool(self.cookie_file and os.path.exists(self.cookie_file))
@@ -820,7 +820,7 @@ class StudIPSession(SsoFlowMixin):
             if getattr(self, "user_id", None):
                 try:
                     from unibot import db
-                    db.delete_user_credentials(self.user_id)
+                    db.get_user_scope(self.user_id).delete_credentials()
                 except Exception as exc:
                     self.logger.warning("Could not delete credentials for user %s: %s", self.user_id, exc)
 

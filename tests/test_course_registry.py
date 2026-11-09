@@ -33,15 +33,15 @@ class RegistryTableTests(unittest.TestCase):
         _clear_tables()
 
     def test_sync_adds_keeps_prefs_and_drops(self):
-        db.sync_user_courses(1, {"c1", "c2"}, now=100.0)
-        db.set_course_pref(1, "c1", "format", "title")
-        db.sync_user_courses(1, {"c1", "c3"}, now=200.0)
-        self.assertEqual(db.user_course_ids(1), ["c1", "c3"])
-        self.assertEqual(db.get_course_prefs(1, "c1")["format"], "title")
-        self.assertEqual(db.get_course_prefs(1, "c3"),
+        db.get_user_scope(1).sync_courses({"c1", "c2"}, now=100.0)
+        db.get_user_scope(1).set_course_pref("c1", "format", "title")
+        db.get_user_scope(1).sync_courses({"c1", "c3"}, now=200.0)
+        self.assertEqual(db.get_user_scope(1).course_ids(), ["c1", "c3"])
+        self.assertEqual(db.get_user_scope(1).course_prefs("c1")["format"], "title")
+        self.assertEqual(db.get_user_scope(1).course_prefs("c3"),
                          {"is_muted": False, "notify_files": True, "notify_announcements": True,
                           "notify_forum": True, "format": "silent"})
-        self.assertIsNone(db.get_course_prefs(1, "c2"))
+        self.assertIsNone(db.get_user_scope(1).course_prefs("c2"))
 
     def test_global_courses_hold_no_user_data(self):
         cols = [r[1] for r in db._connection().execute("PRAGMA table_info(global_courses)")]
@@ -55,18 +55,18 @@ class RegistryTableTests(unittest.TestCase):
                           row["last_scanned_at"]), ("Math I", "WiSe 26/27", 8, "abc", "def", 60.0))
 
     def test_bad_pref_values_are_rejected(self):
-        db.sync_user_courses(1, {"c1"})
+        db.get_user_scope(1).sync_courses({"c1"})
         with self.assertRaises(ValueError):
-            db.set_course_pref(1, "c1", "format", "loud")
+            db.get_user_scope(1).set_course_pref("c1", "format", "loud")
         with self.assertRaises(ValueError):
-            db.set_course_pref(1, "c1", "user_id; DROP TABLE users", 1)
-        self.assertFalse(db.set_course_pref(1, "nope", "is_muted", True))
+            db.get_user_scope(1).set_course_pref("c1", "user_id; DROP TABLE users", 1)
+        self.assertFalse(db.get_user_scope(1).set_course_pref("nope", "is_muted", True))
 
     def test_registry_sync_only_touches_known_users(self):
-        db.sync_user_courses(2, {"old"})
+        db.get_user_scope(2).sync_courses({"old"})
         stats = cr.sync_registry({"c1": "Math", "c2": "AI"}, {"c1": {1, 2}, "c2": {1}}, known_uids={1})
-        self.assertEqual(db.user_course_ids(1), ["c1", "c2"])
-        self.assertEqual(db.user_course_ids(2), ["old"])  # user 2's list was not fetched this cycle
+        self.assertEqual(db.get_user_scope(1).course_ids(), ["c1", "c2"])
+        self.assertEqual(db.get_user_scope(2).course_ids(), ["old"])  # user 2's list was not fetched this cycle
         self.assertEqual((stats["courses"], stats["pairs"]), (2, 3))
         self.assertEqual(db.get_global_course("c2")["title"], "AI")
 
@@ -137,11 +137,11 @@ class FanOutTests(unittest.TestCase):
     def setUp(self):
         _clear_tables()
         for uid in (1, 2, 3, 4, 5):
-            db.sync_user_courses(uid, {"c1"})
-        db.set_course_pref(1, "c1", "format", "full")
-        db.set_course_pref(2, "c1", "format", "title")
-        db.set_course_pref(4, "c1", "is_muted", True)
-        db.set_course_pref(5, "c1", "notify_files", False)
+            db.get_user_scope(uid).sync_courses({"c1"})
+        db.get_user_scope(1).set_course_pref("c1", "format", "full")
+        db.get_user_scope(2).set_course_pref("c1", "format", "title")
+        db.get_user_scope(4).set_course_pref("c1", "is_muted", True)
+        db.get_user_scope(5).set_course_pref("c1", "notify_files", False)
         self.sent = []
         self.docs = []
         outer = self
@@ -192,7 +192,7 @@ class CourseAlertsUiTests(unittest.TestCase):
     def setUp(self):
         _clear_tables()
         db.upsert_global_course("c1", "Statistics")
-        db.sync_user_courses(1, {"c1"})
+        db.get_user_scope(1).sync_courses({"c1"})
 
     def _tap(self, data):
         query = mock.MagicMock()
@@ -212,15 +212,15 @@ class CourseAlertsUiTests(unittest.TestCase):
         self._tap("calert|t|m|c1")
         self._tap("calert|t|p|c1")
         q = self._tap("calert|fmt|c1")
-        prefs = db.get_course_prefs(1, "c1")
+        prefs = db.get_user_scope(1).course_prefs("c1")
         self.assertEqual((prefs["is_muted"], prefs["notify_forum"], prefs["format"]), (True, False, "full"))
         self.assertIn("Statistics", q.edit_message_text.call_args.args[0])
         self._tap("calert|fmt|c1")
-        self.assertEqual(db.get_course_prefs(1, "c1")["format"], "title")
+        self.assertEqual(db.get_user_scope(1).course_prefs("c1")["format"], "title")
 
     def test_unknown_course_shows_the_list(self):
         q = self._tap("calert|t|m|other")
-        self.assertIsNone(db.get_course_prefs(1, "other"))
+        self.assertIsNone(db.get_user_scope(1).course_prefs("other"))
         self.assertIn("Course alerts", q.edit_message_text.call_args.args[0])
 
 

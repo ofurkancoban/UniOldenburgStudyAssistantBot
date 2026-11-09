@@ -540,7 +540,7 @@ class LoginServer:
                 if getattr(studip_sess, "user_id", None):
                     try:
                         from unibot import db
-                        has_cookies = bool(db.load_user_credential(studip_sess.user_id, "cookies"))
+                        has_cookies = bool(db.get_user_scope(studip_sess.user_id).credential("cookies"))
                     except Exception:
                         logging.debug("Ignored a non-critical error", exc_info=True)
                 has_file = bool(studip_sess.cookie_file and os.path.exists(studip_sess.cookie_file))

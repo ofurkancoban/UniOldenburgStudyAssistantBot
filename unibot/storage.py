@@ -247,20 +247,32 @@ def save_general_cache(data):
 TASKS_CACHE_PATH = "tasks_cache.json"
 
 
-def load_tasks() -> list:
-    if db.exists(TASKS_CACHE_PATH):
-        try:
-            return db.load(TASKS_CACHE_PATH)
-        except Exception as e:
-            logging.warning("Could not load tasks cache: %s", e)
-    return []
+# Tasks are personal: each student's list is a private record reached only
+# through their own db.UserScope; there is no "all tasks" list any more.
+
+def user_tasks(user_id) -> list:
+    """The student's own tasks ([] without a student)."""
+    if user_id is None:
+        return []
+    return db.get_user_scope(user_id).tasks()
 
 
-def save_tasks(tasks: list) -> None:
-    try:
-        db.save(TASKS_CACHE_PATH, tasks)
-    except Exception as e:
-        logging.error("Could not save tasks cache: %s", e)
+def save_user_tasks(user_id, tasks: list) -> None:
+    db.get_user_scope(user_id).save_tasks(tasks)
+
+
+def add_user_task(user_id, task: dict) -> None:
+    db.get_user_scope(user_id).add_task(task)
+
+
+def remove_user_tasks(user_id, ids) -> list:
+    """Drop the student's tasks with these ids; returns the removed ones."""
+    return db.get_user_scope(user_id).remove_tasks(ids)
+
+
+def students_with_tasks() -> list[int]:
+    """Ids of the students with tasks, for the reminder job (ids only)."""
+    return db.task_owner_ids()
 
 
 DEFAULT_SEMESTER_CACHE_PATH = "default_semester.json"

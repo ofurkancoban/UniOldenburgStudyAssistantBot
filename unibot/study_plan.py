@@ -36,7 +36,7 @@ from unibot.study_day import plan_day
 from unibot.storage import (
     get_scan_previous_semester_enabled,
     link_cache,
-    load_tasks,
+    user_tasks,
     record_study_block,
     study_block_log,
     get_weekly_study_plan_enabled,
@@ -1790,8 +1790,8 @@ def _due_tasks(user_id: int, now: datetime, course: Optional[str] = None) -> lis
     soonest first (only that course's when `course` is given)."""
     horizon = now + timedelta(days=STUDY_PACK_DUE_DAYS)
     due = []
-    for t in load_tasks():
-        if t.get("user_id") != user_id or not t.get("due_time"):  # a done task is deleted
+    for t in user_tasks(user_id):
+        if not t.get("due_time"):  # a done task is deleted
             continue
         try:
             when = datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN)

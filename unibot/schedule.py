@@ -26,7 +26,7 @@ from unibot.storage import (
     record_study_block,
     load_general_cache,
     load_reminders_cache,
-    load_tasks,
+    user_tasks,
     save_reminders_cache,
     single_flight,
     update_general_cache,
@@ -821,8 +821,8 @@ def _week_tasks_for_range(week_start, week_end, user_id: Optional[int] = None) -
     user_id = user_id if user_id is not None else current_user_id()
     try:
         tasks = [
-            t for t in load_tasks()
-            if t.get("user_id") == user_id and t.get("due_time")
+            t for t in user_tasks(user_id)
+            if t.get("due_time")
             and week_start <= datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() <= week_end
         ]
     except Exception as e:
@@ -1768,9 +1768,7 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
         logging.warning("Upcoming dashboard: exam date fetch failed: %s", e)
 
     todos = []
-    for t in load_tasks():
-        if t["user_id"] != user_id:
-            continue
+    for t in user_tasks(user_id):
         course_suffix = f" [{t['course']}]" if t.get("course") else ""
         if t.get("due_time"):
             dt = datetime.fromisoformat(t["due_time"])

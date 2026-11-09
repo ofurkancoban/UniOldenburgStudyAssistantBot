@@ -198,8 +198,9 @@ async def handle_calendar_sync(update: Update, context: ContextTypes.DEFAULT_TYP
     if action == "file":
         await query.answer("Preparing your calendar...")
         body = await calendar_for(user_id)
-        await query.message.reply_document(document=io.BytesIO(body.encode("utf-8")), filename="study-blocks.ics",
-                                           caption="📅 Open this file to add your study blocks to your calendar.")
+        with io.BytesIO(body.encode("utf-8")) as buffer:
+            await query.message.reply_document(document=buffer, filename="study-blocks.ics",
+                                               caption="📅 Open this file to add your study blocks to your calendar.")
         return
     if action == "reset":
         reset_calendar_token(user_id)

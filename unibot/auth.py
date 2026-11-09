@@ -75,7 +75,7 @@ def has_stored_login(sess) -> bool:
         return False
     if getattr(sess, "user_id", None):
         try:
-            if db.load_user_credential(sess.user_id, "cookies"):
+            if db.get_user_scope(sess.user_id).credential("cookies"):
                 return True
         except Exception:
             logging.debug("Ignored a non-critical error", exc_info=True)
@@ -283,7 +283,7 @@ def pick_watcher_session(exclude: Optional[int] = None) -> StudIPSession:
             return sess
     for uid in candidates:
         try:
-            has_login = bool(db.load_user_credential(uid, "cookies"))
+            has_login = bool(db.get_user_scope(uid).credential("cookies"))
         except Exception:
             has_login = False
         if has_login or os.path.exists(f"studip_cookies_{uid}.json"):
@@ -738,7 +738,7 @@ async def _perform_logout(user_id: Optional[int] = None) -> None:
         sess = state.user_sessions.pop(user_id, None)
         if sess is not None:
             await sess.logout()
-        db.delete_user_credentials(user_id)
+        db.get_user_scope(user_id).delete_credentials()
         if studip_oauth.oauth_enabled():
             studip_oauth.clear_tokens(user_id=user_id)
         db.update_user_studip(user_id, "")

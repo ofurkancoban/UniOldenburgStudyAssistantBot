@@ -35,7 +35,7 @@ from unibot.storage import (
     get_weekly_study_plan_enabled,
     link_cache,
     load_default_semester,
-    load_tasks,
+    user_tasks,
     save_user_name,
     set_watch_previous_semester_enabled,
     set_weekly_study_plan_enabled,
@@ -1420,7 +1420,7 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     lines = [f"📘 <b>{course_name}</b>", "━━━━━━━━━━━━━━━━━"]
 
-    course_tasks = [t for t in load_tasks() if t["user_id"] == user_id and t.get("course") == course_name]
+    course_tasks = [t for t in user_tasks(user_id) if t.get("course") == course_name]
     if course_tasks:
         lines.append("📝 <b>Tasks</b>")
         for t in sorted(course_tasks, key=lambda t: t.get("due_time") or ""):

@@ -57,12 +57,13 @@ async def _send_file_bytes(message, content: bytes, fname: str, sid: str, captio
     doc_markup = None
     if os.path.splitext(safe_name)[1].lower() in (".pdf", ".pptx", ".html"):
         doc_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎧 1-Min Audio Summary", callback_data=f"file_audio_sum|{sid}")]])
-    await message.reply_document(
-        document=io.BytesIO(content),
-        filename=safe_name,
-        caption=caption,
-        reply_markup=doc_markup,
-    )
+    with io.BytesIO(content) as buffer:  # closed as soon as the upload is done
+        await message.reply_document(
+            document=buffer,
+            filename=safe_name,
+            caption=caption,
+            reply_markup=doc_markup,
+        )
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────

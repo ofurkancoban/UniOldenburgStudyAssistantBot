@@ -483,7 +483,7 @@ def _require_uid(user_id) -> int:
     return user_id
 
 
-def save_user_credential(user_id: int, credential_type: str, data: Any) -> None:
+def _save_user_credential(user_id: int, credential_type: str, data: Any) -> None:
     from studip_vault import encrypt_user_payload
     uid = _require_uid(user_id)
     encrypted_blob = encrypt_user_payload(uid, data)
@@ -498,7 +498,7 @@ def save_user_credential(user_id: int, credential_type: str, data: Any) -> None:
         )
 
 
-def load_user_credential(user_id: int, credential_type: str) -> Optional[Any]:
+def _load_user_credential(user_id: int, credential_type: str) -> Optional[Any]:
     """The student's decrypted credential; a record still under the old shared
     key is re-encrypted with the student's own key on this read."""
     from studip_vault import decrypt_user_payload
@@ -513,7 +513,7 @@ def load_user_credential(user_id: int, credential_type: str) -> Optional[Any]:
         legacy: list = []
         data = decrypt_user_payload(uid, row[0], legacy)
         if legacy and data is not None:
-            save_user_credential(uid, credential_type, data)
+            _save_user_credential(uid, credential_type, data)
         return data
 
 
@@ -521,7 +521,7 @@ def load_user_credential(user_id: int, credential_type: str) -> Optional[Any]:
 # Kept apart from the shared document store: one row per student and kind,
 # encrypted with that student's own key, and only reachable with their id.
 
-def save_private(user_id: int, kind: str, data: Any) -> None:
+def _save_private(user_id: int, kind: str, data: Any) -> None:
     from studip_vault import encrypt_user_payload
     uid = _require_uid(user_id)
     with _lock:
@@ -533,7 +533,7 @@ def save_private(user_id: int, kind: str, data: Any) -> None:
         )
 
 
-def load_private(user_id: int, kind: str) -> Optional[Any]:
+def _load_private(user_id: int, kind: str) -> Optional[Any]:
     from studip_vault import decrypt_user_payload
     uid = _require_uid(user_id)
     with _lock:
@@ -543,7 +543,7 @@ def load_private(user_id: int, kind: str) -> Optional[Any]:
     return decrypt_user_payload(uid, row[0]) if row else None
 
 
-def has_private(user_id: int, kind: str) -> bool:
+def _has_private(user_id: int, kind: str) -> bool:
     uid = _require_uid(user_id)
     with _lock:
         return _connection().execute(
@@ -551,7 +551,7 @@ def has_private(user_id: int, kind: str) -> bool:
         ).fetchone() is not None
 
 
-def delete_private(user_id: int, kind: Optional[str] = None) -> None:
+def _delete_private(user_id: int, kind: Optional[str] = None) -> None:
     uid = _require_uid(user_id)
     with _lock:
         if kind is None:
@@ -560,7 +560,14 @@ def delete_private(user_id: int, kind: Optional[str] = None) -> None:
             _connection().execute("DELETE FROM user_private_data WHERE user_id = ? AND kind = ?", (uid, kind))
 
 
-def delete_user_credentials(user_id: int) -> None:
+def _delete_user_credential(user_id: int, credential_type: str) -> None:
+    uid = _require_uid(user_id)
+    with _lock:
+        _connection().execute("DELETE FROM user_credentials WHERE user_id = ? AND credential_type = ?",
+                              (uid, credential_type))
+
+
+def _delete_user_credentials(user_id: int) -> None:
     with _lock:
         _connection().execute("DELETE FROM user_credentials WHERE user_id = ?", (user_id,))
 
@@ -670,7 +677,7 @@ def mark_course_scanned(course_id: str, scanner_uid: Optional[int], *, file_hash
         )
 
 
-def sync_user_courses(user_id: int, course_ids, now: Optional[float] = None) -> None:
+def _sync_user_courses(user_id: int, course_ids, now: Optional[float] = None) -> None:
     """Make the user's followed courses exactly `course_ids`: new ones get the
     default preferences, existing ones keep theirs, dropped ones go."""
     wanted = set(course_ids)
@@ -691,13 +698,13 @@ def course_followers(course_id: str) -> list[int]:
             "SELECT user_id FROM user_courses WHERE course_id = ? ORDER BY enrolled_at, user_id", (course_id,))]
 
 
-def user_course_ids(user_id: int) -> list[str]:
+def _user_course_ids(user_id: int) -> list[str]:
     with _lock:
         return [r[0] for r in _connection().execute(
             "SELECT course_id FROM user_courses WHERE user_id = ? ORDER BY course_id", (user_id,))]
 
 
-def get_course_prefs(user_id: int, course_id: str) -> Optional[dict]:
+def _get_course_prefs(user_id: int, course_id: str) -> Optional[dict]:
     """The user's preferences for a followed course, or None when not followed."""
     with _lock:
         row = _connection().execute(
@@ -712,7 +719,7 @@ def get_course_prefs(user_id: int, course_id: str) -> Optional[dict]:
     return prefs
 
 
-def set_course_pref(user_id: int, course_id: str, column: str, value) -> bool:
+def _set_course_pref(user_id: int, course_id: str, column: str, value) -> bool:
     """Change one preference of a followed course; False when not followed."""
     if column not in COURSE_PREF_COLUMNS:
         raise ValueError(f"unknown course preference {column!r}")
@@ -750,3 +757,141 @@ def privacy_counts() -> dict:
             "SELECT COUNT(*), COUNT(DISTINCT user_id) FROM user_private_data").fetchone()
     return {"credentials_own_key": own, "credentials_shared_key": legacy,
             "private_rows": private, "private_students": students}
+
+
+# ── UserScope: the only way to a student's own records ───────────────────────
+# Every per-student read and write goes through a scope opened for one
+# student id. The scope adds the user_id filter and the student's key to each
+# query itself, so a caller cannot forget either, and nothing outside this
+# module reads the per-student tables directly (tests/test_data_boundary.py
+# enforces that).
+
+LEGACY_TASKS_DOC = "tasks_cache.json"
+TASKS_KIND = "tasks"
+
+
+class UserScope:
+    """One student's isolated view of the database."""
+
+    __slots__ = ("user_id",)
+
+    def __init__(self, user_id: int):
+        self.user_id = _require_uid(user_id)
+
+    def __repr__(self) -> str:
+        return f"UserScope({self.user_id})"
+
+    # credentials: cookies, OAuth tokens, StuMS state
+    def credential(self, kind: str) -> Optional[Any]:
+        return _load_user_credential(self.user_id, kind)
+
+    def save_credential(self, kind: str, data: Any) -> None:
+        _save_user_credential(self.user_id, kind, data)
+
+    def delete_credential(self, kind: str) -> None:
+        _delete_user_credential(self.user_id, kind)
+
+    def delete_credentials(self) -> None:
+        _delete_user_credentials(self.user_id)
+
+    # private records: exam cache (grades, registrations, fees), tasks, ...
+    def private(self, kind: str) -> Optional[Any]:
+        return _load_private(self.user_id, kind)
+
+    def save_private(self, kind: str, data: Any) -> None:
+        _save_private(self.user_id, kind, data)
+
+    def has_private(self, kind: str) -> bool:
+        return _has_private(self.user_id, kind)
+
+    def delete_private(self, kind: Optional[str] = None) -> None:
+        _delete_private(self.user_id, kind)
+
+    def grades(self) -> dict:
+        """The grades seen so far, {exam number: fingerprint}."""
+        cache = self.private("exam_cache") or {}
+        return dict(cache.get("known_grades") or {})
+
+    # tasks
+    def tasks(self) -> list:
+        _migrate_shared_tasks()
+        return list(self.private(TASKS_KIND) or [])
+
+    def save_tasks(self, tasks: list) -> None:
+        for task in tasks:
+            owner = task.get("user_id")
+            if owner is not None and owner != self.user_id:
+                raise ValueError("a task of another student cannot be saved in this scope")
+        self.save_private(TASKS_KIND, [{**t, "user_id": self.user_id} for t in tasks])
+
+    def add_task(self, task: dict) -> None:
+        self.save_tasks(self.tasks() + [task])
+
+    def remove_tasks(self, ids) -> list:
+        """Drop the student's tasks with these ids; returns the removed ones."""
+        ids = set(ids)
+        tasks = self.tasks()
+        removed = [t for t in tasks if t.get("id") in ids]
+        if removed:
+            self.save_tasks([t for t in tasks if t.get("id") not in ids])
+        return removed
+
+    # course registry rows of this student
+    def course_ids(self) -> list[str]:
+        return _user_course_ids(self.user_id)
+
+    def course_prefs(self, course_id: str) -> Optional[dict]:
+        return _get_course_prefs(self.user_id, course_id)
+
+    def set_course_pref(self, course_id: str, column: str, value) -> bool:
+        return _set_course_pref(self.user_id, course_id, column, value)
+
+    def sync_courses(self, course_ids, now: Optional[float] = None) -> None:
+        _sync_user_courses(self.user_id, course_ids, now)
+
+
+def get_user_scope(user_id: int) -> UserScope:
+    """Open one student's scope; raises ValueError without a valid user id."""
+    return UserScope(user_id)
+
+
+def private_owner_ids(kind: str) -> list[int]:
+    """Ids of the students that have a private record of `kind`: ids only,
+    for jobs that then open each student's own scope."""
+    with _lock:
+        return [r[0] for r in _connection().execute(
+            "SELECT user_id FROM user_private_data WHERE kind = ? ORDER BY user_id", (kind,))]
+
+
+def task_owner_ids() -> list[int]:
+    """Ids of the students that have tasks (ids only, no task content)."""
+    _migrate_shared_tasks()
+    return private_owner_ids(TASKS_KIND)
+
+
+def _migrate_shared_tasks() -> None:
+    """Move the old shared task list into each owner's private record once
+    (tasks without an owner belong to the primary admin, as before)."""
+    with _lock:
+        # the database row only: task files from the JSON era were imported long ago
+        row = _row(_key(LEGACY_TASKS_DOC))
+        if row is None:
+            return
+        try:
+            shared = json.loads(row[0]) or []
+        except Exception:
+            logging.warning("The shared task list could not be read; left in place")
+            return
+        from unibot.config import ALLOWED_USER_IDS
+        fallback = next(iter(ALLOWED_USER_IDS), None)
+        by_owner: dict[int, list] = {}
+        for task in shared if isinstance(shared, list) else []:
+            owner = task.get("user_id") if isinstance(task.get("user_id"), int) else fallback
+            if owner is not None:
+                by_owner.setdefault(owner, []).append({**task, "user_id": owner})
+        for owner, tasks in by_owner.items():
+            have = list(_load_private(owner, TASKS_KIND) or [])
+            known = {t.get("id") for t in have}
+            _save_private(owner, TASKS_KIND, have + [t for t in tasks if t.get("id") not in known])
+        _connection().execute("DELETE FROM documents WHERE key = ?", (_key(LEGACY_TASKS_DOC),))
+        logging.info("Moved the shared task list into %s private task records", len(by_owner))

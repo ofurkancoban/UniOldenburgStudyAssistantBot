@@ -19,7 +19,14 @@ from telegram.error import TelegramError
 from fast_enroll import clear_pending_job, run_fast_enroll
 from studip_utils import TZ_BERLIN
 
-from unibot.storage import load_tasks, record_task_outcome, save_tasks
+from unibot.storage import (
+    add_user_task,
+    record_task_outcome,
+    remove_user_tasks,
+    save_user_tasks,
+    students_with_tasks,
+    user_tasks,
+)
 from unibot.telegram_ui import user_data, get_main_keyboard
 from unibot.auth import get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import list_courses
@@ -114,7 +121,7 @@ async def send_tasks_menu(sender):
 
 
 async def send_task_list(message, user_id: int):
-    tasks = [t for t in load_tasks() if t["user_id"] == user_id]
+    tasks = user_tasks(user_id)
     if not tasks:
         await message.reply_text("ℹ️ No tasks yet. Use ➕ Add Task to create one.")
         return
@@ -161,20 +168,18 @@ async def handle_task_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     action, task_id = query.data.split("|", 1)
-    tasks = load_tasks()
-    # a button only ever acts on the student's own task
-    own = next((t for t in tasks if t["id"] == task_id and t.get("user_id") == user_id), None)
+    # the scope holds only the student's own tasks, so a button can never act on another's
+    tasks = user_tasks(user_id)
+    own = next((t for t in tasks if t["id"] == task_id), None)
     if own is None and action in ("task_done", "task_delete"):
         await query.edit_message_text("⚠️ This task no longer exists.")
         return
     if action == "task_done" and own is not None:
         record_task_outcome(user_id, own, time.time())
-        tasks = [t for t in tasks if t is not own]
-        save_tasks(tasks)
+        save_user_tasks(user_id, [t for t in tasks if t is not own])
         await query.edit_message_text("✔️ Done!")
     elif action == "task_delete" and own is not None:
-        tasks = [t for t in tasks if t is not own]
-        save_tasks(tasks)
+        save_user_tasks(user_id, [t for t in tasks if t is not own])
         await query.edit_message_text("🗑️ Deleted.")
 
 
@@ -282,9 +287,7 @@ async def handle_task_course_pick(update: Update, context: ContextTypes.DEFAULT_
         "created_at": datetime.now(TZ_BERLIN).isoformat(),
         "notified": False,
     }
-    tasks = load_tasks()
-    tasks.append(task)
-    save_tasks(tasks)
+    add_user_task(user_id, task)
     context.user_data.pop("task_wizard", None)
 
     course_line = f" [{course_name}]" if course_name else ""
@@ -308,9 +311,7 @@ def _save_task_and_confirmation_text(user_id: int, text: str, due_time: Optional
         "created_at": datetime.now(TZ_BERLIN).isoformat(),
         "notified": False,
     }
-    tasks = load_tasks()
-    tasks.append(task)
-    save_tasks(tasks)
+    add_user_task(user_id, task)
 
     course_line = f" [{course}]" if course else ""
     if due_time:
@@ -392,35 +393,31 @@ TASK_SNOOZE_OPTIONS = [("15m", "⏰ +15 min"), ("1h", "⏰ +1 hour"), ("1d", "�
 async def check_task_reminders(bot):
     """Send any reminder-tasks whose due time has passed, then drop them (one-shot).
     Plain to-dos (no due_time) are left untouched until the user marks them done.
-    The fired task is kept in task_reminder_cache (keyed by its own id, which
-    is unique) so the reminder message's "✔️ Done" / snooze buttons can still
-    act on it after it's already been removed from tasks_cache.json."""
-    tasks = load_tasks()
+    Each student's tasks are read and changed in their own scope. The fired
+    task is kept in task_reminder_cache (keyed by its own id, which is unique)
+    so the reminder message's "✔️ Done" / snooze buttons can still act on it
+    after it's already been removed from the student's list."""
     now = datetime.now(TZ_BERLIN)
-    fired_ids: set = set()
-
-    for task in tasks:
-        due = task.get("due_time")
-        if due:
-            due_dt = datetime.fromisoformat(due)
-            if due_dt <= now:
-                task_reminder_cache[task["id"]] = task
-                record_task_outcome(task.get("user_id"), task)  # due now; done or not comes later
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✔️ Done", callback_data=f"task_reminder_done|{task['id']}")],
-                    [InlineKeyboardButton(label, callback_data=f"task_reminder_snooze|{task['id']}|{code}") for code, label in TASK_SNOOZE_OPTIONS],
-                ])
-                try:
-                    await bot.send_message(chat_id=task["user_id"], text=f"⏰ <b>Reminder:</b> {html.escape(str(task['text']))}", parse_mode="HTML", reply_markup=keyboard)
-                except Exception as e:
-                    logging.error("Failed to send task reminder %s: %s", task['id'], e)
-                fired_ids.add(task["id"])
+    for uid in students_with_tasks():
+        fired_ids: set = set()
+        for task in user_tasks(uid):
+            due = task.get("due_time")
+            if not due or datetime.fromisoformat(due) > now:
                 continue
-
-    if fired_ids:
-        # Re-read: tasks added or edited while the reminders were being sent
-        # must survive; only the fired one-shot reminders are removed.
-        save_tasks([t for t in load_tasks() if t.get("id") not in fired_ids])
+            task_reminder_cache[task["id"]] = task
+            record_task_outcome(uid, task)  # due now; done or not comes later
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✔️ Done", callback_data=f"task_reminder_done|{task['id']}")],
+                [InlineKeyboardButton(label, callback_data=f"task_reminder_snooze|{task['id']}|{code}") for code, label in TASK_SNOOZE_OPTIONS],
+            ])
+            try:
+                await bot.send_message(chat_id=uid, text=f"⏰ <b>Reminder:</b> {html.escape(str(task['text']))}", parse_mode="HTML", reply_markup=keyboard)
+            except Exception as e:
+                logging.error("Failed to send task reminder %s: %s", task['id'], e)
+            fired_ids.add(task["id"])
+        if fired_ids:
+            # removed by id on a fresh read: tasks added while sending survive
+            remove_user_tasks(uid, fired_ids)
 
 
 def _snooze_offset(code: str) -> timedelta:
@@ -441,7 +438,12 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
 
     parts = query.data.split("|")
     action, task_id = parts[0], parts[1]
-    task = task_reminder_cache.pop(task_id, None)
+    task = task_reminder_cache.get(task_id)
+    if task and task.get("user_id") != user_id:
+        logging.warning("Task reminder of user %s tapped by user %s; ignored", task.get("user_id"), user_id)
+        task = None
+    else:
+        task_reminder_cache.pop(task_id, None)
     if not task:
         await query.answer("This reminder has expired.", show_alert=True)
         return
@@ -452,16 +454,14 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
         pass
 
     if action == "task_reminder_done":
-        record_task_outcome(task.get("user_id"), task, time.time())
+        record_task_outcome(user_id, task, time.time())
         await query.message.reply_text(f"✔️ Done: {task['text']}")
         return
 
     code = parts[2]
     new_due = datetime.now(TZ_BERLIN) + _snooze_offset(code)
     task["due_time"] = new_due.isoformat()
-    tasks = load_tasks()
-    tasks.append(task)
-    save_tasks(tasks)
+    add_user_task(user_id, task)
     await query.message.reply_text(f"⏰ Snoozed - reminding you again at {new_due.strftime('%d.%m.%Y %H:%M')}: {task['text']}")
 
 

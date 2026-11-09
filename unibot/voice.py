@@ -35,8 +35,8 @@ from unibot.storage import (
     get_user_name,
     link_cache,
     load_default_semester,
-    load_tasks,
-    save_tasks,
+    add_user_task,
+    user_tasks,
     set_wardrobe_reference_photo,
 )
 from unibot.formatting import _short_id, clean_course_title
@@ -219,9 +219,7 @@ async def build_qa_context(user_id=None) -> str:
                 logging.warning("build_qa_context: transcript failed: %s", e)
 
     try:
-        tasks = load_tasks()
-        if user_id is not None:
-            tasks = [t for t in tasks if t.get("user_id") == user_id]
+        tasks = user_tasks(user_id)  # [] without a student: never someone else's
         if tasks:
             lines = [f"- {t['text']}" + (f" (due {t['due_time']})" if t.get("due_time") else "") for t in tasks]
             parts.append("Personal tasks:\n" + "\n".join(lines))
@@ -622,9 +620,7 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
         "created_at": datetime.now(TZ_BERLIN).isoformat(),
         "notified": False,
     }
-    tasks = load_tasks()
-    tasks.append(task)
-    save_tasks(tasks)
+    add_user_task(update.effective_user.id, task)
 
     exam_when = exam_dt.strftime("%d.%m.%Y %H:%M") if has_time else exam_dt.strftime("%d.%m.%Y (time unknown)")
     past_warning = "\n⚠️ That exam date has already passed — double-check this is the sitting you meant." if exam_dt.date() < berlin_now().date() else ""

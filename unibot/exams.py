@@ -394,12 +394,16 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
     except TelegramError:
         pass
 
-    await query.message.reply_document(
-        document=io.BytesIO(pdf_bytes),
-        filename=filename,
-        caption=f"✅ <b>{html.escape(spec['label'])}</b>",
-        parse_mode="HTML",
-    )
+    # Zero-disk: the official PDF goes from StuMS to Telegram through a
+    # memory buffer only, which is closed (and the bytes dropped) once sent.
+    with io.BytesIO(pdf_bytes) as buffer:
+        del pdf_bytes
+        await query.message.reply_document(
+            document=buffer,
+            filename=filename,
+            caption=f"✅ <b>{html.escape(spec['label'])}</b>",
+            parse_mode="HTML",
+        )
 
 
 async def build_tuition_status_text(session=None, user_id=None) -> tuple[str, InlineKeyboardMarkup]:

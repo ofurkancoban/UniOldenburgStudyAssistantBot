@@ -122,7 +122,7 @@ def load_tokens(user_id: Optional[int] = None) -> Optional[dict]:
     if user_id is not None:
         try:
             from unibot import db
-            tokens = db.load_user_credential(user_id, "oauth_tokens")
+            tokens = db.get_user_scope(user_id).credential("oauth_tokens")
             if tokens and isinstance(tokens, dict) and tokens.get("access_token"):
                 return tokens
         except Exception as exc:
@@ -170,23 +170,15 @@ def save_tokens(tokens: dict, fresh: bool = True, user_id: Optional[int] = None)
     if user_id is not None:
         try:
             from unibot import db
-            db.save_user_credential(user_id, "oauth_tokens", tokens)
+            db.get_user_scope(user_id).save_credential("oauth_tokens", tokens)
             logger.info("Tokens encrypted and saved to DB for user %s (expires in %ss)", user_id, tokens.get("expires_in", 3600))
         except Exception as exc:
             logger.warning("Could not save tokens to DB for user %s: %s", user_id, exc)
 
-    save_file = False
+    # A named student's tokens live only in their encrypted credential row
+    # (their own key); the shared-key token file is for the account-less
+    # single-user setup alone.
     if user_id is None:
-        save_file = True
-    else:
-        try:
-            from unibot.config import ADMIN_USER_IDS
-            if user_id in ADMIN_USER_IDS:
-                save_file = True
-        except Exception:
-            logging.debug("Ignored a non-critical error", exc_info=True)
-
-    if save_file:
         from studip_vault import write_vault_file
         for target in (TOKEN_FILE, f"{TOKEN_FILE}.bak"):
             write_vault_file(target, tokens, mode=0o600)
@@ -197,9 +189,8 @@ def clear_tokens(user_id: Optional[int] = None) -> None:
     """Remove stored OAuth2 token files from disk or DB."""
     if user_id is not None:
         try:
-            from unibot.db import _connection, _lock
-            with _lock:
-                _connection().execute("DELETE FROM user_credentials WHERE user_id = ? AND credential_type = 'oauth_tokens'", (user_id,))
+            from unibot import db
+            db.get_user_scope(user_id).delete_credential("oauth_tokens")
         except Exception as exc:
             logger.warning("Could not clear tokens from DB for user %s: %s", user_id, exc)
 

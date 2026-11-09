@@ -145,12 +145,14 @@ class CalendarFeedTests(unittest.TestCase):
 
     def test_file_button_sends_the_ics(self):
         query = _query("cal_sync|file", self.UID)
+        seen = []
+        query.message.reply_document = mock.AsyncMock(side_effect=lambda **kw: seen.append(kw["document"].getvalue()))
         with mock.patch.object(study_week, "is_user_allowed", lambda uid: True), \
                 mock.patch.object(study_week, "calendar_for", mock.AsyncMock(return_value="BEGIN:VCALENDAR\r\n")):
             asyncio.run(study_week.handle_calendar_sync(mock.MagicMock(callback_query=query), None))
         kwargs = query.message.reply_document.await_args.kwargs
         self.assertEqual(kwargs["filename"], "study-blocks.ics")
-        self.assertEqual(kwargs["document"].getvalue(), b"BEGIN:VCALENDAR\r\n")
+        self.assertEqual(seen, [b"BEGIN:VCALENDAR\r\n"])
 
 
 def _window(day, start, end, campus="haarentor", spot="BIS library, 2nd floor quiet room"):
@@ -248,7 +250,8 @@ class StreakTests(unittest.TestCase):
         task = {"id": "t-1", "user_id": uid, "text": "Problem Set 3", "due_time": _at(WED, "23:59").isoformat()}
         query = _query("task_done|t-1", uid)
         saved = []
-        with mock.patch.object(tasks, "load_tasks", lambda: [task]), mock.patch.object(tasks, "save_tasks", saved.append), \
+        with mock.patch.object(tasks, "user_tasks", lambda u: [task] if u == uid else []), \
+                mock.patch.object(tasks, "save_user_tasks", lambda u, t: saved.append(t)), \
                 mock.patch.object(tasks, "is_user_allowed", lambda uid: True):
             stranger = _query("task_done|t-1", 9999)
             asyncio.run(tasks.handle_task_buttons(mock.MagicMock(callback_query=stranger), None))

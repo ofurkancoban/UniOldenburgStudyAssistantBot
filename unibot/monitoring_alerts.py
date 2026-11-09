@@ -103,10 +103,14 @@ def _full_file_sender(it: dict, text: str, keyboard, downloader_uid: Optional[in
                 shared["failed"] = True
                 return False
             document = io.BytesIO(content)
-        msg = await bot.send_document(
-            chat_id=uid, document=document, filename=safe_filename(str(it.get("name") or "file")),
-            caption=text[:1024], parse_mode="HTML", reply_markup=keyboard,
-        )
+        try:
+            msg = await bot.send_document(
+                chat_id=uid, document=document, filename=safe_filename(str(it.get("name") or "file")),
+                caption=text[:1024], parse_mode="HTML", reply_markup=keyboard,
+            )
+        finally:
+            if isinstance(document, io.BytesIO):
+                document.close()  # later followers get the file_id, not the bytes
         file_id = getattr(getattr(msg, "document", None), "file_id", None)
         if file_id:
             shared["file_id"] = file_id

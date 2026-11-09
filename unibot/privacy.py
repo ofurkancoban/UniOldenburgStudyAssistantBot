@@ -94,10 +94,10 @@ def delete_confirm_view() -> tuple:
 
 async def delete_personal_data(user_id: int) -> dict:
     """Remove everything personal the bot keeps about the student."""
-    removed: dict = {"private": db.has_private(user_id, PRIVATE_EXAM_KIND)}
-    db.delete_private(user_id)
+    removed: dict = {"private": db.get_user_scope(user_id).has_private(PRIVATE_EXAM_KIND)}
+    db.get_user_scope(user_id).delete_private()
     await _perform_logout(user_id)  # session, cookies, tokens, StuMS state
-    db.sync_user_courses(user_id, set())
+    db.get_user_scope(user_id).sync_courses(set())
     removed["cache_sections"] = forget_personal_cache(user_id)
     for sid in [sid for sid, info in exam_action_cache.items() if info.get("user_id") == user_id]:
         exam_action_cache.pop(sid, None)

@@ -178,7 +178,7 @@ def sync_registry(titles: dict, members: dict, known_uids) -> dict:
             if uid in by_user:
                 by_user[uid].add(cid)
     for uid, cids in by_user.items():
-        db.sync_user_courses(uid, cids)
+        db.get_user_scope(uid).sync_courses(cids)
     pairs = sum(len(u) for u in members.values())
     last_stats.clear()
     last_stats.update({"courses": len(titles), "pairs": pairs, "ts": time.time()})
@@ -214,7 +214,7 @@ def delivery_format(uid: int, cid: Optional[str], kind: str) -> Optional[str]:
     if cid is None:
         return DEFAULT_FORMAT
     try:
-        prefs = db.get_course_prefs(uid, cid)
+        prefs = db.get_user_scope(uid).course_prefs(cid)
     except Exception:
         logging.debug("Course preferences unavailable", exc_info=True)
         prefs = None
@@ -299,13 +299,13 @@ def _course_summary(prefs: dict) -> str:
 
 
 def course_alerts_list_view(user_id: int) -> tuple:
-    cids = db.user_course_ids(user_id)
+    cids = db.get_user_scope(user_id).course_ids()
     if not cids:
         return ("🔔 <b>Course alerts</b>\n\nNo followed courses yet. They appear after the next "
                 "watcher cycle once you are signed in.", None)
     rows = []
     for cid in sorted(cids, key=lambda c: course_title(c).lower()):
-        prefs = db.get_course_prefs(user_id, cid) or {}
+        prefs = db.get_user_scope(user_id).course_prefs(cid) or {}
         label = f"{_course_summary(prefs)} {course_title(cid)}" if prefs else course_title(cid)
         rows.append([InlineKeyboardButton(label[:60], callback_data=f"calert|c|{cid}")])
     text = ("🔔 <b>Course alerts</b>\n\nEach course is checked once for everyone who takes it; "
@@ -316,7 +316,7 @@ def course_alerts_list_view(user_id: int) -> tuple:
 
 
 def course_alerts_course_view(user_id: int, cid: str) -> tuple:
-    prefs = db.get_course_prefs(user_id, cid)
+    prefs = db.get_user_scope(user_id).course_prefs(cid)
     if prefs is None:
         return course_alerts_list_view(user_id)
     def mark(col: str) -> str:
@@ -357,14 +357,14 @@ async def handle_course_alerts(update: Update, context: ContextTypes.DEFAULT_TYP
     action = parts[1] if len(parts) > 1 else ""
     cid = parts[-1] if action in ("c", "t", "fmt") else None
     if action == "t" and len(parts) == 4 and parts[2] in _TOGGLES and cid:
-        prefs = db.get_course_prefs(user_id, cid)
+        prefs = db.get_user_scope(user_id).course_prefs(cid)
         if prefs is not None:
             column = _TOGGLES[parts[2]][0]
-            db.set_course_pref(user_id, cid, column, not prefs[column])
+            db.get_user_scope(user_id).set_course_pref(cid, column, not prefs[column])
     elif action == "fmt" and cid:
-        prefs = db.get_course_prefs(user_id, cid)
+        prefs = db.get_user_scope(user_id).course_prefs(cid)
         if prefs is not None:
-            db.set_course_pref(user_id, cid, "format", _next_format(prefs["format"]))
+            db.get_user_scope(user_id).set_course_pref(cid, "format", _next_format(prefs["format"]))
     await query.answer()
     text, markup = course_alerts_course_view(user_id, cid) if cid else course_alerts_list_view(user_id)
     if action:

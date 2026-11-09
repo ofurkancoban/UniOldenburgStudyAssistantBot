@@ -397,7 +397,7 @@ class MorningSummaryTests(unittest.TestCase):
                  {"user_id": 1, "text": "early", "due_time": datetime(2026, 11, 4, 8, tzinfo=tz).isoformat()},
                  {"user_id": 2, "text": "someone else's", "due_time": datetime(2026, 11, 4, 9, tzinfo=tz).isoformat()},
                  {"user_id": 1, "text": "tomorrow", "due_time": datetime(2026, 11, 5, 8, tzinfo=tz).isoformat()}]
-        with mock.patch.object(self.morning, "load_tasks", return_value=tasks):
+        with mock.patch.object(self.morning, "user_tasks", lambda uid: [t for t in tasks if t.get("user_id") == uid]):
             loaded = self.morning._load_today_tasks(today, user_id=1)
             self.assertEqual(self.morning._load_today_tasks(today), [])  # no user: nobody's tasks
         self.assertEqual([t["text"] for t in loaded], ["early", "late"])

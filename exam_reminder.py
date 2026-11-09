@@ -174,7 +174,7 @@ def adopt_legacy_exam_cache(user_id) -> None:
     built for) the first time per-user caches are used, so nothing is
     re-notified after the switch."""
     db = _exam_store()
-    if user_id is None or db.has_private(int(user_id), PRIVATE_EXAM_KIND) \
+    if user_id is None or db.get_user_scope(int(user_id)).has_private(PRIVATE_EXAM_KIND) \
             or db.exists(exam_cache_path(user_id)) or not db.exists(EXAM_CACHE_PATH):
         return
     try:
@@ -194,13 +194,13 @@ def load_exam_cache(user_id=None) -> dict:
     owner = _cache_owner(user_id)
     try:
         if owner is not None:
-            data = db.load_private(int(owner), PRIVATE_EXAM_KIND)
+            data = db.get_user_scope(int(owner)).private(PRIVATE_EXAM_KIND)
             if data is not None:
                 return data
             legacy = exam_cache_path(owner)
             if db.exists(legacy):
                 data = db.load(legacy)
-                db.save_private(int(owner), PRIVATE_EXAM_KIND, data)
+                db.get_user_scope(int(owner)).save_private(PRIVATE_EXAM_KIND, data)
                 db.delete(legacy)
                 return data
         elif db.exists(EXAM_CACHE_PATH):
@@ -214,7 +214,7 @@ def save_exam_cache(data: dict, user_id=None) -> None:
     owner = _cache_owner(user_id)
     try:
         if owner is not None:
-            _exam_store().save_private(int(owner), PRIVATE_EXAM_KIND, data)
+            _exam_store().get_user_scope(int(owner)).save_private(PRIVATE_EXAM_KIND, data)
         else:
             _exam_store().save(EXAM_CACHE_PATH, data)
     except Exception as e:

@@ -484,7 +484,7 @@ class WatcherSessionTests(unittest.TestCase):
             mock.patch.object(auth, "PRIMARY_ADMIN_ID", 1),
             mock.patch.object(auth, "ALLOWED_USER_IDS", {1, 2}),
             mock.patch.object(auth.db, "get_all_users", lambda: []),
-            mock.patch.object(auth.db, "load_user_credential", lambda uid, kind: None),
+            mock.patch.object(auth.db.UserScope, "credential", lambda self, kind: None),
         ]
         for p in self.patches:
             p.start()
@@ -600,7 +600,7 @@ class ResourceHygieneTests(unittest.TestCase):
         state.user_sessions.update({1: a, 2: b})
         state.global_session = watcher
         try:
-            with mock.patch.object(auth.db, "delete_user_credentials", lambda uid: None), \
+            with mock.patch.object(auth.db.UserScope, "delete_credentials", lambda self: None), \
                     mock.patch.object(auth.db, "update_user_studip", lambda uid, name: None), \
                     mock.patch.object(auth.studip_oauth, "oauth_enabled", return_value=False):
                 asyncio.run(auth._perform_logout(user_id=1))
@@ -830,7 +830,7 @@ class SqliteStoreTests(unittest.TestCase):
             self.assertFalse(os.path.exists(pending))
         # the exam cache is personal: it left the shared store for the student's encrypted record
         self.assertFalse(db.exists(legacy))
-        self.assertTrue(db.has_private(42, "exam_cache") and db.exists(pending))
+        self.assertTrue(db.get_user_scope(42).has_private("exam_cache") and db.exists(pending))
 
 
 class CookieStorageTests(unittest.TestCase):
@@ -841,7 +841,7 @@ class CookieStorageTests(unittest.TestCase):
         cookie_file = os.path.join(tmp, "studip_cookies_4242.json")
         write_vault_file(cookie_file, [{"key": "Studip_Session", "value": "abc", "domain": "elearning.uni-oldenburg.de",
                                         "path": "/", "host_only": True}])
-        db.delete_user_credentials(4242)
+        db.get_user_scope(4242).delete_credentials()
 
         async def scenario():
             sess = studip_session.StudIPSession("", "", "", cookie_file=cookie_file, user_id=4242)
@@ -853,16 +853,16 @@ class CookieStorageTests(unittest.TestCase):
 
         jar = asyncio.run(scenario())
         self.assertEqual(jar.get("Studip_Session"), "abc")
-        stored = db.load_user_credential(4242, "cookies")
+        stored = db.get_user_scope(4242).credential("cookies")
         self.assertEqual([c["value"] for c in stored if c["key"] == "Studip_Session"], ["abc"])
         self.assertFalse(os.path.exists(cookie_file))
-        db.delete_user_credentials(4242)
+        db.get_user_scope(4242).delete_credentials()
 
 
     def test_stums_state_survives_a_restart_and_not_a_logout(self):
         from unibot import db
-        db.delete_user_credentials(4343)
-        db.save_user_credential(4343, "cookies", [{"key": "Studip_Session", "value": "abc",
+        db.get_user_scope(4343).delete_credentials()
+        db.get_user_scope(4343).save_credential("cookies", [{"key": "Studip_Session", "value": "abc",
                                                    "domain": "elearning.uni-oldenburg.de", "path": "/",
                                                    "host_only": True}])
         paused = time.time() + 900
@@ -887,13 +887,13 @@ class CookieStorageTests(unittest.TestCase):
             self.assertEqual((restored.verified_at, restored.referer, restored.blocked_until),
                              (123.0, "https://stums/x", paused))
             # after a logout the state is neither kept nor written again
-            db.delete_user_credentials(4343)
+            db.get_user_scope(4343).delete_credentials()
             sess = studip_session.StudIPSession("", "", "", cookie_file=None, user_id=4343)
             sess.explicitly_logged_out = True
             sess.save_stums_state()
-            self.assertIsNone(db.load_user_credential(4343, "stums_state"))
+            self.assertIsNone(db.get_user_scope(4343).credential("stums_state"))
         finally:
-            db.delete_user_credentials(4343)
+            db.get_user_scope(4343).delete_credentials()
 
 
 class DatabaseBackupTests(unittest.TestCase):

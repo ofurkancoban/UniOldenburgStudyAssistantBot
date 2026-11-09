@@ -26,7 +26,7 @@ from unibot.storage import (
     get_wardrobe_entry,
     get_wardrobe_feature_enabled,
     load_general_cache,
-    load_tasks,
+    user_tasks,
     record_worn_items,
     save_cached_outfit_today,
     save_general_cache,
@@ -117,8 +117,8 @@ def _load_today_tasks(today_date, user_id: Optional[int] = None) -> list:
         return []
     try:
         tasks = [
-            t for t in load_tasks()
-            if t.get("user_id") == owner and t.get("due_time")
+            t for t in user_tasks(owner)
+            if t.get("due_time")
             and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == today_date
         ]
         return sorted(tasks, key=lambda t: t["due_time"])
@@ -766,8 +766,8 @@ async def send_daily_plan_voice(sender, events: list, target_date, user_id=None)
     try:
         owner = user_id if user_id is not None else current_user_id()
         today_tasks = [
-            t for t in load_tasks()
-            if t.get("user_id") == owner and t.get("due_time")
+            t for t in user_tasks(owner)
+            if t.get("due_time")
             and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == target_date
         ]
     except Exception as e:

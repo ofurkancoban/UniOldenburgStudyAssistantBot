@@ -175,19 +175,18 @@ class BotStateTests(unittest.TestCase):
 
     def test_task_reminder_keeps_tasks_added_meanwhile(self):
         past = (datetime.now(studip_utils.TZ_BERLIN) - timedelta(minutes=1)).isoformat()
-        self.storage.save_tasks([{"id": "t1", "user_id": 1, "text": "Read <ch.3> & notes", "due_time": past}])
+        self.storage.save_user_tasks(1, [{"id": "t1", "user_id": 1, "text": "Read <ch.3> & notes", "due_time": past}])
         sent = []
 
         class FakeBot:
             async def send_message(inner_self, **kw):
                 sent.append(kw["text"])
                 # the user adds a task while the reminder is being sent
-                tasks = self.storage.load_tasks()
-                tasks.append({"id": "t2", "user_id": 1, "text": "new", "due_time": None})
-                self.storage.save_tasks(tasks)
+                self.storage.add_user_task(1, {"id": "t2", "user_id": 1, "text": "new", "due_time": None})
 
         asyncio.run(self.tasks.check_task_reminders(FakeBot()))
-        self.assertEqual([t["id"] for t in self.storage.load_tasks()], ["t2"])
+        self.assertEqual([t["id"] for t in self.storage.user_tasks(1)], ["t2"])
+        self.storage.save_user_tasks(1, [])
         self.assertIn("Read &lt;ch.3&gt; &amp; notes", sent[0])  # HTML-escaped
 
     def test_single_flight_serializes(self):
@@ -226,11 +225,13 @@ class BotStateTests(unittest.TestCase):
 
     def test_send_file_bytes_uses_memory_and_safe_name(self):
         message = mock.MagicMock()
-        message.reply_document = mock.AsyncMock()
+        seen = []
+        message.reply_document = mock.AsyncMock(side_effect=lambda **kw: seen.append(kw["document"].getvalue()))
         asyncio.run(self.ui._send_file_bytes(message, b"%PDF", "../../evil.pdf", "sid1"))
         kwargs = message.reply_document.await_args.kwargs
         self.assertEqual(kwargs["filename"], "evil.pdf")
-        self.assertEqual(kwargs["document"].getvalue(), b"%PDF")
+        self.assertEqual(seen, [b"%PDF"])
+        self.assertTrue(kwargs["document"].closed)  # the buffer is closed once sent
 
 
 if __name__ == "__main__":

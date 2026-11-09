@@ -15,7 +15,7 @@ os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tes
 os.environ.setdefault("BOT_DB_FILE", os.path.join(tempfile.mkdtemp(prefix="unibot-tests-"), "bot_data.sqlite3"))
 
 from studip_utils import TZ_BERLIN  # noqa: E402
-from unibot import schedule, state, study_day, study_plan  # noqa: E402
+from unibot import schedule, state, storage, study_day, study_plan  # noqa: E402
 
 WED = date(2026, 11, 4)
 
@@ -282,9 +282,9 @@ class StudyPackTests(unittest.TestCase):
         self.assertEqual(study_plan.study_pack_course({"after_cid": "c2"}, self.UID, now), ("c2", "Statistics"))
         tasks = [{"user_id": self.UID, "text": "PS 2", "course": "Statistics",
                   "due_time": (now + timedelta(days=2)).isoformat()}]
-        with mock.patch.object(study_plan, "load_tasks", lambda: tasks):
+        with mock.patch.object(study_plan, "user_tasks", lambda uid: [t for t in tasks if t.get("user_id") == uid]):
             self.assertEqual(study_plan.study_pack_course({}, self.UID, now), ("c2", "Statistics"))
-        with mock.patch.object(study_plan, "load_tasks", lambda: []):
+        with mock.patch.object(study_plan, "user_tasks", lambda uid: []):
             self.assertIsNone(study_plan.study_pack_course({}, self.UID, now))
 
     def test_pack_message_with_deadline_and_download_buttons(self):
@@ -303,7 +303,7 @@ class StudyPackTests(unittest.TestCase):
 
         cache: dict = {}
         with mock.patch.object(study_plan, "_list_course_files_deep", files), \
-                mock.patch.object(study_plan, "load_tasks", lambda: tasks), \
+                mock.patch.object(study_plan, "user_tasks", lambda uid: [t for t in tasks if t.get("user_id") == uid]), \
                 mock.patch.object(study_plan, "link_cache", cache):
             text, markup = asyncio.run(study_plan.build_study_pack(window, self.UID, now))
         self.assertIn("STUDY BLOCK STARTED", text)
@@ -322,7 +322,7 @@ class StudyPackTests(unittest.TestCase):
 
     def test_pack_without_course_still_describes_the_block(self):
         window = schedule.find_study_windows_for_day([], WED)[0]
-        with mock.patch.object(study_plan, "load_tasks", lambda: []):
+        with mock.patch.object(study_plan, "user_tasks", lambda uid: []):
             text, markup = asyncio.run(study_plan.build_study_pack(window, self.UID, window["start_dt"]))
         self.assertIn("Study block", text)
         self.assertEqual(len(markup.inline_keyboard), 1)  # just the Studied / Skipped answer
@@ -391,11 +391,15 @@ class TaskPrivacyTests(unittest.TestCase):
     def test_weekly_view_lists_only_the_users_own_tasks(self):
         tasks = [{"user_id": 1, "text": "mine", "due_time": "2026-11-04T10:00:00+01:00"},
                  {"user_id": 2, "text": "theirs", "due_time": "2026-11-04T11:00:00+01:00"}]
-        with mock.patch.object(schedule, "load_tasks", lambda: tasks):
-            own = schedule._week_tasks_for_range(date(2026, 11, 2), date(2026, 11, 8), user_id=1)
-            from unibot.auth import acting_as
-            with acting_as(2):
-                current = schedule._week_tasks_for_range(date(2026, 11, 2), date(2026, 11, 8))
+        # real per-student scopes: each list is stored and read under its own id
+        for uid in (1, 2):
+            storage.save_user_tasks(uid, [t for t in tasks if t["user_id"] == uid])
+        own = schedule._week_tasks_for_range(date(2026, 11, 2), date(2026, 11, 8), user_id=1)
+        from unibot.auth import acting_as
+        with acting_as(2):
+            current = schedule._week_tasks_for_range(date(2026, 11, 2), date(2026, 11, 8))
+        for uid in (1, 2):
+            storage.save_user_tasks(uid, [])
         self.assertEqual([t["text"] for t in own], ["mine"])
         self.assertEqual([t["text"] for t in current], ["theirs"])
 
@@ -430,7 +434,7 @@ class PerUserMorningSummaryTests(unittest.TestCase):
                     mock.patch.object(morning, "get_user_session", lambda uid=None: sessions[uid]), \
                     mock.patch.object(morning, "has_stored_login", lambda s: logged_in[next(k for k, v in sessions.items() if v is s)]), \
                     mock.patch.object(morning, "get_calendar_events", events), \
-                    mock.patch.object(morning, "load_tasks", lambda: tasks), \
+                    mock.patch.object(morning, "user_tasks", lambda uid: [t for t in tasks if t.get("user_id") == uid]), \
                     mock.patch.object(morning, "get_weather_snapshot", mock.AsyncMock(return_value=None)), \
                     mock.patch.object(morning, "_fetch_lunch_pick", mock.AsyncMock(return_value=None)), \
                     mock.patch.object(morning, "_prepare_lunch_photo", mock.AsyncMock(return_value=(None, None))), \
@@ -654,7 +658,7 @@ class StudyBlockFeedbackTests(unittest.TestCase):
         events = [_event("09:00", "10:00", "Statistics", cid="c2"), _event("16:00", "18:00", "Econometrics", cid="c1")]
         window = schedule.find_study_windows_for_day(events, WED)[-2]
         with mock.patch.object(study_plan, "_list_course_files_deep", mock.AsyncMock(return_value=[])), \
-                mock.patch.object(study_plan, "load_tasks", lambda: []), \
+                mock.patch.object(study_plan, "user_tasks", lambda uid: []), \
                 mock.patch.object(study_plan.state, "user_courses_map", {self.UID: {"c1": "Econometrics"}}):
             text, _ = asyncio.run(study_plan.build_study_pack(window, self.UID, _at(WED, "14:00")))
         self.assertIn("skipped the last 2 blocks", text)
@@ -792,7 +796,7 @@ class CampusLunchPickTests(unittest.TestCase):
                     mock.patch.object(morning, "get_user_session", lambda uid=None: sessions[uid]), \
                     mock.patch.object(morning, "has_stored_login", lambda s: True), \
                     mock.patch.object(morning, "get_calendar_events", events), \
-                    mock.patch.object(morning, "load_tasks", lambda: []), \
+                    mock.patch.object(morning, "user_tasks", lambda uid: []), \
                     mock.patch.object(morning, "get_weather_snapshot", mock.AsyncMock(return_value=None)), \
                     mock.patch.object(morning, "build_food_recommendation", pick), \
                     mock.patch.object(morning, "fetch_dish_photo_url", mock.AsyncMock(side_effect=lambda d, loc_id="2": f"photo-{loc_id}")), \
