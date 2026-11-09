@@ -1872,6 +1872,8 @@ async def find_makeup_slot(user_id: int, now: datetime) -> Optional[dict]:
     """The student's next study window starting after `now`, today or in the
     next STUDY_MAKEUP_DAYS days; None when there is none or the timetable
     can't be read."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=TZ_BERLIN)
     session = get_user_session(user_id)
     events: list = []
     fetched: set = set()

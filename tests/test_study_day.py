@@ -682,6 +682,10 @@ class StudyBlockFeedbackTests(unittest.TestCase):
                 mock.patch.object(study_plan, "get_calendar_events", mock.AsyncMock(return_value=events)):
             slot = asyncio.run(study_plan.find_makeup_slot(self.UID, _at(WED, "12:10")))
         self.assertEqual(slot["start_dt"].strftime("%a %H:%M"), "Wed 15:00")
+        with mock.patch.object(study_plan, "get_user_session", lambda uid=None: None), \
+                mock.patch.object(study_plan, "get_calendar_events", mock.AsyncMock(return_value=events)):
+            naive = asyncio.run(study_plan.find_makeup_slot(self.UID, _at(WED, "12:10").replace(tzinfo=None)))
+        self.assertEqual(naive["start_dt"].strftime("%a %H:%M"), "Wed 15:00")
 
 
 class TransientTelegramErrorLogTests(unittest.TestCase):
