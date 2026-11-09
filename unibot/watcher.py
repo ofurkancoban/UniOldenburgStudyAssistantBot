@@ -25,7 +25,7 @@ from exam_reminder import (
 )
 from studip_utils import TZ_BERLIN, berlin_now
 
-from unibot import db
+from unibot import course_registry, db
 from unibot import state
 from unibot.config import (
     ADMIN_USER_IDS,
@@ -326,6 +326,10 @@ async def _send_daily_digest(bot):
     log_paths = [f"{LOG_FILE}.1", LOG_FILE]  # the rotated file covers a rollover
     # Log timestamps are the server's naive local time, so compare in that clock.
     lines = daily_digest(datetime.now(), log_paths, previous)
+    registry_line = course_registry.savings_line()
+    if registry_line:
+        lines.append(registry_line)
+    course_registry.reset_digest_counters()
     update_general_cache({"daily_digest_snapshot": traffic_snapshot()})
     await broadcast(bot, "\n".join(lines), parse_mode="HTML", members=set(ADMIN_USER_IDS))
 

@@ -53,6 +53,7 @@ from unibot.auth import (
 from unibot.studip_api import get_studip_user_profile, list_courses
 from unibot.documents import handle_file_audio_summary
 from unibot.weather import handle_set_weather_location
+from unibot.course_registry import handle_course_alerts
 from unibot.study_week import handle_calendar_sync, handle_study_buddy, register_calendar_feed
 from unibot.mensa import (
     handle_foodpref_category,
@@ -365,6 +366,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_study_block_feedback, pattern=r"^sp_block\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_calendar_sync, pattern=r"^cal_sync(\|.*)?$"))
     app.add_handler(CallbackQueryHandler(handle_study_buddy, pattern=r"^buddy(\|.*)?$"))
+    app.add_handler(CallbackQueryHandler(handle_course_alerts, pattern=r"^calert(\|.*)?$"))
     app.add_handler(CallbackQueryHandler(handle_study_progress_menu, pattern=r"^(sp_progress|sp_progress_refresh|sp_course\|.*|sp_unit\|.*)$"))
     app.add_handler(CallbackQueryHandler(handle_study_track_menu, pattern=r"^(sp_track_menu|sp_track_auto|sp_track\|.*)$"))
     app.add_handler(CallbackQueryHandler(handle_wardrobe_menu, pattern="^wardrobe_menu$"))

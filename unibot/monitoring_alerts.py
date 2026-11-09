@@ -3,6 +3,7 @@ course's participants), the alert texts and buttons, and sending them."""
 
 import asyncio
 import html
+import io
 import logging
 import os
 import time
@@ -10,13 +11,15 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from unibot import state
+from studip_utils import safe_filename
+from unibot import course_registry, state
+from unibot.auth import get_user_session
 from unibot.config import ALLOWED_USER_IDS
 from unibot.formatting import (
     _short_id,
 )
 from unibot.storage import link_cache
-from unibot.telegram_ui import (
+from unibot.telegram_ui import (  # noqa: F401 - broadcast is re-exported for callers
     broadcast,
 )
 
@@ -52,11 +55,74 @@ def _file_alert(it: dict, sid: str) -> tuple[str, InlineKeyboardMarkup]:
     return text, InlineKeyboardMarkup(btn_rows)
 
 
+FULL_FILE_MAX_BYTES = 20 * 1024 * 1024
+
+
+def _title_line(icon: str, course, what) -> str:
+    """The one-line "title only" version of an alert."""
+    return f"{icon} <b>{html.escape(str(course))}</b>: {html.escape(str(what))}"
+
+
+def file_title_text(it: dict) -> str:
+    label = "new file" if it.get("type") == "new" else "updated file"
+    return _title_line("📄", it.get("course", ""), f"{it.get('name', '')} ({label})")
+
+
+def announcement_title_text(ann: dict) -> str:
+    return _title_line("📢", ann.get("course", ""), ann.get("subject", ""))
+
+
+def forum_title_text(p: dict) -> str:
+    return _title_line("💬", p.get("course", ""), f"{p.get('thread', '')} ({p.get('author', '')})")
+
+
+def _full_file_sender(it: dict, text: str, keyboard, downloader_uid: Optional[int]):
+    """send_full for fan_out: the file itself with the alert as its caption.
+    Downloaded once with a member's session; later followers get the
+    Telegram file_id. Returns False (fall back to the card) when the file
+    has no URL, is too big or cannot be fetched."""
+    shared: dict = {}
+
+    async def send(bot, uid) -> bool:
+        if shared.get("failed") or not it.get("url"):
+            return False
+        document = shared.get("file_id")
+        if document is None:
+            try:
+                session = get_user_session(downloader_uid) or state.global_session
+                if session is None:
+                    raise RuntimeError("no session")
+                async with await session.get(it["url"]) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    content = await resp.read()
+                if len(content) > FULL_FILE_MAX_BYTES:
+                    raise RuntimeError(f"{len(content)} bytes")
+            except Exception as e:
+                logging.info("Full file alert for %s falls back to the card: %s", it.get("name"), e)
+                shared["failed"] = True
+                return False
+            document = io.BytesIO(content)
+        msg = await bot.send_document(
+            chat_id=uid, document=document, filename=safe_filename(str(it.get("name") or "file")),
+            caption=text[:1024], parse_mode="HTML", reply_markup=keyboard,
+        )
+        file_id = getattr(getattr(msg, "document", None), "file_id", None)
+        if file_id:
+            shared["file_id"] = file_id
+        return True
+
+    return send
+
+
 async def _send_file_alerts(bot, events: list) -> None:
-    """Send file notifications in chronological order, each with download buttons."""
+    """Send file notifications in chronological order, each with download
+    buttons, to every follower in their own format."""
     for it in sorted(events, key=lambda x: (x["dt"], x["course"], x["name"])):
         try:
             sid = _short_id()
+            downloader = next(iter(sorted(course_members(it.get("cid")) or ())), None) \
+                or next(iter(ALLOWED_USER_IDS), None)
             link_cache[sid] = {
                 "cid": it["cid"],
                 "name": it["name"],
@@ -64,12 +130,14 @@ async def _send_file_alerts(bot, events: list) -> None:
                 "url": it.get("url"),
                 "ts": time.time(),
                 # a participant's session can download it (an admin's may not be enrolled)
-                "user_id": next(iter(sorted(course_members(it.get("cid")) or ())), None)
-                or next(iter(ALLOWED_USER_IDS), None),
+                "user_id": downloader,
             }
             text, keyboard = _file_alert(it, sid)
-            await broadcast(bot, text, parse_mode="HTML", reply_markup=keyboard, cid=it.get("cid"),
-                            members=course_members(it.get("cid")))
+            await course_registry.fan_out(
+                bot, it.get("cid"), "files", text, file_title_text(it), reply_markup=keyboard,
+                members=course_members(it.get("cid")),
+                send_full=_full_file_sender(it, text, keyboard, downloader),
+            )
             await asyncio.sleep(0.3)  # Rate limiting
         except Exception as e:
             logging.error("Error sending notification for file %s: %s", it.get('name'), e)

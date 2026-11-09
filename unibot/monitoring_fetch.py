@@ -252,25 +252,34 @@ def _forum_thread_entry(course_name: str, cid: str, disc: dict, posts_data: dict
     }
 
 
+async def _fetch_course_forum_strict(session, course_name: str, cid: str) -> list:
+    """Entries for the 10 most recently updated discussions of one course.
+    Raises when the session cannot read the course (expired login, no
+    access), so the course registry can hand the scan to another member."""
+    url = f"{BASE_URL}/jsonapi.php/v1/courses/{cid}/forum-discussions"
+    async with await session.get(url, headers=JSONAPI_HEADERS) as r:
+        if r.status in (401, 403):
+            raise PermissionError(f"forum of {cid} answered HTTP {r.status}")
+        if r.status != 200:
+            return []
+        data = await r.json()
+    entries = []
+    for disc in data.get("data", [])[:10]:
+        posts_url = f"{BASE_URL}/jsonapi.php/v1/forum-discussions/{disc.get('id')}/postings?include=author"
+        async with await session.get(posts_url, headers=JSONAPI_HEADERS) as r2:
+            if r2.status != 200:
+                continue
+            posts_data = await r2.json()
+        entry = _forum_thread_entry(course_name, cid, disc, posts_data)
+        if entry:
+            entries.append(entry)
+    return entries
+
+
 async def _fetch_course_forum(session, course_name: str, cid: str) -> list:
-    """Entries for the 10 most recently updated discussions of one course."""
+    """_fetch_course_forum_strict, with every failure read as no entries."""
     try:
-        url = f"{BASE_URL}/jsonapi.php/v1/courses/{cid}/forum-discussions"
-        async with await session.get(url, headers=JSONAPI_HEADERS) as r:
-            if r.status != 200:
-                return []
-            data = await r.json()
-        entries = []
-        for disc in data.get("data", [])[:10]:
-            posts_url = f"{BASE_URL}/jsonapi.php/v1/forum-discussions/{disc.get('id')}/postings?include=author"
-            async with await session.get(posts_url, headers=JSONAPI_HEADERS) as r2:
-                if r2.status != 200:
-                    continue
-                posts_data = await r2.json()
-            entry = _forum_thread_entry(course_name, cid, disc, posts_data)
-            if entry:
-                entries.append(entry)
-        return entries
+        return await _fetch_course_forum_strict(session, course_name, cid)
     except Exception as e:
         logging.warning("Error while checking forum API for %s: %s", course_name, e)
         return []

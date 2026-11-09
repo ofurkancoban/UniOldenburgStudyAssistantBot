@@ -67,21 +67,12 @@ async def _send_file_bytes(message, content: bytes, fname: str, sid: str, captio
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 # ── broadcast helper ──────────────────────────────────────────────────────────
-async def broadcast(
-    bot,
-    text,
-    parse_mode="HTML",
-    disable_notification=True,
-    reply_markup=None,
-    cid: Optional[str] = None,
-    members=None,
-):
-    """Send a message to allowed and active users with optional reply markup.
-    If cid is provided, filters recipients to students enrolled in or tracking that course,
-    plus primary administrators. With `members` (the course's known
-    participants) administrators are no exception: only participants and
-    users tracking the course get it.
-    """
+def broadcast_targets(cid: Optional[str] = None, members=None) -> set:
+    """Who a broadcast reaches. Without `cid`: every allowed and active user.
+    With `cid`: students enrolled in or tracking that course, plus primary
+    administrators. With `members` (the course's known participants)
+    administrators are no exception: only participants and users tracking
+    the course get it."""
     targets = set(members) if members is not None else set(ALLOWED_USER_IDS)
     try:
         for u in db.get_all_users():
@@ -106,7 +97,20 @@ async def broadcast(
             targets.add(uid)
     except Exception:
         logging.debug("Ignored a non-critical error", exc_info=True)
-    for uid in targets:
+    return targets
+
+
+async def broadcast(
+    bot,
+    text,
+    parse_mode="HTML",
+    disable_notification=True,
+    reply_markup=None,
+    cid: Optional[str] = None,
+    members=None,
+):
+    """Send a message with optional reply markup to broadcast_targets()."""
+    for uid in broadcast_targets(cid, members):
         try:
             await bot.send_message(
                 chat_id=uid,

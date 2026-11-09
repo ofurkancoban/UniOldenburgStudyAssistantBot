@@ -1121,9 +1121,11 @@ class CourseWatchPlanTests(unittest.TestCase):
             listed.append(user_id)
             state.user_courses_map[user_id] = {1: {"c1": "Math", "c2": "Stats"}, 2: {"c2": "Stats", "c3": "AI"}}[user_id]
 
-        from unibot import auth
+        from unibot import auth, course_registry
+        course_registry._rotation.clear()
         with mock.patch.object(m, "list_courses", fake_list), \
                 mock.patch.object(auth, "has_stored_login", lambda s: True), \
+                mock.patch.object(course_registry, "has_stored_login", lambda s: True), \
                 mock.patch.object(auth.db, "get_all_users", lambda: [{"telegram_id": 1}, {"telegram_id": 2}]), \
                 mock.patch.object(auth, "ALLOWED_USER_IDS", {1}):
             plan = asyncio.run(m.watched_courses())
@@ -1133,6 +1135,8 @@ class CourseWatchPlanTests(unittest.TestCase):
         self.assertEqual(state.course_members["c2"], {1, 2})
         self.assertEqual(state.course_members["c3"], {2})
         self.assertEqual(len(again), 3)
+        # the shared course c2 is scanned by the other member next cycle
+        self.assertEqual({cid: sess for _n, cid, sess in again}["c2"], s2)
         self.assertEqual(sorted(listed), [1, 2])  # course lists are cached between cycles
 
     def test_course_alerts_reach_participants_only(self):

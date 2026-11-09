@@ -77,6 +77,32 @@ CREATE TABLE IF NOT EXISTS user_activity (
     created_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_user_activity_tg_created ON user_activity(telegram_id, created_at);
+
+-- Course registry: one row per Stud.IP course, scanned once for everyone.
+-- Holds no user data; who follows a course lives in user_courses.
+CREATE TABLE IF NOT EXISTS global_courses (
+    course_id       TEXT PRIMARY KEY,
+    title           TEXT NOT NULL,
+    semester        TEXT,
+    last_scanned_at REAL,
+    scanner_uid     INTEGER,
+    file_hash       TEXT,
+    forum_hash      TEXT
+);
+
+-- Who follows which course, with that user's notification preferences.
+CREATE TABLE IF NOT EXISTS user_courses (
+    user_id              INTEGER NOT NULL,
+    course_id            TEXT NOT NULL,
+    enrolled_at          REAL NOT NULL,
+    is_muted             INTEGER NOT NULL DEFAULT 0,
+    notify_files         INTEGER NOT NULL DEFAULT 1,
+    notify_announcements INTEGER NOT NULL DEFAULT 1,
+    notify_forum         INTEGER NOT NULL DEFAULT 1,
+    format               TEXT NOT NULL DEFAULT 'silent',
+    PRIMARY KEY (user_id, course_id)
+);
+CREATE INDEX IF NOT EXISTS idx_user_courses_course ON user_courses(course_id);
 """
 
 _lock = threading.RLock()
@@ -533,3 +559,112 @@ def bootstrap_admins(admin_ids: set[int]) -> None:
     for aid in admin_ids:
         upsert_user(telegram_id=aid, role="admin", is_active=1)
 
+
+
+# ── Course registry (global_courses / user_courses) ───────────────────────────
+
+COURSE_PREF_COLUMNS = ("is_muted", "notify_files", "notify_announcements", "notify_forum", "format")
+COURSE_FORMATS = ("full", "title", "silent")
+
+
+def upsert_global_course(course_id: str, title: str, semester: Optional[str] = None) -> None:
+    """Add a course to the registry or refresh its title (and semester when known)."""
+    with _lock:
+        _connection().execute(
+            "INSERT INTO global_courses (course_id, title, semester) VALUES (?, ?, ?) "
+            "ON CONFLICT(course_id) DO UPDATE SET title = excluded.title, "
+            "semester = COALESCE(excluded.semester, global_courses.semester)",
+            (course_id, title, semester),
+        )
+
+
+def get_global_course(course_id: str) -> Optional[dict]:
+    with _lock:
+        row = _connection().execute(
+            "SELECT course_id, title, semester, last_scanned_at, scanner_uid, file_hash, forum_hash "
+            "FROM global_courses WHERE course_id = ?",
+            (course_id,),
+        ).fetchone()
+    if not row:
+        return None
+    keys = ("course_id", "title", "semester", "last_scanned_at", "scanner_uid", "file_hash", "forum_hash")
+    return dict(zip(keys, row))
+
+
+def mark_course_scanned(course_id: str, scanner_uid: Optional[int], *, file_hash: Optional[str] = None,
+                        forum_hash: Optional[str] = None, ts: Optional[float] = None) -> None:
+    """Record a scan: when, by whose session, and the content hashes it saw."""
+    with _lock:
+        _connection().execute(
+            "UPDATE global_courses SET last_scanned_at = ?, scanner_uid = ?, "
+            "file_hash = COALESCE(?, file_hash), forum_hash = COALESCE(?, forum_hash) WHERE course_id = ?",
+            (ts if ts is not None else time.time(), scanner_uid, file_hash, forum_hash, course_id),
+        )
+
+
+def sync_user_courses(user_id: int, course_ids, now: Optional[float] = None) -> None:
+    """Make the user's followed courses exactly `course_ids`: new ones get the
+    default preferences, existing ones keep theirs, dropped ones go."""
+    wanted = set(course_ids)
+    with _lock:
+        conn = _connection()
+        have = {r[0] for r in conn.execute("SELECT course_id FROM user_courses WHERE user_id = ?", (user_id,))}
+        stamp = now if now is not None else time.time()
+        for cid in wanted - have:
+            conn.execute("INSERT OR IGNORE INTO user_courses (user_id, course_id, enrolled_at) VALUES (?, ?, ?)",
+                         (user_id, cid, stamp))
+        for cid in have - wanted:
+            conn.execute("DELETE FROM user_courses WHERE user_id = ? AND course_id = ?", (user_id, cid))
+
+
+def course_followers(course_id: str) -> list[int]:
+    with _lock:
+        return [r[0] for r in _connection().execute(
+            "SELECT user_id FROM user_courses WHERE course_id = ? ORDER BY enrolled_at, user_id", (course_id,))]
+
+
+def user_course_ids(user_id: int) -> list[str]:
+    with _lock:
+        return [r[0] for r in _connection().execute(
+            "SELECT course_id FROM user_courses WHERE user_id = ? ORDER BY course_id", (user_id,))]
+
+
+def get_course_prefs(user_id: int, course_id: str) -> Optional[dict]:
+    """The user's preferences for a followed course, or None when not followed."""
+    with _lock:
+        row = _connection().execute(
+            f"SELECT {', '.join(COURSE_PREF_COLUMNS)} FROM user_courses WHERE user_id = ? AND course_id = ?",
+            (user_id, course_id),
+        ).fetchone()
+    if not row:
+        return None
+    prefs = dict(zip(COURSE_PREF_COLUMNS, row))
+    for k in ("is_muted", "notify_files", "notify_announcements", "notify_forum"):
+        prefs[k] = bool(prefs[k])
+    return prefs
+
+
+def set_course_pref(user_id: int, course_id: str, column: str, value) -> bool:
+    """Change one preference of a followed course; False when not followed."""
+    if column not in COURSE_PREF_COLUMNS:
+        raise ValueError(f"unknown course preference {column!r}")
+    if column == "format":
+        if value not in COURSE_FORMATS:
+            raise ValueError(f"unknown format {value!r}")
+    else:
+        value = 1 if value else 0
+    with _lock:
+        cur = _connection().execute(
+            f"UPDATE user_courses SET {column} = ? WHERE user_id = ? AND course_id = ?",
+            (value, user_id, course_id),
+        )
+    return cur.rowcount > 0
+
+
+def registry_counts() -> dict:
+    """{"courses": unique followed courses, "pairs": user-course pairs}."""
+    with _lock:
+        conn = _connection()
+        courses = conn.execute("SELECT COUNT(DISTINCT course_id) FROM user_courses").fetchone()[0]
+        pairs = conn.execute("SELECT COUNT(*) FROM user_courses").fetchone()[0]
+    return {"courses": courses, "pairs": pairs}

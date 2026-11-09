@@ -24,7 +24,7 @@ from telegram.ext import ContextTypes
 
 import studip_oauth
 from studip_utils import berlin_now
-from unibot import db, state
+from unibot import course_registry, db, state
 from unibot.ai import transcribe_voice_message
 from unibot.auth import (
     act_as_bot,
@@ -51,7 +51,9 @@ from unibot.monitoring_alerts import (  # noqa: F401 - the notification layer, r
     _forum_alert_text,
     _send_file_alerts,
     announcement_task_cache,
+    announcement_title_text,
     course_members,
+    forum_title_text,
     task_suggestion_cache,
 )
 from unibot.monitoring_diff import (  # noqa: F401 - change detection, re-exported for callers
@@ -65,6 +67,7 @@ from unibot.monitoring_fetch import (  # noqa: F401 - the fetch layer, re-export
     MESSAGE_CHECK_LIMIT,
     _course_announcements_api,
     _fetch_course_forum,
+    _fetch_course_forum_strict,
     _fetch_messages_api,
     _fetch_messages_html,
     _forum_author_name,
@@ -84,14 +87,14 @@ from unibot.studip_api import (
     _api_rel_id,
     _ensure_watched_courses_map,
     list_courses,
-    list_files,
+    _list_files_api,
+    _list_files_html,
     studip_api_get,
 )
 from unibot.telegram_ui import (
     _show_typing,
     _start_loading_animation,
     _stop_loading_animation,
-    broadcast,
 )
 
 global_message_watcher = None
@@ -233,18 +236,26 @@ _course_list_fetched: dict[int, float] = {}
 async def watched_courses() -> list:
     """[(course name, cid, session)], one entry per course across all users.
 
-    The watcher session's map also holds the previous semester's courses when
-    that is enabled. Each user's own course list is refreshed every
-    COURSE_LIST_REFRESH_SECONDS. state.course_members records who takes what."""
-    plan: dict = {}
+    The session is the course's designated scanner: members whose sessions
+    are signed in take turns (course_registry.pick_scanner), and a failing one
+    hands over to the next member during the scan. The watcher session's map
+    also holds the previous semester's courses when that is enabled. Each
+    user's own course list is refreshed every COURSE_LIST_REFRESH_SECONDS.
+    state.course_members records who takes what, and the registry tables
+    (global_courses, user_courses) are kept in step with it."""
+    titles: dict = {}
     members: dict = {}
+    candidates: dict = {}
+    known_uids: set = set()
     watcher = state.global_session
     if watcher is not None and has_stored_login(watcher):
         await _ensure_watched_courses_map(watcher)
+        watcher_uid = getattr(watcher, "user_id", None)
         for cid, name in state.courses_map.items():
-            plan.setdefault(cid, (name, cid, watcher))
-            if getattr(watcher, "user_id", None):
-                members.setdefault(cid, set()).add(watcher.user_id)
+            titles.setdefault(cid, name)
+            candidates.setdefault(cid, []).append((watcher_uid, watcher))
+            if watcher_uid:
+                members.setdefault(cid, set()).add(watcher_uid)
     for account in signed_in_accounts():
         uid, sess = account.user_id, account.session
         if time.time() - _course_list_fetched.get(uid, 0.0) > COURSE_LIST_REFRESH_SECONDS \
@@ -255,11 +266,24 @@ async def watched_courses() -> list:
                 _course_list_fetched[uid] = time.time()
             except Exception as e:
                 logging.warning("Course list for user %s unavailable: %s", uid, e)
+        if uid in state.user_courses_map:
+            known_uids.add(uid)
         for cid, name in (state.user_courses_map.get(uid) or {}).items():
-            plan.setdefault(cid, (name, cid, sess))
+            titles.setdefault(cid, name)
+            candidates.setdefault(cid, []).append((uid, sess))
             members.setdefault(cid, set()).add(uid)
     state.course_members = members
-    return list(plan.values())
+    try:
+        course_registry.sync_registry(titles, members, known_uids)
+    except Exception as e:
+        logging.warning("Course registry sync failed: %s", e)
+    plan = []
+    for cid, name in titles.items():
+        course_registry.set_candidates(cid, candidates.get(cid) or [])
+        scanner = course_registry.pick_scanner(cid)
+        if scanner is not None:
+            plan.append((name, cid, scanner))
+    return plan
 
 
 async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, courses=None):
@@ -295,7 +319,10 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
         async def check_single_course_announcements(course_name, cid, session):
             async with semaphore:
                 try:
-                    return course_name, cid, await _course_announcements_api(cid, course_name, session=session)
+                    found, used = await course_registry.scan_with_failover(
+                        cid, session, lambda s: _course_announcements_api(cid, course_name, session=s))
+                    course_registry.record_scan(cid, used)
+                    return course_name, cid, found
                 except Exception as e:
                     logging.warning("Announcements API failed for %s (%s), falling back to the overview page", course_name, e)
                 try:
@@ -385,8 +412,9 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                     [InlineKeyboardButton("📝 Add as Task", callback_data=f"ann_to_task|{sid}")],
                 ]
                 markup = InlineKeyboardMarkup(buttons)
-                await broadcast(bot, text[:4000], parse_mode="HTML", reply_markup=markup, cid=ann.get("cid"),
-                                members=course_members(ann.get("cid")))
+                await course_registry.fan_out(bot, ann.get("cid"), "announcements", text[:4000],
+                                              announcement_title_text(ann), reply_markup=markup,
+                                              members=course_members(ann.get("cid")))
         elif not silent:
             await bot.send_message(chat_id=chat_id, text="☑️ No new announcements found.", disable_notification=True)
 
@@ -541,10 +569,17 @@ async def _scan_course_files(course_name: str, cid: str, cache: dict, session=No
     later comparisons use the latest timestamps.
     """
     try:
-        files = await list_files(cid, session=session)
+        try:
+            files, used = await course_registry.scan_with_failover(
+                cid, session, lambda s: _list_files_api(cid, None, session=s))
+        except Exception as e:
+            logging.warning("File API failed for %s with every member (%s), falling back to the HTML page",
+                            course_name, e)
+            files, used = await _list_files_html(cid, None, session=session), session
         if not files:
             return [], False
         current = _snapshot_course_files(files)
+        course_registry.record_scan(cid, used, file_hash=course_registry.content_hash(current))
         old = cache.get(cid, {})
         events = _file_events(course_name, cid, *_diff_course_files(current, old))
         if current == old:
@@ -785,7 +820,15 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, cou
 
         async def fetch(course_name, cid, sess):
             async with semaphore:
-                return await _fetch_course_forum(sess, course_name, cid)
+                try:
+                    entries, used = await course_registry.scan_with_failover(
+                        cid, sess, lambda s: _fetch_course_forum_strict(s, course_name, cid))
+                except Exception as e:
+                    logging.warning("Forum of %s unavailable with every member: %s", course_name, e)
+                    return []
+                course_registry.record_scan(cid, used, forum_hash=course_registry.content_hash(
+                    sorted((p.get("key"), p.get("date")) for p in entries)))
+                return entries
 
         results = await asyncio.gather(*(fetch(name, cid, sess) for name, cid, sess in courses),
                                        return_exceptions=True)
@@ -802,8 +845,9 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, cou
 
         for p in new_posts_found:
             markup = await _forum_alert_markup(p)
-            await broadcast(bot, _forum_alert_text(p)[:4000], parse_mode="HTML", reply_markup=markup, cid=p.get("cid"),
-                            members=course_members(p.get("cid")))
+            await course_registry.fan_out(bot, p.get("cid"), "forum", _forum_alert_text(p)[:4000],
+                                          forum_title_text(p), reply_markup=markup,
+                                          members=course_members(p.get("cid")))
 
         # Always save cache to bootstrap the "Last 5" feature
         db.save(FORUM_CACHE_PATH, cache)

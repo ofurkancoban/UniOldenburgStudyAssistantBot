@@ -117,6 +117,7 @@ def _status_group_view(group: str, user_id: Optional[int] = None) -> tuple:
                                   callback_data="status_group_toggle|semester|travel")],
             [InlineKeyboardButton("📅 Calendar Sync", callback_data="cal_sync"),
              InlineKeyboardButton("👥 Study Buddy", callback_data="buddy")],
+            [InlineKeyboardButton("🔔 Course Alerts", callback_data="calert")],
         ]
     else:
         title = "📄 <b>Official Documents &amp; Tuition</b>\n\nDownload official StuMS PDF certificates, transcript, and semester fee status:"

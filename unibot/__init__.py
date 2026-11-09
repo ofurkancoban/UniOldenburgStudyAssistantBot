@@ -35,6 +35,7 @@ MODULE_ORDER = (
     "whatsapp",
     "monitoring_fetch",   # watcher fetch layer: Stud.IP reads and parsing
     "monitoring_diff",    # watcher change detection (pure)
+    "course_registry",    # one scan per course, rotating scanner, per-user fan-out
     "monitoring_alerts",  # watcher notification layer
     "monitoring",   # announcement/file/forum/message watchers
     "exams",
