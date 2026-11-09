@@ -71,7 +71,10 @@ healthy() {
     sleep 5
     pm2 jlist | python3 -c 'import json,os,sys; sys.exit(0 if any(p["name"] == os.environ["PM2_APP"] and p["pm2_env"]["status"] == "online" for p in json.load(sys.stdin)) else 1)' || continue
     # shellcheck disable=SC2086
-    if for f in $LOGS; do tail -c 200000 "$f"; done | awk -v s="$since" '$1" "$2 >= s' | grep -q "Unified watcher controller started successfully"; then
+    # grep without -q reads to the end: an early exit would SIGPIPE the
+    # tail and, under pipefail, turn a found match into a failure
+    if for f in $LOGS; do tail -c 200000 "$f"; done | awk -v s="$since" '$1" "$2 >= s' \
+        | grep -F "Unified watcher controller started successfully" >/dev/null; then
       return 0
     fi
   done
