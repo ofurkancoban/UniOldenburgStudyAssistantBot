@@ -131,6 +131,28 @@ class AdminOnlyTests(unittest.TestCase):
             self.assertTrue(query.answer.call_args.kwargs.get("show_alert"))
         self.assertEqual(sent, [])
 
+    def test_a_file_sent_as_the_file_itself_has_no_forward_button_for_students(self):
+        from unibot import monitoring_alerts
+        session = mock.MagicMock()
+        response = mock.MagicMock()
+        response.status = 200
+        response.read = mock.AsyncMock(return_value=b"pdf")
+        response.__aenter__ = mock.AsyncMock(return_value=response)
+        response.__aexit__ = mock.AsyncMock(return_value=False)
+        session.get = mock.AsyncMock(return_value=response)
+        bot = mock.MagicMock()
+        bot.send_document = mock.AsyncMock(return_value=mock.MagicMock(document=None))
+        keyboard = InlineKeyboardMarkup([WA_ROW])
+        send = monitoring_alerts._full_file_sender({"url": "https://x/f.pdf", "name": "f.pdf"}, "text", keyboard, 1)
+        with mock.patch.object(monitoring_alerts, "get_user_session", lambda uid: session), \
+                mock.patch.object(telegram_ui, "ADMIN_USER_IDS", {1}), \
+                mock.patch.object(telegram_ui.db, "is_user_admin_db", lambda uid: False):
+            self.assertTrue(asyncio.run(send(bot, 2)))
+            self.assertTrue(asyncio.run(send(bot, 1)))
+        student, admin = (c.kwargs["reply_markup"] for c in bot.send_document.await_args_list)
+        self.assertIsNone(student)
+        self.assertIs(admin, keyboard)
+
     def test_a_held_digest_never_carries_the_forward_button(self):
         from unibot import course_registry
         self.assertIsNone(course_registry._first_button(InlineKeyboardMarkup([WA_ROW])))

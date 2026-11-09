@@ -21,6 +21,7 @@ from unibot.formatting import (
 from unibot.storage import link_cache, persistent_callback_cache
 from unibot.telegram_ui import (  # noqa: F401 - broadcast is re-exported for callers
     broadcast,
+    markup_for,
 )
 
 # short_id -> { text, due_time (ISO or None), course }; persisted, so the
@@ -110,7 +111,7 @@ def _full_file_sender(it: dict, text: str, keyboard, downloader_uid: Optional[in
         try:
             msg = await bot.send_document(
                 chat_id=uid, document=document, filename=safe_filename(str(it.get("name") or "file")),
-                caption=text[:1024], parse_mode="HTML", reply_markup=keyboard,
+                caption=text[:1024], parse_mode="HTML", reply_markup=markup_for(uid, keyboard),
             )
         finally:
             if isinstance(document, io.BytesIO):
