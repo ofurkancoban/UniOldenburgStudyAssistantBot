@@ -37,14 +37,24 @@ from studip_utils import TZ_BERLIN, berlin_now, html_escape as _h
 
 from unibot import db
 from unibot import state
-from unibot.storage import load_default_semester, recall_user_callback, remember_user_callback, single_flight
-from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, broadcast
-from unibot.auth import get_user_session, is_user_allowed, login_studip, personal_session
-from unibot.studip_api import BASE_URL, _ensure_watched_courses_map, _parse_file_date_v2, list_courses
+from unibot import course_registry
+from unibot.monitoring_alerts import course_members
+from unibot.storage import (
+    load_default_semester,
+    personal_record,
+    recall_user_callback,
+    remember_user_callback,
+    save_personal_record,
+    single_flight,
+    student_courses,
+)
+from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, markup_for
+from unibot.auth import get_user_session, is_user_allowed, personal_session
+from unibot.studip_api import BASE_URL, _parse_file_date_v2, list_courses
 from unibot.ai import _call_openrouter, _extract_json_object
 from unibot.documents import extract_text_from_file_async
 from unibot.whatsapp import EXAM_DATES_FOOTER, WA_FORWARD_ASK_MARKUP, _send_text_to_whatsapp
-from unibot.monitoring import _format_exam_dates_message
+from unibot.monitoring import _format_exam_dates_message, watched_courses
 
 
 class _ExamActions(dict):
@@ -654,12 +664,11 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
     # scan_course_files_for_exams), from the daily scan's cache. StuMS
     # dates override them, and those are already listed above.
     try:
-        await _ensure_watched_courses_map(session)
-        await refresh_stums_exam_sittings(session, all_exams=exams)
+        await refresh_stums_exam_sittings(session, all_exams=exams, user_id=user_id)
     except Exception as e:
         logging.warning("handle_exam_dates_list: StuMS override refresh failed: %s", e)
     file_events = [
-        e for e in get_file_exam_events()
+        e for e in get_file_exam_events(user_id)
         if e.get("source") != "StuMS" and (not e["date"] or e["date"] >= today.isoformat())
     ]
     file_lines = render_file_exam_events(file_events, "📄 <b>From Course Files</b>") if file_events else []
@@ -711,7 +720,7 @@ async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     lines = _format_exam_dates_message("📋 <b>All Upcoming Exam Dates</b>", upcoming, show_status=False)
-    wa_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+    wa_markup = markup_for(user_id, InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]]))
     await _send_exam_dates_chunks(query.message, lines, final_reply_markup=wa_markup)
 
 
@@ -989,21 +998,27 @@ def _exam_event_key(cid: str, e: dict) -> str:
     return f"{cid}|{e['kind']}|{e['date']}|{e.get('start') or ''}"
 
 
-def get_file_exam_events() -> list:
-    """Every event found in course files, flattened and de-duplicated
-    (the same date often appears in both the syllabus and the first
-    slides), each with its "cid" and "course" name. Undated format-only
-    events are kept once per course and kind."""
+STUMS_SITTINGS_RECORD = "stums_sittings"
+
+
+def _student_tracked(user_id: int) -> Optional[set]:
+    """The courses the student follows on /progress (None: all of them)."""
     from unibot.study_plan import _auto_tracked_cids, load_study_progress
-    cache = load_exam_file_cache()
-    names = dict(state.courses_map)
-    progress = load_study_progress()
+    progress = load_study_progress(user_id=user_id)
     tracked = progress.get("tracked")
     if tracked is None and progress.get("held"):
-        tracked = _auto_tracked_cids(progress)
+        tracked = _auto_tracked_cids(progress, user_id=user_id)
+    return None if tracked is None else set(tracked)
+
+
+def course_file_exam_events(cids=None) -> list:
+    """Exam info found in the course files (course facts, the same for
+    every student), de-duplicated (the same date often appears in both the
+    syllabus and the first slides), each with "cid" and "course"."""
+    cache = load_exam_file_cache()
     seen, out = set(), []
     for cid, files in cache.get("files", {}).items():
-        if (names and cid not in names) or (tracked is not None and cid not in tracked):
+        if cids is not None and cid not in cids:
             continue
         for entry in files.values():
             for e in entry.get("events", []):
@@ -1011,29 +1026,11 @@ def get_file_exam_events() -> list:
                 if key in seen:
                     continue
                 seen.add(key)
-                out.append({**e, "cid": cid, "course": names.get(cid, cid)})
-    # StuMS is authoritative: for a course with StuMS sittings, those
-    # replace whatever exam/retake/midterm dates the course files gave
-    # (see refresh_stums_exam_sittings). Presentations and submissions
-    # aren't in StuMS, so the files stay the source for those.
-    stums = cache.get("stums_sittings", {})
-    overridden_kinds = ("exam", "retake", "midterm")
-    for cid, sittings in stums.items():
-        if not sittings or (names and cid not in names) or (tracked is not None and cid not in tracked):
-            continue
-        file_dates = {e["kind"]: e["date"] for e in out if e["cid"] == cid and e["kind"] in overridden_kinds and e["date"]}
-        out = [e for e in out if not (e["cid"] == cid and e["kind"] in overridden_kinds)]
-        for i, s in enumerate(sorted(sittings, key=lambda s: s["date"])):
-            kind = "exam" if i == 0 else "retake"
-            file_date = file_dates.get(kind)
-            out.append({
-                "kind": kind, "date": s["date"], "start": s.get("start"), "end": s.get("end"),
-                "format": None, "location": s.get("room"), "note": None, "quote": "",
-                "year_corrected": False, "source": "StuMS",
-                "file_date": file_date if file_date and file_date != s["date"] else None,
-                "cid": cid, "course": names.get(cid, cid),
-            })
+                out.append({**e, "cid": cid, "course": course_registry.course_title(cid)})
+    return out
 
+
+def _drop_superseded(out: list) -> list:
     # A course with an upcoming dated event of some kind doesn't also need
     # its "date not announced" entry of the same kind. Past dates don't
     # count: reused slides often still carry last year's deadline.
@@ -1044,15 +1041,54 @@ def get_file_exam_events() -> list:
     return out
 
 
-async def refresh_stums_exam_sittings(session, all_exams: Optional[list] = None) -> None:
-    """Store each tracked course's StuMS exam sittings (matched via module
-    codes, cached since they practically never change) in the exam file
-    cache, where get_file_exam_events uses them to override dates found
-    in course files. all_exams can be passed in by a caller that already
-    fetched get_all_exam_dates."""
+def get_file_exam_events(user_id: Optional[int] = None) -> list:
+    """The student's view: course file events of their own (tracked)
+    courses, with the dates from their own StuMS sittings taking over the
+    file dates. Without a student: every course, files only."""
+    if user_id is None:
+        return _drop_superseded(course_file_exam_events())
+    names = student_courses(user_id)
+    tracked = _student_tracked(user_id)
+    cids = {cid for cid in names if tracked is None or cid in tracked}
+    out = course_file_exam_events(cids)
+    for e in out:
+        e["course"] = names.get(e["cid"], e["course"])
+    # StuMS is authoritative: for a course with StuMS sittings, those
+    # replace whatever exam/retake/midterm dates the course files gave
+    # (see refresh_stums_exam_sittings). Presentations and submissions
+    # aren't in StuMS, so the files stay the source for those.
+    stums = personal_record(user_id, STUMS_SITTINGS_RECORD, {}) or {}
+    overridden_kinds = ("exam", "retake", "midterm")
+    for cid, sittings in stums.items():
+        if not sittings or cid not in cids:
+            continue
+        file_dates = {e["kind"]: e["date"] for e in out if e["cid"] == cid and e["kind"] in overridden_kinds and e["date"]}
+        out = [e for e in out if not (e["cid"] == cid and e["kind"] in overridden_kinds)]
+        for i, sitting in enumerate(sorted(sittings, key=lambda x: x["date"])):
+            kind = "exam" if i == 0 else "retake"
+            file_date = file_dates.get(kind)
+            out.append({
+                "kind": kind, "date": sitting["date"], "start": sitting.get("start"), "end": sitting.get("end"),
+                "format": None, "location": sitting.get("room"), "note": None, "quote": "",
+                "year_corrected": False, "source": "StuMS",
+                "file_date": file_date if file_date and file_date != sitting["date"] else None,
+                "cid": cid, "course": names.get(cid, cid),
+            })
+    return _drop_superseded(out)
+
+
+async def refresh_stums_exam_sittings(session, all_exams: Optional[list] = None,
+                                      user_id: Optional[int] = None) -> None:
+    """Store the student's StuMS exam sittings per course (matched via
+    module codes, which are course facts cached for everyone) in their own
+    record, where get_file_exam_events uses them to override dates found
+    in course files. all_exams (the student's own StuMS list) can be passed
+    in by a caller that already fetched get_all_exam_dates."""
+    if user_id is None:
+        return  # sittings and passed modules are personal
     cache = load_exam_file_cache()
     codes = cache.get("module_codes", {})
-    cids = list(state.courses_map)
+    cids = list(student_courses(user_id))
     missing = [cid for cid in cids if cid not in codes]
     if missing:
         fetched = await get_course_module_codes(session, missing)
@@ -1082,38 +1118,48 @@ async def refresh_stums_exam_sittings(session, all_exams: Optional[list] = None)
         if seen:
             sittings[cid] = list(seen.values())
 
+    save_personal_record(user_id, STUMS_SITTINGS_RECORD, sittings)
     cache = load_exam_file_cache()
     cache["module_codes"] = codes
-    cache["stums_sittings"] = sittings
+    cache.pop("stums_sittings", None)  # the old single-account sittings
     save_exam_file_cache(cache)
 
 
+def _followed_by_someone(cid: str) -> bool:
+    """Whether any of the course's students follows it on /progress (all
+    their courses while their selection is automatic)."""
+    members = (getattr(state, "course_members", None) or {}).get(cid) or set()
+    for uid in members:
+        try:
+            tracked = _student_tracked(uid)
+        except Exception:
+            logging.debug("Study progress unavailable", exc_info=True)
+            return True
+        if tracked is None or cid in tracked:
+            return True
+    return not members
+
+
 @single_flight
-async def scan_course_files_for_exams(session) -> list:
-    """Scan the tracked courses' files (see /trackcourses; all watched
-    courses while selection is automatic) for exam dates. Returns the
-    dated, still-upcoming events that are new since the last scan (each
-    with "previous_date" set when it replaced an older date of the same
-    kind), for notify_new_file_exam_events."""
-    from unibot.study_plan import _auto_tracked_cids, _file_size_mb, _list_course_files, classify_lecture_file, load_study_progress
-    # downloads use the session the caller passed in (a participant's), not the admin's
-    http = session or state.global_session
-    if http is None:
-        return []
-    await _ensure_watched_courses_map(session)
-    progress = load_study_progress()
-    tracked = progress.get("tracked")
-    if tracked is None and progress.get("held"):
-        tracked = _auto_tracked_cids(progress)  # same courses /progress shows in automatic mode
-    courses = [(name, cid) for cid, name in state.courses_map.items() if tracked is None or cid in tracked]
+async def scan_course_files_for_exams(session=None) -> list:
+    """Scan the files of every watched course someone follows for exam
+    dates, each course once with its registry scanner (a member's own
+    session, handing over to another member when it fails). Returns the
+    dated, still-upcoming course events that are new since the last scan
+    (each with "previous_date" set when it replaced an older date of the
+    same kind), for notify_new_file_exam_events. `session` is unused (kept
+    for callers)."""
+    from unibot.study_plan import _file_size_mb, _list_course_files, classify_lecture_file
+    plan = [(name, cid, scanner) for name, cid, scanner in await watched_courses() if _followed_by_someone(cid)]
     cache = load_exam_file_cache()
     files_cache = cache.setdefault("files", {})
     semaphore = asyncio.Semaphore(3)
 
-    async def process_course(course_name, cid):
+    async def process_course(course_name, cid, scanner):
         async with semaphore:
             try:
-                files = await _list_course_files(cid, _EXAM_SCAN_SKIPPED_FOLDER_RE)
+                files, http = await course_registry.scan_with_failover(
+                    cid, scanner, lambda sess: _list_course_files(cid, _EXAM_SCAN_SKIPPED_FOLDER_RE, session=sess))
             except Exception as e:
                 logging.warning("scan_course_files_for_exams: listing failed for %s: %s", cid, e)
                 return
@@ -1157,22 +1203,18 @@ async def scan_course_files_for_exams(session) -> list:
                 if events:
                     logging.info("📄 Exam info in %s / %s: %s", course_name, key, [(e['kind'], e['date']) for e in events])
 
-    await asyncio.gather(*(process_course(name, cid) for name, cid in courses))
+    await asyncio.gather(*(process_course(name, cid, scanner) for name, cid, scanner in plan))
     # The scan awaited for minutes; only write its own key onto a fresh copy
-    # so StuMS sittings / notified flags written meanwhile aren't undone.
+    # so module codes / notified flags written meanwhile aren't undone.
     fresh = load_exam_file_cache()
     fresh["files"] = files_cache
     save_exam_file_cache(fresh)
-    try:
-        await refresh_stums_exam_sittings(session)
-    except Exception as e:
-        logging.warning("scan_course_files_for_exams: StuMS sittings unavailable, keeping the previous ones: %s", e)
 
     today = datetime.now(TZ_BERLIN).date().isoformat()
     notified = cache.get("notified", {})
     current = {
         _exam_event_key(e["cid"], e): e
-        for e in get_file_exam_events()
+        for e in course_file_exam_events()
         if e["date"] and e["date"] >= today
     }
     new_events = []
@@ -1230,29 +1272,45 @@ def render_file_exam_events(events: list, header: str) -> list:
 
 
 async def notify_new_file_exam_events(bot, new_events: list) -> None:
-    if not new_events:
-        return
-    lines = render_file_exam_events(new_events, "📄 <b>New exam dates</b> <i>(course files / StuMS)</i>")
-    lines.append(EXAM_DATES_FOOTER)
-    await broadcast(bot, "\n".join(lines), disable_notification=False, reply_markup=WA_FORWARD_ASK_MARKUP)
+    """New exam dates from course files, one message per course, only to
+    that course's students (in their own course alert settings)."""
+    by_course: dict = {}
+    for e in new_events:
+        by_course.setdefault(e["cid"], []).append(e)
+    for cid, events in by_course.items():
+        lines = render_file_exam_events(events, "📄 <b>New exam dates</b> <i>(course files)</i>")
+        lines.append(EXAM_DATES_FOOTER)
+        title = f"📄 New exam date: {html.escape(events[0]['course'])}"
+        await course_registry.fan_out(bot, cid, "exams", "\n".join(lines), title,
+                                      reply_markup=WA_FORWARD_ASK_MARKUP, members=course_members(cid))
 
 
-async def check_file_exam_reminders(bot, registered: list) -> None:
+def _registered_dates(user_id: int) -> set:
+    """Dates of the StuMS sittings the student is registered for (recorded
+    by their own exam date check)."""
+    try:
+        return set(load_exam_cache(user_id).get("registered_dates") or [])
+    except Exception:
+        logging.debug("Exam cache unreadable", exc_info=True)
+        return set()
+
+
+async def check_file_exam_reminders(bot, registered: Optional[list] = None) -> None:
     """Reminders for exam dates found in course files, EXAM_FILE_REMINDER_DAYS
-    days before. Skipped when StuMS already has a registered sitting on the
-    same date (check_exam_date_reminders covers that one). A retake is
-    only reminded once the course's main exam date has passed, since
-    before that it isn't the next relevant date."""
+    days before, to the course's students only. A student registered in
+    StuMS for a sitting on that date is skipped (check_exam_date_reminders
+    covers it for them). A retake is only reminded once the course's main
+    exam date has passed, since before that it isn't the next relevant
+    date. `registered` is unused (kept for callers)."""
     today = datetime.now(TZ_BERLIN).date()
     cache = load_exam_file_cache()
     reminded = cache.get("reminded", {})
-    events = [e for e in get_file_exam_events() if e["date"]]
-    registered_dates = {r.get("date") for r in registered}
+    events = [e for e in course_file_exam_events() if e["date"]]
     main_exam_passed = {e["cid"] for e in events if e["kind"] == "exam" and e["date"] < today.isoformat()}
 
     for e in events:
         days_left = (datetime.fromisoformat(e["date"]).date() - today).days
-        if days_left < 0 or e["date"] in registered_dates:
+        if days_left < 0:
             continue
         if e["kind"] == "retake" and e["cid"] not in main_exam_passed:
             continue
@@ -1271,7 +1329,11 @@ async def check_file_exam_reminders(bot, registered: list) -> None:
             f"📎 <i>{html.escape(e['source'])}</i>",
             "━━━━━━━━━━━━━━━━━",
         ])
-        await broadcast(bot, text, disable_notification=False, reply_markup=WA_FORWARD_ASK_MARKUP)
+        members = course_members(e["cid"])
+        recipients = {uid for uid in course_registry.broadcast_targets(e["cid"], members)
+                      if e["date"] not in _registered_dates(uid)}
+        await course_registry.fan_out(bot, e["cid"], "exams", text, f"📚 {html.escape(e['course'])}: {when_line}",
+                                      reply_markup=WA_FORWARD_ASK_MARKUP, recipients=recipients)
         # Mark every threshold already passed too, so a reminder that was
         # missed (bot down) isn't followed by a burst of older ones.
         reminded[key] = sorted(sent | set(due))
@@ -1289,11 +1351,9 @@ async def handle_exam_files_scan(update: Update, context: ContextTypes.DEFAULT_T
         return
     status_msg = await query.message.reply_text("📄 Scanning course files for exam dates...", disable_notification=True)
     try:
-        if not state.global_session or not await state.global_session.is_logged_in():
-            await login_studip()
-        new_events = await scan_course_files_for_exams(state.global_session)
+        new_events = await scan_course_files_for_exams()
         await notify_new_file_exam_events(context.bot, new_events)
-        events = get_file_exam_events()
+        events = get_file_exam_events(query.from_user.id)
         today = datetime.now(TZ_BERLIN).date().isoformat()
         events = [e for e in events if not e["date"] or e["date"] >= today]
         if not events:

@@ -151,7 +151,8 @@ async def handle_status_group(update: Update, context: ContextTypes.DEFAULT_TYPE
         if feature == "watch_prev":
             uid = query.from_user.id
             set_pref(uid, "watch_previous_semester", not get_pref(uid, "watch_previous_semester"))
-            state.courses_map = {}  # same as handle_toggle_watch_prev_sem: rebuild on the next watcher cycle
+            if uid == getattr(state.global_session, "user_id", None):
+                state.courses_map = {}  # the watcher's own map: rebuild it on the next cycle
         elif feature == "study_plan":
             uid = query.from_user.id
             set_pref(uid, "weekly_study_plan", not get_pref(uid, "weekly_study_plan"))

@@ -1705,6 +1705,9 @@ COURSE_SESSION_STATE_KEY = "course_session_state"  # {cid: {event id: entry}}, c
 COURSE_SESSION_DAYS_AHEAD = 14
 COURSE_SESSION_SCAN_SECONDS = 20 * 60        # every course at most this often
 PERSONAL_TIMETABLE_CHECK_SECONDS = 6 * 3600  # each student's own timetable
+COURSE_SESSION_PARALLEL = 3  # courses read at the same time
+PERSONAL_TIMETABLES_PER_CYCLE = 5  # students' timetables read per watcher cycle
+PERSONAL_TIMETABLE_RETRY_SECONDS = 30 * 60  # after a failed read
 SESSION_URGENT_HOURS = 48  # a change to a session this close skips the evening digest
 _last_course_session_scan = 0.0
 _timetable_checked_at: dict[int, float] = {}
@@ -1761,13 +1764,22 @@ async def check_course_session_changes(bot, now: Optional[datetime] = None, forc
     now = now or datetime.now(TZ_BERLIN)
     plan = await watched_courses()
     all_state = dict(load_general_cache().get(COURSE_SESSION_STATE_KEY) or {})
-    for course_name, cid, scanner in plan:
-        try:
-            (raw, _meta), _used = await course_registry.scan_with_failover(
-                cid, scanner, lambda sess, cid=cid: studip_api_get_all(f"/courses/{cid}/events", session=sess))
-        except Exception as exc:
+    semaphore = asyncio.Semaphore(COURSE_SESSION_PARALLEL)
+
+    async def fetch(cid, scanner):
+        async with semaphore:
+            try:
+                (raw, _meta), _used = await course_registry.scan_with_failover(
+                    cid, scanner, lambda sess: studip_api_get_all(f"/courses/{cid}/events", session=sess))
+                return raw
+            except Exception as exc:
+                logging.debug("Course sessions of %s unavailable: %s", cid, exc)
+                return None
+
+    fetched = await asyncio.gather(*(fetch(cid, scanner) for _, cid, scanner in plan))
+    for (course_name, cid, _scanner), raw in zip(plan, fetched):
+        if raw is None:
             stats["failed"] += 1
-            logging.debug("Course sessions of %s unavailable: %s", cid, exc)
             continue
         stats["courses"] += 1
         events = _course_session_events(cid, course_name, raw, now)
@@ -1810,17 +1822,21 @@ async def check_personal_timetable_changes(bot, now: Optional[datetime] = None) 
     legacy = load_general_cache().get("user_schedule_slots")
     watcher_uid = getattr(state.global_session, "user_id", None) or PRIMARY_ADMIN_ID
     checked = 0
-    for account in signed_in_accounts():
+    due = [a for a in signed_in_accounts()
+           if time.time() - _timetable_checked_at.get(a.user_id, 0.0) >= PERSONAL_TIMETABLE_CHECK_SECONDS]
+    # longest waiting first, a few per cycle, so a restart doesn't read everyone at once
+    due.sort(key=lambda a: _timetable_checked_at.get(a.user_id, 0.0))
+    for account in due[:PERSONAL_TIMETABLES_PER_CYCLE]:
         uid, sess = account.user_id, account.session
-        if time.time() - _timetable_checked_at.get(uid, 0.0) < PERSONAL_TIMETABLE_CHECK_SECONDS:
-            continue
-        _timetable_checked_at[uid] = time.time()
         try:
             with acting_as(uid):
                 slots = await fetch_user_schedule_api(user_id=uid, session=sess)
         except Exception as exc:
             logging.debug("Timetable of a student unavailable: %s", exc)
+            # try again in PERSONAL_TIMETABLE_RETRY_SECONDS, not a whole interval later
+            _timetable_checked_at[uid] = time.time() - PERSONAL_TIMETABLE_CHECK_SECONDS + PERSONAL_TIMETABLE_RETRY_SECONDS
             continue
+        _timetable_checked_at[uid] = time.time()
         checked += 1
         old = personal_record(uid, "user_schedule_slots", {}) or {}
         if not old and uid == watcher_uid and isinstance(legacy, dict) and legacy:

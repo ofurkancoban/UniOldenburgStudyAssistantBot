@@ -20,6 +20,7 @@ from unibot.auth import is_user_admin
 from unibot.storage import shared_http
 
 
+WA_ADMIN_ONLY = "⛔ Forwarding to WhatsApp is for administrators only."
 WA_FORWARD_ASK_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
 WA_FORWARD_CONFIRM_MARKUP = InlineKeyboardMarkup([[
     InlineKeyboardButton("✅ Yes, forward", callback_data="forward_wa_confirm"),
@@ -31,6 +32,9 @@ async def handle_forward_wa_ask(update: Update, context: ContextTypes.DEFAULT_TY
     """First tap on any 'Forward to WA' button - swap it for a Yes/No confirmation
     instead of sending immediately, since these messages can carry personal info."""
     query = update.callback_query
+    if not is_user_admin(query.from_user.id):
+        await query.answer(WA_ADMIN_ONLY, show_alert=True)
+        return
     await query.answer()
     try:
         await query.edit_message_reply_markup(reply_markup=WA_FORWARD_CONFIRM_MARKUP)
@@ -41,6 +45,9 @@ async def handle_forward_wa_ask(update: Update, context: ContextTypes.DEFAULT_TY
 async def handle_forward_wa_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User declined forwarding - restore the original button so they can retry."""
     query = update.callback_query
+    if not is_user_admin(query.from_user.id):
+        await query.answer(WA_ADMIN_ONLY, show_alert=True)
+        return
     await query.answer("Cancelled")
     try:
         await query.edit_message_reply_markup(reply_markup=WA_FORWARD_ASK_MARKUP)
@@ -51,6 +58,10 @@ async def handle_forward_wa_cancel(update: Update, context: ContextTypes.DEFAULT
 async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward message to WhatsApp group via Node.js microservice."""
     query = update.callback_query
+    if not is_user_admin(query.from_user.id):
+        # the group belongs to the administrator: students can't post into it
+        await query.answer(WA_ADMIN_ONLY, show_alert=True)
+        return
     await query.answer("Sending to WhatsApp...")
 
     text = query.message.text or query.message.caption or "No text found"

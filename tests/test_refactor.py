@@ -447,7 +447,6 @@ class WatcherCycleTests(unittest.TestCase):
             "check_grade_reminders": job("grades"),
             "check_tuition_reminders": job("tuition"),
             "check_exam_date_reminders": job("exam_dates"),
-            "get_registered_exam_schedule": job("registered", fails=True),
             "check_file_exam_reminders": job("file_exams"),
             "scan_course_files_for_exams": job("scan", result=[]),
             "notify_new_file_exam_events": job("notify"),
@@ -473,7 +472,7 @@ class WatcherCycleTests(unittest.TestCase):
                 asyncio.run(watcher.unified_watcher_controller(app))
 
         for expected in ("morning", "calendar", "schedule_changes", "timetable", "tasks", "exam_registrations", "grades",
-                         "tuition", "exam_dates", "registered", "file_exams", "health", "announcements", "forum"):
+                         "tuition", "exam_dates", "file_exams", "health", "announcements", "forum"):
             self.assertIn(expected, calls)
         self.assertIn("files", calls)  # throttled to every 30 min, so due on the first cycle
         self.assertEqual(cache["health_state"], {"studip": False})

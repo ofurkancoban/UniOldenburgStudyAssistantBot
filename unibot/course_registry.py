@@ -35,7 +35,7 @@ from unibot.auth import ACTIVE, has_stored_login, is_user_allowed, lifecycle_sta
 from unibot.preferences import DIGEST_HOUR, get_pref, in_quiet_hours, morning_send_time
 from unibot.storage import load_default_semester
 from unibot.studip_api import BASE_URL
-from unibot.telegram_ui import broadcast_targets
+from unibot.telegram_ui import WA_FORWARD_CALLBACK_PREFIX, broadcast_targets, markup_for
 
 SCANNER_FAILURE_COOLDOWN = 3600
 KIND_COLUMN = {
@@ -258,8 +258,10 @@ def _first_button(markup) -> Optional[dict]:
         return None
     if getattr(button, "url", None):
         return {"text": button.text, "url": button.url}
-    if getattr(button, "callback_data", None):
-        return {"text": button.text, "callback_data": button.callback_data}
+    data = getattr(button, "callback_data", None)
+    if data and not str(data).startswith(WA_FORWARD_CALLBACK_PREFIX):
+        # "Forward to WA" would forward the whole digest, so it's not kept
+        return {"text": button.text, "callback_data": data}
     return None
 
 
@@ -294,7 +296,8 @@ def _prune_queue(queue: list, now: datetime) -> list:
 async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str, *,
                   reply_markup=None, members=None, parse_mode: str = "HTML",
                   send_full: Optional[Callable[..., Awaitable[bool]]] = None,
-                  now: Optional[datetime] = None, urgent: bool = False) -> dict:
+                  now: Optional[datetime] = None, urgent: bool = False,
+                  recipients=None) -> dict:
     """Deliver one alert to the course's followers in their own way.
 
     Per course: muted, kind switched off, or the format (full card with
@@ -306,10 +309,11 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
     An urgent alert (a session soon cancelled or moved) still respects a
     muted course and quiet hours, but always comes as a full card with sound
     and skips the evening digest.
+    `recipients` (a set of students) replaces the course's usual audience.
     Returns {"full"|"title"|"silent"|"skipped"|"queued": count}."""
     counts = {"full": 0, "title": 0, "silent": 0, "skipped": 0, "queued": 0}
     now = now or datetime.now(TZ_BERLIN)
-    for uid in sorted(broadcast_targets(cid, members)):
+    for uid in sorted(recipients if recipients is not None else broadcast_targets(cid, members)):
         fmt = delivery_format(uid, cid, kind)
         if fmt is None:
             counts["skipped"] += 1
@@ -317,7 +321,7 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
         if urgent:
             fmt = "full"
         files_mode = get_pref(uid, "file_delivery") if kind == "files" else "card"
-        markup = files_link_markup(cid) if files_mode == "link" else reply_markup
+        markup = markup_for(uid, files_link_markup(cid) if files_mode == "link" else reply_markup)
         try:
             reason = _hold_reason(uid, now)
             if urgent and reason == "digest":

@@ -25,7 +25,8 @@ from studip_utils import aread_bytes
 from studip_utils import md_escape as _md
 from studip_utils import safe_filename as _safe_filename
 from unibot import db, state
-from unibot.config import ALLOWED_USER_IDS
+from unibot.config import ADMIN_USER_IDS, ALLOWED_USER_IDS
+from unibot.storage import load_student_progress
 
 nav_names: dict[int, list[str]] = {}  # user_id -> [name1, name2, ...]  (for breadcrumb)
 
@@ -142,13 +143,44 @@ class TelegramSafetyLimiter(BaseRateLimiter):
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
+WA_FORWARD_CALLBACK_PREFIX = "forward_wa"
+
+
+def is_admin_chat(uid: Optional[int]) -> bool:
+    """Whether the chat is an administrator's (same rule as auth.is_user_admin)."""
+    if uid is None:
+        return False
+    if uid in ADMIN_USER_IDS:
+        return True
+    try:
+        return db.is_user_admin_db(uid)
+    except Exception:
+        logging.debug("Admin lookup failed", exc_info=True)
+        return False
+
+
+def markup_for(uid: Optional[int], markup):
+    """The reply markup as this chat may see it: the "Forward to WA" button
+    posts into the administrator's WhatsApp group, so only admins get it."""
+    if markup is None or is_admin_chat(uid):
+        return markup
+    rows = getattr(markup, "inline_keyboard", None)
+    if rows is None:
+        return markup
+    kept = [[b for b in row if not str(getattr(b, "callback_data", "") or "").startswith(WA_FORWARD_CALLBACK_PREFIX)]
+            for row in rows]
+    kept = [row for row in kept if row]
+    return InlineKeyboardMarkup(kept) if kept else None
+
+
 # ── broadcast helper ──────────────────────────────────────────────────────────
 def broadcast_targets(cid: Optional[str] = None, members=None) -> set:
     """Who a broadcast reaches. Without `cid`: every allowed and active user.
     With `cid`: students enrolled in or tracking that course, plus primary
     administrators. With `members` (the course's known participants)
     administrators are no exception: only participants and users tracking
-    the course get it."""
+    the course get it. `members` without `cid` (admins only, one student)
+    is exactly who gets it. Inactive students are never included."""
     targets = set(members) if members is not None else set(ALLOWED_USER_IDS)
     try:
         for u in db.get_all_users():
@@ -163,17 +195,25 @@ def broadcast_targets(cid: Optional[str] = None, members=None) -> set:
                 if cid in user_courses:
                     targets.add(uid)
                     continue
-                progress_key = f"study_progress_{uid}.json"
-                if db.exists(progress_key):
-                    prog = db.load(progress_key)
-                    if cid in (prog.get("tracked") or []):
-                        targets.add(uid)
-                        continue
+                if cid in (load_student_progress(uid).get("tracked") or []):
+                    targets.add(uid)
+                    continue
                 continue
-            targets.add(uid)
+            if members is None:
+                targets.add(uid)  # given members without a course are the exact audience
     except Exception:
         logging.debug("Ignored a non-critical error", exc_info=True)
-    return targets
+    return {uid for uid in targets if not _is_inactive(uid)}
+
+
+def _is_inactive(uid: int) -> bool:
+    """A student who used /stop, deleted their data or blocked the bot gets
+    nothing until they come back with /start."""
+    try:
+        return db.get_lifecycle(uid)["state"] == "inactive"
+    except Exception:
+        logging.debug("Lifecycle lookup failed", exc_info=True)
+        return False
 
 
 async def broadcast(
@@ -193,7 +233,7 @@ async def broadcast(
                 text=text,
                 parse_mode=parse_mode,
                 disable_notification=disable_notification,
-                reply_markup=reply_markup
+                reply_markup=markup_for(uid, reply_markup),
             )
             await asyncio.sleep(0.3)  # Telegram rate limit safety
         except Exception as e:

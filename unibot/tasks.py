@@ -29,7 +29,7 @@ from unibot.storage import (
     students_with_tasks,
     user_tasks,
 )
-from unibot.telegram_ui import user_data, get_main_keyboard
+from unibot.telegram_ui import get_main_keyboard, markup_for, user_data
 from unibot.auth import acting_as, get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import list_courses
 from unibot.ai import _call_openrouter, _extract_json_object
@@ -386,9 +386,8 @@ async def handle_announcement_to_task(update: Update, context: ContextTypes.DEFA
 
     confirmation = _save_task_and_confirmation_text(user_id, result["text"], result.get("due_time"), info["course"])
     try:
-        await query.edit_message_reply_markup(
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
-        )
+        await query.edit_message_reply_markup(reply_markup=markup_for(
+            user_id, InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])))
     except TelegramError:
         pass
     await query.message.reply_text(confirmation)

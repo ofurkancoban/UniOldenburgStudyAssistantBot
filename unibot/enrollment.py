@@ -29,7 +29,7 @@ from unibot.telegram_ui import (
     _stop_loading_animation,
     get_main_keyboard,
 )
-from unibot.auth import ACTIVE, is_user_allowed, lifecycle_state, login_studip
+from unibot.auth import INACTIVE, is_user_allowed, lifecycle_state, login_studip
 from unibot.schedule import fastenroll_tasks, schedule_fastenroll_job
 from unibot.study_plan import _render_enrolled_courses_for_semester, _render_open_courses_for_semester
 from unibot.tasks import _run_fastenroll_task
@@ -561,8 +561,11 @@ async def restore_pending_fastenroll_jobs(app):
     pending = load_pending()
     for chat_id_str, jobs in pending.items():
         chat_id = int(chat_id_str)
-        if not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE:
-            logging.info("Pending fastenroll jobs of %s not resumed: no longer allowed or active", chat_id)
+        if not is_user_allowed(chat_id) or lifecycle_state(chat_id) == INACTIVE:
+            # they left or stopped the bot: drop the jobs instead of keeping
+            # them for a later restart, when the target time may be long gone
+            logging.info("Pending fastenroll jobs of %s dropped: no longer allowed or active", chat_id)
+            clear_pending_job(chat_id)
             continue
         for sem_id, job in jobs.items():
             target_time_str = job.get("target_time_str")

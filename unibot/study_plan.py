@@ -29,6 +29,7 @@ from studip_utils import TZ_BERLIN, format_hours
 
 from unibot import db
 from unibot.config import (
+    PRIMARY_ADMIN_ID,
     GWDG_API_KEY,
     GWDG_API_URL,
     GWDG_EMBEDDING_MODEL,
@@ -37,6 +38,8 @@ from unibot import state
 from unibot.study_day import plan_day
 from unibot.preferences import campus_anchor, get_pref, set_pref
 from unibot.storage import (
+    load_student_progress,
+    save_student_progress,
     link_cache,
     user_tasks,
     record_study_block,
@@ -55,7 +58,7 @@ from unibot.telegram_ui import (
     _start_loading_animation,
     _stop_loading_animation,
 )
-from unibot.auth import current_user_id, get_user_session, has_stored_login, is_user_admin, is_user_allowed, login_studip
+from unibot.auth import current_user_id, get_user_session, has_stored_login, is_user_allowed, login_studip
 from unibot.studip_api import (
     _ensure_watched_courses_map,
     _parse_file_date_v2,
@@ -575,8 +578,8 @@ async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
     exercise material (README, syllabus, quizzes) are never downloaded,
     since the planner doesn't schedule them. When the student picked
     which courses to track, only those are scanned."""
-    if user_id is None or is_user_admin(user_id):
-        await _ensure_watched_courses_map(session)
+    if user_id is None or (session is not None and session is state.global_session):
+        await _ensure_watched_courses_map(session)  # only the watcher's own session rebuilds its map
     tracked = load_study_progress(user_id=user_id).get("tracked")
     courses_dict = (student_courses(user_id) if user_id else state.courses_map)
     courses = [(name, cid) for cid, name in courses_dict.items() if tracked is None or cid in tracked]
@@ -593,7 +596,7 @@ async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
     async def process_course(course_name, cid):
         async with semaphore:
             try:
-                files = await _list_course_files(cid)
+                files = await _list_course_files(cid, session=active_session)
             except Exception as e:
                 logging.warning("collect_course_topics: list_files failed for %s: %s", cid, e)
                 return
@@ -1043,50 +1046,36 @@ def _apply_unit_progress(unit: dict, studied: set, task_minutes: dict) -> None:
 STUDY_PROGRESS_PATH = "study_progress.json"
 
 
+def _progress_owner(user_id: Optional[int]) -> Optional[int]:
+    if user_id is not None:
+        return user_id
+    return getattr(state.global_session, "user_id", None) or PRIMARY_ADMIN_ID or None
+
+
 def load_study_progress(user_id: Optional[int] = None) -> dict:
     """{"studied": {cid: [unit_key, ...]}, "last_plan": [session, ...],
     "held": {cid: n}, "held_date": "YYYY-MM-DD", "tracked": [cid, ...]}.
     A unit_key is the lecture file's name, or "session-N" for a held
     lecture with no slides. "tracked" is absent while course selection is
-    automatic (see compute_course_progress)."""
-    if user_id is not None:
-        user_key = f"study_progress_{user_id}.json"
-        if db.exists(user_key):
-            try:
-                return db.load(user_key)
-            except Exception as e:
-                logging.warning("Could not load study progress for user %s: %s", user_id, e)
-        if is_user_admin(user_id) and db.exists(STUDY_PROGRESS_PATH):
-            try:
-                return db.load(STUDY_PROGRESS_PATH)
-            except Exception:
-                logging.debug("Ignored a non-critical error", exc_info=True)
+    automatic (see compute_course_progress). Kept in the student's
+    encrypted record; without a student it is the watcher session's."""
+    owner = _progress_owner(user_id)
+    if owner is None:
         return {}
-
-    if db.exists(STUDY_PROGRESS_PATH):
-        try:
-            return db.load(STUDY_PROGRESS_PATH)
-        except Exception as e:
-            logging.warning("Could not load study progress: %s", e)
-    return {}
+    try:
+        return load_student_progress(owner)
+    except Exception as e:
+        logging.warning("Could not load study progress: %s", e)
+        return {}
 
 
 def save_study_progress(data: dict, user_id: Optional[int] = None) -> None:
-    if user_id is not None:
-        user_key = f"study_progress_{user_id}.json"
-        try:
-            db.save(user_key, data)
-        except Exception as e:
-            logging.error("Failed to save study progress for user %s: %s", user_id, e)
-        if is_user_admin(user_id):
-            try:
-                db.save(STUDY_PROGRESS_PATH, data)
-            except Exception:
-                logging.debug("Ignored a non-critical error", exc_info=True)
+    owner = _progress_owner(user_id)
+    if owner is None:
+        logging.warning("Study progress needs a student; nothing saved")
         return
-
     try:
-        db.save(STUDY_PROGRESS_PATH, data)
+        save_student_progress(owner, data)
     except Exception as e:
         logging.error("Failed to save study progress: %s", e)
 
@@ -1311,7 +1300,7 @@ async def gather_weekly_study_inputs(session, user_id: Optional[int] = None) -> 
     # course, no fuzzy matching needed). Retakes are left out: before the
     # main exam they aren't what the student is preparing for.
     known = {(e["matched_cid"], e.get("date")) for e in exams}
-    for fe in get_file_exam_events():
+    for fe in get_file_exam_events(user_id):
         if fe["kind"] not in ("exam", "midterm") or not fe["date"]:
             continue
         days_until = (datetime.fromisoformat(fe["date"]).date() - today).days

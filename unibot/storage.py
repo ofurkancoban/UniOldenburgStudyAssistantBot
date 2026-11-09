@@ -672,6 +672,40 @@ def delete_personal_record(user_id, section: str) -> None:
         save_general_cache(cache)
 
 
+STUDY_PROGRESS_RECORD = "study_progress"
+LEGACY_SHARED_PROGRESS = "study_progress.json"  # an admin's progress, mirrored in plain text
+
+
+def load_student_progress(user_id) -> dict:
+    """The student's /progress state from their encrypted record. The old
+    plain documents (their own, and the shared admin mirror for the primary
+    admin) move over on the first read and are deleted."""
+    uid = int(user_id)
+    data = personal_record(uid, STUDY_PROGRESS_RECORD)
+    if data is not None:
+        return data
+    own = f"study_progress_{uid}.json"
+    sources = [own] + ([LEGACY_SHARED_PROGRESS] if uid == PRIMARY_ADMIN_ID else [])
+    for key in sources:
+        try:
+            if not db.exists(key):
+                continue
+            data = db.load(key) or {}
+        except Exception as e:
+            logging.warning("Could not read old study progress: %s", e)
+            continue
+        save_personal_record(uid, STUDY_PROGRESS_RECORD, data)
+        for old in sources:
+            if db.exists(old):
+                db.delete(old)
+        return data
+    return {}
+
+
+def save_student_progress(user_id, data: dict) -> None:
+    save_personal_record(int(user_id), STUDY_PROGRESS_RECORD, data)
+
+
 STUDY_BLOCK_LOG_DAYS = 35  # how long sent study blocks and their feedback are kept
 STUDY_BLOCK_STATUSES = ("sent", "done", "skipped")
 

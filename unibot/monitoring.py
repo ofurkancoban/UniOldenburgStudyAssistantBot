@@ -82,7 +82,15 @@ from unibot.monitoring_fetch import (  # noqa: F401 - the fetch layer, re-export
 )
 from fast_enroll import get_semester_options
 from unibot.preferences import get_pref
-from unibot.storage import link_cache, load_default_semester, load_files_cache, save_files_cache, single_flight
+from unibot.storage import (
+    link_cache,
+    load_default_semester,
+    load_files_cache,
+    personal_record,
+    save_files_cache,
+    save_personal_record,
+    single_flight,
+)
 from unibot.studip_api import (
     BASE_URL,
     STUDIP_API_URL,
@@ -97,6 +105,7 @@ from unibot.studip_api import (
     studip_api_get,
 )
 from unibot.telegram_ui import (
+    markup_for,
     _show_typing,
     _start_loading_animation,
     _stop_loading_animation,
@@ -110,27 +119,61 @@ check_in_progress: set[int] = set()  # chat_id set to prevent concurrent checks
 _OLDEST = datetime.fromtimestamp(0, TZ_BERLIN)  # sorts files without a date first (no overflow when compared)
 
 
-def message_cache_key(user_id: Optional[int] = None) -> str:
-    """Inbox cache per Telegram user; the admin session keeps the original file."""
+MESSAGES_RECORD = "studip_messages"  # the student's recent inbox, in their encrypted record
+
+
+def _message_owner(user_id: Optional[int] = None) -> Optional[int]:
+    """Whose inbox: the given or acting student, else the watcher session's."""
     if user_id is None:
         user_id = current_user_id()
     if user_id is None:
-        return "messages_cache.json"
-    sess = state.user_sessions.get(user_id)
-    if sess is not None and sess is state.global_session:
-        return "messages_cache.json"
-    return f"messages_cache_{user_id}.json"
+        user_id = getattr(state.global_session, "user_id", None) or PRIMARY_ADMIN_ID
+    return user_id
+
+
+def _legacy_message_keys(user_id: int) -> list[str]:
+    """Plain documents the inbox used to be kept in."""
+    keys = [f"messages_cache_{user_id}.json"]
+    watcher_uid = getattr(state.global_session, "user_id", None) or PRIMARY_ADMIN_ID
+    if user_id == watcher_uid:
+        keys.append("messages_cache.json")
+    return keys
+
+
+def stored_messages(user_id: Optional[int] = None) -> Optional[list]:
+    """The student's remembered inbox (None before their first check). An
+    old plain document is moved into the encrypted record and deleted."""
+    uid = _message_owner(user_id)
+    if uid is None:
+        return None
+    messages = personal_record(uid, MESSAGES_RECORD)
+    if messages is not None:
+        return messages
+    for key in _legacy_message_keys(uid):
+        try:
+            if db.exists(key):
+                messages = db.load(key) or []
+                save_personal_record(uid, MESSAGES_RECORD, messages)
+                db.delete(key)
+                return messages
+        except Exception as e:
+            logging.warning("Could not move an old message cache: %s", e)
+    return None
+
+
+def save_messages(user_id: Optional[int], messages: list) -> None:
+    uid = _message_owner(user_id)
+    if uid is not None:
+        save_personal_record(uid, MESSAGES_RECORD, messages)
 
 
 def load_message_cache(user_id: Optional[int] = None) -> list[dict]:
-    """Load the acting user's message cache."""
-    key = message_cache_key(user_id)
+    """The acting (or given) student's remembered inbox."""
     try:
-        if db.exists(key):
-            return db.load(key)
+        return stored_messages(user_id) or []
     except Exception as e:
         logging.warning("load_message_cache failed: %s", e)
-    return []
+        return []
 
 
 async def watch_loop(chat_id, context):
@@ -746,7 +789,7 @@ async def check_new_messages(bot, chat_id, silent: bool = False):
 async def _check_new_messages(bot, chat_id, silent: bool = False):
     # the acting user's own inbox (the admin's outside of any user context)
     session = get_user_session()
-    cache_key = message_cache_key()
+    owner = _message_owner()
     if not silent:
         await bot.send_message(chat_id=chat_id, text="📨 Checking messages...", disable_notification=True)
 
@@ -757,19 +800,14 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
             logging.warning("check_new_messages: API failed (%s), falling back to the overview page", e)
             all_messages = await _fetch_messages_html(session)
 
-        if not db.exists(cache_key):
+        old_messages = stored_messages(owner)
+        if old_messages is None:
             # first check for this user: remember the inbox as it is instead
             # of sending every old message as "new"
-            db.save(cache_key, all_messages[:100])
+            save_messages(owner, all_messages[:100])
             if not silent:
                 await bot.send_message(chat_id=chat_id, text="☑️ No new messages found.", disable_notification=True)
             return False
-
-        old_messages = []
-        try:
-            old_messages = db.load(cache_key)
-        except (OSError, ValueError):
-            pass
 
         old_ids = {m["id"] for m in old_messages}
         new_messages = [m for m in all_messages if m["id"] not in old_ids]
@@ -787,7 +825,7 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
         # Update cache with new messages prepended or appended
         # Best to just store all recent ones
         all_messages_combined = (new_messages + old_messages)[:100]
-        db.save(cache_key, all_messages_combined)
+        save_messages(owner, all_messages_combined)
 
         new_messages_sorted = sorted(new_messages, key=lambda m: parse_date_safe(m.get("date", "")))
         for msg in new_messages_sorted:
@@ -819,7 +857,7 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
                 if can_reply:
                     btn_rows.append([InlineKeyboardButton("↩️ Reply on Stud.IP", callback_data=f"msg_reply|{msg['id']}")])
                 btn_rows.append([InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")])
-                markup = InlineKeyboardMarkup(btn_rows)
+                markup = markup_for(chat_id, InlineKeyboardMarkup(btn_rows))
             # a Stud.IP message is private: only its recipient gets it
             await bot.send_message(chat_id=chat_id, text=text[:4000], parse_mode="HTML", reply_markup=markup)
             await asyncio.sleep(0.3)
@@ -937,14 +975,13 @@ async def show_last_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     try:
         # Load the tapping user's own message cache
-        cache_key = message_cache_key(query.from_user.id)
-        if not db.exists(cache_key):
-            await _stop_loading_animation(stop_evt, anim_task)
-            await query.edit_message_text("⚠️ No message history available.")
-            return
-
         try:
-            all_messages = db.load(cache_key)
+            stored = stored_messages(query.from_user.id)
+            if stored is None:
+                await _stop_loading_animation(stop_evt, anim_task)
+                await query.edit_message_text("⚠️ No message history available.")
+                return
+            all_messages = stored
         except Exception as e:
             logging.error("Failed to load message cache: %s", e)
             await _stop_loading_animation(stop_evt, anim_task)
@@ -1152,7 +1189,7 @@ async def handle_studip_message_reply_start(update: Update, context: ContextType
         await query.message.reply_text("⚠️ Invalid message ID.")
         return
 
-    cached_msg = next((m for m in load_message_cache() if m.get("id") == msg_id), None)
+    cached_msg = next((m for m in load_message_cache(query.from_user.id) if m.get("id") == msg_id), None)
     sender_id = (cached_msg or {}).get("sender_id")
     sender_name = (cached_msg or {}).get("sender") or "Unknown"
     orig_subject = (cached_msg or {}).get("title") or "(No subject)"

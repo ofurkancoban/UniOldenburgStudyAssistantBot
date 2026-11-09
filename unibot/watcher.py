@@ -14,14 +14,12 @@ from typing import Optional
 
 from exam_reminder import (
     adopt_legacy_exam_cache,
-    background_stums,
     exam_cache_user,
     load_exam_cache,
     check_exam_date_reminders,
     check_exam_reminders,
     check_grade_reminders,
     check_tuition_reminders,
-    get_registered_exam_schedule,
 )
 from studip_utils import TZ_BERLIN, berlin_now
 
@@ -43,7 +41,7 @@ from unibot.storage import (
     save_general_cache,
     update_general_cache,
 )
-from unibot.telegram_ui import broadcast
+from unibot.telegram_ui import broadcast, markup_for
 from unibot.auth import (
     ACTIVE,
     INACTIVE,
@@ -220,7 +218,8 @@ def _user_sender(user_id: int):
     async def send(bot, text, parse_mode="HTML", disable_notification=True, reply_markup=None, cid=None):
         try:
             await bot.send_message(chat_id=user_id, text=text, parse_mode=parse_mode,
-                                   disable_notification=disable_notification, reply_markup=reply_markup)
+                                   disable_notification=disable_notification,
+                                   reply_markup=markup_for(user_id, reply_markup))
         except Exception as e:
             logging.warning("Could not send StuMS alert to %s: %s", user_id, e)
     return send
@@ -353,14 +352,9 @@ async def _run_reminder_checks(bot, session, now: datetime):
 
 
 async def _check_file_exam_reminders(bot, session):
-    try:
-        with background_stums():
-            registered = await get_registered_exam_schedule(session)
-    except Exception as e:
-        log = logging.debug if getattr(e, "quiet", False) else logging.warning
-        log("File exam reminders: registered schedule unavailable: %s", e)
-        registered = []
-    await check_file_exam_reminders(bot, registered)
+    # per course, to its students; each student's own StuMS check records
+    # the sittings they are registered for, which are skipped for them
+    await check_file_exam_reminders(bot)
 
 
 async def _run_exam_date_checks(bot, session, now: datetime):
@@ -391,9 +385,11 @@ async def _report_health_changes(bot):
         # never run yet (e.g. OPENROUTER_API_KEY genuinely unset).
         was_ok = prev_state.get(key, True)
         if was_ok and not ok:
-            await broadcast(bot, f"🔴 <b>Health check failed:</b> {HEALTH_CHECK_LABELS[key]}\n{html.escape(detail)}", parse_mode="HTML")
+            await broadcast(bot, f"🔴 <b>Health check failed:</b> {HEALTH_CHECK_LABELS[key]}\n{html.escape(detail)}",
+                            parse_mode="HTML", members=set(ADMIN_USER_IDS))  # server internals: admins only
         elif not was_ok and ok:
-            await broadcast(bot, f"🟢 <b>Recovered:</b> {HEALTH_CHECK_LABELS[key]} is back up.", parse_mode="HTML")
+            await broadcast(bot, f"🟢 <b>Recovered:</b> {HEALTH_CHECK_LABELS[key]} is back up.", parse_mode="HTML",
+                            members=set(ADMIN_USER_IDS))
     update_general_cache({"health_state": new_state})
 
 

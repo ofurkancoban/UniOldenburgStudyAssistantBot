@@ -260,6 +260,10 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
         return
 
     cache = load_exam_cache()
+    # the sittings this student is registered for: reminders built from course
+    # files skip these dates for them (this check already covers those)
+    cache["registered_dates"] = sorted({str(e["date"])[:10] for e in exams if e.get("date")})
+    save_exam_cache(cache)
     notified_days = cache.get("notified_exam_date", {})
     notified_hours = cache.get("notified_exam_hours", {})
 

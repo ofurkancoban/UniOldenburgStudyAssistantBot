@@ -11,10 +11,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from exam_reminder import PRIVATE_EXAM_KIND, exam_cache_user, load_exam_cache
+from fast_enroll import clear_pending_job
 from studip_utils import TZ_BERLIN
 from unibot import db, stagger, state
 from unibot.auth import _perform_logout, acting_as, has_stored_login, is_user_allowed, personal_session
 from unibot.exams import exam_action_cache
+from unibot.schedule import fastenroll_tasks
 from unibot.storage import (
     forget_personal_cache,
     get_ai_grades_enabled,
@@ -93,6 +95,21 @@ def delete_confirm_view() -> tuple:
     return text, InlineKeyboardMarkup(rows)
 
 
+def _delete_plain_documents(user_id: int) -> list[str]:
+    """Per-student documents from before the encrypted records (inbox,
+    study progress) and the calendar reminder bookkeeping."""
+    keys = [f"messages_cache_{user_id}.json", f"study_progress_{user_id}.json", f"reminders_cache_{user_id}.json"]
+    removed = []
+    for key in keys:
+        try:
+            if db.exists(key):
+                db.delete(key)
+                removed.append(key)
+        except Exception:
+            logging.warning("Could not delete a personal document", exc_info=True)
+    return removed
+
+
 async def delete_personal_data(user_id: int) -> dict:
     """Remove everything personal the bot keeps about the student."""
     removed: dict = {"private": db.get_user_scope(user_id).has_private(PRIVATE_EXAM_KIND)}
@@ -100,6 +117,10 @@ async def delete_personal_data(user_id: int) -> dict:
     await _perform_logout(user_id)  # session, cookies, tokens, StuMS state
     db.get_user_scope(user_id).sync_courses(set())
     removed["cache_sections"] = forget_personal_cache(user_id)
+    removed["documents"] = _delete_plain_documents(user_id)
+    for task in (fastenroll_tasks.pop(user_id, None) or {}).values():
+        task.cancel()  # a scheduled fast enroll would log in again for them
+    clear_pending_job(user_id)
     for sid in [sid for sid, info in exam_action_cache.items() if info.get("user_id") == user_id]:
         exam_action_cache.pop(sid, None)
     for members in (getattr(state, "course_members", None) or {}).values():
