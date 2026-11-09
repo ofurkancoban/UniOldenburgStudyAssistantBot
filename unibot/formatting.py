@@ -14,6 +14,30 @@ from typing import Any
 from bs4 import BeautifulSoup
 
 
+TELEGRAM_HTML_LIMIT = 4000  # under Telegram's 4096 characters per message
+_HTML_TAG_RE = re.compile(r"<(/?)([a-zA-Z-]+)[^>]*>")
+
+
+def truncate_html(text: str, limit: int = TELEGRAM_HTML_LIMIT, marker: str = "…") -> str:
+    """Telegram HTML cut to at most `limit` characters without breaking it:
+    never inside a tag or an entity (&amp;), and every tag still open at the
+    cut is closed again (a blind text[:limit] can make Telegram reject the
+    whole message)."""
+    if len(text) <= limit:
+        return text
+    cut = text[:max(0, limit - len(marker) - 40)]  # room for the closing tags
+    cut = re.sub(r"<[^>]*$", "", cut)              # a tag cut in half
+    cut = re.sub(r"&#?[a-zA-Z0-9]*$", "", cut)     # an entity cut in half
+    open_tags: list[str] = []
+    for closing, name in _HTML_TAG_RE.findall(cut):
+        name = name.lower()
+        if not closing:
+            open_tags.append(name)
+        elif name in open_tags:
+            del open_tags[len(open_tags) - 1 - open_tags[::-1].index(name)]
+    return cut + marker + "".join(f"</{name}>" for name in reversed(open_tags))
+
+
 def clean_for_html(text: str) -> str:
     """Clean text for HTML parse mode."""
     if not text:

@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest
 from telegram.ext import ContextTypes
 
 from studip_utils import TZ_BERLIN
@@ -334,13 +335,17 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
                 counts[fmt] += 1
                 await asyncio.sleep(0.3)
                 continue
-            await bot.send_message(
-                chat_id=uid,
-                text=title_text if fmt == "title" else text,
-                parse_mode=parse_mode,
-                disable_notification=fmt == "silent",
-                reply_markup=markup,
-            )
+            body = title_text if fmt == "title" else text
+            try:
+                await bot.send_message(chat_id=uid, text=body, parse_mode=parse_mode,
+                                       disable_notification=fmt == "silent", reply_markup=markup)
+            except BadRequest as e:
+                if parse_mode != "HTML" or "parse" not in str(e).lower():
+                    raise
+                # markup Telegram can't parse must not cost the student the alert
+                logging.warning("A %s alert for %s was rejected (%s); sending it as plain text", kind, uid, e)
+                await bot.send_message(chat_id=uid, text=_plain(body), disable_notification=fmt == "silent",
+                                       reply_markup=markup)
             counts[fmt] += 1
             await asyncio.sleep(0.3)  # Telegram rate limit safety
         except Exception as e:
@@ -418,8 +423,6 @@ async def flush_alert_queues(bot, now: Optional[datetime] = None, user_ids=None,
     how many students got one. `user_ids` limits it to those students and
     `with_morning` sends their quiet-hours alerts right after the morning
     summary. Paused students (not ACTIVE) keep their queue until /start."""
-    from telegram.error import BadRequest
-
     now = now or datetime.now(TZ_BERLIN)
     sent = 0
     owners = db.private_owner_ids(ALERT_QUEUE_KIND)

@@ -925,7 +925,7 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, cou
 
         for p in new_posts_found:
             markup = await _forum_alert_markup(p)
-            await course_registry.fan_out(bot, p.get("cid"), "forum", _forum_alert_text(p)[:4000],
+            await course_registry.fan_out(bot, p.get("cid"), "forum", _forum_alert_text(p),
                                           forum_title_text(p), reply_markup=markup,
                                           members=course_members(p.get("cid")))
 

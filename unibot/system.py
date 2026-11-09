@@ -772,7 +772,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         if invites:
             for inv in invites:
                 status = "✅ Used" if inv["is_used"] else ("⏳ Pending" if inv["expires_at"] > time.time() else "⌛ Expired")
-                lbl = f" ({inv['label']})" if inv['label'] else ""
+                lbl = f" ({html.escape(inv['label'])})" if inv['label'] else ""
                 lines.append(f"🎫 <code>{inv['code']}</code>{lbl} - {status}")
         else:
             lines.append("<i>No invite codes generated yet.</i>")

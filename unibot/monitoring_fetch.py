@@ -199,6 +199,9 @@ def _post_author_id(post: dict):
     return post.get("relationships", {}).get("author", {}).get("data", {}).get("id")
 
 
+FORUM_OMITTED = "<i>... (older messages omitted) ...</i>"
+
+
 def _html_to_text(content_html: str) -> str:
     return BeautifulSoup(content_html, "html.parser").get_text(separator=" ", strip=True)
 
@@ -222,7 +225,7 @@ def _forum_thread_entry(course_name: str, cid: str, disc: dict, posts_data: dict
         p_author = _forum_author_name(posts_data, _post_author_id(post))
         history.append(f"👤 <b>{html.escape(p_author)}</b> <i>({_friendly_forum_date(attrs.get('mkdate', ''))})</i>:\n{html.escape(p_body)}")
     if len(history) > 15:
-        history = ["<i>... (older messages omitted) ...</i>"] + history[-15:]
+        history = [FORUM_OMITTED] + history[-15:]
 
     last_post = posts[-1]
     last_attrs = last_post.get("attributes", {})

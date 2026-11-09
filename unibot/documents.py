@@ -22,7 +22,7 @@ from unibot.config import (
 )
 from unibot import state
 from unibot.storage import link_cache, shared_http
-from unibot.formatting import clean_course_title
+from unibot.formatting import clean_course_title, truncate_html
 from unibot.telegram_ui import _start_loading_animation, _stop_loading_animation
 from unibot.auth import is_user_allowed, login_studip
 from unibot.studip_api import get_fresh_file_url
@@ -140,7 +140,7 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
         "━━━━━━━━━━━━━━━━━\n"
         f"{html.escape(clean_script)}"
     )
-    await status_msg.edit_text(summary_card[:4000], parse_mode="HTML")
+    await status_msg.edit_text(truncate_html(summary_card), parse_mode="HTML")
     await _try_send_voice(query.message, clean_script)
 
 

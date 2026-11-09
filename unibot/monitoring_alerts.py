@@ -16,8 +16,11 @@ from unibot import course_registry, state
 from unibot.auth import get_user_session
 from unibot.config import PRIMARY_ADMIN_ID
 from unibot.formatting import (
+    TELEGRAM_HTML_LIMIT,
     _short_id,
+    truncate_html,
 )
+from unibot.monitoring_fetch import FORUM_OMITTED
 from unibot.storage import link_cache, persistent_callback_cache
 from unibot.telegram_ui import (  # noqa: F401 - broadcast is re-exported for callers
     broadcast,
@@ -152,8 +155,11 @@ async def _send_file_alerts(bot, events: list) -> None:
             logging.error("Error sending notification for file %s: %s", it.get('name'), e)
 
 
-def _forum_alert_text(p: dict) -> str:
-    return (
+def _forum_alert_text(p: dict, limit: int = TELEGRAM_HTML_LIMIT) -> str:
+    """The forum alert, within Telegram's limit: a long conversation loses
+    its oldest messages first (never the newest one), and whatever is still
+    too long is cut without breaking the HTML."""
+    head = (
         "🔥 💬 <b>NEW FORUM POST</b> 🔥\n"
         "━━━━━━━━━━━━━━━━━\n"
         f"🏫 <b>Course:</b> {html.escape(p.get('course', ''))}\n"
@@ -161,9 +167,19 @@ def _forum_alert_text(p: dict) -> str:
         f"👤 <b>By:</b> {html.escape(p.get('author', ''))}\n"
         f"🕒 <b>Date:</b> {html.escape(p.get('date', '-'))}\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"{p['body']}\n"
-        "━━━━━━━━━━━━━━━━━"
     )
+    tail = "\n━━━━━━━━━━━━━━━━━"
+    body = p["body"]
+    # a conversation is its heading, then one block per message (oldest
+    # first), "\n\n" apart; a single message is one block
+    heading, *rest = body.split("\n\n")
+    entries = [block for block in rest if block != FORUM_OMITTED]
+    omitted = len(entries) != len(rest)
+    while len(head) + len(body) + len(tail) > limit and len(entries) > 1:
+        entries.pop(0)
+        omitted = True
+        body = "\n\n".join([heading] + ([FORUM_OMITTED] if omitted else []) + entries)
+    return head + truncate_html(body, limit - len(head) - len(tail)) + tail
 
 
 async def _forum_alert_markup(p: dict) -> InlineKeyboardMarkup:

@@ -10,6 +10,7 @@ import errno
 import html
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -288,10 +289,10 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
                 param = parts[1].strip()
                 if param.startswith("inv_"):
                     code = param[4:]
-                elif param.upper().startswith("UNI-"):
-                    code = param.upper()
-        elif text.upper().startswith("UNI-"):
-            code = text.upper()
+                else:
+                    code = invite_code_in(param)
+        else:
+            code = invite_code_in(text)
 
         if code and _invite_attempts_exhausted(user.id):
             # Codes are short (24 bits), so guessing is capped per account.
@@ -374,6 +375,18 @@ def _load_invite_failures(now: float) -> dict:
         if kept:
             recent[str(uid)] = kept
     return recent
+
+
+# What a code looks like once dashes and spaces are gone (create_invite_token:
+# "UNI-" and six hex digits), so "uniabc123" and "UNI abc 123" count too while
+# ordinary words starting with "uni" don't use up the guess limit.
+_INVITE_SHAPE = re.compile(r"UNI[0-9A-F]{6}")
+
+
+def invite_code_in(text: str) -> Optional[str]:
+    """The invite code a message is, written any common way, or None."""
+    raw = "".join(ch for ch in (text or "").upper() if ch.isalnum())
+    return raw if _INVITE_SHAPE.fullmatch(raw) else None
 
 
 def _invite_attempts_exhausted(user_id: int) -> bool:

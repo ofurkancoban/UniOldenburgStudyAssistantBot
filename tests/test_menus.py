@@ -146,7 +146,7 @@ class AuthorizationGateTests(unittest.TestCase):
         update.effective_message.reply_text.assert_awaited()  # told how to get access
 
     def test_wrong_invite_code_is_stopped(self):
-        update = self._update(99, text="UNI-WRONG")
+        update = self._update(99, text="UNI-ABC-999")
         with mock.patch.object(auth, "is_user_allowed", lambda uid: False), \
                 mock.patch.object(auth, "redeem_invite_token", lambda *a, **k: (False, "unknown code")):
             with self.assertRaises(ApplicationHandlerStop):
