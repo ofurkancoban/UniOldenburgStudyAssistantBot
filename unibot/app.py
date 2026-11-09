@@ -535,7 +535,7 @@ def _is_our_whatsapp_service(proc, wa_dir: str) -> bool:
     try:
         cmdline = proc.cmdline()
         cwd = proc.cwd()
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+    except (psutil.Error, OSError):  # gone, not ours to read, or its cwd was removed
         return False
     return (bool(cmdline) and os.path.basename(cmdline[0]).startswith("node")
             and any(os.path.basename(arg) == "server.js" for arg in cmdline[1:])

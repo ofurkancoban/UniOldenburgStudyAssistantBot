@@ -9,6 +9,7 @@ import logging
 import os
 import tempfile
 import uuid
+from collections.abc import Mapping
 from typing import Optional
 
 from telegram import (
@@ -125,7 +126,9 @@ class TelegramSafetyLimiter(BaseRateLimiter):
             try:
                 return await callback(*args, **kwargs)
             except Forbidden as e:
-                chat_id = (data or {}).get("chat_id")
+                # PTB passes the call's parameters as a dict (files too: they
+                # become multipart only later); anything else just isn't read
+                chat_id = data.get("chat_id") if isinstance(data, Mapping) else None
                 try:
                     chat_id = int(chat_id) if chat_id is not None else None
                 except (TypeError, ValueError):

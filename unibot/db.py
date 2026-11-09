@@ -62,6 +62,15 @@ CREATE TABLE IF NOT EXISTS invite_tokens (
     used_at     REAL
 );
 
+-- every use of an invite code (a code may admit several students; used_by
+-- in invite_tokens only ever held the latest one)
+CREATE TABLE IF NOT EXISTS invite_redemptions (
+    code        TEXT NOT NULL,
+    telegram_id INTEGER NOT NULL,
+    used_at     REAL NOT NULL,
+    PRIMARY KEY (code, telegram_id)
+);
+
 CREATE TABLE IF NOT EXISTS user_credentials (
     user_id         INTEGER NOT NULL,
     credential_type TEXT NOT NULL,
@@ -157,6 +166,10 @@ def _migrate_columns(conn: sqlite3.Connection) -> None:
         have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in have:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    # the uses recorded before invite_redemptions existed (idempotent)
+    conn.execute(
+        "INSERT OR IGNORE INTO invite_redemptions (code, telegram_id, used_at) "
+        "SELECT code, used_by, COALESCE(used_at, 0) FROM invite_tokens WHERE used_by IS NOT NULL")
 
 
 def _key(path: str) -> str:
@@ -508,6 +521,10 @@ def redeem_invite_token(code: str, telegram_id: int, full_name: Optional[str] = 
             "UPDATE invite_tokens SET use_count = ?, is_used = ?, used_by = ?, used_at = ? WHERE code = ?",
             (uses, 1 if uses >= row[5] else 0, telegram_id, now, clean_code),
         )
+        _connection().execute(
+            "INSERT OR IGNORE INTO invite_redemptions (code, telegram_id, used_at) VALUES (?, ?, ?)",
+            (clean_code, telegram_id, now),
+        )
         upsert_user(
             telegram_id=telegram_id,
             role="user",
@@ -550,8 +567,19 @@ def list_invite_tokens(active_only: bool = False) -> list[dict]:
                 "used_at": r[6],
                 "max_uses": r[7],
                 "use_count": r[8],
+                "redeemed_by": invite_redemptions(r[0]),
             })
         return res
+
+
+def invite_redemptions(code: str) -> list[int]:
+    """The Telegram ids that used the code, oldest first."""
+    with _lock:
+        rows = _connection().execute(
+            "SELECT telegram_id FROM invite_redemptions WHERE code = ? ORDER BY used_at, telegram_id",
+            (normalize_invite_code(code),),
+        ).fetchall()
+    return [r[0] for r in rows]
 
 
 # ── User Credentials (Encrypted Vault in SQLite) ──────────────────────────────

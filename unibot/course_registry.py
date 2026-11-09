@@ -447,7 +447,10 @@ async def flush_alert_queues(bot, now: Optional[datetime] = None, user_ids=None,
         except Exception as e:
             logging.warning("Course digest for %s failed: %s", uid, e)
             continue
-        scope.save_private(ALERT_QUEUE_KIND, [item for item in queue if item not in batch])
+        # re-read: an alert queued while the digest was being sent (the
+        # awaits above) must not be overwritten by the list read before
+        current = list(scope.private(ALERT_QUEUE_KIND) or [])
+        scope.save_private(ALERT_QUEUE_KIND, [item for item in current if item not in batch])
         sent += 1
         await asyncio.sleep(0.3)  # Telegram rate limit safety between students
     return sent
