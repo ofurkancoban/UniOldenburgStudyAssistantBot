@@ -279,3 +279,27 @@ class RescanFixTests(unittest.TestCase):
             plan, refused = asyncio.run(monitoring._manual_check_plan(1010))
         self.assertIsNone(refused)
         self.assertEqual(plan, [("One", "c1", session)])
+
+
+class CrossAccountTests(unittest.TestCase):
+    def test_course_content_reaches_only_students_of_that_course(self):
+        from unibot import telegram_ui
+        db.upsert_user(1101, "in-registry")
+        db.upsert_user(1102, "outsider")
+        db.get_user_scope(1101).sync_courses({"c-reg"})
+        db.get_user_scope(1102).sync_courses(set())
+        with mock.patch.object(telegram_ui, "ALLOWED_USER_IDS", {1102}), \
+                mock.patch.object(state, "user_courses_map", {}):
+            targets = telegram_ui.broadcast_targets("c-reg", None)
+        self.assertIn(1101, targets)  # known from the course registry
+        self.assertNotIn(1102, targets)  # an allowed user who doesn't take it gets nothing
+
+    def test_a_stopped_student_is_not_offered_as_a_study_buddy(self):
+        from unibot import study_week
+        courses = {1103: {"c1": "One"}, 1104: {"c1": "One"}, 1105: {"c1": "One"}}
+        states = {1103: "active", 1104: "inactive", 1105: "active"}
+        with mock.patch.object(state, "user_courses_map", courses), \
+                mock.patch.object(study_week, "get_study_buddy_enabled", lambda uid: True), \
+                mock.patch.object(study_week, "is_user_allowed", lambda uid: True), \
+                mock.patch.object(study_week, "lifecycle_state", lambda uid: states[uid]):
+            self.assertEqual([uid for uid, _ in study_week.buddy_candidates(1103)], [1105])

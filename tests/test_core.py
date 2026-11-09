@@ -591,7 +591,7 @@ class MultiUserSessionTests(unittest.TestCase):
             asyncio.run(broadcast(bot, "New Announcement in Math", cid="math_101"))
 
             sent_to = [call.kwargs.get("chat_id") or call.args[0] if call.args else call.kwargs.get("chat_id") for call in bot.send_message.call_args_list]
-            self.assertIn(9999, sent_to)  # Admin always gets alerts
+            self.assertNotIn(9999, sent_to)  # an admin who doesn't take the course gets nothing
             self.assertIn(8001, sent_to)  # Math student gets alert
             self.assertNotIn(8002, sent_to)  # CS student does not
 

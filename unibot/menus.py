@@ -807,7 +807,7 @@ async def _selection_file(update, context, query, data, user_id):
     # Check cached or current URL
     temp_url = info.get("url")
     current_url = info.get("current_url")
-    # get_user_session falls back to the watcher session by itself
+    # always the tapping student's own session: Stud.IP decides what they may download
     user_sess = active_session = get_user_session(user_id)
 
     # Try cached URL first

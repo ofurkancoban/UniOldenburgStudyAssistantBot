@@ -1166,7 +1166,7 @@ class CourseWatchPlanTests(unittest.TestCase):
             self.assertEqual(sorted(sent), [2])  # admin 1 does not take c3
             sent.clear()
             asyncio.run(telegram_ui.broadcast(Bot(), "x", cid="c3"))
-            self.assertEqual(sorted(sent), [1, 2])  # unknown participants: old rules
+            self.assertEqual(sent, [])  # unknown participants: nobody who doesn't take it, admins included
 
 
 class AccountRegistryTests(unittest.TestCase):

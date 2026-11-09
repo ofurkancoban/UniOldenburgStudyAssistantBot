@@ -21,7 +21,7 @@ from telegram.ext import ContextTypes
 
 from studip_utils import TZ_BERLIN, format_hours
 from unibot import state
-from unibot.auth import acting_as, get_user_session, has_stored_login, is_user_allowed
+from unibot.auth import INACTIVE, acting_as, get_user_session, has_stored_login, is_user_allowed, lifecycle_state
 from unibot.config import CLOUDFLARE_TUNNEL
 from unibot.schedule import get_calendar_events, plan_study_day
 from unibot.storage import (
@@ -239,8 +239,9 @@ def buddy_candidates(user_id: int) -> list[tuple[int, list[str]]]:
     mine = state.user_courses_map.get(user_id) or {}
     out = []
     for other, courses in state.user_courses_map.items():
-        if other == user_id or not get_study_buddy_enabled(other) or not is_user_allowed(other):
-            continue
+        if other == user_id or not is_user_allowed(other) or lifecycle_state(other) == INACTIVE \
+                or not get_study_buddy_enabled(other):
+            continue  # a student who stopped the bot is not shown to classmates
         shared = sorted({mine[cid] for cid in mine.keys() & (courses or {}).keys()})
         if shared:
             out.append((other, shared))

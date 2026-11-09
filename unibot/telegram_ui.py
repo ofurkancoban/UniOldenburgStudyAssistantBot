@@ -175,35 +175,49 @@ def markup_for(uid: Optional[int], markup):
 
 # ── broadcast helper ──────────────────────────────────────────────────────────
 def broadcast_targets(cid: Optional[str] = None, members=None) -> set:
-    """Who a broadcast reaches. Without `cid`: every allowed and active user.
-    With `cid`: students enrolled in or tracking that course, plus primary
-    administrators. With `members` (the course's known participants)
-    administrators are no exception: only participants and users tracking
-    the course get it. `members` without `cid` (admins only, one student)
-    is exactly who gets it. Inactive students are never included."""
-    targets = set(members) if members is not None else set(ALLOWED_USER_IDS)
+    """Who a broadcast reaches. Inactive students are never included.
+
+    Without `cid` and `members`: every allowed and active user (an admin
+    announcement). `members` without `cid` is exactly the audience (the
+    admins, one student). With `cid`: only students who take that course
+    (the given `members`, their course list, the course registry) or track
+    it on /progress; nobody else, administrators included."""
+    if cid is None:
+        if members is not None:
+            targets = set(members)
+        else:
+            targets = set(ALLOWED_USER_IDS)
+            try:
+                targets |= {u["telegram_id"] for u in db.get_all_users() if u.get("is_active", 1)}
+            except Exception:
+                logging.debug("User list unavailable", exc_info=True)
+        return {uid for uid in targets if not _is_inactive(uid)}
+
+    targets = set(members) if members is not None else set()
     try:
         for u in db.get_all_users():
-            if not u.get("is_active", 1):
-                continue
             uid = u["telegram_id"]
-            if uid in ALLOWED_USER_IDS and members is None:
+            if not u.get("is_active", 1) or uid in targets:
+                continue
+            if _takes_course(uid, cid):
                 targets.add(uid)
-                continue
-            if cid is not None:
-                user_courses = state.user_courses_map.get(uid, {})
-                if cid in user_courses:
-                    targets.add(uid)
-                    continue
-                if cid in (load_student_progress(uid).get("tracked") or []):
-                    targets.add(uid)
-                    continue
-                continue
-            if members is None:
-                targets.add(uid)  # given members without a course are the exact audience
     except Exception:
         logging.debug("Ignored a non-critical error", exc_info=True)
     return {uid for uid in targets if not _is_inactive(uid)}
+
+
+def _takes_course(uid: int, cid: str) -> bool:
+    """Whether the student takes or tracks the course (from what the bot
+    knows about them, never from anyone else's list)."""
+    if cid in (state.user_courses_map.get(uid) or {}):
+        return True
+    try:
+        if cid in db.get_user_scope(uid).course_ids():
+            return True
+        return cid in (load_student_progress(uid).get("tracked") or [])
+    except Exception:
+        logging.debug("Course membership unavailable", exc_info=True)
+        return False
 
 
 def _is_inactive(uid: int) -> bool:
