@@ -23,14 +23,14 @@ _BUILDING_RE = re.compile(r"^\s*([AVW])\s?(\d{1,2})\b", re.IGNORECASE)
 CAMPUS_INFO: dict[str, dict[str, Any]] = {
     HAARENTOR: {
         "name": "Campus Haarentor",
-        "study_spot": "BIS central library (Uhlhornsweg)",
+        "study_spot": "BIS library, 2nd floor quiet room",
         "mensa": "Mensa Uhlhornsweg",
         # the Stud.IP mensa widget's sub path for this mensa's menu
         "menu_path": "2/",
     },
     WECHLOY: {
         "name": "Campus Wechloy",
-        "study_spot": "BIS Wechloy branch library",
+        "study_spot": "BIS Wechloy branch library or the W3 tables",
         "mensa": "Mensa Wechloy",
         "menu_path": None,  # not offered by the Stud.IP widget the bot reads
     },
@@ -126,10 +126,8 @@ def _lunch_slot(a: datetime, b: datetime, day: date, carve: bool = False) -> Opt
     start = min(max(_at(day, LUNCH_PREFERRED_START), lo), hi - timedelta(minutes=LUNCH_MINUTES))
     if carve and 0 < _minutes(a, start) < MIN_STUDY_PIECE_MINUTES:
         start = lo  # no study crumb before the meal
-    end = start + timedelta(minutes=LUNCH_MINUTES)
-    if carve and 0 < _minutes(end, b) < MIN_STUDY_PIECE_MINUTES and b <= _at(day, LUNCH_LATEST_END):
-        end = b  # nor after it
-    return start, end
+    # always exactly LUNCH_MINUTES; a too short rest after it is simply not a study window
+    return start, start + timedelta(minutes=LUNCH_MINUTES)
 
 
 def _campus_near(day_events: list, moment: datetime) -> Optional[str]:

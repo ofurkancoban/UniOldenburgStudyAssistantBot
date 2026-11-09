@@ -61,7 +61,7 @@ class LunchBreakTests(unittest.TestCase):
         after_lunch = plan["windows"][1]
         self.assertEqual(after_lunch["duration_minutes"], 75)
         self.assertEqual(after_lunch["study_type"]["key"], "focus")
-        self.assertEqual(after_lunch["study_spot"], "BIS central library (Uhlhornsweg)")
+        self.assertEqual(after_lunch["study_spot"], "BIS library, 2nd floor quiet room")
         self.assertIn("after lunch", after_lunch["description"])
         # find_study_windows_for_day is the same plan without the lunch entry
         self.assertEqual(_spans(schedule.find_study_windows_for_day(events, WED)), _spans(plan["windows"]))
@@ -106,9 +106,13 @@ class CampusTravelTests(unittest.TestCase):
         self.assertEqual(_spans([gap]), [("10:20", "12:00")])  # then lunch 12:00-12:45
         self.assertEqual(gap["travel_minutes"], 20)
         self.assertEqual(gap["campus"], study_day.WECHLOY)
-        self.assertEqual(gap["study_spot"], "BIS Wechloy branch library")
+        self.assertEqual(gap["study_spot"], "BIS Wechloy branch library or the W3 tables")
         plan = schedule.plan_study_day(events, WED)
-        self.assertEqual(plan["lunch"]["mensa"], "Mensa Wechloy")
+        lunch = plan["lunch"]
+        self.assertEqual(_spans([lunch]), [("12:00", "12:45")])  # always 45 minutes
+        self.assertEqual((lunch["mensa"], lunch["campus"]), ("Mensa Wechloy", study_day.WECHLOY))
+        # the piece before lunch is already on Wechloy, where the student travelled to
+        self.assertEqual([w["campus"] for w in plan["windows"]], [study_day.WECHLOY, study_day.WECHLOY])
 
     def test_travel_note_moves_to_the_piece_after_lunch(self):
         events = [_event("10:00", "12:00", "Statistics", "A05 1-161"), _event("14:30", "16:00", "Biology", "W14 0-001")]
@@ -156,7 +160,7 @@ class MenuHighlightTests(unittest.TestCase):
         self.assertEqual(lines, ["🥗 `12:00–12:45` Lunch at Mensa Uhlhornsweg (Falafel Bowl & dessert)"])
         deep = schedule._plan_entry_lines(plan["windows"][2])
         self.assertIn("Deep work", deep[1])
-        self.assertIn("BIS central library", deep[1])
+        self.assertIn("BIS library, 2nd floor quiet room", deep[1])
 
 
 class StudyPackTests(unittest.TestCase):
@@ -279,7 +283,7 @@ class StudyReminderTests(unittest.TestCase):
         reminder = [t for t in texts if "STUDY TIME REMINDER" in t]
         self.assertEqual(len(reminder), 1)
         self.assertIn("Deep work", reminder[0])
-        self.assertIn("BIS central library", reminder[0])
+        self.assertIn("BIS library", reminder[0])
 
 
 class TaskPrivacyTests(unittest.TestCase):
