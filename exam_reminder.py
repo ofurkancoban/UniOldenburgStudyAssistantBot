@@ -155,38 +155,68 @@ def _exam_store():
     return db
 
 
-def adopt_legacy_exam_cache(user_id) -> None:
-    """Give the original single-user cache to `user_id` (the account it was
-    built for) the first time per-user caches are used, so nothing is
-    re-notified after the switch."""
-    db = _exam_store()
-    target = exam_cache_path(user_id)
-    if user_id is None or db.exists(target) or not db.exists(EXAM_CACHE_PATH):
-        return
-    try:
-        save_exam_cache(db.load(EXAM_CACHE_PATH), user_id=user_id)
-        logging.info("exam_reminder: adopted %s for user %s", EXAM_CACHE_PATH, user_id)
-    except Exception as e:
-        logging.warning("Could not adopt the legacy exam cache for %s: %s", user_id, e)
+PRIVATE_EXAM_KIND = "exam_cache"
 
 
-def load_exam_cache(user_id=None) -> dict:
-    db = _exam_store()
-    path = exam_cache_path(user_id)
-    if db.exists(path):
-        try:
-            return db.load(path)
-        except Exception as e:
-            logging.warning("Could not load exam reminder cache: %s", e)
+def _cache_owner(user_id=None):
+    return user_id if user_id is not None else _exam_cache_user.get()
+
+
+def _empty_exam_cache() -> dict:
     return {
         "notified_open": {}, "notified_deadline": {}, "notified_exam_date": {},
         "notified_exam_hours": {}, "known_grades": {},
     }
 
 
-def save_exam_cache(data: dict, user_id=None) -> None:
+def adopt_legacy_exam_cache(user_id) -> None:
+    """Give the original single-user cache to `user_id` (the account it was
+    built for) the first time per-user caches are used, so nothing is
+    re-notified after the switch."""
+    db = _exam_store()
+    if user_id is None or db.has_private(int(user_id), PRIVATE_EXAM_KIND) \
+            or db.exists(exam_cache_path(user_id)) or not db.exists(EXAM_CACHE_PATH):
+        return
     try:
-        _exam_store().save(exam_cache_path(user_id), data)
+        save_exam_cache(db.load(EXAM_CACHE_PATH), user_id=user_id)
+        db.delete(EXAM_CACHE_PATH)
+        logging.info("exam_reminder: adopted the legacy exam cache for user %s", user_id)
+    except Exception as e:
+        logging.warning("Could not adopt the legacy exam cache for %s: %s", user_id, e)
+
+
+def load_exam_cache(user_id=None) -> dict:
+    """A student's exam cache (grades seen, registrations, fee status) comes
+    from their encrypted private record; a per-user document left from older
+    versions moves there on first read. Without any student (single-account
+    setup) the original shared document is used."""
+    db = _exam_store()
+    owner = _cache_owner(user_id)
+    try:
+        if owner is not None:
+            data = db.load_private(int(owner), PRIVATE_EXAM_KIND)
+            if data is not None:
+                return data
+            legacy = exam_cache_path(owner)
+            if db.exists(legacy):
+                data = db.load(legacy)
+                db.save_private(int(owner), PRIVATE_EXAM_KIND, data)
+                db.delete(legacy)
+                return data
+        elif db.exists(EXAM_CACHE_PATH):
+            return db.load(EXAM_CACHE_PATH)
+    except Exception as e:
+        logging.warning("Could not load exam reminder cache: %s", e)
+    return _empty_exam_cache()
+
+
+def save_exam_cache(data: dict, user_id=None) -> None:
+    owner = _cache_owner(user_id)
+    try:
+        if owner is not None:
+            _exam_store().save_private(int(owner), PRIVATE_EXAM_KIND, data)
+        else:
+            _exam_store().save(EXAM_CACHE_PATH, data)
     except Exception as e:
         logging.error("Could not save exam reminder cache: %s", e)
 
@@ -244,7 +274,7 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
                 )
                 try:
                     await broadcast_fn(bot, text, reply_markup=WA_FORWARD_MARKUP)
-                    logging.info("🎓 Notified: exam date reminder (%sd) for %s", threshold, key)
+                    logging.info("🎓 Exam date reminder sent")
                 except Exception as e:
                     logging.error("exam_reminder: failed to send exam-date reminder for %s: %s", key, e)
                 sent_days.add(threshold)
@@ -269,7 +299,7 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
                 )
                 try:
                     await broadcast_fn(bot, text, reply_markup=WA_FORWARD_MARKUP)
-                    logging.info("🎓 Notified: exam starting soon for %s", key)
+                    logging.info("🎓 Exam starting soon reminder sent")
                 except Exception as e:
                     logging.error("exam_reminder: failed to send starting-soon reminder for %s: %s", key, e)
                 notified_hours[key] = True
@@ -372,7 +402,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
             )
             try:
                 await broadcast_fn(bot, text, reply_markup=keyboard)
-                logging.info("🎓 Notified: exam registration opened for %s", occurrence_key)
+                logging.info("🎓 Exam registration opening sent")
             except Exception as e:
                 logging.error("exam_reminder: failed to send open-notification for %s: %s", occurrence_key, e)
             notified_open[occurrence_key] = now.isoformat()
@@ -398,7 +428,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
                     )
                     try:
                         await broadcast_fn(bot, text, reply_markup=keyboard)
-                        logging.info("🎓 Notified: %s day(s) left for %s", days_left, occurrence_key)
+                        logging.info("🎓 Exam registration deadline reminder sent")
                     except Exception as e:
                         logging.error("exam_reminder: failed to send deadline-notification for %s: %s", occurrence_key, e)
                     sent_thresholds.add(threshold)
@@ -480,7 +510,7 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
                 known_grades[entry["number"]] = {"status_title": st, "grade": entry.get("grade")}
         cache["known_grades"] = known_grades
         save_exam_cache(cache)
-        logging.info("🎓 Seeded %s historical grades into baseline cache.", len(known_grades))
+        logging.info("🎓 Grade baseline seeded")
         return
 
     for entry in grades:
@@ -538,9 +568,9 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
         try:
             await broadcast_fn(bot, personal_text, parse_mode="HTML")
             await broadcast_fn(bot, announcement_text, parse_mode="HTML", reply_markup=WA_FORWARD_MARKUP)
-            logging.info("🎓 Notified: grade result for %s (%s)", entry.get('title'), number)
+            logging.info("🎓 Grade notification sent")
         except Exception as e:
-            logging.error("exam_reminder: failed to send grade notification for %s: %s", number, e)
+            logging.error("exam_reminder: failed to send a grade notification: %s", type(e).__name__)
 
         known_grades[number] = fingerprint
         cache["known_grades"] = known_grades

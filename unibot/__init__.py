@@ -22,6 +22,7 @@ MODULE_ORDER = (
     "diagnostics",  # read-only connection report for /healthcheck
     "storage",      # JSON caches, stored settings, shared HTTP session, job locks
     "formatting",   # text/HTML/date helpers
+    "stagger",      # per-student personal check times (pure)
     "telegram_ui",  # Telegram message helpers
     "auth",         # access control, Stud.IP login, /login Mini App
     "studip_api",   # Stud.IP JSON:API and HTML access

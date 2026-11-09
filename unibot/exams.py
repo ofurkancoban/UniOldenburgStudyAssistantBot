@@ -39,7 +39,7 @@ from unibot import db
 from unibot import state
 from unibot.storage import load_default_semester, single_flight
 from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, broadcast
-from unibot.auth import get_user_session, is_user_allowed, login_studip
+from unibot.auth import get_user_session, is_user_allowed, login_studip, personal_session
 from unibot.studip_api import BASE_URL, _ensure_watched_courses_map, _parse_file_date_v2, list_courses
 from unibot.ai import _call_openrouter, _extract_json_object
 from unibot.documents import extract_text_from_file_async
@@ -64,11 +64,10 @@ def _exam_action(sid: str, user_id: int) -> Optional[dict]:
     return info
 
 
-async def send_exam_registration_menu(message, user_id=None):
+async def send_exam_registration_menu(message, user_id: int):
     """Show currently open-for-registration and currently-registered exams on
     the StuMS/HISinOne portal, each with a Register/Deregister button."""
-    user_sess = get_user_session(user_id) if user_id else None
-    session = user_sess or get_user_session()
+    session = personal_session(user_id)
 
     try:
         open_exams = await get_open_exam_registrations(session)
@@ -142,7 +141,7 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await _show_typing(query)
         stop_evt, anim_task = _start_loading_animation(status_msg, "Loading exam registration status...")
         try:
-            await send_exam_registration_menu(query.message)
+            await send_exam_registration_menu(query.message, user_id=query.from_user.id)
         finally:
             await _stop_loading_animation(stop_evt, anim_task)
         return
@@ -370,8 +369,7 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
     )
     stop_evt, anim_task = _start_loading_animation(status_msg, f"Generating {spec['label']}...")
     try:
-        user_sess = get_user_session(user_id)
-        session = user_sess or get_user_session()
+        session = personal_session(user_id)
         pdf_bytes, filename = await download_stums_document(session, doc_key)
     except Exception as exc:
         logging.error("StuMS document download failed for %s: %s", doc_key, exc)
@@ -406,8 +404,7 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
 
 async def build_tuition_status_text(session=None, user_id=None) -> tuple[str, InlineKeyboardMarkup]:
     """Fetch and format the StuMS tuition / semester fee (*Rückmeldung*) status."""
-    user_sess = get_user_session(user_id) if user_id else None
-    sess = session or user_sess or get_user_session()
+    sess = session or personal_session(user_id)
     try:
         info = await get_tuition_status(sess)
     except Exception as exc:
@@ -604,8 +601,7 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
     stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching your exam dates... this may take a moment.")
 
     try:
-        user_sess = get_user_session(user_id)
-        session = user_sess or get_user_session()
+        session = personal_session(user_id)
         courses = await list_courses(user_id=user_id)
         module_codes = await get_my_module_codes(session, courses)
         exams = await get_all_exam_dates(session)
@@ -670,8 +666,7 @@ async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TY
     stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching all exam dates... this may take a moment.")
 
     try:
-        user_sess = get_user_session(user_id)
-        session = user_sess or get_user_session()
+        session = personal_session(user_id)
         exams = await get_all_exam_dates(session)
     except Exception as e:
         logging.error("All exam dates error: %s", e)
@@ -709,8 +704,7 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
     stop_evt, anim_task = _start_loading_animation(status_msg, "Fetching your transcript...")
 
     try:
-        user_sess = get_user_session(user_id)
-        session = user_sess or get_user_session()
+        session = personal_session(user_id)
         grades = await get_grades(session)
     except Exception as e:
         logging.error("Transcript summary error: %s", e)

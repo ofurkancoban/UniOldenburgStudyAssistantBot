@@ -333,6 +333,15 @@ def get_user_session(user_id: Optional[int] = None) -> StudIPSession:
     return sess
 
 
+def personal_session(user_id: Optional[int]) -> StudIPSession:
+    """The session for a student's personal StuMS data (grades, exam
+    registrations, fees, official documents). It is always that student's
+    own session: there is no fallback to the watcher or an admin account."""
+    if not isinstance(user_id, int) or isinstance(user_id, bool):
+        raise ValueError("personal data needs an explicit user id")
+    return get_user_session(user_id)
+
+
 async def login_studip(notify=None, user_id: Optional[int] = None):
     if user_id is None:
         user_id = current_user_id()

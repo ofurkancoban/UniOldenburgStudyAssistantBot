@@ -103,6 +103,16 @@ CREATE TABLE IF NOT EXISTS user_courses (
     PRIMARY KEY (user_id, course_id)
 );
 CREATE INDEX IF NOT EXISTS idx_user_courses_course ON user_courses(course_id);
+
+-- Private student data, one encrypted row per student and kind; never part
+-- of the shared document store or the course registry.
+CREATE TABLE IF NOT EXISTS user_private_data (
+    user_id        INTEGER NOT NULL,
+    kind           TEXT NOT NULL,
+    encrypted_blob TEXT NOT NULL,
+    updated_at     REAL NOT NULL,
+    PRIMARY KEY (user_id, kind)
+);
 """
 
 _lock = threading.RLock()
@@ -466,9 +476,17 @@ def list_invite_tokens(active_only: bool = False) -> list[dict]:
 
 # ── User Credentials (Encrypted Vault in SQLite) ──────────────────────────────
 
+def _require_uid(user_id) -> int:
+    """Personal data is always read and written for one named student."""
+    if not isinstance(user_id, int) or isinstance(user_id, bool):
+        raise ValueError("personal data needs an explicit user id")
+    return user_id
+
+
 def save_user_credential(user_id: int, credential_type: str, data: Any) -> None:
-    from studip_vault import encrypt_payload
-    encrypted_blob = encrypt_payload(data)
+    from studip_vault import encrypt_user_payload
+    uid = _require_uid(user_id)
+    encrypted_blob = encrypt_user_payload(uid, data)
     now = time.time()
     with _lock:
         _connection().execute(
@@ -476,20 +494,70 @@ def save_user_credential(user_id: int, credential_type: str, data: Any) -> None:
             "VALUES (?, ?, ?, ?) "
             "ON CONFLICT(user_id, credential_type) DO UPDATE SET "
             "encrypted_blob = excluded.encrypted_blob, updated_at = excluded.updated_at",
-            (user_id, credential_type, encrypted_blob, now),
+            (uid, credential_type, encrypted_blob, now),
         )
 
 
 def load_user_credential(user_id: int, credential_type: str) -> Optional[Any]:
-    from studip_vault import decrypt_payload
+    """The student's decrypted credential; a record still under the old shared
+    key is re-encrypted with the student's own key on this read."""
+    from studip_vault import decrypt_user_payload
+    uid = _require_uid(user_id)
     with _lock:
         row = _connection().execute(
             "SELECT encrypted_blob FROM user_credentials WHERE user_id = ? AND credential_type = ?",
-            (user_id, credential_type),
+            (uid, credential_type),
         ).fetchone()
         if not row:
             return None
-        return decrypt_payload(row[0])
+        legacy: list = []
+        data = decrypt_user_payload(uid, row[0], legacy)
+        if legacy and data is not None:
+            save_user_credential(uid, credential_type, data)
+        return data
+
+
+# ── Private student data (grades, exam registrations, fees) ──────────────────
+# Kept apart from the shared document store: one row per student and kind,
+# encrypted with that student's own key, and only reachable with their id.
+
+def save_private(user_id: int, kind: str, data: Any) -> None:
+    from studip_vault import encrypt_user_payload
+    uid = _require_uid(user_id)
+    with _lock:
+        _connection().execute(
+            "INSERT INTO user_private_data (user_id, kind, encrypted_blob, updated_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, kind) DO UPDATE SET "
+            "encrypted_blob = excluded.encrypted_blob, updated_at = excluded.updated_at",
+            (uid, kind, encrypt_user_payload(uid, data), time.time()),
+        )
+
+
+def load_private(user_id: int, kind: str) -> Optional[Any]:
+    from studip_vault import decrypt_user_payload
+    uid = _require_uid(user_id)
+    with _lock:
+        row = _connection().execute(
+            "SELECT encrypted_blob FROM user_private_data WHERE user_id = ? AND kind = ?", (uid, kind),
+        ).fetchone()
+    return decrypt_user_payload(uid, row[0]) if row else None
+
+
+def has_private(user_id: int, kind: str) -> bool:
+    uid = _require_uid(user_id)
+    with _lock:
+        return _connection().execute(
+            "SELECT 1 FROM user_private_data WHERE user_id = ? AND kind = ?", (uid, kind),
+        ).fetchone() is not None
+
+
+def delete_private(user_id: int, kind: Optional[str] = None) -> None:
+    uid = _require_uid(user_id)
+    with _lock:
+        if kind is None:
+            _connection().execute("DELETE FROM user_private_data WHERE user_id = ?", (uid,))
+        else:
+            _connection().execute("DELETE FROM user_private_data WHERE user_id = ? AND kind = ?", (uid, kind))
 
 
 def delete_user_credentials(user_id: int) -> None:

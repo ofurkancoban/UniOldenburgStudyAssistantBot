@@ -477,38 +477,68 @@ class WatcherCycleTests(unittest.TestCase):
         self.assertIn("last_exam_date_check", cache)
         self.assertTrue(any("Health check failed" in t and "down &lt;now&gt;" in t for t in sent))
 
-    def test_stums_checks_are_throttled(self):
+    def test_stums_checks_follow_the_students_staggered_slots(self):
         watcher = _import("watcher")
-        cache, calls, exam_cache = {}, [], {}
+        from unibot import stagger
+        cache, calls, exam_cache, sent_to = {}, [], {}, []
 
         def job(name):
             async def run(*args, **kwargs):
                 calls.append(name)
+                if name in ("registrations", "grades", "tuition"):
+                    session, bot, send = args[:3]
+                    await send(bot, "personal")
             return run
+
+        class Bot:
+            async def send_message(self, chat_id, **kwargs):
+                sent_to.append(chat_id)
 
         patches = dict(
             load_general_cache=lambda: dict(cache), update_general_cache=lambda d: cache.update(d),
-            load_exam_cache=lambda: exam_cache, ALLOWED_USER_IDS=set(),
+            load_exam_cache=lambda *a, **k: exam_cache, ALLOWED_USER_IDS={5}, _stums_users=lambda: [],
             check_calendar_reminders=job("calendar"), check_course_schedule_changes=job("changes"),
             check_task_reminders=job("tasks"), check_exam_reminders=job("registrations"),
             check_grade_reminders=job("grades"), check_tuition_reminders=job("tuition"),
         )
-        start = datetime(2026, 11, 5, 12, 0, tzinfo=watcher.TZ_BERLIN)
+        day = datetime(2026, 11, 5, tzinfo=watcher.TZ_BERLIN).date()
+        first, second = stagger.personal_slots(5, day, season=False)
 
-        def cycle(minutes):
+        def cycle(at):
             calls.clear()
-            asyncio.run(watcher._run_reminder_checks(None, object(), start + timedelta(minutes=minutes)))
+            asyncio.run(watcher._run_reminder_checks(Bot(), object(), at))
             return {c for c in calls if c in ("registrations", "grades", "tuition")}
 
-        with mock.patch.multiple(watcher, **patches):
-            self.assertEqual(cycle(0), {"registrations", "grades", "tuition"})
-            self.assertEqual(cycle(2), set())  # next watcher cycle: nothing due
-            self.assertEqual(cycle(16), {"grades"})  # grades every 15 min
-            self.assertEqual(cycle(31), {"grades"})  # registrations hourly outside a window
-            self.assertEqual(cycle(61), {"registrations", "grades", "tuition"})
+        everything = {"registrations", "grades", "tuition"}
+        with mock.patch.multiple(watcher, **patches), \
+                mock.patch.object(watcher, "_send_calendar_reminders", job("calendar")):
+            night = datetime(2026, 11, 5, 3, 0, tzinfo=watcher.TZ_BERLIN)
+            self.assertEqual(cycle(night), set())  # personal checks sleep at night
+            self.assertEqual(cycle(first - timedelta(minutes=1)), set())
+            self.assertEqual(cycle(first + timedelta(minutes=1)), everything)
+            self.assertEqual(cycle(first + timedelta(minutes=3)), set())  # that slot is done
+            self.assertEqual(cycle(second + timedelta(minutes=1)), everything)
+            self.assertEqual(cycle(second + timedelta(hours=2)), set())
+            # an open registration switches to the four grade-season windows
             exam_cache["notified_open"] = {"MOD1:sitting": "2026-11-05"}
-            self.assertEqual(cycle(92), {"registrations", "grades"})  # 30 min while a window is open
+            late = stagger.personal_slots(5, day, season=True)[-1]
+            self.assertEqual(cycle(late + timedelta(minutes=1)), everything)
         self.assertIn("tasks", calls)  # local checks still run every cycle
+        self.assertEqual(set(sent_to), {5})  # personal alerts reach only that student
+
+    def test_staggered_slots_differ_between_students(self):
+        from unibot import stagger
+        day = datetime(2026, 11, 5).date()
+        quiet = [stagger.personal_slots(uid, day, season=False) for uid in range(1, 51)]
+        self.assertTrue(all(len(s) == 2 for s in quiet))
+        self.assertGreater(len({s[0].strftime("%H:%M") for s in quiet}), 35)
+        for slots in quiet:
+            self.assertTrue(9 <= slots[0].hour < 12 and 15 <= slots[1].hour <= 18)
+        season = stagger.personal_slots(7, datetime(2026, 2, 10).date(), season=stagger.is_grade_season(
+            datetime(2026, 2, 10).date()))
+        self.assertEqual(len(season), 4)
+        self.assertNotEqual(stagger.describe_slots(7, day, False),
+                            stagger.describe_slots(7, day + timedelta(days=1), False))
 
     def test_once_per_period(self):
         watcher = _import("watcher")

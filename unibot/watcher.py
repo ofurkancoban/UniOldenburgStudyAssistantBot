@@ -25,7 +25,7 @@ from exam_reminder import (
 )
 from studip_utils import TZ_BERLIN, berlin_now
 
-from unibot import course_registry, db
+from unibot import course_registry, db, stagger
 from unibot import state
 from unibot.config import (
     ADMIN_USER_IDS,
@@ -75,12 +75,8 @@ FILE_WATCHER_INTERVAL = 30 * 60
 # stops the others; a failure is logged and retried on the next cycle.
 
 EXAM_DATE_CHECK_INTERVAL_SECONDS = 3 * 3600  # upcoming exam dates change rarely
-# StuMS checks are throttled: every check signs in to StuMS through the SSO,
-# and a student account should not log in hundreds of times a day.
-GRADE_CHECK_INTERVAL_SECONDS = 15 * 60
-EXAM_REGISTRATION_CHECK_INTERVAL_SECONDS = 60 * 60
-EXAM_REGISTRATION_OPEN_INTERVAL_SECONDS = 30 * 60  # while a registration window is open
-TUITION_ATTEMPT_INTERVAL_SECONDS = 60 * 60  # check_tuition_reminders itself runs once a day
+# Grades, exam registrations and fees: each student at their own staggered
+# times per day (unibot.stagger), so StuMS sees no login bursts.
 HEALTH_CHECK_INTERVAL_SECONDS = 30 * 60
 # Admin daily digest: sent on the first watcher cycle from this hour on.
 DAILY_DIGEST_HOUR = 9
@@ -189,12 +185,6 @@ async def _send_calendar_reminders(bot):
             await check_calendar_reminders(bot, uid, silent=True)
 
 
-def _exam_registration_interval() -> int:
-    """Shorter while StuMS has an open registration we have notified about."""
-    return EXAM_REGISTRATION_OPEN_INTERVAL_SECONDS if load_exam_cache().get("notified_open") \
-        else EXAM_REGISTRATION_CHECK_INTERVAL_SECONDS
-
-
 async def _run_throttled(cache_key: str, now: datetime, interval: int, label: str, job, *args,
                          start_message=None, **kwargs):
     """Run a job when its interval has passed; the attempt is recorded even
@@ -222,25 +212,42 @@ def _stums_users() -> list:
     return signed_in_accounts()
 
 
-async def _run_stums_checks(bot, session, now: datetime, cache_suffix: str = "", send=None):
-    """Exam registrations, grades and fees for one StuMS account."""
-    send = send or broadcast
-    await _run_throttled(f"last_exam_registration_check{cache_suffix}", now, _exam_registration_interval(),
-                         "Exam reminder check", check_exam_reminders, session, bot, send, exam_action_cache,
-                         start_message="🎓 Checking exam registrations...")
-    await _run_throttled(f"last_grade_check{cache_suffix}", now, GRADE_CHECK_INTERVAL_SECONDS, "Grade reminder check",
-                         check_grade_reminders, session, bot, send,
-                         start_message="🎓 Checking for new grades...")
-    await _run_throttled(f"last_tuition_attempt{cache_suffix}", now, TUITION_ATTEMPT_INTERVAL_SECONDS,
-                         "Tuition reminder check", check_tuition_reminders, session, bot, send,
-                         start_message="💶 Checking tuition / fee status...")
+async def _run_stums_checks(bot, session, send):
+    """Exam registrations, grades and fees for one StuMS account, sent only
+    to that student. check_tuition_reminders limits itself to once a day."""
+    await _guarded("Exam reminder check", check_exam_reminders, session, bot, send, exam_action_cache,
+                   start_message="🎓 Checking exam registrations...")
+    await _guarded("Grade reminder check", check_grade_reminders, session, bot, send,
+                   start_message="🎓 Checking for new grades...")
+    await _guarded("Tuition reminder check", check_tuition_reminders, session, bot, send,
+                   start_message="💶 Checking tuition / fee status...")
 
 
-async def _for_each_stums_user(job):
-    """Run `job(uid, session)` for every signed-in student, one at a time and
-    spaced out; each runs in that student's user and exam-cache context."""
+PERSONAL_SLOTS_KEY = "personal_check_slots"
+
+
+def _personal_due(uid: int, now: datetime) -> Optional[str]:
+    """The student's due check slot (stagger.due_slot), or None."""
+    done = (load_general_cache().get(PERSONAL_SLOTS_KEY) or {}).get(str(uid))
+    try:
+        registration_open = bool(load_exam_cache(uid).get("notified_open"))
+    except Exception:
+        registration_open = False
+    return stagger.due_slot(uid, now, done, stagger.is_grade_season(now.date(), registration_open))
+
+
+def _mark_personal_slot(uid: int, slot: str) -> None:
+    slots = dict(load_general_cache().get(PERSONAL_SLOTS_KEY) or {})
+    slots[str(uid)] = slot
+    update_general_cache({PERSONAL_SLOTS_KEY: slots})
+
+
+async def _for_each_stums_user(job, accounts=None):
+    """Run `job(uid, session)` for every signed-in student (or `accounts`),
+    one at a time and spaced out; each runs in that student's user and
+    exam-cache context."""
     admin_id = next(iter(ALLOWED_USER_IDS), None)
-    for index, account in enumerate(_stums_users()):
+    for index, account in enumerate(_stums_users() if accounts is None else accounts):
         uid, sess = account.user_id, account.session
         if index:
             await asyncio.sleep(random.uniform(*STUMS_USER_GAP_SECONDS))
@@ -250,6 +257,12 @@ async def _for_each_stums_user(job):
             await _guarded(f"StuMS checks for {uid}", job, uid, sess)
 
 
+def _single_account_owner(session) -> Optional[int]:
+    """Whose StuMS data the single-account setup reads: the watcher session's
+    student, else the primary admin."""
+    return getattr(session, "user_id", None) or next(iter(ALLOWED_USER_IDS), None)
+
+
 async def _run_reminder_checks(bot, session, now: datetime):
     """Calendar, schedule change, task, exam, grade and tuition reminders."""
     await _guarded("Calendar reminder check", _send_calendar_reminders, bot)
@@ -257,14 +270,28 @@ async def _run_reminder_checks(bot, session, now: datetime):
     await _guarded("Course schedule change check", check_course_schedule_changes, session, bot)
     # Personal task reminders (local JSON, no network calls needed)
     await _guarded("Task reminder check", check_task_reminders, bot)
-    # StuMS: exam registrations, grades and fees, per student, each on its own interval
+    # StuMS: exam registrations, grades and fees, each student at their own
+    # staggered times (unibot.stagger), never at night
     if _stums_users():
-        await _for_each_stums_user(
-            lambda uid, sess: _run_stums_checks(bot, sess, now, f"_{uid}", _user_sender(uid))
-        )
+        due = [(account, slot) for account in _stums_users()
+               if (slot := _personal_due(account.user_id, now)) is not None]
+        slots = {account.user_id: slot for account, slot in due}
+
+        async def job(uid, sess):
+            await _run_stums_checks(bot, sess, _user_sender(uid))
+            _mark_personal_slot(uid, slots[uid])
+
+        if due:
+            await _for_each_stums_user(job, [account for account, _slot in due])
     else:
-        # single-account setup without per-user logins
-        await _run_stums_checks(bot, session, now)
+        # single-account setup without per-user logins: still that one student's data only
+        owner = _single_account_owner(session)
+        if owner is None:
+            return
+        slot = _personal_due(owner, now)
+        if slot is not None:
+            await _run_stums_checks(bot, session, _user_sender(owner))
+            _mark_personal_slot(owner, slot)
 
 
 async def _check_file_exam_reminders(bot, session):
@@ -280,15 +307,17 @@ async def _check_file_exam_reminders(bot, session):
 
 async def _run_exam_date_checks(bot, session, now: datetime):
     """Upcoming exam dates (StuMS and course files), throttled to every 3 hours."""
-    if not _is_due("last_exam_date_check", now, EXAM_DATE_CHECK_INTERVAL_SECONDS):
+    if stagger.is_night(now) or not _is_due("last_exam_date_check", now, EXAM_DATE_CHECK_INTERVAL_SECONDS):
         return
     if _stums_users():
         await _for_each_stums_user(
             lambda uid, sess: check_exam_date_reminders(sess, bot, _user_sender(uid))
         )
     else:
-        await _guarded("Exam date reminder check", check_exam_date_reminders, session, bot, broadcast,
-                       start_message="🎓 Checking upcoming exam dates...")
+        owner = _single_account_owner(session)
+        if owner is not None:
+            await _guarded("Exam date reminder check", check_exam_date_reminders, session, bot,
+                           _user_sender(owner), start_message="🎓 Checking upcoming exam dates...")
     await _guarded("File exam reminder check", _check_file_exam_reminders, bot, session)
     update_general_cache({"last_exam_date_check": now.isoformat()})
 

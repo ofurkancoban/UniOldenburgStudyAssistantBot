@@ -828,7 +828,9 @@ class SqliteStoreTests(unittest.TestCase):
             fast_enroll.save_pending_job(7, "sem1", "10:00", "2026-11-09")
             self.assertEqual(fast_enroll.list_pending_jobs(7)["sem1"]["target_time_str"], "10:00")
             self.assertFalse(os.path.exists(pending))
-        self.assertTrue(db.exists(legacy) and db.exists(pending))
+        # the exam cache is personal: it left the shared store for the student's encrypted record
+        self.assertFalse(db.exists(legacy))
+        self.assertTrue(db.has_private(42, "exam_cache") and db.exists(pending))
 
 
 class CookieStorageTests(unittest.TestCase):

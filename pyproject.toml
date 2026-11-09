@@ -74,6 +74,7 @@ files = [
     "unibot/tasks.py",
     "unibot/study_week.py",
     "unibot/course_registry.py",
+    "unibot/stagger.py",
     "unibot/mensa.py",
     "unibot/wardrobe.py",
     "unibot/menus.py",

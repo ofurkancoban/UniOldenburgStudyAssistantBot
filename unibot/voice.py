@@ -161,7 +161,9 @@ async def build_qa_context(user_id=None) -> str:
 
     session = None
     try:
-        session = await login_studip()
+        # personal sections only ever come from the asking student's own session
+        if user_id is not None:
+            session = await login_studip(user_id=user_id)
     except Exception as e:
         logging.warning("build_qa_context: login failed: %s", e)
 
@@ -590,7 +592,7 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
         )
         return True
     try:
-        session = await login_studip()
+        session = await login_studip(user_id=update.effective_user.id)
         exam_title, exam_dt, has_time = await _find_exam_datetime(session, course_query)
     except Exception as e:
         logging.error("_route_voice_intent: create_exam_reminder_task fetch failed: %s", e)
@@ -843,7 +845,7 @@ async def _voice_intent_exam_register(update, context, result, transcript, inten
         await message.reply_text(f"🎙️ Found a match: {matched_exam['title']}", reply_markup=keyboard)
     else:
         await message.reply_text("🎙️ Couldn't confidently match that exam — here's the full list:")
-        await send_exam_registration_menu(message)
+        await send_exam_registration_menu(message, user_id=update.effective_user.id)
     return True
 
 

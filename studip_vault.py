@@ -142,6 +142,55 @@ def decrypt_payload(raw_text: str, _legacy_flag: Optional[list] = None) -> Optio
         return None
 
 
+# ── per-user keys ─────────────────────────────────────────────────────────────
+# A student's credentials and private data are encrypted with a key of their
+# own: HKDF-SHA256 of the vault key with a random per-record salt and the
+# student's Telegram id as context. A blob copied into another student's row
+# does not decrypt there, and the database alone reveals nothing.
+USER_MAGIC = "VAULT:u1:"
+
+
+def _user_key(user_id: int, salt: bytes) -> bytes:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt,
+                info=f"unibot-user-vault:{int(user_id)}".encode("ascii"))
+    return base64.urlsafe_b64encode(hkdf.derive(base64.urlsafe_b64decode(_primary_key())))
+
+
+def encrypt_user_payload(user_id: int, data: Any) -> str:
+    """Encrypt JSON-able data with `user_id`'s own key (fresh salt per call)."""
+    from cryptography.fernet import Fernet
+
+    if not isinstance(user_id, int) or isinstance(user_id, bool):
+        raise ValueError("a user id is required for personal data")
+    salt = os.urandom(16)
+    token = Fernet(_user_key(user_id, salt)).encrypt(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+    return f"{USER_MAGIC}{base64.urlsafe_b64encode(salt).decode('ascii')}:{token.decode('utf-8')}"
+
+
+def decrypt_user_payload(user_id: int, raw_text: str, _legacy_flag: Optional[list] = None) -> Optional[Any]:
+    """Decrypt a per-user blob of `user_id`. Older shared-key blobs are still
+    read; `_legacy_flag` then gets True appended so the caller re-encrypts."""
+    from cryptography.fernet import Fernet, InvalidToken
+
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return None
+    if not raw_text.startswith(USER_MAGIC):
+        if _legacy_flag is not None:
+            _legacy_flag.append(True)
+        return decrypt_payload(raw_text)
+    try:
+        salt_b64, token = raw_text[len(USER_MAGIC):].split(":", 1)
+        plain = Fernet(_user_key(user_id, base64.urlsafe_b64decode(salt_b64))).decrypt(token.encode("utf-8"))
+    except (InvalidToken, ValueError) as exc:
+        logger.error("Failed to decrypt a personal vault record (%s)", type(exc).__name__)
+        return None
+    return json.loads(plain.decode("utf-8"))
+
+
 def write_vault_file(path: str, data: Any, mode: int = 0o600) -> None:
     """Atomically write encrypted data with strict file permissions (0600)."""
     cipher_text = encrypt_payload(data)
