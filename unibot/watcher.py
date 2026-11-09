@@ -60,7 +60,8 @@ from unibot.auth import (
 )
 from unibot.schedule import (
     check_calendar_reminders,
-    check_course_schedule_changes,
+    check_course_session_changes,
+    check_personal_timetable_changes,
     run_morning_summary_schedule,
 )
 from unibot.monitoring import (
@@ -321,8 +322,10 @@ async def _run_reminder_checks(bot, session, now: datetime):
     # course alerts held for quiet hours or the evening digest go out when due
     await _guarded("Course digest", course_registry.flush_alert_queues, bot, now)
     await _guarded("Calendar reminder check", _send_calendar_reminders, bot)
-    # Automatic course cancellation & room change alerts
-    await _guarded("Course schedule change check", check_course_schedule_changes, session, bot)
+    # Cancelled, moved or rescheduled sessions: once per course, to its students only
+    await _guarded("Course session change check", check_course_session_changes, bot)
+    # Each student's own weekly timetable (added, moved or removed courses)
+    await _guarded("Timetable change check", check_personal_timetable_changes, bot)
     # Personal task reminders (local JSON, no network calls needed)
     await _guarded("Task reminder check", check_task_reminders, bot)
     # StuMS: exam registrations, grades and fees, each student at their own

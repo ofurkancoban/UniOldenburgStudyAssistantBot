@@ -440,7 +440,8 @@ class WatcherCycleTests(unittest.TestCase):
             "run_morning_summary_schedule": job("morning"),
             "get_pref": lambda uid, key: False,
             "check_calendar_reminders": job("calendar"),
-            "check_course_schedule_changes": job("schedule_changes", fails=True),
+            "check_course_session_changes": job("schedule_changes", fails=True),
+            "check_personal_timetable_changes": job("timetable"),
             "check_task_reminders": job("tasks"),
             "check_exam_reminders": job("exam_registrations", fails=True),
             "check_grade_reminders": job("grades"),
@@ -471,7 +472,7 @@ class WatcherCycleTests(unittest.TestCase):
             with self.assertRaises(_StopWatcher):
                 asyncio.run(watcher.unified_watcher_controller(app))
 
-        for expected in ("morning", "calendar", "schedule_changes", "tasks", "exam_registrations", "grades",
+        for expected in ("morning", "calendar", "schedule_changes", "timetable", "tasks", "exam_registrations", "grades",
                          "tuition", "exam_dates", "registered", "file_exams", "health", "announcements", "forum"):
             self.assertIn(expected, calls)
         self.assertIn("files", calls)  # throttled to every 30 min, so due on the first cycle
@@ -499,7 +500,8 @@ class WatcherCycleTests(unittest.TestCase):
         patches = dict(
             load_general_cache=lambda: dict(cache), update_general_cache=lambda d: cache.update(d),
             load_exam_cache=lambda *a, **k: exam_cache, ALLOWED_USER_IDS={5}, PRIMARY_ADMIN_ID=5, _stums_users=lambda: [],
-            check_calendar_reminders=job("calendar"), check_course_schedule_changes=job("changes"),
+            check_calendar_reminders=job("calendar"), check_course_session_changes=job("changes"),
+            check_personal_timetable_changes=job("timetable"),
             check_task_reminders=job("tasks"), check_exam_reminders=job("registrations"),
             check_grade_reminders=job("grades"), check_tuition_reminders=job("tuition"),
         )

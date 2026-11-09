@@ -47,7 +47,7 @@ from unibot.formatting import (
     clean_course_title,
 )
 from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation
-from unibot.auth import current_user_id, get_user_session, is_user_allowed, login_studip
+from unibot.auth import acting_as, current_user_id, get_user_session, is_user_allowed, login_studip, signed_in_accounts
 from unibot.studip_api import (
     BASE_URL,
     _api_berlin,
@@ -1701,73 +1701,132 @@ def _diff_timetable(old: dict, new: dict) -> list[str]:
     return alerts
 
 
-async def check_course_schedule_changes(session, bot) -> None:
-    """Inspect upcoming course sessions over the next 14 days and weekly timetable slots
-    via Stud.IP JSON:API (/users/{id}/schedule, /courses/{cid}/events, /users/{id}/events)
-    and notify immediately if:
-      - A session is cancelled (🚫 COURSE SESSION CANCELLED)
-      - A previously cancelled session is restored (🟢 COURSE SESSION RESTORED)
-      - A room / location changes (📍 COURSE ROOM CHANGED)
-      - A session time is rescheduled (⏰ COURSE SESSION RESCHEDULED)
-      - A new course is added to the weekly timetable (📅 NEW COURSE ADDED TO TIMETABLE)
-      - An existing timetable slot changes day/time/room (🔄 TIMETABLE SCHEDULE UPDATED)
-      - A course slot is removed from the weekly timetable (ℹ️ COURSE REMOVED FROM TIMETABLE)
-    """
-    now = datetime.now(TZ_BERLIN)
-    wa_kb = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
-    # The timetable and calendar read here are the session owner's own: the
-    # alerts and the saved state belong to that student only, never everyone.
-    owner = getattr(session, "user_id", None) or PRIMARY_ADMIN_ID
-    if not owner:
-        return
+COURSE_SESSION_STATE_KEY = "course_session_state"  # {cid: {event id: entry}}, course facts only
+COURSE_SESSION_DAYS_AHEAD = 14
+COURSE_SESSION_SCAN_SECONDS = 20 * 60        # every course at most this often
+PERSONAL_TIMETABLE_CHECK_SECONDS = 6 * 3600  # each student's own timetable
+_last_course_session_scan = 0.0
+_timetable_checked_at: dict[int, float] = {}
 
-    async def send(alert_text):
+_SCHEDULE_WA_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
+
+
+def _alert_title(text: str) -> str:
+    """The one-line form of an alert box (for students who chose titles only):
+    its headline and the course."""
+    lines = [re.sub(r"<[^>]+>", "", line).strip() for line in text.splitlines()]
+    lines = [line for line in lines if line and not set(line) <= set("━─-")]
+    return " | ".join(lines[:2])[:300]
+
+
+def _course_session_events(cid: str, course_name: str, raw: list, now: datetime) -> list[dict]:
+    """The course's concrete sessions in the next COURSE_SESSION_DAYS_AHEAD
+    days, in the shape _diff_course_events reads."""
+    horizon = now + timedelta(days=COURSE_SESSION_DAYS_AHEAD)
+    events = []
+    for ev in raw:
+        attr = ev.get("attributes", {})
+        start_dt, end_dt = _api_berlin(attr.get("start")), _api_berlin(attr.get("end"))
+        if not start_dt or not end_dt or end_dt < now - timedelta(days=1) or start_dt > horizon:
+            continue
+        events.append({
+            "id": ev.get("id") or f"{cid}|{start_dt.isoformat()}",
+            "title": course_name or attr.get("title") or "Course",
+            "start_dt": start_dt,
+            "end_dt": end_dt,
+            "is_cancelled": bool(attr.get("is-cancelled", False)),
+            "location": (attr.get("location") or "").strip(),
+        })
+    return events
+
+
+async def check_course_session_changes(bot, now: Optional[datetime] = None, force: bool = False) -> dict:
+    """Cancelled, restored, moved or rescheduled sessions, per course.
+
+    These are facts about a course, the same for everyone in it: each watched
+    course is read once (with its registry scanner, handing over to another
+    member when that fails) and an alert goes only to the students who take
+    or track that course, in their own format, quiet hours and digest mode.
+    The first scan of a course only records its sessions. Returns counters."""
+    global _last_course_session_scan
+    from unibot import course_registry
+    from unibot.monitoring import watched_courses
+    from unibot.monitoring_alerts import course_members
+
+    stats = {"courses": 0, "alerts": 0, "failed": 0}
+    if not force and time.time() - _last_course_session_scan < COURSE_SESSION_SCAN_SECONDS:
+        return stats
+    _last_course_session_scan = time.time()
+    now = now or datetime.now(TZ_BERLIN)
+    plan = await watched_courses()
+    all_state = dict(load_general_cache().get(COURSE_SESSION_STATE_KEY) or {})
+    for course_name, cid, scanner in plan:
         try:
-            await bot.send_message(chat_id=owner, text=alert_text, parse_mode="HTML",
-                                   disable_notification=False, reply_markup=wa_kb)
+            (raw, _meta), _used = await course_registry.scan_with_failover(
+                cid, scanner, lambda sess, cid=cid: studip_api_get_all(f"/courses/{cid}/events", session=sess))
         except Exception as exc:
-            logging.warning("Schedule change alert not delivered: %s", exc)
+            stats["failed"] += 1
+            logging.debug("Course sessions of %s unavailable: %s", cid, exc)
+            continue
+        stats["courses"] += 1
+        events = _course_session_events(cid, course_name, raw, now)
+        first_scan = cid not in all_state
+        course_state = dict(all_state.get(cid) or {})
+        alerts, _changed = _diff_course_events(events, course_state, now)
+        all_state[cid] = course_state
+        if first_scan:
+            continue  # baseline: sessions cancelled before we knew the course are not news
+        for text in alerts:
+            await course_registry.fan_out(bot, cid, "schedule", text, _alert_title(text),
+                                          reply_markup=_SCHEDULE_WA_MARKUP, members=course_members(cid), now=now)
+            stats["alerts"] += 1
+    known = {cid for _, cid, _ in plan}
+    all_state = {cid: entries for cid, entries in all_state.items() if cid in known}
+    cache = load_general_cache()
+    cache[COURSE_SESSION_STATE_KEY] = all_state
+    cache.pop("course_events_state", None)  # the old single-account state
+    save_general_cache(cache)
+    return stats
 
-    # 1. Concrete course & user calendar events (14 days ahead)
-    try:
-        events = await _get_calendar_events_api(now.date(), days=14, session=session)
-    except Exception as exc:
-        logging.debug("check_course_schedule_changes events fetch skipped: %s", exc)
-        events = []
 
-    legacy = load_general_cache()  # state from before it moved to the owner's record
-    ev_state: dict = dict(personal_record(owner, "course_events_state", {}) or {})
-    if not ev_state:
-        ev_state = dict(legacy.get("course_events_state") or {})
-    alerts, ev_updated = _diff_course_events(events, ev_state, now)
-    for alert in alerts:
-        await send(alert)
+async def check_personal_timetable_changes(bot, now: Optional[datetime] = None) -> int:
+    """Courses added to, moved in or removed from each student's own weekly
+    timetable, read with their own session (every
+    PERSONAL_TIMETABLE_CHECK_SECONDS) and compared with their private record.
+    Alerts go to that student only. Returns how many students were checked."""
+    from unibot import course_registry
 
-    # 2. Weekly recurring timetable slots (/users/{id}/schedule)
-    try:
-        current_slots = await fetch_user_schedule_api(session=session)
-    except Exception as exc:
-        logging.debug("check_course_schedule_changes schedule fetch skipped: %s", exc)
-        current_slots = None
-
-    if current_slots is not None:
-        sched_state: dict = personal_record(owner, "user_schedule_slots", {}) or {}
-        if not sched_state and isinstance(legacy.get("user_schedule_slots"), dict):
-            sched_state = legacy["user_schedule_slots"]  # the owner's timetable itself, not a per-student map
-        new_sched_map = _timetable_map(current_slots)
-        if sched_state:
-            for alert in _diff_timetable(sched_state, new_sched_map):
-                await send(alert)
-        if new_sched_map != sched_state:
-            save_personal_record(owner, "user_schedule_slots", new_sched_map)
-
-    if ev_updated or "course_events_state" in legacy:
-        save_personal_record(owner, "course_events_state", ev_state)
-    if current_slots is not None and any(key in legacy for key in ("user_schedule_slots", "course_events_state")):
-        general_cache = load_general_cache()
-        general_cache.pop("user_schedule_slots", None)
-        general_cache.pop("course_events_state", None)
-        save_general_cache(general_cache)
+    now = now or datetime.now(TZ_BERLIN)
+    legacy = load_general_cache().get("user_schedule_slots")
+    watcher_uid = getattr(state.global_session, "user_id", None) or PRIMARY_ADMIN_ID
+    checked = 0
+    for account in signed_in_accounts():
+        uid, sess = account.user_id, account.session
+        if time.time() - _timetable_checked_at.get(uid, 0.0) < PERSONAL_TIMETABLE_CHECK_SECONDS:
+            continue
+        _timetable_checked_at[uid] = time.time()
+        try:
+            with acting_as(uid):
+                slots = await fetch_user_schedule_api(user_id=uid, session=sess)
+        except Exception as exc:
+            logging.debug("Timetable of a student unavailable: %s", exc)
+            continue
+        checked += 1
+        old = personal_record(uid, "user_schedule_slots", {}) or {}
+        if not old and uid == watcher_uid and isinstance(legacy, dict) and legacy:
+            old = legacy  # the single-account timetable from before
+        new = _timetable_map(slots)
+        if old:
+            for text in _diff_timetable(old, new):
+                await course_registry.fan_out(bot, None, "schedule", text, _alert_title(text),
+                                              reply_markup=_SCHEDULE_WA_MARKUP, members={uid}, now=now)
+        if new != old:
+            save_personal_record(uid, "user_schedule_slots", new)
+    if legacy is not None and checked:
+        cache = load_general_cache()
+        cache.pop("user_schedule_slots", None)
+        save_general_cache(cache)
+    return checked
 
 
 async def build_upcoming_dashboard(session, user_id: int) -> str:

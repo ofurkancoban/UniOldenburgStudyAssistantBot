@@ -343,26 +343,82 @@ class PersonalRecordTests(SharedCacheMixin, unittest.TestCase):
         self.assertNotIn("728", self.cache["calendar_tokens"])
         self.assertEqual(storage.user_for_calendar_token("legacy-token"), 728)
 
-    def test_schedule_changes_go_to_the_timetables_owner_only(self):
+    def _schedule_patches(self, fan_outs):
+        from unibot import course_registry, schedule
+
+        async def fan_out(bot, cid, kind, text, title_text, **kwargs):
+            fan_outs.append((cid, kind, set(kwargs.get("members") or ()), title_text))
+            return {}
+
+        return [mock.patch.object(schedule, "load_general_cache", lambda: self.cache),
+                mock.patch.object(schedule, "save_general_cache", lambda d: self.cache.update(d)),
+                mock.patch.object(course_registry, "fan_out", fan_out)]
+
+    def test_session_changes_reach_only_the_courses_students(self):
+        from unibot import course_registry, monitoring, schedule
+        noon = datetime(2026, 11, 10, 12, 0, tzinfo=TZ_BERLIN)
+
+        def event(cancelled):
+            return {"id": "e1", "attributes": {"start": "2026-11-12T10:00:00+01:00", "end": "2026-11-12T12:00:00+01:00",
+                                               "is-cancelled": cancelled, "location": "A1"}}
+
+        feeds = {"c1": [event(False)], "c2": [event(False)]}
+
+        async def get_all(path, session=None, **kwargs):
+            return feeds[path.split("/")[2]], None
+
+        async def scan(cid, primary, fetch):
+            return await fetch(primary), primary
+
+        fan_outs: list = []
+        plan = [("Course One", "c1", "s1"), ("Course Two", "c2", "s2")]
+        patches = self._schedule_patches(fan_outs) + [
+            mock.patch.object(monitoring, "watched_courses", mock.AsyncMock(return_value=plan)),
+            mock.patch.object(course_registry, "scan_with_failover", scan),
+            mock.patch.object(schedule, "studip_api_get_all", get_all),
+            mock.patch.object(state, "course_members", {"c1": {801, 802}, "c2": {803}}),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        first = asyncio.run(schedule.check_course_session_changes(None, now=noon, force=True))
+        self.assertEqual((first["courses"], fan_outs), (2, []))  # the first scan is the baseline
+        feeds["c1"] = [event(True)]
+        asyncio.run(schedule.check_course_session_changes(None, now=noon, force=True))
+        self.assertEqual([(cid, kind, members) for cid, kind, members, _ in fan_outs], [("c1", "schedule", {801, 802})])
+        self.assertIn("CANCELLED", fan_outs[0][3])
+        self.assertIn("Course One", fan_outs[0][3])
+        self.assertNotIn("801", json.dumps(self.cache))  # the shared state holds course facts only
+
+    def test_each_student_gets_their_own_timetable_changes(self):
         from unibot import schedule
-        slots = [[{"id": "s1", "weekday": 1, "start": "10:00", "end": "12:00", "title": "Course", "location": "A1"}],
-                 [{"id": "s1", "weekday": 1, "start": "10:00", "end": "12:00", "title": "Course", "location": "B2"}]]
-        bot = mock.MagicMock()
-        bot.send_message = mock.AsyncMock()
 
-        async def timetable(*args, **kwargs):
-            return slots.pop(0)
+        def slot(room):
+            return [{"id": "s1", "weekday": 1, "start": "10:00", "end": "12:00", "title": "Course", "location": room}]
 
-        with mock.patch.object(schedule, "_get_calendar_events_api", mock.AsyncMock(return_value=[])), \
-                mock.patch.object(schedule, "fetch_user_schedule_api", timetable), \
-                mock.patch.object(schedule, "load_general_cache", lambda: self.cache), \
-                mock.patch.object(schedule, "save_general_cache", lambda d: self.cache.update(d)):
-            session = mock.MagicMock(user_id=729)
-            asyncio.run(schedule.check_course_schedule_changes(session, bot))
-            asyncio.run(schedule.check_course_schedule_changes(session, bot))
-        self.assertTrue(bot.send_message.await_args_list)
-        self.assertEqual({c.kwargs["chat_id"] for c in bot.send_message.await_args_list}, {729})
-        self.assertNotIn("user_schedule_slots", self.cache)
+        timetables = {811: slot("A1"), 812: slot("B2")}
+
+        async def fetch(timestamp=None, user_id=None, session=None):
+            return timetables[user_id]
+
+        accounts = [mock.MagicMock(user_id=811, session="s811"), mock.MagicMock(user_id=812, session="s812")]
+        fan_outs: list = []
+        patches = self._schedule_patches(fan_outs) + [
+            mock.patch.object(schedule, "signed_in_accounts", lambda: accounts),
+            mock.patch.object(schedule, "fetch_user_schedule_api", fetch),
+            mock.patch.dict(schedule._timetable_checked_at, clear=True),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.assertEqual(asyncio.run(schedule.check_personal_timetable_changes(None)), 2)
+        self.assertEqual(fan_outs, [])
+        schedule._timetable_checked_at.clear()
+        timetables[811] = slot("C3")
+        asyncio.run(schedule.check_personal_timetable_changes(None))
+        self.assertEqual([(cid, members) for cid, _, members, _ in fan_outs], [(None, {811})])
+        self.assertEqual(storage.personal_record(812, "user_schedule_slots")["s1"]["location"], "B2")
+        self.assertNotIn("C3", json.dumps(self.cache))
 
 
 class RequirementsTests(unittest.TestCase):

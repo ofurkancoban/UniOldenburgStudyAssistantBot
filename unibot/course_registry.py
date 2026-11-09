@@ -357,7 +357,7 @@ def _queue_due(uid: int, item: dict, now: datetime, with_morning: bool = False) 
 
 def digest_text(items: list) -> str:
     """The digest message for `items` (see digest_batch for the size limit)."""
-    kinds = {"files": "📄", "announcements": "📢", "forum": "💬"}
+    kinds = {"files": "📄", "announcements": "📢", "forum": "💬", "schedule": "📅"}
     lines = [f"🗞️ <b>Course updates</b> ({len(items)})", ""]
     for item in items:
         lines.append(item.get("title") or f"{kinds.get(item.get('kind'), '•')} update")
