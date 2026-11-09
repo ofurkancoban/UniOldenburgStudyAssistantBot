@@ -40,6 +40,7 @@ from unibot.storage import close_shared_http, link_cache
 from unibot.telegram_ui import _show_typing
 from unibot.auth import (
     _authorization_gate,
+    _get_login_server,
     _start_login_infra,
     acquire_instance_lock,
     close_all_sessions,
@@ -52,6 +53,7 @@ from unibot.auth import (
 from unibot.studip_api import get_studip_user_profile, list_courses
 from unibot.documents import handle_file_audio_summary
 from unibot.weather import handle_set_weather_location
+from unibot.study_week import handle_calendar_sync, handle_study_buddy, register_calendar_feed
 from unibot.mensa import (
     handle_foodpref_category,
     handle_foodpref_clear_ask,
@@ -361,6 +363,8 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_status_group, pattern=r"^(status_group|status_group_toggle)\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_study_plan_toggle, pattern=r"^sp_plan\|\d+$"))
     app.add_handler(CallbackQueryHandler(handle_study_block_feedback, pattern=r"^sp_block\|.*$"))
+    app.add_handler(CallbackQueryHandler(handle_calendar_sync, pattern=r"^cal_sync(\|.*)?$"))
+    app.add_handler(CallbackQueryHandler(handle_study_buddy, pattern=r"^buddy(\|.*)?$"))
     app.add_handler(CallbackQueryHandler(handle_study_progress_menu, pattern=r"^(sp_progress|sp_progress_refresh|sp_course\|.*|sp_unit\|.*)$"))
     app.add_handler(CallbackQueryHandler(handle_study_track_menu, pattern=r"^(sp_track_menu|sp_track_auto|sp_track\|.*)$"))
     app.add_handler(CallbackQueryHandler(handle_wardrobe_menu, pattern="^wardrobe_menu$"))
@@ -442,6 +446,7 @@ async def main():
 
         # Login page (+ optional Cloudflare tunnel + menu button)
         try:
+            register_calendar_feed(_get_login_server())  # GET /cal/<token>.ics
             await _start_login_infra(app)
         except Exception as exc:
             logging.error("⚠️ Login infrastructure failed to start: %s", exc)

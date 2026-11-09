@@ -7,6 +7,7 @@ import asyncio
 import html
 import logging
 import re
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Optional
@@ -18,7 +19,7 @@ from telegram.error import TelegramError
 from fast_enroll import clear_pending_job, run_fast_enroll
 from studip_utils import TZ_BERLIN
 
-from unibot.storage import load_tasks, save_tasks
+from unibot.storage import load_tasks, record_task_outcome, save_tasks
 from unibot.telegram_ui import user_data, get_main_keyboard
 from unibot.auth import get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import list_courses
@@ -161,12 +162,18 @@ async def handle_task_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     action, task_id = query.data.split("|", 1)
     tasks = load_tasks()
-    if action == "task_done":
-        tasks = [t for t in tasks if t["id"] != task_id]
+    # a button only ever acts on the student's own task
+    own = next((t for t in tasks if t["id"] == task_id and t.get("user_id") == user_id), None)
+    if own is None and action in ("task_done", "task_delete"):
+        await query.edit_message_text("⚠️ This task no longer exists.")
+        return
+    if action == "task_done" and own is not None:
+        record_task_outcome(user_id, own, time.time())
+        tasks = [t for t in tasks if t is not own]
         save_tasks(tasks)
         await query.edit_message_text("✔️ Done!")
-    elif action == "task_delete":
-        tasks = [t for t in tasks if t["id"] != task_id]
+    elif action == "task_delete" and own is not None:
+        tasks = [t for t in tasks if t is not own]
         save_tasks(tasks)
         await query.edit_message_text("🗑️ Deleted.")
 
@@ -398,6 +405,7 @@ async def check_task_reminders(bot):
             due_dt = datetime.fromisoformat(due)
             if due_dt <= now:
                 task_reminder_cache[task["id"]] = task
+                record_task_outcome(task.get("user_id"), task)  # due now; done or not comes later
                 keyboard = InlineKeyboardMarkup([
                     [InlineKeyboardButton("✔️ Done", callback_data=f"task_reminder_done|{task['id']}")],
                     [InlineKeyboardButton(label, callback_data=f"task_reminder_snooze|{task['id']}|{code}") for code, label in TASK_SNOOZE_OPTIONS],
@@ -444,6 +452,7 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
         pass
 
     if action == "task_reminder_done":
+        record_task_outcome(task.get("user_id"), task, time.time())
         await query.message.reply_text(f"✔️ Done: {task['text']}")
         return
 

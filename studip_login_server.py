@@ -278,9 +278,13 @@ class _RedactedAccessLogger(AbstractAccessLogger):
     through this proxy carry one-time OAuth codes and state values in the
     query string (and in the Referer of the next request)."""
 
+    # the secret in a login link or a calendar feed link is part of the path
+    _SECRET_PATH_RE = re.compile(r"^/(login|cal)/[^/]+")
+
     def log(self, request, response, time):
+        path = self._SECRET_PATH_RE.sub(r"/\1/***", request.path)
         self.logger.info('%s "%s %s" %s %s %.3fs', request.remote, request.method,
-                         request.path, response.status, response.body_length, time)
+                         path, response.status, response.body_length, time)
 
 
 class LoginServer:
@@ -312,6 +316,13 @@ class LoginServer:
         # per Telegram user, so two students signing in at once both get
         # their post-login hook (StuMS handoff, profile sync)
         self._last_auth_notify: dict = {}
+        # (method, path, handler) the bot adds before start(), e.g. the
+        # calendar feed; they go in front of the catch-all Stud.IP proxy
+        self.extra_routes: list[tuple[str, str, Callable]] = []
+
+    def add_route(self, method: str, path: str, handler: Callable) -> None:
+        """Serve an extra route (registered at start(), before the proxy)."""
+        self.extra_routes.append((method, path, handler))
 
     @staticmethod
     def _default_host() -> str:
@@ -764,6 +775,8 @@ class LoginServer:
         app.router.add_get("/login/{token}", self._token_login)
         app.router.add_post("/api/login", self._api_login)
         app.router.add_get("/health", self._health)
+        for method, path, handler in self.extra_routes:
+            app.router.add_route(method, path, handler)
         app.router.add_route("*", "/{tail:.*}", self._proxy)
         self._runner = web.AppRunner(app, access_log_class=_RedactedAccessLogger)
         await self._runner.setup()

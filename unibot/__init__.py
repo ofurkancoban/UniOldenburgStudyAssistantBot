@@ -40,6 +40,7 @@ MODULE_ORDER = (
     "exams",
     "study_plan",
     "tasks",
+    "study_week",   # calendar feed, study buddy, Sunday report
     "enrollment",
     "morning",      # morning summary and spoken plans
     "voice",        # voice notes, intents, Q&A

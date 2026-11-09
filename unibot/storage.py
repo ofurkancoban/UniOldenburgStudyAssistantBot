@@ -6,7 +6,9 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 import asyncio
 import contextlib
 import functools
+import hmac
 import logging
+import secrets
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -491,9 +493,10 @@ STUDY_BLOCK_LOG_DAYS = 35  # how long sent study blocks and their feedback are k
 STUDY_BLOCK_STATUSES = ("sent", "done", "skipped")
 
 
-def record_study_block(user_id, start_ts: int, status: str, course: Optional[str] = None) -> None:
+def record_study_block(user_id, start_ts: int, status: str, course: Optional[str] = None,
+                       minutes: Optional[int] = None) -> None:
     """Log a study block: "sent" when its pack goes out, then "done" or
-    "skipped" from the student's answer (the course is kept from "sent")."""
+    "skipped" from the student's answer (course and minutes are kept from "sent")."""
     if status not in STUDY_BLOCK_STATUSES:
         raise ValueError(status)
     cache = load_general_cache()
@@ -502,6 +505,8 @@ def record_study_block(user_id, start_ts: int, status: str, course: Optional[str
     entry["status"] = status
     if course is not None:
         entry["course"] = course
+    if minutes is not None:
+        entry["minutes"] = int(minutes)
     log[str(start_ts)] = entry
     cutoff = time.time() - STUDY_BLOCK_LOG_DAYS * 86400
     for key in [k for k in log if int(k) < cutoff]:
@@ -514,6 +519,80 @@ def study_block_log(user_id, since_ts: float, until_ts: float) -> list[dict]:
     log = (load_general_cache().get("study_blocks") or {}).get(str(user_id)) or {}
     return [{"ts": int(k), **v} for k, v in sorted(log.items(), key=lambda kv: int(kv[0]))
             if since_ts <= int(k) < until_ts]
+
+
+# ── task deadlines kept or missed (tasks are deleted once done) ─────────────
+TASK_OUTCOME_KEEP_DAYS = 120
+
+
+def record_task_outcome(user_id, task: dict, done_ts: Optional[float] = None) -> None:
+    """Remember a deadline task: when it was due and, once the student marks
+    it done, when that was. The first due time is kept, so a snoozed task
+    finished later still counts as late."""
+    if not task.get("due_time") or not task.get("id"):
+        return
+    cache = load_general_cache()
+    log = cache.setdefault("task_outcomes", {}).setdefault(str(user_id), {})
+    entry = log.get(task["id"]) or {"due": task["due_time"], "text": str(task.get("text") or "")[:120]}
+    if done_ts is not None and not entry.get("done"):
+        entry["done"] = int(done_ts)
+    log[task["id"]] = entry
+    cutoff = time.time() - TASK_OUTCOME_KEEP_DAYS * 86400
+    for key in [k for k, v in log.items() if _iso_ts(v.get("due")) < cutoff]:
+        del log[key]
+    save_general_cache(cache)
+
+
+def task_outcomes(user_id) -> list[dict]:
+    """[{"due" (ISO), "done" (timestamp or None), "text"}] of the student's deadline tasks."""
+    log = (load_general_cache().get("task_outcomes") or {}).get(str(user_id)) or {}
+    return [{"id": k, **v} for k, v in log.items()]
+
+
+def _iso_ts(value) -> float:
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
+
+
+# ── calendar feed and study buddy (per user) ──────────────────────────────────
+def calendar_token(user_id, create: bool = True) -> Optional[str]:
+    """The secret in the student's calendar feed link (made on first use)."""
+    cache = load_general_cache()
+    tokens = cache.setdefault("calendar_tokens", {})
+    token = tokens.get(str(user_id))
+    if token is None and create:
+        token = tokens[str(user_id)] = secrets.token_urlsafe(24)
+        save_general_cache(cache)
+    return token
+
+
+def reset_calendar_token(user_id) -> str:
+    """A new feed link; the old one stops working."""
+    cache = load_general_cache()
+    cache.setdefault("calendar_tokens", {}).pop(str(user_id), None)
+    save_general_cache(cache)
+    return calendar_token(user_id) or ""
+
+
+def user_for_calendar_token(token: str) -> Optional[int]:
+    for uid, known in (load_general_cache().get("calendar_tokens") or {}).items():
+        if token and hmac.compare_digest(known, token):
+            return int(uid)
+    return None
+
+
+def get_study_buddy_enabled(user_id) -> bool:
+    """Opt in: only then are the student's common free windows shown to
+    classmates who opted in too (never their timetable itself)."""
+    return bool((load_general_cache().get("study_buddy") or {}).get(str(user_id)))
+
+
+def set_study_buddy_enabled(user_id, enabled: bool) -> None:
+    cache = load_general_cache()
+    cache.setdefault("study_buddy", {})[str(user_id)] = bool(enabled)
+    save_general_cache(cache)
 
 
 TRAVEL_MODES = ("bike", "bus")

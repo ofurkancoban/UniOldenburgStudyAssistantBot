@@ -115,6 +115,8 @@ def _status_group_view(group: str, user_id: Optional[int] = None) -> tuple:
             [InlineKeyboardButton(f"{'✅' if watch_prev else '🔲'} Watch Previous Semester Too", callback_data="status_group_toggle|semester|watch_prev")],
             [InlineKeyboardButton("🚌 Switch to Bus" if travel == "bike" else "🚲 Switch to Bike",
                                   callback_data="status_group_toggle|semester|travel")],
+            [InlineKeyboardButton("📅 Calendar Sync", callback_data="cal_sync"),
+             InlineKeyboardButton("👥 Study Buddy", callback_data="buddy")],
         ]
     else:
         title = "📄 <b>Official Documents &amp; Tuition</b>\n\nDownload official StuMS PDF certificates, transcript, and semester fee status:"

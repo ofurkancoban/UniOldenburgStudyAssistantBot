@@ -545,7 +545,10 @@ class TravelModeTests(unittest.TestCase):
         storage.set_travel_mode(self.UID, "bike")
         text, markup = menus._status_group_view("semester", self.UID)
         self.assertIn("Bike (15 min, bus when it rains)", text)
-        self.assertEqual(markup.inline_keyboard[-1][0].callback_data, "status_group_toggle|semester|travel")
+        callbacks = [b.callback_data for row in markup.inline_keyboard for b in row]
+        self.assertIn("status_group_toggle|semester|travel", callbacks)
+        self.assertIn("cal_sync", callbacks)
+        self.assertIn("buddy", callbacks)
         query = mock.MagicMock()
         query.data = "status_group_toggle|semester|travel"
         query.from_user.id = self.UID

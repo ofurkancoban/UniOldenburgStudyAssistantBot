@@ -261,7 +261,8 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                     reminders[start_key] = int(now.timestamp())
                     updated = True
                     course = study_pack_course(w, chat_id, now)
-                    record_study_block(chat_id, int(start_dt.timestamp()), "sent", course[1] if course else None)
+                    record_study_block(chat_id, int(start_dt.timestamp()), "sent", course[1] if course else None,
+                                       w["duration_minutes"])
                 except Exception as e:
                     logging.error("Failed to send study pack: %s", e)
 

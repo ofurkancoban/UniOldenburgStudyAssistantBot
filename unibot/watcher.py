@@ -62,6 +62,7 @@ from unibot.exams import (
 )
 from unibot.study_plan import index_course_files, run_weekly_study_plan_job
 from unibot.tasks import check_task_reminders
+from unibot.study_week import weekly_report, weekly_report_due
 from unibot.system import HEALTH_CHECK_LABELS, run_health_checks
 
 
@@ -329,6 +330,27 @@ async def _send_daily_digest(bot):
     await broadcast(bot, "\n".join(lines), parse_mode="HTML", members=set(ADMIN_USER_IDS))
 
 
+async def _send_weekly_reports(bot):
+    """Every signed-in student gets their own Sunday report (study_week.weekly_report)."""
+    for account in signed_in_accounts():
+        try:
+            text = await weekly_report(account.user_id)
+            await bot.send_message(chat_id=account.user_id, text=text, parse_mode="HTML")
+        except Exception as e:
+            logging.warning("Weekly report failed for %s: %s", account.user_id, e)
+
+
+async def _run_weekly_report(bot, now: datetime):
+    """Sunday evening, once per ISO week."""
+    if not weekly_report_due(now):
+        return
+    year, week, _ = now.isocalendar()
+    await _run_once_per_period(
+        "last_weekly_report", f"{year}-W{week:02d}", "Weekly report",
+        "📊 Sending the weekly reports...", _send_weekly_reports, bot,
+    )
+
+
 async def _backup_database():
     path = await asyncio.to_thread(db.backup)
     logging.info("💾 Database backup written: %s", os.path.basename(path))
@@ -434,6 +456,7 @@ async def unified_watcher_controller(app):
             await _run_health_check(bot, now)
             await _run_daily_backup(now)
             await _run_daily_digest(bot, now)
+            await _run_weekly_report(bot, now)
             await _run_content_watchers(bot, admin_id, cycle_count, now)
 
             logging.info("✅ Watcher cycle #%s completed", cycle_count)

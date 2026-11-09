@@ -194,7 +194,7 @@ class HandlerTableTests(unittest.TestCase):
     """Builds the real Application offline (no login, no network)."""
 
     # number of app.add_handler(...) calls in the original main()
-    EXPECTED_HANDLERS = 121
+    EXPECTED_HANDLERS = 123
 
     @classmethod
     def setUpClass(cls):
