@@ -23,7 +23,7 @@ import json
 import logging
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -361,7 +361,14 @@ def _queue_due(uid: int, item: dict, now: datetime, with_morning: bool = False) 
     if in_quiet_hours(uid, now):
         return False
     if is_digest:
-        return local.hour >= DIGEST_HOUR
+        # once the first DIGEST_HOUR after it was queued has come: an alert
+        # from 20:00 waits for tomorrow's digest instead of going out alone
+        # minutes later (and a digest missed while the bot was down follows)
+        last_digest = local.replace(hour=DIGEST_HOUR, minute=0, second=0, microsecond=0)
+        if local < last_digest:
+            last_digest -= timedelta(days=1)
+        queued = item.get("ts")
+        return not isinstance(queued, (int, float)) or queued < last_digest.timestamp()
     morning = morning_send_time(uid)
     return morning is None or local.time() >= morning or local.hour >= DIGEST_HOUR
 

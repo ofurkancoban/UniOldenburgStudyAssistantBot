@@ -109,11 +109,23 @@ RATE_COOLDOWN_SECONDS = 30
 RATE_WARNING = "⚠️ Please don't tap so fast. Try again in half a minute."
 _rate_hits: dict[int, list] = {}
 _rate_cooldown_until: dict[int, float] = {}
+RATE_TABLE_PRUNE_AT = 2000  # entries before idle users are dropped
+
+
+def _prune_rate_tables(now: float) -> None:
+    """Forget users idle for over a minute and finished cooldowns, so
+    accounts that wrote once don't stay in memory for good."""
+    for uid in [u for u, hits in _rate_hits.items() if not hits or now - hits[-1] >= 60.0]:
+        _rate_hits.pop(uid, None)
+    for uid in [u for u, until in _rate_cooldown_until.items() if until <= now]:
+        _rate_cooldown_until.pop(uid, None)
 
 
 def rate_limit(user_id: int, now: Optional[float] = None) -> str:
     """"ok", "warn" (limit just exceeded: tell the user) or "drop"."""
     now = now if now is not None else time.monotonic()
+    if len(_rate_hits) + len(_rate_cooldown_until) > RATE_TABLE_PRUNE_AT:
+        _prune_rate_tables(now)
     if now < _rate_cooldown_until.get(user_id, 0.0):
         return "drop"
     hits = [t for t in _rate_hits.get(user_id, []) if now - t < 60.0]

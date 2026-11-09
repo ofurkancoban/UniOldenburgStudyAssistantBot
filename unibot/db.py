@@ -126,17 +126,20 @@ def _db_path() -> str:
 
 def _connection() -> sqlite3.Connection:
     global _conn, _conn_path
-    path = _db_path()
-    if _conn is None or _conn_path != path:
-        if _conn is not None:
-            _conn.close()
-        _conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
-        _conn.execute("PRAGMA journal_mode=WAL")
-        _conn.execute("PRAGMA synchronous=FULL")
-        _conn.executescript(_SCHEMA)
-        _migrate_columns(_conn)
-        _conn_path = path
-    return _conn
+    # opening (or switching) the connection is guarded too: two threads must
+    # never both open one, or close the other's (_lock is reentrant)
+    with _lock:
+        path = _db_path()
+        if _conn is None or _conn_path != path:
+            if _conn is not None:
+                _conn.close()
+            _conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
+            _conn.execute("PRAGMA journal_mode=WAL")
+            _conn.execute("PRAGMA synchronous=FULL")
+            _conn.executescript(_SCHEMA)
+            _migrate_columns(_conn)
+            _conn_path = path
+        return _conn
 
 
 # Columns added after a table first shipped: (table, column, definition).
@@ -628,11 +631,14 @@ def _has_private(user_id: int, kind: str) -> bool:
         ).fetchone() is not None
 
 
-def _delete_private(user_id: int, kind: Optional[str] = None) -> None:
+def _delete_private(user_id: int, kind: Optional[str] = None, keep: tuple = ()) -> None:
     uid = _require_uid(user_id)
     with _lock:
         if kind is None:
-            _connection().execute("DELETE FROM user_private_data WHERE user_id = ?", (uid,))
+            marks = ",".join("?" * len(keep))
+            _connection().execute(
+                "DELETE FROM user_private_data WHERE user_id = ?" + (f" AND kind NOT IN ({marks})" if keep else ""),
+                (uid, *keep))
         else:
             _connection().execute("DELETE FROM user_private_data WHERE user_id = ? AND kind = ?", (uid, kind))
 
@@ -881,8 +887,9 @@ class UserScope:
     def has_private(self, kind: str) -> bool:
         return _has_private(self.user_id, kind)
 
-    def delete_private(self, kind: Optional[str] = None) -> None:
-        _delete_private(self.user_id, kind)
+    def delete_private(self, kind: Optional[str] = None, keep: tuple = ()) -> None:
+        """Delete one kind, or every kind except those in `keep`."""
+        _delete_private(self.user_id, kind, keep)
 
     def grades(self) -> dict:
         """The grades seen so far, {exam number: fingerprint}."""

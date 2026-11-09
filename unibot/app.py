@@ -4,11 +4,11 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
 import subprocess
-import time
 from typing import Any
 
 import psutil
@@ -529,40 +529,64 @@ async def main():
             release_instance_lock()
         logging.info("✅ Bot shutdown complete")
 
+def _is_our_whatsapp_service(proc, wa_dir: str) -> bool:
+    """A `node server.js` started in our whatsapp_service folder, never
+    some other process that took over a recycled PID or the port."""
+    try:
+        cmdline = proc.cmdline()
+        cwd = proc.cwd()
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+    return (bool(cmdline) and os.path.basename(cmdline[0]).startswith("node")
+            and any(os.path.basename(arg) == "server.js" for arg in cmdline[1:])
+            and os.path.realpath(cwd) == os.path.realpath(wa_dir))
+
+
+def _stop_process(proc) -> None:
+    try:
+        proc.terminate()
+        proc.wait(timeout=3)
+    except psutil.TimeoutExpired:
+        proc.kill()
+    except psutil.NoSuchProcess:
+        pass
+
+
 def _cleanup_stale_whatsapp_service(wa_dir: str):
-    """Ensure no stale or orphaned node server.js is running before startup."""
+    """Stop a stale or orphaned WhatsApp service of ours before startup (the
+    same on Linux and macOS, no fuser/lsof). Whatever else holds the port is
+    left alone and only reported."""
     lock_file = os.path.join(wa_dir, "whatsapp_service.lock")
+    stale = []
     if os.path.exists(lock_file):
         try:
             with open(lock_file, "r") as f:
                 old_pid = int(f.read().strip())
             if old_pid != os.getpid() and psutil.pid_exists(old_pid):
-                try:
-                    os.kill(old_pid, signal.SIGTERM)
-                    time.sleep(0.5)
-                    if psutil.pid_exists(old_pid):
-                        os.kill(old_pid, signal.SIGKILL)
-                    logging.info("Cleaned up stale WhatsApp service process (PID %s)", old_pid)
-                except (ProcessLookupError, OSError):
-                    pass
-            try:
-                os.remove(lock_file)
-            except OSError:
-                pass
+                proc = psutil.Process(old_pid)
+                if _is_our_whatsapp_service(proc, wa_dir):
+                    stale.append(proc)
         except Exception as e:
             logging.debug("Error reading WhatsApp lock file: %s", e)
+        with contextlib.suppress(OSError):
+            os.remove(lock_file)
+    # an orphan whose lock file is gone (e.g. after a crash)
+    for proc in psutil.process_iter():
+        if proc.pid != os.getpid() and proc.pid not in {p.pid for p in stale} and _is_our_whatsapp_service(proc, wa_dir):
+            stale.append(proc)
+    for proc in stale:
+        _stop_process(proc)
+        logging.info("Cleaned up stale WhatsApp service process (PID %s)", proc.pid)
 
     port = WA_SERVICE_PORT
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
             if s.connect_ex(("127.0.0.1", port)) == 0:
-                logging.warning("Port %s is occupied by an existing process. Terminating stale process...", port)
-                if os.name != 'nt':
-                    subprocess.run(["fuser", "-k", f"{port}/tcp"], capture_output=True, timeout=5)
-                time.sleep(1)
+                logging.warning("Port %s is still taken by a process that is not our WhatsApp service; "
+                                "it was left running", port)
     except Exception as e:
-        logging.debug("Port check/cleanup skipped: %s", e)
+        logging.debug("Port check skipped: %s", e)
 
 
 def start_whatsapp_microservice():

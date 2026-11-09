@@ -441,6 +441,15 @@ class WatcherCycleTests(unittest.TestCase):
             "run_morning_summary_schedule": job("morning"),
             "get_pref": lambda uid, key: False,
             "check_calendar_reminders": job("calendar"),
+            # one ACTIVE, signed-in student, whatever other tests left in the database
+            "_get_active_user_ids": lambda: [1],
+            "has_stored_login": lambda session: True,
+            # the StuMS checks never run at night: a fixed slot keeps the test
+            # independent of the clock (and of accounts other tests left)
+            "_stums_users": lambda: [],
+            "_personal_due": lambda uid, now: "test-slot",
+            "_mark_personal_slot": lambda uid, slot: None,
+            "adopt_legacy_exam_cache": lambda uid: None,
             "check_course_session_changes": job("schedule_changes", fails=True),
             "check_personal_timetable_changes": job("timetable"),
             "check_task_reminders": job("tasks"),
@@ -468,7 +477,8 @@ class WatcherCycleTests(unittest.TestCase):
         with mock.patch.multiple(watcher, **patches), \
                 mock.patch.object(watcher.asyncio, "sleep", fake_sleep), \
                 mock.patch.object(state, "global_session", None), \
-                mock.patch.object(state, "global_watcher_paused", False):
+                mock.patch.object(state, "global_watcher_paused", False), \
+                mock.patch.object(watcher.stagger, "is_night", lambda now: False):  # any time of day
             with self.assertRaises(_StopWatcher):
                 asyncio.run(watcher.unified_watcher_controller(app))
 

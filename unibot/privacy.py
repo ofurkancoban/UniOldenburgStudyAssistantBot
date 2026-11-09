@@ -116,7 +116,8 @@ async def delete_personal_data(user_id: int) -> dict:
     """Remove everything personal the bot keeps about the student."""
     removed: dict = {"private": db.get_user_scope(user_id).has_private(PRIVATE_EXAM_KIND)}
     place = load_weather_location(user_id)  # read before the record goes
-    db.get_user_scope(user_id).delete_private()
+    # everything private except their own tasks, which the confirmation keeps
+    db.get_user_scope(user_id).delete_private(keep=(db.TASKS_KIND,))
     await _perform_logout(user_id)  # session, cookies, tokens, StuMS state
     db.get_user_scope(user_id).sync_courses(set())
     removed["cache_sections"] = forget_personal_cache(user_id)

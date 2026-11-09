@@ -70,6 +70,7 @@ files = [
     "unibot/system.py",
     "unibot/voice.py",
     "unibot/study_plan.py",
+    "unibot/study_day.py",
     "unibot/schedule.py",
     "unibot/tasks.py",
     "unibot/study_week.py",

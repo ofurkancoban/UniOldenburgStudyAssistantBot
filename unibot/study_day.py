@@ -245,8 +245,8 @@ def plan_day(day_events: list, windows: list[dict], day: date,
                 break
         target = None
         if slot is None:
-            candidates = [(w, _lunch_slot(w["start_dt"], w["end_dt"], day, carve=True)) for w in refined]
-            candidates = [(w, s) for w, s in candidates if s]
+            carved = [(w, _lunch_slot(w["start_dt"], w["end_dt"], day, carve=True)) for w in refined]
+            candidates: list[tuple[dict, tuple[datetime, datetime]]] = [(w, s) for w, s in carved if s is not None]
             if candidates:
                 target, slot = min(candidates, key=lambda c: abs(_minutes(_at(day, LUNCH_PREFERRED_START), c[1][0])))
         if slot:

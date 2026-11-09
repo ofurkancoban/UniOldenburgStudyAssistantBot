@@ -44,7 +44,6 @@ from unibot.storage import (
 from unibot.telegram_ui import broadcast, markup_for
 from unibot.auth import (
     ACTIVE,
-    INACTIVE,
     NEEDS_REAUTH,
     act_as_bot,
     acting_as,
@@ -144,14 +143,20 @@ async def _scan_and_announce_file_exams(bot, session):
 
 
 def _get_active_user_ids() -> list[int]:
+    """Students the per-user background jobs (morning summary, calendar
+    reminders, weekly plan) run for: ACTIVE only. An expired (NEEDS_REAUTH)
+    session would read an empty timetable and the summary would claim a free
+    day; those students get their sign-in prompt instead. The .env list is
+    only a fallback for an install with no users in the database."""
     try:
-        active = [u["telegram_id"] for u in db.get_all_users()
-                  if u.get("is_active", 1) and lifecycle_state(u["telegram_id"]) != INACTIVE]
-        if active:
-            return active
+        users = db.get_all_users()
     except Exception:
-        logging.debug("Ignored a non-critical error", exc_info=True)
-    return list(ALLOWED_USER_IDS)
+        logging.warning("User list unavailable for the background jobs", exc_info=True)
+        return []
+    if not users:
+        return list(ALLOWED_USER_IDS)
+    return [u["telegram_id"] for u in users
+            if u.get("is_active", 1) and lifecycle_state(u["telegram_id"]) == ACTIVE]
 
 
 async def _run_weekly_study_plan_all_users(bot, active_uids, session):

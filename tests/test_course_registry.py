@@ -223,15 +223,15 @@ class QuietHoursAndDigestTests(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def _at(self, hh, mm=0):
+    def _at(self, hh, mm=0, day=10):
         from datetime import datetime
-        return datetime(2026, 11, 10, hh, mm, tzinfo=cr.TZ_BERLIN)
+        return datetime(2026, 11, day, hh, mm, tzinfo=cr.TZ_BERLIN)
 
     def test_alerts_wait_for_quiet_hours_and_the_digest(self):
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         card = InlineKeyboardMarkup([[InlineKeyboardButton("📥 Download", callback_data="file|abc")]])
         counts = asyncio.run(cr.fan_out(self.bot, "c1", "files", "FULL", "📄 Stats: sheet.pdf", reply_markup=card,
-                                        members={21, 22, 23}, now=self._at(23, 30)))
+                                        members={21, 22, 23}, now=self._at(23, 30, day=9)))
         self.assertEqual(counts["queued"], 2)           # 21 is asleep, 22 wants the digest
         self.assertEqual([c for c, _t, _m in self.sent], [23])
         self.assertEqual(self.sent[0][2].inline_keyboard[0][0].url,
