@@ -16,11 +16,13 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-os.environ.setdefault("BOT_DB_FILE", os.path.join(tempfile.mkdtemp(prefix="unibot-tests-"), "bot_data.sqlite3"))
+from tests.testenv import use_temp_db  # noqa: E402
+use_temp_db()
 
 import studip_login_server  # noqa: E402
 from unibot import auth, monitoring  # noqa: E402
 
+WED_DAY = __import__("datetime").date(2026, 11, 11)
 EVIL = '<a href="https://evil.example/login">Re-login here</a> & <b>'
 
 
@@ -99,10 +101,12 @@ class ProxyCookieTests(unittest.TestCase):
 
 class InviteGuessLimitTests(unittest.TestCase):
     def setUp(self):
-        auth._invite_failures.clear()
+        auth._reset_invite_failures()
+        auth._gate_replied.clear()
 
     def tearDown(self):
-        auth._invite_failures.clear()
+        auth._reset_invite_failures()
+        auth._gate_replied.clear()
 
     def test_guessing_is_capped_per_account_and_window(self):
         for _ in range(auth.INVITE_MAX_FAILURES):
@@ -187,6 +191,126 @@ class VoiceRecordingTests(unittest.TestCase):
                 asyncio.run(monitoring.handle_voice_message(update, context))
         self.assertTrue(created)
         self.assertFalse(os.path.exists(created[0]))
+
+
+class PerStudentSettingTests(unittest.TestCase):
+    A, B, OWNER = 9301, 9302, 9300
+
+    def setUp(self):
+        from unibot import db, storage, weather
+        self.db, self.storage, self.weather = db, storage, weather
+        for uid in (self.A, self.B, self.OWNER):
+            db.get_user_scope(uid).delete_private()
+        for target in (storage, weather):
+            patcher = mock.patch.object(target, "PRIMARY_ADMIN_ID", self.OWNER)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_weather_place_is_each_students_own(self):
+        self.weather.save_weather_location("Bremen", "DE", 53.08, 8.8, user_id=self.A)
+        self.assertEqual(self.weather.load_weather_location(self.A)["name"], "Bremen")
+        self.assertIsNone(self.weather.load_weather_location(self.B))
+        with auth.acting_as(self.B):
+            self.assertIsNone(self.weather.load_weather_location())
+        self.assertNotEqual(self.weather.snapshot_key(WED_DAY, self.A), self.weather.snapshot_key(WED_DAY, self.B))
+
+    def test_old_shared_place_goes_to_the_bot_owner_only(self):
+        self.db.save(self.weather.WEATHER_LOCATION_CACHE_PATH, {"name": "Kiel", "country": "DE",
+                                                               "latitude": 54.3, "longitude": 10.1})
+        self.assertIsNone(self.weather.load_weather_location(self.A))
+        self.assertEqual(self.weather.load_weather_location(self.OWNER)["name"], "Kiel")
+        self.assertFalse(self.db.exists(self.weather.WEATHER_LOCATION_CACHE_PATH))
+
+    def test_default_semester_is_each_students_own(self):
+        self.storage.save_default_semester("s1", "WiSe 26/27", user_id=self.A)
+        self.assertEqual(self.storage.load_default_semester(self.A)["id"], "s1")
+        self.assertEqual(self.storage.load_default_semester(self.B), {})
+        self.storage.clear_default_semester(self.A)
+        self.assertEqual(self.storage.load_default_semester(self.A), {})
+
+    def test_background_work_uses_the_watcher_owners_semester(self):
+        self.db.save(self.storage.DEFAULT_SEMESTER_CACHE_PATH, {"id": "old", "label": "SoSe 26"})
+        self.assertEqual(self.storage.load_default_semester(self.B), {})
+        self.assertEqual(self.storage.load_default_semester()["id"], "old")  # no acting user: the owner
+        self.assertFalse(self.db.exists(self.storage.DEFAULT_SEMESTER_CACHE_PATH))
+
+
+class AdminPanelTests(unittest.TestCase):
+    def test_student_chosen_names_and_typed_actions_are_escaped(self):
+        from unibot import system
+
+        evil_user = {"username": None, "full_name": EVIL, "telegram_id": 1, "interactions": 3,
+                     "last_active_at": time.time(), "created_at": time.time(), "action": "cmd:/<b>"}
+        stats = {"total_users": 1, "active_users": 1, "dau": 1, "wau": 1, "pending_invites": 0,
+                 "top_users": [evil_user], "recent_activities": [evil_user]}
+        with mock.patch.object(system.db, "get_user_analytics", return_value=stats):
+            text, _markup = system._build_admin_overview_view()
+        self.assertNotIn("<a href", text)
+        self.assertIn("cmd:/&lt;b&gt;", text)
+
+    def test_broadcast_needs_admin_rights_when_sent(self):
+        from unibot import menus
+
+        update = mock.MagicMock()
+        update.effective_user.id = 77
+        update.effective_message.reply_text = mock.AsyncMock()
+        context = mock.MagicMock()
+        context.user_data = {"pending_step": "admin_broadcast_text"}
+        broadcast = mock.AsyncMock()
+        with mock.patch.object(menus, "is_user_admin", return_value=False), \
+                mock.patch.object(menus, "broadcast", broadcast):
+            self.assertTrue(asyncio.run(menus.handle_pending_step(update, context, text_override="hi all")))
+        broadcast.assert_not_called()
+
+
+class EmptyTimetableTests(unittest.TestCase):
+    UID = 9401
+
+    def test_one_empty_read_neither_alerts_nor_forgets(self):
+        from unibot import schedule
+
+        old = {"s1": {"title": "Math", "weekday": 1, "weekday_name": "Monday", "start": "10:00",
+                      "end": "12:00", "location": "A1"}}
+        schedule.save_personal_record(self.UID, "user_schedule_slots", old)
+        schedule._timetable_checked_at.pop(self.UID, None)
+        schedule._empty_timetable_reads.pop(self.UID, None)
+        account = types.SimpleNamespace(user_id=self.UID, session=object())
+        fan_out = mock.AsyncMock()
+        with mock.patch.object(schedule, "signed_in_accounts", return_value=[account]), \
+                mock.patch.object(schedule, "fetch_user_schedule_api", mock.AsyncMock(return_value=[])), \
+                mock.patch("unibot.course_registry.fan_out", fan_out):
+            for _ in range(schedule.EMPTY_TIMETABLE_CONFIRMATIONS - 1):
+                schedule._timetable_checked_at.pop(self.UID, None)
+                asyncio.run(schedule.check_personal_timetable_changes(mock.MagicMock()))
+            fan_out.assert_not_called()
+            self.assertEqual(schedule.personal_record(self.UID, "user_schedule_slots"), old)
+            schedule._timetable_checked_at.pop(self.UID, None)
+            asyncio.run(schedule.check_personal_timetable_changes(mock.MagicMock()))
+        fan_out.assert_not_called()  # an emptied timetable is accepted quietly
+        self.assertEqual(schedule.personal_record(self.UID, "user_schedule_slots"), {})
+
+
+class InviteGatePersistenceTests(unittest.TestCase):
+    def setUp(self):
+        auth._reset_invite_failures()
+        auth._gate_replied.clear()
+
+    def tearDown(self):
+        auth._reset_invite_failures()
+        auth._gate_replied.clear()
+
+    def test_the_guess_count_survives_a_restart(self):
+        for _ in range(auth.INVITE_MAX_FAILURES):
+            auth._record_invite_failure(31)
+        # a restart keeps only what is in the database
+        self.assertTrue(auth._invite_attempts_exhausted(31))
+
+    def test_unknown_accounts_get_the_invite_reply_once_per_interval(self):
+        self.assertTrue(auth._gate_reply_due(32))
+        self.assertFalse(auth._gate_reply_due(32))
+        later = time.time() + auth.GATE_REPLY_INTERVAL + 1
+        with mock.patch.object(auth.time, "time", return_value=later):
+            self.assertTrue(auth._gate_reply_due(32))
 
 
 if __name__ == "__main__":

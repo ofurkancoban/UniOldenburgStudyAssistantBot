@@ -182,7 +182,7 @@ async def build_qa_context(user_id=None) -> str:
         logging.warning("build_qa_context: calendar failed: %s", e)
 
     try:
-        weather = await get_weather_snapshot(today)
+        weather = await get_weather_snapshot(today, user_id=user_id)
         if weather:
             wet_note = "wet (rain/drizzle/snow expected)" if weather["is_wet"] else "dry"
             parts.append(

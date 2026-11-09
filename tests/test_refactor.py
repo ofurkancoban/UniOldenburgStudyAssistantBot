@@ -21,7 +21,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
 # Tests must never touch the real bot database
-os.environ.setdefault("BOT_DB_FILE", os.path.join(tempfile.mkdtemp(prefix="unibot-tests-"), "bot_data.sqlite3"))
+from tests.testenv import use_temp_db  # noqa: E402
+use_temp_db()
 
 FIXTURES = os.path.join(ROOT, "tests", "fixtures")
 

@@ -154,7 +154,7 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
         first_class_weather = None
         if first_start_today:
             try:
-                first_class_weather = await get_weather_snapshot(first_start_today.date())
+                first_class_weather = await get_weather_snapshot(first_start_today.date(), user_id=chat_id)
             except Exception as e:
                 logging.warning("check_calendar_reminders: weather fetch failed: %s", e)
 
@@ -885,7 +885,7 @@ def user_travel(day: date, user_id: Optional[int] = None) -> dict:
     between the campuses on `day`: their bike/bus setting, by bus when the
     bot has seen a wet forecast for that day."""
     uid = user_id if user_id is not None else current_user_id()
-    weather = cached_weather_snapshot(day)
+    weather = cached_weather_snapshot(day, uid)
     return travel_for(get_travel_mode(uid) if uid is not None else "bus", bool(weather and weather.get("is_wet")))
 
 
@@ -1711,6 +1711,8 @@ PERSONAL_TIMETABLE_RETRY_SECONDS = 30 * 60  # after a failed read
 SESSION_URGENT_HOURS = 48  # a change to a session this close skips the evening digest
 _last_course_session_scan = 0.0
 _timetable_checked_at: dict[int, float] = {}
+EMPTY_TIMETABLE_CONFIRMATIONS = 3  # empty reads in a row before an emptied timetable counts
+_empty_timetable_reads: dict[int, int] = {}
 
 _SCHEDULE_WA_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])
 
@@ -1847,7 +1849,19 @@ async def check_personal_timetable_changes(bot, now: Optional[datetime] = None) 
             legacy_moved = True
         if not old and uid == watcher_uid and isinstance(legacy, dict) and legacy:
             old = legacy  # the single-account timetable from before
+            save_personal_record(uid, "user_schedule_slots", old)  # moved before the legacy copy goes
         new = _timetable_map(slots)
+        if old and not new:
+            # A filled timetable that comes back empty is far more often a
+            # Stud.IP hiccup than every course dropped at once: no "removed"
+            # flood, and the old record stays to compare the next read with.
+            _empty_timetable_reads[uid] = _empty_timetable_reads.get(uid, 0) + 1
+            if _empty_timetable_reads[uid] < EMPTY_TIMETABLE_CONFIRMATIONS:
+                continue
+            # still empty after several reads (semester over): accept it quietly
+            save_personal_record(uid, "user_schedule_slots", new)
+            continue
+        _empty_timetable_reads.pop(uid, None)
         if old:
             for text in _diff_timetable(old, new):
                 await course_registry.fan_out(bot, None, "schedule", text, _alert_title(text),

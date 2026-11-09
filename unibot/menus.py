@@ -1194,7 +1194,8 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not resolved:
             await update.effective_message.reply_text(f"🤷 Couldn't find \"{query_text}\" - try a more specific city name, or check the spelling.")
             return True
-        save_weather_location(resolved["name"], resolved["country"], resolved["latitude"], resolved["longitude"])
+        save_weather_location(resolved["name"], resolved["country"], resolved["latitude"], resolved["longitude"],
+                              user_id=update.effective_user.id)
         await update.effective_message.reply_text(
             f"📍 Got it - checking weather for {resolved['name']}, {resolved['country']} from now on.",
             reply_markup=get_main_keyboard(),
@@ -1229,6 +1230,11 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if step == "admin_broadcast_text":
         context.user_data.pop("pending_step", None)
+        if not is_user_admin(update.effective_user.id if update.effective_user else None):
+            # admin rights may have been taken away since the prompt
+            await update.effective_message.reply_text("⛔ Only administrators can broadcast.",
+                                                      reply_markup=get_main_keyboard())
+            return True
         msg_text = text.strip()
         if not msg_text or msg_text.lower() in ("/cancel", "cancel"):
             await update.effective_message.reply_text("📢 Broadcast cancelled.", reply_markup=get_main_keyboard())

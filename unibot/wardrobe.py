@@ -469,7 +469,7 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
     status_msg = await query.message.reply_text("👔 Picking an outfit for you...", disable_notification=True)
     stop_evt, anim_task = _start_loading_animation(status_msg, "Picking an outfit for you...")
     try:
-        weather = await get_weather_snapshot(datetime.now(TZ_BERLIN).date())
+        weather = await get_weather_snapshot(datetime.now(TZ_BERLIN).date(), user_id=user_id)
         recent_ids = get_recently_worn_item_ids(user_id)
         outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids)
     finally:

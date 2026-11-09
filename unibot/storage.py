@@ -378,29 +378,61 @@ def students_with_tasks() -> list[int]:
 DEFAULT_SEMESTER_CACHE_PATH = "default_semester.json"
 
 
-def load_default_semester() -> dict:
-    """Return {"id": ..., "label": ...} for the semester picked via /status's
-    "Set Default Semester" button, or {} if none has been set - in which case
-    Files/Browse Courses/Sign Out each fall back to showing their own semester
-    picker as before."""
-    if db.exists(DEFAULT_SEMESTER_CACHE_PATH):
-        try:
-            return db.load(DEFAULT_SEMESTER_CACHE_PATH)
-        except Exception as e:
-            logging.warning("Could not load default semester: %s", e)
+DEFAULT_SEMESTER_RECORD = "default_semester"
+
+
+def _setting_owner(user_id=None) -> Optional[int]:
+    """Whose setting: the given student, else the user the update acts for,
+    else (background work) the primary admin, whose account the watcher uses."""
+    if user_id is not None:
+        return int(user_id)
+    from unibot.auth import current_user_id
+    uid = current_user_id()
+    return uid if uid is not None else PRIMARY_ADMIN_ID
+
+
+def load_default_semester(user_id=None) -> dict:
+    """Return {"id": ..., "label": ...} for the semester the student picked
+    via /status's "Set Default Semester" button, or {} if none has been set -
+    in which case Files/Browse Courses/Sign Out each fall back to showing
+    their own semester picker as before. Each student has their own."""
+    uid = _setting_owner(user_id)
+    if uid is None:
+        return {}
+    try:
+        own = personal_record(uid, DEFAULT_SEMESTER_RECORD)
+        if own:
+            return own
+        if uid == PRIMARY_ADMIN_ID and db.exists(DEFAULT_SEMESTER_CACHE_PATH):
+            # the one shared setting from before was the bot owner's
+            legacy = db.load(DEFAULT_SEMESTER_CACHE_PATH) or {}
+            if legacy:
+                save_personal_record(uid, DEFAULT_SEMESTER_RECORD, legacy)
+            db.delete(DEFAULT_SEMESTER_CACHE_PATH)
+            return legacy
+    except Exception as e:
+        logging.warning("Could not load default semester: %s", e)
     return {}
 
 
-def save_default_semester(semester_id: str, label: str) -> None:
+def save_default_semester(semester_id: str, label: str, user_id=None) -> None:
+    uid = _setting_owner(user_id)
+    if uid is None:
+        return
     try:
-        db.save(DEFAULT_SEMESTER_CACHE_PATH, {"id": semester_id, "label": label})
+        save_personal_record(uid, DEFAULT_SEMESTER_RECORD, {"id": semester_id, "label": label})
     except Exception as e:
         logging.error("Could not save default semester: %s", e)
 
 
-def clear_default_semester() -> None:
+def clear_default_semester(user_id=None) -> None:
+    uid = _setting_owner(user_id)
+    if uid is None:
+        return
     try:
-        db.delete(DEFAULT_SEMESTER_CACHE_PATH)
+        delete_personal_record(uid, DEFAULT_SEMESTER_RECORD)
+        if uid == PRIMARY_ADMIN_ID and db.exists(DEFAULT_SEMESTER_CACHE_PATH):
+            db.delete(DEFAULT_SEMESTER_CACHE_PATH)
     except Exception as e:
         logging.error("Could not clear default semester: %s", e)
 
@@ -437,12 +469,15 @@ def set_watch_previous_semester_enabled(enabled: bool) -> None:
     save_general_cache(cache)
 
 
-USER_NAMES_CACHE_PATH = "user_names.json"
+USER_NAMES_CACHE_PATH = "user_names.json"  # legacy: every name in one plain record
+USER_NAME_RECORD = "display_name"     # each student's own name, encrypted
+WATCHER_NAME_RECORD = "studip_name"   # the primary admin's Stud.IP name
+_names_migrated: set = set()
 
 
 def load_user_names() -> dict:
-    """Return {"<user_id>": "Display Name"} for users, synced automatically
-    from Stud.IP via /users/me."""
+    """The legacy shared {"<user_id>": "Display Name"} record (names move to
+    each student's own record on first use)."""
     if db.exists(USER_NAMES_CACHE_PATH):
         try:
             return db.load(USER_NAMES_CACHE_PATH)
@@ -451,20 +486,44 @@ def load_user_names() -> dict:
     return {}
 
 
+def _take_legacy_name(key: str) -> Optional[str]:
+    """Remove `key` from the legacy shared name record and return its value."""
+    names = load_user_names()
+    if key not in names:
+        return None
+    value = names.pop(key)
+    try:
+        if names:
+            db.save(USER_NAMES_CACHE_PATH, names)
+        else:
+            db.delete(USER_NAMES_CACHE_PATH)
+    except Exception as e:
+        logging.error("Could not update the legacy name record: %s", e)
+    return value
+
+
+def _own_name(uid: int) -> Optional[str]:
+    name = personal_record(uid, USER_NAME_RECORD)
+    if not name and uid not in _names_migrated:
+        _names_migrated.add(uid)
+        name = _take_legacy_name(str(uid))
+        if name:
+            save_personal_record(uid, USER_NAME_RECORD, name)
+    return name or None
+
+
 def save_studip_user_name(name: str, user_id: Optional[int] = None) -> None:
     """Save the name Stud.IP reports for a student, unless they told the bot
     what to call them. Without a student it is the watcher account's name
-    (the primary admin's), kept as "studip_name"."""
+    (the primary admin's)."""
     if not name:
         return
-    names = load_user_names()
     owner = user_id if user_id is not None else PRIMARY_ADMIN_ID
-    if owner is not None and not names.get(str(owner)):
-        names[str(owner)] = name
-    if user_id is None:
-        names["studip_name"] = name
     try:
-        db.save(USER_NAMES_CACHE_PATH, names)
+        if owner is not None and not _own_name(int(owner)):
+            save_personal_record(int(owner), USER_NAME_RECORD, name)
+        if user_id is None and PRIMARY_ADMIN_ID is not None:
+            save_personal_record(PRIMARY_ADMIN_ID, WATCHER_NAME_RECORD, name)
     except Exception as e:
         logging.error("Could not save Stud.IP user name: %s", e)
 
@@ -473,9 +532,12 @@ def get_user_name(user_id=None) -> Optional[str]:
     """The student's own name, or None. Only the primary admin (or no
     student at all) falls back to the watcher account's Stud.IP name, so no
     student ever sees or hears someone else's name."""
-    names = load_user_names()
     if user_id is not None:
-        own = names.get(str(user_id))
+        try:
+            own = _own_name(int(user_id))
+        except Exception:
+            logging.debug("Name record unreadable", exc_info=True)
+            own = None
         if own:
             return own
         if user_id != PRIMARY_ADMIN_ID:
@@ -485,15 +547,23 @@ def get_user_name(user_id=None) -> Optional[str]:
 
 def get_primary_user_name() -> Optional[str]:
     """The watcher account's (primary admin's) name synced from Stud.IP."""
-    names = load_user_names()
-    return names.get("studip_name") or (names.get(str(PRIMARY_ADMIN_ID)) if PRIMARY_ADMIN_ID else None)
+    if PRIMARY_ADMIN_ID is None:
+        return None
+    try:
+        name = personal_record(PRIMARY_ADMIN_ID, WATCHER_NAME_RECORD)
+        if not name:
+            name = _take_legacy_name("studip_name")
+            if name:
+                save_personal_record(PRIMARY_ADMIN_ID, WATCHER_NAME_RECORD, name)
+        return name or _own_name(PRIMARY_ADMIN_ID)
+    except Exception:
+        logging.debug("Watcher name unreadable", exc_info=True)
+        return None
 
 
 def save_user_name(user_id, name: str) -> None:
-    names = load_user_names()
-    names[str(user_id)] = name
     try:
-        db.save(USER_NAMES_CACHE_PATH, names)
+        save_personal_record(int(user_id), USER_NAME_RECORD, name)
     except Exception as e:
         logging.error("Could not save user name: %s", e)
 

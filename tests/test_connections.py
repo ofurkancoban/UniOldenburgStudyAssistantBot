@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -10,7 +11,8 @@ from unittest import mock
 
 # never touch the live log or database (set before unibot is imported)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-os.environ.setdefault("BOT_DB_FILE", os.path.join(tempfile.mkdtemp(prefix="unibot-tests-"), "bot_data.sqlite3"))
+from tests.testenv import use_temp_db  # noqa: E402
+use_temp_db()
 
 from aiohttp import web
 from yarl import URL
@@ -822,6 +824,7 @@ class SqliteStoreTests(unittest.TestCase):
         import fast_enroll
         from unibot import db
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
         legacy = os.path.join(tmp, "exam_reminder_cache_42.json")
         with open(legacy, "w") as fh:
             json.dump({"notified_open": {"x:None:None": "t"}}, fh)
@@ -847,6 +850,7 @@ class CookieStorageTests(unittest.TestCase):
         from studip_vault import write_vault_file
         from unibot import db
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
         cookie_file = os.path.join(tmp, "studip_cookies_4242.json")
         write_vault_file(cookie_file, [{"key": "Studip_Session", "value": "abc", "domain": "elearning.uni-oldenburg.de",
                                         "path": "/", "host_only": True}])
@@ -912,6 +916,7 @@ class DatabaseBackupTests(unittest.TestCase):
         import stat
         from unibot import db
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
         db.save(os.path.join(tmp, "backup_probe.json"), {"kept": 1})
         for day in ("2026-11-01", "2026-11-02", "2026-11-03"):
             db.backup(tmp, keep=2, stamp=day)
@@ -935,6 +940,7 @@ class DatabaseBackupTests(unittest.TestCase):
     def test_digest_line_flags_missing_and_old_backups(self):
         from unibot import diagnostics
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
         self.assertIn("none yet", diagnostics.backup_line(tmp))
         path = os.path.join(tmp, "bot_data_2026-11-09.sqlite3.gz")
         with open(path, "wb") as fh:
@@ -1014,6 +1020,7 @@ class RetireImportedFilesTests(unittest.TestCase):
     def test_files_already_in_the_database_are_renamed(self):
         from unibot import db
         tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
         stale = os.path.join(tmp, "stale_cache.json")
         db.save(stale, {"live": True})
         with open(stale, "w") as fh:

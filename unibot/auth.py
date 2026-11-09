@@ -321,10 +321,11 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
             "(e.g., <code>UNI-ABC-123</code>) provided by your administrator.\n"
             "━━━━━━━━━━━━━━━━━━"
         )
-        try:
-            await update.effective_message.reply_text(gate_text, parse_mode="HTML")
-        except TelegramError:
-            pass
+        if _gate_reply_due(user.id):
+            try:
+                await update.effective_message.reply_text(gate_text, parse_mode="HTML")
+            except TelegramError:
+                pass
         raise ApplicationHandlerStop
 
     logging.warning("⛔ Ignored update from unauthorised user %s", user.id if user else "unknown")
@@ -339,31 +340,65 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # Failed invite code guesses per Telegram account: at most
-# INVITE_MAX_FAILURES in any INVITE_FAILURE_WINDOW seconds.
+# INVITE_MAX_FAILURES in any INVITE_FAILURE_WINDOW seconds. Kept in the
+# database, so a restart doesn't reset anyone's count.
 INVITE_MAX_FAILURES = 5
 INVITE_FAILURE_WINDOW = 3600
-_invite_failures: dict[int, list[float]] = {}
+INVITE_FAILURES_PATH = "invite_failures.json"
+# The "invite only" reply goes to an unknown account at most this often.
+GATE_REPLY_INTERVAL = 6 * 3600
+_gate_replied: dict[int, float] = {}
 
 
-def _recent_invite_failures(user_id: int, now: float) -> list[float]:
-    recent = [t for t in _invite_failures.get(user_id, []) if now - t < INVITE_FAILURE_WINDOW]
-    if recent:
-        _invite_failures[user_id] = recent
-    else:
-        _invite_failures.pop(user_id, None)
+def _load_invite_failures(now: float) -> dict:
+    try:
+        raw = db.load(INVITE_FAILURES_PATH) if db.exists(INVITE_FAILURES_PATH) else {}
+    except Exception:
+        logging.debug("Invite failure record unreadable", exc_info=True)
+        raw = {}
+    recent = {}
+    for uid, times in (raw or {}).items():
+        kept = [t for t in times if now - t < INVITE_FAILURE_WINDOW]
+        if kept:
+            recent[str(uid)] = kept
     return recent
 
 
 def _invite_attempts_exhausted(user_id: int) -> bool:
-    return len(_recent_invite_failures(user_id, time.time())) >= INVITE_MAX_FAILURES
+    now = time.time()
+    return len(_load_invite_failures(now).get(str(user_id), [])) >= INVITE_MAX_FAILURES
 
 
 def _record_invite_failure(user_id: int) -> None:
     now = time.time()
-    _recent_invite_failures(user_id, now)
-    _invite_failures.setdefault(user_id, []).append(now)
-    if len(_invite_failures[user_id]) == INVITE_MAX_FAILURES:
+    failures = _load_invite_failures(now)
+    failures.setdefault(str(user_id), []).append(now)
+    try:
+        db.save(INVITE_FAILURES_PATH, failures)
+    except Exception:
+        logging.warning("Could not record a failed invite code", exc_info=True)
+    if len(failures[str(user_id)]) == INVITE_MAX_FAILURES:
         logging.warning("Invite code guessing capped for a Telegram account for %ss", INVITE_FAILURE_WINDOW)
+
+
+def _reset_invite_failures() -> None:
+    try:
+        db.delete(INVITE_FAILURES_PATH)
+    except Exception:
+        logging.debug("No invite failure record to reset", exc_info=True)
+
+
+def _gate_reply_due(user_id: int) -> bool:
+    """Whether an unknown account gets the "invite only" reply now (once
+    per GATE_REPLY_INTERVAL, so a flood of messages isn't answered)."""
+    now = time.time()
+    if len(_gate_replied) > 1000:
+        for uid in [u for u, t in _gate_replied.items() if now - t >= GATE_REPLY_INTERVAL]:
+            _gate_replied.pop(uid, None)
+    if now - _gate_replied.get(user_id, 0.0) < GATE_REPLY_INTERVAL:
+        return False
+    _gate_replied[user_id] = now
+    return True
 
 
 def is_user_allowed(user_id: Optional[int]) -> bool:

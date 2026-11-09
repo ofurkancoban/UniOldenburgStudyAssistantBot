@@ -7,6 +7,7 @@ requirements and the instance lock."""
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,8 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-os.environ.setdefault("BOT_DB_FILE", os.path.join(tempfile.mkdtemp(prefix="unibot-tests-"), "bot_data.sqlite3"))
+from tests.testenv import use_temp_db  # noqa: E402
+use_temp_db()
 
 from telegram.ext import ApplicationHandlerStop  # noqa: E402
 
@@ -469,7 +471,9 @@ class RequirementsTests(unittest.TestCase):
 
 class InstanceLockTests(unittest.TestCase):
     def setUp(self):
-        self.lock = os.path.join(tempfile.mkdtemp(prefix="unibot-lock-"), ".bot_instance.lock")
+        lock_dir = tempfile.mkdtemp(prefix="unibot-lock-")
+        self.addCleanup(shutil.rmtree, lock_dir, True)
+        self.lock = os.path.join(lock_dir, ".bot_instance.lock")
         for target, name, value in ((auth, "LOCK_FILE", self.lock), (auth.sys, "argv", ["studip_bot.py"])):
             patcher = mock.patch.object(target, name, value)
             patcher.start()

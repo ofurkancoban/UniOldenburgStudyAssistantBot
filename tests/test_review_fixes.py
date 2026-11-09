@@ -20,7 +20,8 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-os.environ.setdefault("BOT_DB_FILE", os.path.join(tempfile.mkdtemp(prefix="unibot-tests-"), "bot_data.sqlite3"))
+from tests.testenv import use_temp_db  # noqa: E402
+use_temp_db()
 
 from telegram.error import BadRequest, Forbidden  # noqa: E402
 
@@ -98,12 +99,15 @@ class BlockedUserTests(unittest.TestCase):
 
 class StudentNameTests(unittest.TestCase):
     def setUp(self):
-        self.names = {"studip_name": "Admin Person", "9201": "Ada"}
-        patches = [mock.patch.object(storage, "load_user_names", lambda: dict(self.names)),
-                   mock.patch.object(storage, "PRIMARY_ADMIN_ID", 9200)]
-        for p in patches:
-            p.start()
-            self.addCleanup(p.stop)
+        patcher = mock.patch.object(storage, "PRIMARY_ADMIN_ID", 9200)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for uid in (9200, 9201, 9202, 9203):
+            db.get_user_scope(uid).delete_private()
+            storage._names_migrated.discard(uid)
+        db.delete(storage.USER_NAMES_CACHE_PATH)
+        storage.save_personal_record(9200, storage.WATCHER_NAME_RECORD, "Admin Person")
+        storage.save_user_name(9201, "Ada")
 
     def test_no_student_gets_someone_elses_name(self):
         self.assertEqual(storage.get_user_name(9201), "Ada")
@@ -111,13 +115,20 @@ class StudentNameTests(unittest.TestCase):
         self.assertEqual(storage.get_user_name(9200), "Admin Person")  # the primary admin
 
     def test_stud_ip_name_never_overwrites_a_chosen_name(self):
-        saved = {}
-        with mock.patch.object(storage.db, "save", lambda path, data: saved.update(data)):
-            storage.save_studip_user_name("Ada Lovelace", user_id=9201)
-            self.assertEqual(saved.get("9201"), "Ada")
-            storage.save_studip_user_name("Grace Hopper", user_id=9203)
-            self.assertEqual(saved.get("9203"), "Grace Hopper")
-            self.assertEqual(saved.get("studip_name"), "Admin Person")  # untouched by a student
+        storage.save_studip_user_name("Ada Lovelace", user_id=9201)
+        self.assertEqual(storage.get_user_name(9201), "Ada")
+        storage.save_studip_user_name("Grace Hopper", user_id=9203)
+        self.assertEqual(storage.get_user_name(9203), "Grace Hopper")
+        self.assertEqual(storage.get_primary_user_name(), "Admin Person")  # untouched by a student
+
+    def test_names_leave_the_shared_plain_record_and_die_with_the_student(self):
+        db.save(storage.USER_NAMES_CACHE_PATH, {"9202": "Bob", "studip_name": "Admin Old"})
+        db.get_user_scope(9200).delete_private()
+        self.assertEqual(storage.get_user_name(9202), "Bob")
+        self.assertEqual(storage.get_primary_user_name(), "Admin Old")
+        self.assertFalse(db.exists(storage.USER_NAMES_CACHE_PATH))  # nothing left in plain text
+        db.get_user_scope(9202).delete_private()  # what deleting their data does
+        self.assertIsNone(storage.get_user_name(9202))
 
 
 class HtmlEscapeTests(unittest.TestCase):

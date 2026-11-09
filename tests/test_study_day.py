@@ -12,7 +12,8 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-os.environ.setdefault("BOT_DB_FILE", os.path.join(tempfile.mkdtemp(prefix="unibot-tests-"), "bot_data.sqlite3"))
+from tests.testenv import use_temp_db  # noqa: E402
+use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
 from unibot import schedule, state, storage, study_day, study_plan  # noqa: E402
@@ -514,8 +515,9 @@ class TravelModeTests(unittest.TestCase):
 
     def setUp(self):
         from unibot import weather
-        weather._SNAPSHOTS.pop(WED, None)
-        self.addCleanup(weather._SNAPSHOTS.pop, WED, None)
+        self.key = weather.snapshot_key(WED, self.UID)
+        weather._SNAPSHOTS.pop(self.key, None)
+        self.addCleanup(weather._SNAPSHOTS.pop, self.key, None)
 
     def test_bike_bus_and_rain(self):
         self.assertEqual(study_day.travel_for("bike"), {"minutes": 15, "mode": "bike", "reason": None})
@@ -529,19 +531,19 @@ class TravelModeTests(unittest.TestCase):
         bike = schedule.plan_study_day(events, WED, user_id=self.UID)["windows"][0]
         self.assertEqual((bike["start_dt"].strftime("%H:%M"), bike["travel_mode"]), ("10:15", "bike"))
         self.assertIn("🚲 15 min to Campus Haarentor first", study_day.travel_note(bike))
-        weather._SNAPSHOTS[WED] = {"is_wet": True}
+        weather._SNAPSHOTS[self.key] = {"is_wet": True}
         rain = schedule.plan_study_day(events, WED, user_id=self.UID)["windows"][0]
         self.assertEqual(rain["start_dt"].strftime("%H:%M"), "10:20")
         self.assertEqual(study_day.travel_note(rain), "🚌 20 min to Campus Haarentor first (rain)")
         storage.set_travel_mode(self.UID, "bus")
-        weather._SNAPSHOTS.pop(WED)
+        weather._SNAPSHOTS.pop(self.key)
         self.assertEqual(schedule.user_travel(WED, self.UID)["minutes"], 20)
 
     def test_a_bike_makes_a_short_switch_possible_unless_it_rains(self):
         from unibot import weather
         events = [_event("08:00", "09:42", location="W14 0-001"), _event("10:00", "12:00", location="A05 1-161")]
         self.assertEqual(study_day.tight_campus_switches(events, study_day.travel_for("bike")), [])
-        weather._SNAPSHOTS[WED] = {"is_wet": True}
+        weather._SNAPSHOTS[self.key] = {"is_wet": True}
         (switch,) = study_day.tight_campus_switches(events, study_day.travel_for("bike", wet=True))
         self.assertIn("~20 min by bus (rain)", study_day.switch_warning(switch))
 

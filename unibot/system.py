@@ -256,9 +256,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 logging.debug("Ignored a non-critical error", exc_info=True)
 
-        default_semester = load_default_semester()
+        default_semester = load_default_semester(user_id)
         default_semester_label = default_semester.get("label") or "Not set"
-        weather_location = load_weather_location()
+        weather_location = load_weather_location(user_id)
         weather_location_label = f"{weather_location['name']}, {weather_location['country']}" if weather_location else "Uni Oldenburg (default)"
         study_plan_enabled = get_pref(user_id, "weekly_study_plan")
 
@@ -379,7 +379,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text += f"\n\n{sys_info}"
 
-    default_semester = load_default_semester()
+    default_semester = load_default_semester(user_id)
     default_semester_label = default_semester.get("label") or "Not set (always asks)"
     text += f"\n\n📆 Default Semester: {default_semester_label}"
 
@@ -396,7 +396,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         studip_name = get_user_name(user_id)
     text += f"\n👤 Name: {html.escape(studip_name or 'Not connected')} (from Stud.IP)"
 
-    weather_location = load_weather_location()
+    weather_location = load_weather_location(user_id)
     weather_location_label = f"{weather_location['name']}, {weather_location['country']}" if weather_location else "Uni Oldenburg (default)"
     text += f"\n📍 Weather Location: {weather_location_label}"
 
@@ -461,7 +461,8 @@ def _build_admin_overview_view() -> tuple[str, InlineKeyboardMarkup]:
     )
     if stats["top_users"]:
         for idx, u in enumerate(stats["top_users"], 1):
-            name = u["username"] or u["full_name"] or str(u["telegram_id"])
+            # Telegram names are chosen by the student: never markup
+            name = html.escape(str(u["username"] or u["full_name"] or u["telegram_id"]))
             ago = _format_time_ago(u["last_active_at"])
             text += f"{idx}. <b>@{name}</b> - {u['interactions']} actions ({ago})\n"
     else:
@@ -470,9 +471,10 @@ def _build_admin_overview_view() -> tuple[str, InlineKeyboardMarkup]:
     text += "\n⚡ <b>Recent Activities:</b>\n"
     if stats["recent_activities"]:
         for a in stats["recent_activities"]:
-            name = a["username"] or a["full_name"] or str(a["telegram_id"])
+            name = html.escape(str(a["username"] or a["full_name"] or a["telegram_id"]))
             ago = _format_time_ago(a["created_at"])
-            text += f"• <b>@{name}:</b> <code>{a['action']}</code> ({ago})\n"
+            # the action holds what the student typed
+            text += f"• <b>@{name}:</b> <code>{html.escape(str(a['action'] or ''))}</code> ({ago})\n"
     else:
         text += "<i>No recent activity.</i>\n"
 
@@ -651,7 +653,8 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         ]
         keyboard = []
         for u in users:
-            name = u["username"] or u["full_name"] or str(u["telegram_id"])
+            raw_name = str(u["username"] or u["full_name"] or u["telegram_id"])
+            name = html.escape(raw_name)
             role_badge = "👑 Admin" if u["role"] == "admin" else "🎓 Student"
             status_icon = "🟢" if u["is_active"] else "🔴"
             ago = _format_time_ago(u["last_active_at"])
@@ -661,7 +664,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             )
             keyboard.append([
                 InlineKeyboardButton(
-                    f"{status_icon} @{name} ({role_badge})",
+                    f"{status_icon} @{raw_name} ({role_badge})"[:64],
                     callback_data=f"admin_user_detail|{u['telegram_id']}",
                 )
             ])

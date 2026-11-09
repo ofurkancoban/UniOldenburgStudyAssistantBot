@@ -218,7 +218,7 @@ async def _prepare_lunch_photo(food: Optional[dict]) -> tuple[Optional[str], Opt
     return photo_url, f"🍽️ <b>Today's lunch pick{html.escape(place)}:</b> {html.escape(food['dish'])}"
 
 
-async def _prepare_outfits(bot, user_ids, weather) -> dict:
+async def _prepare_outfits(bot, user_ids, weather_of: dict) -> dict:
     """Daily outfit suggestion with a virtual try-on image per user. Opt-in
     (toggle in /status) and skipped for users with an empty wardrobe or no
     reference photo. Every step is best-effort."""
@@ -239,7 +239,7 @@ async def _prepare_outfits(bot, user_ids, weather) -> dict:
             if not items or not ref_file_id:
                 continue
             recent_ids = get_recently_worn_item_ids(uid)
-            outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids)
+            outfit = await pick_outfit_from_wardrobe(items, weather_of.get(uid), recent_ids)
             if not outfit:
                 continue
             reference_bytes = await _download_telegram_file(bot, ref_file_id)
@@ -283,9 +283,10 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
         return None
 
     today_date = datetime.now(TZ_BERLIN).date()
-    # Shared by everyone: weather for the morning commute (omitted, not an
-    # empty section, if Open-Meteo is unreachable) and the lunch pick.
-    weather = await get_weather_snapshot(today_date)
+    # Weather for the morning commute at each student's own place (omitted,
+    # not an empty section, if Open-Meteo is unreachable); students at the
+    # same place share one request.
+    weather_of: dict[int, Optional[dict]] = {}
     # The lunch pick and its photo are per mensa: made once for each mensa
     # someone has lunch at today (one AI call each), shared by its students.
     # One pick per mensa and diet: students with the same filter share it.
@@ -307,14 +308,16 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     photos: dict[int, tuple] = {}
     for uid in user_ids:
         with acting_as(uid):
-            texts[uid], voice, menu_buttons[uid], photos[uid] = await _prepare_user_summary(uid, today_date, weather, lunch_at)
+            weather_of[uid] = await get_weather_snapshot(today_date, user_id=uid)
+            texts[uid], voice, menu_buttons[uid], photos[uid] = await _prepare_user_summary(
+                uid, today_date, weather_of[uid], lunch_at)
         if voice:
             voice_paths[uid] = voice
 
     return {
         "texts": texts,
         "photos": photos,
-        "outfits": await _prepare_outfits(bot, user_ids, weather),
+        "outfits": await _prepare_outfits(bot, user_ids, weather_of),
         "voice_paths": voice_paths,
         "menu_buttons": menu_buttons,
     }
@@ -798,7 +801,7 @@ async def send_daily_plan_voice(sender, events: list, target_date, user_id=None)
     except Exception as e:
         logging.warning("send_daily_plan_voice: tasks fetch failed: %s", e)
         today_tasks = []
-    weather = await get_weather_snapshot(target_date)
+    weather = await get_weather_snapshot(target_date, user_id=owner)
     text = await build_ai_daily_plan_narration(today_events, target_date, name=name, today_tasks=today_tasks, weather=weather) or build_daily_plan_speech_text(events, target_date)
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
 

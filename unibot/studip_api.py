@@ -286,7 +286,7 @@ async def _ensure_watched_courses_map(session) -> None:
     anchor_id = None
     semester_options = []
     try:
-        default = load_default_semester()
+        default = load_default_semester(owner)  # the watcher account's own setting
         semester_options = await get_semester_options(session)
         anchor_id = default.get("id") or (semester_options[0][0] if semester_options else None)
     except Exception as e:

@@ -4,6 +4,7 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import logging
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -16,11 +17,12 @@ from studip_utils import TZ_BERLIN
 from unibot import db
 from unibot.telegram_ui import user_data
 from unibot.config import (
+    PRIMARY_ADMIN_ID,
     WEATHER_LATITUDE,
     WEATHER_LONGITUDE,
 )
-from unibot.storage import shared_http
-from unibot.auth import is_user_allowed
+from unibot.storage import personal_record, save_personal_record, shared_http
+from unibot.auth import current_user_id, is_user_allowed
 
 
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
@@ -30,22 +32,48 @@ WEATHER_LOCATION_CACHE_PATH = "weather_location.json"
 WEATHER_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 
 
-def load_weather_location() -> Optional[dict]:
-    """Return {"name", "country", "latitude", "longitude"} for the location
-    set via /status's "📍 Set Location", or None if unset - in which case
-    get_weather_snapshot falls back to WEATHER_LATITUDE/WEATHER_LONGITUDE
-    (Uni Oldenburg's coordinates by default)."""
-    if db.exists(WEATHER_LOCATION_CACHE_PATH):
-        try:
-            return db.load(WEATHER_LOCATION_CACHE_PATH)
-        except Exception as e:
-            logging.warning("Could not load weather location: %s", e)
+WEATHER_LOCATION_RECORD = "weather_location"  # each student's own place, encrypted
+
+
+def _weather_owner(user_id=None) -> Optional[int]:
+    return user_id if user_id is not None else current_user_id()
+
+
+def load_weather_location(user_id=None) -> Optional[dict]:
+    """Return {"name", "country", "latitude", "longitude"} for the place the
+    student (default: the user the update acts for) set via /status's
+    "📍 Set Location", or None if unset - in which case get_weather_snapshot
+    falls back to WEATHER_LATITUDE/WEATHER_LONGITUDE (Uni Oldenburg's
+    coordinates by default). A student's place is never shown to or used
+    for anyone else."""
+    uid = _weather_owner(user_id)
+    if uid is None:
+        return None
+    try:
+        own = personal_record(uid, WEATHER_LOCATION_RECORD)
+        if own:
+            return own
+        if uid == PRIMARY_ADMIN_ID and db.exists(WEATHER_LOCATION_CACHE_PATH):
+            # the one shared place from before belonged to the bot's owner
+            legacy = db.load(WEATHER_LOCATION_CACHE_PATH)
+            if legacy:
+                save_personal_record(uid, WEATHER_LOCATION_RECORD, legacy)
+            db.delete(WEATHER_LOCATION_CACHE_PATH)
+            return legacy or None
+    except Exception as e:
+        logging.warning("Could not load weather location: %s", e)
     return None
 
 
-def save_weather_location(name: str, country: str, latitude: float, longitude: float) -> None:
+def save_weather_location(name: str, country: str, latitude: float, longitude: float,
+                          user_id=None) -> None:
+    uid = _weather_owner(user_id)
+    if uid is None:
+        logging.error("Weather location not saved: no student")
+        return
     try:
-        db.save(WEATHER_LOCATION_CACHE_PATH, {"name": name, "country": country, "latitude": latitude, "longitude": longitude})
+        save_personal_record(uid, WEATHER_LOCATION_RECORD,
+                             {"name": name, "country": country, "latitude": latitude, "longitude": longitude})
     except Exception as e:
         logging.error("Could not save weather location: %s", e)
 
@@ -95,7 +123,7 @@ async def handle_set_weather_location(update: Update, context: ContextTypes.DEFA
         return
 
     user_data(context)["pending_step"] = "weather_location"
-    current = load_weather_location()
+    current = load_weather_location(user_id)
     current_line = f"\nCurrently: {current['name']}, {current['country']}" if current else ""
     await query.message.reply_text(f"📍 Where should I check the weather for? (city or place name){current_line}")
 
@@ -117,16 +145,31 @@ WEATHER_CODE_DESCRIPTIONS = {
 WEATHER_WET_CODE_THRESHOLD = 51
 
 
-_SNAPSHOTS: dict = {}  # date -> the last snapshot fetched for it
+# (date, latitude, longitude) -> the last snapshot fetched for that place
+_SNAPSHOTS: dict = {}
+_FETCHED_AT: dict = {}
+SNAPSHOT_REUSE_SECONDS = 30 * 60  # students at the same place share a fetch
 
 
-def cached_weather_snapshot(day) -> Optional[dict]:
-    """The last get_weather_snapshot result for `day`, without a request
-    (None when it wasn't fetched in this process)."""
-    return _SNAPSHOTS.get(day)
+def _coords(location: Optional[dict]) -> tuple[float, float]:
+    if location:
+        return float(location["latitude"]), float(location["longitude"])
+    return float(WEATHER_LATITUDE), float(WEATHER_LONGITUDE)
 
 
-async def get_weather_snapshot(target_date=None) -> Optional[dict]:
+def snapshot_key(day, user_id=None) -> tuple:
+    """Cache key of `day`'s snapshot at the student's place."""
+    lat, lon = _coords(load_weather_location(user_id))
+    return (day, round(lat, 3), round(lon, 3))
+
+
+def cached_weather_snapshot(day, user_id=None) -> Optional[dict]:
+    """The last get_weather_snapshot result for `day` at the student's place,
+    without a request (None when it wasn't fetched in this process)."""
+    return _SNAPSHOTS.get(snapshot_key(day, user_id))
+
+
+async def get_weather_snapshot(target_date=None, user_id=None) -> Optional[dict]:
     """Fetch a concise weather snapshot for the location set via /status's
     "📍 Set Location" (see load_weather_location), falling back to
     WEATHER_LATITUDE/WEATHER_LONGITUDE (Uni Oldenburg's coordinates by
@@ -149,9 +192,11 @@ async def get_weather_snapshot(target_date=None) -> Optional[dict]:
     if not (0 <= days_ahead <= 1):
         return None
 
-    location = load_weather_location()
-    latitude = location["latitude"] if location else WEATHER_LATITUDE
-    longitude = location["longitude"] if location else WEATHER_LONGITUDE
+    location = load_weather_location(user_id)
+    latitude, longitude = _coords(location)
+    key = (target_date, round(latitude, 3), round(longitude, 3))
+    if key in _SNAPSHOTS and time.time() - _FETCHED_AT.get(key, 0.0) < SNAPSHOT_REUSE_SECONDS:
+        return _SNAPSHOTS[key]
 
     try:
         async with shared_http() as session:
@@ -198,7 +243,8 @@ async def get_weather_snapshot(target_date=None) -> Optional[dict]:
             "temp_max": data["daily"]["temperature_2m_max"][day_index],
             "location_name": location["name"] if location else "Oldenburg",
         }
-        _SNAPSHOTS[target_date] = snapshot
+        _SNAPSHOTS[key] = snapshot
+        _FETCHED_AT[key] = time.time()
         return snapshot
     except (KeyError, IndexError, ValueError) as e:
         logging.warning("get_weather_snapshot: parse failed: %s", e)
