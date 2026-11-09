@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Optional
@@ -49,7 +50,7 @@ from unibot.storage import (
     student_courses,
 )
 from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, markup_for
-from unibot.auth import get_user_session, is_user_allowed, personal_session
+from unibot.auth import get_user_session, is_user_admin, is_user_allowed, personal_session
 from unibot.studip_api import BASE_URL, _parse_file_date_v2, list_courses
 from unibot.ai import _call_openrouter, _extract_json_object
 from unibot.documents import extract_text_from_file_async
@@ -1140,6 +1141,10 @@ def _followed_by_someone(cid: str) -> bool:
     return not members
 
 
+EXAM_SCAN_STUDENT_MIN_SECONDS = 6 * 3600
+_last_exam_file_scan = 0.0
+
+
 @single_flight
 async def scan_course_files_for_exams(session=None) -> list:
     """Scan the files of every watched course someone follows for exam
@@ -1150,6 +1155,8 @@ async def scan_course_files_for_exams(session=None) -> list:
     same kind), for notify_new_file_exam_events. `session` is unused (kept
     for callers)."""
     from unibot.study_plan import _file_size_mb, _list_course_files, classify_lecture_file
+    global _last_exam_file_scan
+    _last_exam_file_scan = time.time()
     plan = [(name, cid, scanner) for name, cid, scanner in await watched_courses() if _followed_by_someone(cid)]
     cache = load_exam_file_cache()
     files_cache = cache.setdefault("files", {})
@@ -1349,10 +1356,18 @@ async def handle_exam_files_scan(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     if not is_user_allowed(query.from_user.id):
         return
-    status_msg = await query.message.reply_text("📄 Scanning course files for exam dates...", disable_notification=True)
+    # a scan reads every watched course and asks the AI about new files:
+    # students may start one when the last is EXAM_SCAN_STUDENT_MIN_SECONDS
+    # old, otherwise they see what the last scan found
+    fresh = time.time() - _last_exam_file_scan < EXAM_SCAN_STUDENT_MIN_SECONDS
+    scan_now = is_user_admin(query.from_user.id) or not fresh
+    status_msg = await query.message.reply_text(
+        "📄 Scanning course files for exam dates..." if scan_now else "📄 Showing the latest scan of your course files...",
+        disable_notification=True)
     try:
-        new_events = await scan_course_files_for_exams()
-        await notify_new_file_exam_events(context.bot, new_events)
+        if scan_now:
+            new_events = await scan_course_files_for_exams()
+            await notify_new_file_exam_events(context.bot, new_events)
         events = get_file_exam_events(query.from_user.id)
         today = datetime.now(TZ_BERLIN).date().isoformat()
         events = [e for e in events if not e["date"] or e["date"] >= today]

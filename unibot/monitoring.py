@@ -34,6 +34,7 @@ from unibot.auth import (
     get_user_session,
     has_stored_login,
     lifecycle_state,
+    is_user_admin,
     is_user_allowed,
     login_studip,
     signed_in_accounts,
@@ -90,6 +91,7 @@ from unibot.storage import (
     save_files_cache,
     save_personal_record,
     single_flight,
+    student_courses,
 )
 from unibot.studip_api import (
     BASE_URL,
@@ -113,7 +115,6 @@ from unibot.telegram_ui import (
 
 global_message_watcher = None
 global_announcement_watcher = None
-watch_tasks: dict[int, asyncio.Task] = {}  # chat_id -> asyncio.Task
 check_in_progress: set[int] = set()  # chat_id set to prevent concurrent checks
 
 _OLDEST = datetime.fromtimestamp(0, TZ_BERLIN)  # sorts files without a date first (no overflow when compared)
@@ -176,16 +177,6 @@ def load_message_cache(user_id: Optional[int] = None) -> list[dict]:
         return []
 
 
-async def watch_loop(chat_id, context):
-    """Legacy watch loop - now delegates to unified watcher (which uses context.application)"""
-    from unibot.watcher import unified_watcher_controller
-    if hasattr(context, "application"):
-        await unified_watcher_controller(context.application)
-    else:
-        # Fallback if context doesn't have application
-        logging.warning("watch_loop called without application context")
-
-
 def get_show_last_keyboard():
     """Show Last keyboard with menu button"""
     kb = [
@@ -216,9 +207,10 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("⚠️ Error reading file history.")
         return
 
+    allowed = set(student_courses(query.from_user.id))  # the shared cache holds every student's courses
     all_files = []
     for cid, files in cache.items():
-        if not isinstance(files, dict):
+        if not isinstance(files, dict) or cid not in allowed:
             continue
         for name, info in files.items():
             if not isinstance(info, dict):
@@ -530,6 +522,10 @@ async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_
         return
 
     history = cache.get("history", [])
+    allowed = set(student_courses(query.from_user.id))  # the shared cache holds every student's courses
+    if isinstance(history, list):
+        history = [a for a in history
+                   if isinstance(a, dict) and (a.get("cid") or str(a.get("key", "")).split(":", 1)[0]) in allowed]
     if not isinstance(history, list) or not history:
         await query.edit_message_text("⚠️ No announcements found in history.")
         return
@@ -581,9 +577,11 @@ async def show_last_forum_posts(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # Extract all posts from cache
+    allowed = set(student_courses(query.from_user.id))  # the shared cache holds every student's courses
     all_posts = []
-    for post in cache.values():
-        all_posts.append(post)
+    for key, post in cache.items():
+        if isinstance(post, dict) and (post.get("cid") or str(key).split(":", 1)[0]) in allowed:
+            all_posts.append(post)
 
     if not all_posts:
         await query.edit_message_text("⚠️ No forum posts found in history.")
@@ -1047,9 +1045,35 @@ async def show_last_messages(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+MANUAL_CHECK_COOLDOWN_SECONDS = 15 * 60  # a student's own /check
+_manual_check_at: dict[int, float] = {}
+
+
+async def _manual_check_plan(user_id: Optional[int]):
+    """(courses plan, None) for a manual check, or (None, reason to refuse).
+    An admin checks every watched course with its scanner; a student only
+    their own courses, with their own session, at most every
+    MANUAL_CHECK_COOLDOWN_SECONDS (the background checks cover the rest)."""
+    if user_id is not None and is_user_admin(user_id):
+        return await watched_courses(), None
+    if user_id is None:
+        return None, "⚠️ Unknown user."
+    wait = int(_manual_check_at.get(user_id, 0.0) + MANUAL_CHECK_COOLDOWN_SECONDS - time.time())
+    if wait > 0:
+        return None, f"⏳ You can check again in {max(1, wait // 60)} min. New items also arrive on their own."
+    session = get_user_session(user_id)
+    if session is None or not await session.is_logged_in():
+        return None, "🔐 Sign in first (/login), then you can check your courses."
+    _manual_check_at[user_id] = time.time()
+    return [(name, cid, session) for cid, name in student_courses(user_id).items()], None
+
+
 async def _run_check_now(update, context):
-    """Manual full check: messages → announcements → files → forum posts"""
+    """Manual full check: messages → announcements → files → forum posts,
+    for the asking student's own inbox and courses (every course for an admin)."""
     chat_id = update.effective_chat.id
+    user_id = update.effective_user.id if update.effective_user else None
+    is_admin = user_id is not None and is_user_admin(user_id)
 
     if chat_id in check_in_progress:
         await update.message.reply_text("⚠️ Another check is already running.")
@@ -1057,7 +1081,12 @@ async def _run_check_now(update, context):
 
     try:
         check_in_progress.add(chat_id)
-        state.global_watcher_paused = True  # ✅ Pause global watchers
+        plan, refused = await _manual_check_plan(user_id)
+        if refused:
+            await update.message.reply_text(refused)
+            return
+        if is_admin:
+            state.global_watcher_paused = True  # an admin's full check replaces the watchers' turn
 
         # Send a single "Checking..." message
         status_msg = await update.message.reply_text(
@@ -1069,14 +1098,6 @@ async def _run_check_now(update, context):
             disable_notification=True
         )
 
-        # ♻️ Ensure session is alive
-        if not state.global_session or not await state.global_session.is_logged_in():
-            await status_msg.edit_text("🔄 Session expired, re-logging...")
-            await login_studip()
-
-        # ✅ Load courses ONCE if needed
-        if not state.courses_map:
-            await _ensure_watched_courses_map(state.global_session)
 
         results = []
 
@@ -1091,7 +1112,7 @@ async def _run_check_now(update, context):
         # 📢 2. Check announcements
         try:
             await status_msg.edit_text("🔍 Checking announcements...")
-            has_new_announcements = await check_new_announcements_parallel(context.bot, chat_id, silent=True)
+            has_new_announcements = await check_new_announcements_parallel(context.bot, chat_id, silent=True, courses=plan)
             results.append(("announcements", has_new_announcements))
         except Exception as e:
             results.append(("announcements", f"error: {e}"))
@@ -1099,7 +1120,7 @@ async def _run_check_now(update, context):
         # 📁 3. Check files
         try:
             await status_msg.edit_text("🔍 Checking files...")
-            has_new_files = await check_new_files(context.bot, chat_id, silent=True)
+            has_new_files = await check_new_files_parallel(context.bot, chat_id, silent=True, courses=plan)
             results.append(("files", has_new_files))
         except Exception as e:
             results.append(("files", f"error: {e}"))
@@ -1107,7 +1128,7 @@ async def _run_check_now(update, context):
         # 💬 4. Check forum
         try:
             await status_msg.edit_text("🔍 Checking forum posts...")
-            has_new_forum = await check_new_forum_posts(context.bot, chat_id, silent=True)
+            has_new_forum = await check_new_forum_posts_parallel(context.bot, chat_id, silent=True, courses=plan)
             results.append(("forum", has_new_forum))
         except Exception as e:
             results.append(("forum", f"error: {e}"))
@@ -1128,7 +1149,8 @@ async def _run_check_now(update, context):
         logging.exception("_run_check_now failed")
     finally:
         check_in_progress.discard(chat_id)
-        state.global_watcher_paused = False
+        if is_admin:
+            state.global_watcher_paused = False
 
 
 # ── Feature 3: Direct Stud.IP Message Reply (`POST /jsonapi.php/v1/messages`) ─
@@ -1358,14 +1380,21 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message, chat = update.message, update.effective_chat
     if message is None or chat is None:
         return
-    chat_id = chat.id
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None or not is_user_allowed(user_id):
         await message.reply_text("Not authorized to use this bot.")
         return
-    if chat_id in watch_tasks and not watch_tasks[chat_id].done():
-        await message.reply_text("Watcher is already running.")
+    if not is_user_admin(user_id):
+        # one watcher serves everyone; a student's own checks run on their schedule
+        await message.reply_text("👀 Your courses and inbox are checked automatically. "
+                                 "/check looks right now, /stop pauses everything and /start resumes.")
         return
-    await message.reply_text("👀 Watcher started (checks every 2 hours).", disable_notification=True)
-    task = asyncio.create_task(watch_loop(chat_id, context))
-    watch_tasks[chat_id] = task
+    # never a second watcher loop: start the one watcher if it isn't running, else resume it
+    from unibot.watcher import start_unified_watcher
+    state.global_watcher_paused = False
+    state.message_watcher_paused = state.announcement_watcher_paused = state.file_watcher_paused = False
+    if state.watcher_controller_running:
+        await message.reply_text("👀 The watcher is running (paused checks resumed).", disable_notification=True)
+        return
+    await start_unified_watcher(context.application)
+    await message.reply_text("👀 Watcher started.", disable_notification=True)

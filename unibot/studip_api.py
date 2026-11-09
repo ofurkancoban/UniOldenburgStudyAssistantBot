@@ -31,7 +31,7 @@ from studip_utils import (
     safe_zip_path as _safe_zip_path,
 )
 from unibot import state
-from unibot.auth import current_user_id, get_user_session, is_user_admin, login_studip
+from unibot.auth import current_user_id, get_user_session, login_studip
 from unibot.formatting import clean_html_text
 from unibot.storage import (
     load_default_semester,
@@ -73,7 +73,9 @@ def _record_course(cid: str, name: str, user_id: Optional[int] = None) -> None:
         if user_id not in state.user_courses_map:
             state.user_courses_map[user_id] = {}
         state.user_courses_map[user_id][cid] = name
-    if user_id is None or is_user_admin(user_id):
+    # the shared map is the watcher session's own course list; another
+    # admin's (or a student's) courses stay in their own map
+    if user_id is None or user_id == getattr(state.global_session, "user_id", None):
         state.courses_map[cid] = name
 
 
@@ -290,7 +292,9 @@ async def _ensure_watched_courses_map(session) -> None:
     except Exception as e:
         logging.warning("_ensure_watched_courses_map: failed to resolve current semester: %s", e)
 
-    courses_list = await list_courses(semester_id=anchor_id) if anchor_id else await list_courses()
+    # always the given (watcher) session's own list, never the acting student's
+    owner = getattr(session, "user_id", None)
+    courses_list = await list_courses(semester_id=anchor_id, session=session, user_id=owner)
     merged = {cid: name for name, cid in courses_list}
 
     if want_prev and anchor_id and semester_options:
@@ -298,7 +302,7 @@ async def _ensure_watched_courses_map(session) -> None:
         if idx is not None and idx + 1 < len(semester_options):
             prev_id, prev_label = semester_options[idx + 1]
             try:
-                prev_courses = await list_courses(semester_id=prev_id)
+                prev_courses = await list_courses(semester_id=prev_id, session=session, user_id=owner)
                 for name, cid in prev_courses:
                     merged.setdefault(cid, name)
                 logging.info("👀 Also watching %s course(s) from %s", len(prev_courses), prev_label)

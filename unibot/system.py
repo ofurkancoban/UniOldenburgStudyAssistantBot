@@ -22,7 +22,9 @@ from studip_utils import TZ_BERLIN, berlin_now
 from unibot import db, state
 from unibot.telegram_ui import user_data, broadcast
 from unibot.config import (
+    ADMIN_USER_IDS,
     ALLOWED_USER_IDS,
+    PRIMARY_ADMIN_ID,
     PROJECT_ROOT,
     WA_HEADERS,
     WA_SERVICE_URL,
@@ -34,6 +36,7 @@ from unibot.storage import (
     get_wardrobe_feature_enabled,
     link_cache,
     load_default_semester,
+    load_general_cache,
     shared_http,
 )
 from unibot.diagnostics import connection_report
@@ -160,6 +163,27 @@ async def run_health_checks(live_openrouter: bool = False) -> dict:
     return {"studip": studip, "whatsapp": whatsapp, "weather": weather, "openrouter": openrouter, "gwdg": gwdg, "disk": disk}
 
 
+async def _student_health_text(user_id: int) -> str:
+    """What a student sees: their own Stud.IP connection and one line from
+    the last background health check. Server details (and the live, paid AI
+    check) are for administrators."""
+    try:
+        signed_in = await get_user_session(user_id).is_logged_in()
+    except Exception:
+        logging.debug("Session check failed", exc_info=True)
+        signed_in = False
+    health = load_general_cache().get("health_state") or {}
+    down = [HEALTH_CHECK_LABELS[k] for k, ok in health.items() if not ok and k in HEALTH_CHECK_LABELS]
+    service = ("✅ All services are working." if not down
+               else "⚠️ Some services have problems right now; the administrators have been told.")
+    return "\n".join([
+        "🩺 <b>Status</b>",
+        "━━━━━━━━━━━━━━━━━",
+        f"🎓 Your Stud.IP connection: {'✅ connected' if signed_in else '❌ not connected (/login)'}",
+        service,
+    ])
+
+
 async def healthcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /healthcheck - an on-demand, full (live OpenRouter call
     included) check of every subsystem the bot depends on, plus the
@@ -167,6 +191,9 @@ async def healthcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     right now" is a single command instead of SSHing into the server."""
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None or not is_user_allowed(user_id):
+        return
+    if not is_user_admin(user_id):
+        await update.message.reply_text(await _student_health_text(user_id), parse_mode="HTML")
         return
 
     msg = await update.message.reply_text("🩺 Running health check...")
@@ -592,6 +619,13 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+def _is_protected_admin(user_id: int) -> bool:
+    """Administrators set in the environment (and the primary admin): no other
+    admin can block them, change their role or revoke their session."""
+    return (user_id in (ADMIN_USER_IDS or set()) or user_id in (ALLOWED_USER_IDS or set())
+            or user_id == PRIMARY_ADMIN_ID)
+
+
 async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Callback router for Admin Dashboard."""
     query = update.callback_query
@@ -670,15 +704,16 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
         )
 
         keyboard = []
-        is_primary_admin = target_id in (ALLOWED_USER_IDS or [])
-        if not is_primary_admin and target_id != user.id:
+        protected = _is_protected_admin(target_id)
+        if not protected and target_id != user.id:
             block_label = "🚫 Block Account" if is_active else "✅ Activate Account"
             keyboard.append([InlineKeyboardButton(block_label, callback_data=f"admin_toggle_user|{target_id}")])
 
             role_label = "🎓 Demote to Student" if role == "admin" else "👑 Promote to Admin"
             keyboard.append([InlineKeyboardButton(role_label, callback_data=f"admin_role_user|{target_id}")])
 
-        keyboard.append([InlineKeyboardButton("🚪 Revoke Stud.IP Session", callback_data=f"admin_revoke_user|{target_id}")])
+        if not protected or target_id == user.id:
+            keyboard.append([InlineKeyboardButton("🚪 Revoke Stud.IP Session", callback_data=f"admin_revoke_user|{target_id}")])
         keyboard.append([InlineKeyboardButton("⬅️ Back to Users", callback_data="admin_users")])
 
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
@@ -686,8 +721,8 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("admin_toggle_user|"):
         target_id = int(data.split("|")[1])
-        if target_id in (ALLOWED_USER_IDS or []) or target_id == user.id:
-            await query.answer("Cannot modify primary administrator.", show_alert=True)
+        if _is_protected_admin(target_id) or target_id == user.id:
+            await query.answer("Cannot modify this administrator.", show_alert=True)
             return
         target = db.get_user(target_id)
         if target:
@@ -700,8 +735,8 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("admin_role_user|"):
         target_id = int(data.split("|")[1])
-        if target_id in (ALLOWED_USER_IDS or []) or target_id == user.id:
-            await query.answer("Cannot modify primary administrator role.", show_alert=True)
+        if _is_protected_admin(target_id) or target_id == user.id:
+            await query.answer("Cannot change this administrator's role.", show_alert=True)
             return
         target = db.get_user(target_id)
         if target:
@@ -714,6 +749,9 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 
     if data.startswith("admin_revoke_user|"):
         target_id = int(data.split("|")[1])
+        if _is_protected_admin(target_id) and target_id != user.id:
+            await query.answer("Cannot revoke this administrator's session.", show_alert=True)
+            return
         await _perform_logout(user_id=target_id)
         await query.answer("Stud.IP session revoked and credentials cleared.", show_alert=True)
         query.data = f"admin_user_detail|{target_id}"
