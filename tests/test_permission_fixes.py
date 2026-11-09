@@ -230,3 +230,52 @@ class ExamScanTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RescanFixTests(unittest.TestCase):
+    def test_unknown_course_students_get_nothing_until_known(self):
+        from unibot import exams
+        calls = []
+
+        async def fan_out(*args, **kwargs):
+            calls.append(args)
+
+        event = {"cid": "c1", "course": "One", "kind": "exam", "date": "2026-12-01", "source": "f.pdf"}
+        with mock.patch.object(exams.course_registry, "fan_out", fan_out), \
+                mock.patch.object(exams, "course_members", lambda cid: None):
+            asyncio.run(exams.notify_new_file_exam_events(mock.MagicMock(), [event]))
+        self.assertEqual(calls, [])
+
+    def test_a_failed_round_keeps_the_course_session_state(self):
+        from unibot import course_registry, monitoring, schedule
+        cache = {schedule.COURSE_SESSION_STATE_KEY: {"c1": {"e1": {"ts": int(time.time())}}}}
+
+        async def scan(cid, primary, fetch):
+            raise RuntimeError("Stud.IP down")
+
+        with mock.patch.object(monitoring, "watched_courses", mock.AsyncMock(return_value=[("One", "c1", "s")])), \
+                mock.patch.object(course_registry, "scan_with_failover", scan), \
+                mock.patch.object(schedule, "load_general_cache", lambda: cache), \
+                mock.patch.object(schedule, "save_general_cache", cache.update):
+            asyncio.run(schedule.check_course_session_changes(None, force=True))
+            with mock.patch.object(monitoring, "watched_courses", mock.AsyncMock(return_value=[])):
+                asyncio.run(schedule.check_course_session_changes(None, force=True))
+        self.assertIn("c1", cache[schedule.COURSE_SESSION_STATE_KEY])
+
+    def test_a_students_first_check_loads_their_course_list(self):
+        from unibot import monitoring
+        monitoring._manual_check_at.clear()
+        courses: dict = {}
+        session = mock.MagicMock()
+        session.is_logged_in = mock.AsyncMock(return_value=True)
+
+        async def list_courses(session=None, user_id=None, **kwargs):
+            courses.update({"c1": "One"})
+
+        with mock.patch.object(monitoring, "is_user_admin", lambda uid: False), \
+                mock.patch.object(monitoring, "get_user_session", lambda uid: session), \
+                mock.patch.object(monitoring, "student_courses", lambda uid: dict(courses)), \
+                mock.patch.object(monitoring, "list_courses", list_courses):
+            plan, refused = asyncio.run(monitoring._manual_check_plan(1010))
+        self.assertIsNone(refused)
+        self.assertEqual(plan, [("One", "c1", session)])

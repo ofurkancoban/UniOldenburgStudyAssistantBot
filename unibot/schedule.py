@@ -1802,8 +1802,11 @@ async def check_course_session_changes(bot, now: Optional[datetime] = None, forc
                 members=course_members(cid), now=now,
                 urgent=start_dt - now <= timedelta(hours=SESSION_URGENT_HOURS))
             stats["alerts"] += 1
-    known = {cid for _, cid, _ in plan}
-    all_state = {cid: entries for cid, entries in all_state.items() if cid in known}
+    if plan and stats["courses"]:
+        # forget courses nobody watches any more; an empty or failed round
+        # keeps the state, or the next scan would be a silent baseline again
+        known = {cid for _, cid, _ in plan}
+        all_state = {cid: entries for cid, entries in all_state.items() if cid in known}
     cache = load_general_cache()
     cache[COURSE_SESSION_STATE_KEY] = all_state
     cache.pop("course_events_state", None)  # the old single-account state
@@ -1822,6 +1825,7 @@ async def check_personal_timetable_changes(bot, now: Optional[datetime] = None) 
     legacy = load_general_cache().get("user_schedule_slots")
     watcher_uid = getattr(state.global_session, "user_id", None) or PRIMARY_ADMIN_ID
     checked = 0
+    legacy_moved = False
     due = [a for a in signed_in_accounts()
            if time.time() - _timetable_checked_at.get(a.user_id, 0.0) >= PERSONAL_TIMETABLE_CHECK_SECONDS]
     # longest waiting first, a few per cycle, so a restart doesn't read everyone at once
@@ -1839,6 +1843,8 @@ async def check_personal_timetable_changes(bot, now: Optional[datetime] = None) 
         _timetable_checked_at[uid] = time.time()
         checked += 1
         old = personal_record(uid, "user_schedule_slots", {}) or {}
+        if uid == watcher_uid:
+            legacy_moved = True
         if not old and uid == watcher_uid and isinstance(legacy, dict) and legacy:
             old = legacy  # the single-account timetable from before
         new = _timetable_map(slots)
@@ -1848,7 +1854,7 @@ async def check_personal_timetable_changes(bot, now: Optional[datetime] = None) 
                                               reply_markup=_SCHEDULE_WA_MARKUP, members={uid}, now=now)
         if new != old:
             save_personal_record(uid, "user_schedule_slots", new)
-    if legacy is not None and checked:
+    if legacy is not None and legacy_moved:  # only once the watcher's owner has it
         cache = load_general_cache()
         cache.pop("user_schedule_slots", None)
         save_general_cache(cache)

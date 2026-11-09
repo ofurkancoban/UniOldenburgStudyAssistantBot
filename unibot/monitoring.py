@@ -1064,8 +1064,16 @@ async def _manual_check_plan(user_id: Optional[int]):
     session = get_user_session(user_id)
     if session is None or not await session.is_logged_in():
         return None, "🔐 Sign in first (/login), then you can check your courses."
+    courses = student_courses(user_id)
+    if not courses:
+        try:
+            with acting_as(user_id):
+                await list_courses(session=session, user_id=user_id)
+        except Exception as e:
+            logging.warning("Course list for a manual check unavailable: %s", e)
+        courses = student_courses(user_id)
     _manual_check_at[user_id] = time.time()
-    return [(name, cid, session) for cid, name in student_courses(user_id).items()], None
+    return [(name, cid, session) for cid, name in courses.items()], None
 
 
 async def _run_check_now(update, context):

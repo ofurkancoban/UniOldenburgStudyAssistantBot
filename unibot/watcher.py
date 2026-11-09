@@ -345,9 +345,12 @@ async def _run_reminder_checks(bot, session, now: datetime):
         owner = _single_account_owner(session)
         if owner is None:
             return
+        adopt_legacy_exam_cache(owner)
         slot = _personal_due(owner, now)
         if slot is not None:
-            await _run_stums_checks(bot, session, _user_sender(owner))
+            # that student's own exam cache (encrypted record), like every other student's
+            with acting_as(owner), exam_cache_user(owner):
+                await _run_stums_checks(bot, session, _user_sender(owner))
             _mark_personal_slot(owner, slot)
 
 
@@ -368,8 +371,10 @@ async def _run_exam_date_checks(bot, session, now: datetime):
     else:
         owner = _single_account_owner(session)
         if owner is not None:
-            await _guarded("Exam date reminder check", check_exam_date_reminders, session, bot,
-                           _user_sender(owner), start_message="🎓 Checking upcoming exam dates...")
+            adopt_legacy_exam_cache(owner)
+            with acting_as(owner), exam_cache_user(owner):
+                await _guarded("Exam date reminder check", check_exam_date_reminders, session, bot,
+                               _user_sender(owner), start_message="🎓 Checking upcoming exam dates...")
     await _guarded("File exam reminder check", _check_file_exam_reminders, bot, session)
     update_general_cache({"last_exam_date_check": now.isoformat()})
 

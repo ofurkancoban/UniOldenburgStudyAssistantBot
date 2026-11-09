@@ -1285,11 +1285,15 @@ async def notify_new_file_exam_events(bot, new_events: list) -> None:
     for e in new_events:
         by_course.setdefault(e["cid"], []).append(e)
     for cid, events in by_course.items():
+        members = course_members(cid)
+        if members is None:
+            logging.info("New exam dates of %s not sent: its students aren't known yet", cid)
+            continue
         lines = render_file_exam_events(events, "📄 <b>New exam dates</b> <i>(course files)</i>")
         lines.append(EXAM_DATES_FOOTER)
         title = f"📄 New exam date: {html.escape(events[0]['course'])}"
         await course_registry.fan_out(bot, cid, "exams", "\n".join(lines), title,
-                                      reply_markup=WA_FORWARD_ASK_MARKUP, members=course_members(cid))
+                                      reply_markup=WA_FORWARD_ASK_MARKUP, members=members)
 
 
 def _registered_dates(user_id: int) -> set:
@@ -1326,6 +1330,9 @@ async def check_file_exam_reminders(bot, registered: Optional[list] = None) -> N
         due = [d for d in EXAM_FILE_REMINDER_DAYS if days_left <= d and d not in sent]
         if not due:
             continue
+        members = course_members(e["cid"])
+        if members is None:
+            continue  # students not known yet (just restarted): next round, not marked as sent
         when_line = "🔴 <b>TODAY!</b>" if days_left == 0 else f"⏳ <b>{days_left} day(s) left</b>"
         text = "\n".join([
             "📚 <b>UPCOMING EXAM</b>" + ("" if e.get("source") == "StuMS" else " <i>(from course files)</i>"),
@@ -1336,7 +1343,6 @@ async def check_file_exam_reminders(bot, registered: Optional[list] = None) -> N
             f"📎 <i>{html.escape(e['source'])}</i>",
             "━━━━━━━━━━━━━━━━━",
         ])
-        members = course_members(e["cid"])
         recipients = {uid for uid in course_registry.broadcast_targets(e["cid"], members)
                       if e["date"] not in _registered_dates(uid)}
         await course_registry.fan_out(bot, e["cid"], "exams", text, f"📚 {html.escape(e['course'])}: {when_line}",

@@ -70,7 +70,7 @@ class ExamDatePerCourseTests(unittest.TestCase):
         registered = {903: {"2026-12-01"}, 904: set()}
         with mock.patch.object(self.exams.course_registry, "fan_out", fan_out), \
                 mock.patch.object(self.exams.course_registry, "broadcast_targets", lambda cid, members: {903, 904}),\
-                mock.patch.object(self.exams, "course_members", lambda cid: None), \
+                mock.patch.object(self.exams, "course_members", lambda cid: {903, 904}), \
                 mock.patch.object(self.exams, "_registered_dates", lambda uid: registered[uid]), \
                 mock.patch.object(self.exams, "datetime", wraps=datetime) as fake_dt:
             fake_dt.now.return_value = today
