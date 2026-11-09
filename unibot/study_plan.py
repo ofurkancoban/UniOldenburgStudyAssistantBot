@@ -55,7 +55,7 @@ from unibot.telegram_ui import (
     _start_loading_animation,
     _stop_loading_animation,
 )
-from unibot.auth import current_user_id, get_user_session, is_user_admin, is_user_allowed, login_studip
+from unibot.auth import current_user_id, get_user_session, has_stored_login, is_user_admin, is_user_allowed, login_studip
 from unibot.studip_api import (
     _ensure_watched_courses_map,
     _parse_file_date_v2,
@@ -768,18 +768,19 @@ def _measure_workload_file(kind: str, name: str, content: bytes) -> dict:
     return {"pages": pages, "questions": len(_QUESTION_LINE_RE.findall(text))}
 
 
-async def _list_course_files_deep(cid) -> list:
+async def _list_course_files_deep(cid, session=None) -> list:
     """Like _list_course_files, plus the problem-set/project subfolders
-    inside weekly dated folders ("20261013/PS/PS_BaseR.pdf")."""
+    inside weekly dated folders ("20261013/PS/PS_BaseR.pdf"), read with
+    `session` (the acting user's when None)."""
     out: list[tuple[Optional[str], dict]] = []  # (dated folder or None, file)
-    for item in await list_files(cid):
+    for item in await list_files(cid, session=session):
         if item.get("type") == "file":
             out.append((None, item))
             continue
         if item.get("type") != "folder" or not item.get("url") or _WORKLOAD_SKIPPED_FOLDER_RE.match(item.get("name", "")):
             continue
         try:
-            sub = await list_files(cid, item["url"])
+            sub = await list_files(cid, item["url"], session=session)
         except Exception as e:
             logging.warning("_list_course_files_deep: listing failed for %s: %s", item.get('name'), e)
             continue
@@ -791,7 +792,7 @@ async def _list_course_files_deep(cid) -> list:
                 and (_PROBLEM_SET_FOLDER_RE.match(s.get("name", "")) or _PROJECT_FOLDER_RE.match(s.get("name", "")))
             ):
                 try:
-                    out.extend((f"{item['name']}/{s['name']}", f) for f in await list_files(cid, s["url"]) if f.get("type") == "file")
+                    out.extend((f"{item['name']}/{s['name']}", f) for f in await list_files(cid, s["url"], session=session) if f.get("type") == "file")
                 except Exception as e:
                     logging.warning("_list_course_files_deep: listing failed for %s/%s: %s", item['name'], s.get('name'), e)
     return out
@@ -811,7 +812,7 @@ async def collect_course_workload(session, cids: list) -> dict:
     async def process_course(cid):
         async with semaphore:
             try:
-                files = await _list_course_files_deep(cid)
+                files = await _list_course_files_deep(cid, session=http)
             except Exception as e:
                 logging.warning("collect_course_workload: listing failed for %s: %s", cid, e)
                 return
@@ -1751,11 +1752,14 @@ async def course_file_buttons(cid: str, course_name: str, user_id: int,
     """Download buttons (the file|<sid> handler) for the newest file of each
     kind in a course, falling back to its lecture course when an exercise
     course has none; [] when nothing is found or the listing fails."""
+    own = get_user_session(user_id)
+    if not has_stored_login(own):
+        return []  # listed with the student's own login only, never someone else's
     courses = state.user_courses_map.get(user_id) or state.courses_map
     picked: list[dict] = []
     for source in [cid, *companion_courses(cid, courses)]:
         try:
-            picked = pick_study_pack_files(await _list_course_files_deep(source), kinds)
+            picked = pick_study_pack_files(await _list_course_files_deep(source, session=own), kinds)
         except Exception as e:
             logging.warning("Course files: listing failed for %s: %s", source, e)
             continue

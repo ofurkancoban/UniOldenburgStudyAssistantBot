@@ -20,7 +20,7 @@ import base64
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from studip_utils import TZ_BERLIN, redact_url
+from studip_utils import TZ_BERLIN, aread_bytes, awrite_bytes, redact_url
 
 from unibot.config import (
     CLOUDFLARE_ACCOUNT_ID,
@@ -83,12 +83,12 @@ def outfit_caption(outfit: dict) -> str:
 
 
 OUTFIT_RECOMMENDATION_SYSTEM_PROMPT = """You are picking a coherent, weather-appropriate outfit for a student from their own wardrobe, using only the candidate items listed (each with an id, type, subtype, color, and warmth level). Follow this layering logic based on today's forecast high temperature and whether rain is expected:
-- Below 5°C ("very cold"): full layering — a top (prefer subtype=sweater, else shirt/t-shirt) + a light_jacket AND a coat together if both are available (worn as mid layer + outer shell) + pants.
+- Below 5°C ("very cold"): full layering - a top (prefer subtype=sweater, else shirt/t-shirt) + a light_jacket AND a coat together if both are available (worn as mid layer + outer shell) + pants.
 - 5-12°C ("cold"): a top + exactly ONE outerwear item (a coat if available, else a light_jacket) + pants.
 - 12-18°C ("mild"): a top + pants; add a light_jacket if rain is expected OR if the morning low is below 10°C (the high alone can be misleading on a day that starts cold).
 - 18-24°C ("warm"): a top (prefer subtype=t-shirt) + pants or shorts, preferring shorts (subtype=shorts) when available; add a light_jacket only if rain is expected.
-- 24°C and above ("hot"): a top (prefer subtype=t-shirt) + shorts, preferring shorts over pants even if rain is expected — just add a light_jacket too if one's available on a rainy hot day.
-Never pick two tops or two bottoms. Also always include exactly one "shoes" item and one headwear "accessory" item (a cap/beanie/hat, not socks or other accessories) if any such items are present in the candidate list — these can't be shown in the outfit image, but still name them in your reasoning. Some items are tagged "[worn in the last couple days, prefer an alternative if one fits]" — pick a different item of that same type when a suitable alternative exists in the list, but don't force an unsuitable combination just to avoid a repeat.
+- 24°C and above ("hot"): a top (prefer subtype=t-shirt) + shorts, preferring shorts over pants even if rain is expected - just add a light_jacket too if one's available on a rainy hot day.
+Never pick two tops or two bottoms. Also always include exactly one "shoes" item and one headwear "accessory" item (a cap/beanie/hat, not socks or other accessories) if any such items are present in the candidate list - these can't be shown in the outfit image, but still name them in your reasoning. Some items are tagged "[worn in the last couple days, prefer an alternative if one fits]" - pick a different item of that same type when a suitable alternative exists in the list, but don't force an unsuitable combination just to avoid a repeat.
 Among the weather-appropriate options, pick the combination whose colors work best together:
 - Neutrals (black, white, grey, navy, denim blue, beige, camel, brown, olive/khaki) go with almost anything; build on them.
 - At most one statement piece per outfit (a bold color like bordeaux or bright green, or a loud pattern); keep the rest neutral. Never combine two loud patterns.
@@ -134,7 +134,7 @@ def _add_required_outerwear(items: list[dict], chosen: list[dict], weather: Opti
 def _temperature_band(temp_max: Optional[float]) -> str:
     """Map a forecast high to one of the 5 bands the outfit logic (both
     the LLM prompt above and this heuristic fallback) reasons in terms
-    of — kept as one function so the two stay in sync if the thresholds
+    of - kept as one function so the two stay in sync if the thresholds
     ever change."""
     if temp_max is None:
         return "mild"
@@ -151,7 +151,7 @@ def _temperature_band(temp_max: Optional[float]) -> str:
 
 def _prefer_unworn(pool: list[dict], recent_ids: set) -> list[dict]:
     """Stable-partition a candidate pool so recently-worn items (see
-    get_recently_worn_item_ids) sort after everything else — the
+    get_recently_worn_item_ids) sort after everything else - the
     "first match" selection below then naturally avoids repeats when a
     genuine alternative exists, but still falls back to a recently-worn
     item rather than nothing when it's the only option in that subtype."""
@@ -161,7 +161,7 @@ def _prefer_unworn(pool: list[dict], recent_ids: set) -> list[dict]:
 
 
 def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict], recent_ids: Optional[set] = None) -> list[dict]:
-    """Fallback used when the LLM call fails or returns unparsable JSON —
+    """Fallback used when the LLM call fails or returns unparsable JSON -
     deterministic temperature-band + layering logic (mirrors
     OUTFIT_RECOMMENDATION_SYSTEM_PROMPT) instead of a plain warmth match,
     since an incoherent random outfit is a worse failure mode than an
@@ -238,7 +238,7 @@ OUTFIT_AI_TIMEOUT_SECONDS = 60
 def _add_mandatory_shoes_and_headwear(items: list[dict], chosen: list[dict]) -> list[dict]:
     """Shoes and a cap/beanie/hat can't be visually rendered (no free
     try-on model supports footwear/headwear), but the user wants them
-    named in the outfit text whenever the wardrobe has one — applied
+    named in the outfit text whenever the wardrobe has one - applied
     after BOTH the LLM pick and the heuristic fallback, so it's
     guaranteed regardless of whether the LLM actually complied with the
     "always include" instruction in OUTFIT_RECOMMENDATION_SYSTEM_PROMPT."""
@@ -264,14 +264,14 @@ def _add_mandatory_shoes_and_headwear(items: list[dict], chosen: list[dict]) -> 
 async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], recent_ids: Optional[set] = None) -> Optional[dict]:
     """Ask the LLM to pick a coherent, temperature-banded outfit from the
     user's cataloged wardrobe items, considering the morning's weather
-    snapshot (see get_weather_snapshot) — structural twin of
+    snapshot (see get_weather_snapshot) - structural twin of
     build_food_recommendation, just over wardrobe metadata instead of menu
     items. Pure text reasoning over already-tagged items, so this reuses
     the bot's existing free-tier OpenRouter text call, not the
     Cloudflare/HF image providers.
 
     `recent_ids` (see get_recently_worn_item_ids) nudges away from
-    repeating the exact same outfit two days running — soft preference,
+    repeating the exact same outfit two days running - soft preference,
     not a hard exclusion, since a small wardrobe may have only one real
     option for a given slot.
 
@@ -294,7 +294,7 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
         if _outerwear_required(weather):
             weather_line += " An outerwear item is required today."
     else:
-        weather_line = "Weather: no data available today — pick something reasonably versatile (mild band)."
+        weather_line = "Weather: no data available today - pick something reasonably versatile (mild band)."
 
     user_text = f"{weather_line}\n\nWardrobe:\n" + "\n".join(lines)
     raw = None
@@ -336,7 +336,7 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
 
 
 def _wardrobe_list_view(user_id) -> tuple:
-    """Build the (text, reply_markup) pair for the "👔 My Wardrobe" screen —
+    """Build the (text, reply_markup) pair for the "👔 My Wardrobe" screen -
     direct template match to _food_preferences_management_view: one delete
     button per cataloged item, an "Add" button, and Clear All when there's
     more than one item."""
@@ -384,7 +384,7 @@ async def handle_wardrobe_set_reference(update: Update, context: ContextTypes.DE
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     user_data(context)["pending_step"] = "wardrobe_set_reference"
-    await query.message.reply_text("🖼️ Send one clear full-body photo of yourself — I'll reuse it every morning.")
+    await query.message.reply_text("🖼️ Send one clear full-body photo of yourself - I'll reuse it every morning.")
 
 
 async def handle_wardrobe_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -428,12 +428,12 @@ async def handle_wardrobe_clear_cancel(update: Update, context: ContextTypes.DEF
 
 
 async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle wardrobe_suggest_now callback ("👔 Suggest Outfit Now") — the
+    """Handle wardrobe_suggest_now callback ("👔 Suggest Outfit Now") - the
     on-demand twin of the morning summary's automatic section (see 4c in
     prepare_morning_summary), using the same pick_outfit_from_wardrobe/
     generate_outfit_tryon_image pipeline. Unlike the morning summary, which
     skips silently when the wardrobe/reference photo aren't set up yet,
-    this is an explicit request — tell the user why nothing happened."""
+    this is an explicit request - tell the user why nothing happened."""
     query = update.callback_query
     await query.answer()
 
@@ -446,14 +446,14 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
     items = entry.get("items", [])
     ref_file_id = entry.get("reference_photo_file_id")
     if not items:
-        await query.message.reply_text("👔 Add at least one clothing item first — tap 📸 Add Clothing Item.")
+        await query.message.reply_text("👔 Add at least one clothing item first - tap 📸 Add Clothing Item.")
         return
     if not ref_file_id:
-        await query.message.reply_text("🖼️ Set your reference photo first — tap 🖼️ Set Reference Photo in /status.")
+        await query.message.reply_text("🖼️ Set your reference photo first - tap 🖼️ Set Reference Photo in /status.")
         return
 
     # Reuse today's already-generated pick if this is a second trigger the
-    # same day (e.g. morning summary already ran) — resending a cached
+    # same day (e.g. morning summary already ran) - resending a cached
     # photo_file_id is instant and free, unlike burning another round of
     # quota-limited image-generation calls for the same day's outfit.
     cached = get_cached_outfit_today(user_id)
@@ -476,7 +476,7 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
         await _stop_loading_animation(stop_evt, anim_task)
 
     if not outfit:
-        await query.message.reply_text("❌ Couldn't put together an outfit right now — try again in a bit.")
+        await query.message.reply_text("❌ Couldn't put together an outfit right now - try again in a bit.")
         return
 
     caption = outfit_caption(outfit)
@@ -692,8 +692,7 @@ async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -
         for data in [reference_bytes] + [g[1] for g in garments]:
             path = os.path.join(tempfile.gettempdir(), f"gemini_tryon_{uuid.uuid4().hex}.jpg")
             paths.append(path)
-            with open(path, "wb") as f:
-                f.write(data)
+            await awrite_bytes(path, data)
             urls.append(await fal_client.upload_file_async(Path(path)))
 
         result = await fal_client.subscribe_async(
@@ -719,14 +718,14 @@ async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -
 
 async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optional[bytes], lower_bytes: Optional[bytes]) -> Optional[bytes]:
     """Dress the reference photo via FASHN's try-on model (fal.ai-hosted,
-    paid, ~$0.075/image) — the primary provider when FAL_KEY is set, since
+    paid, ~$0.075/image) - the primary provider when FAL_KEY is set, since
     a live comparison against the free Spaces below showed it preserves
     the actual garment (cut/taper, logo sharpness) noticeably better.
     Chained the same way as generate_outfit_tryon_ootd: apply the upper
     garment, then feed that result back in as the new model photo for the
     lower garment. Each step is independently best-effort. Returns None
     if FAL_KEY isn't configured, there's nothing to apply, or both steps
-    failed — caller falls back to the free OOTDiffusion path."""
+    failed - caller falls back to the free OOTDiffusion path."""
     if not FAL_KEY or (not upper_bytes and not lower_bytes):
         return None
     try:
@@ -739,10 +738,8 @@ async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optio
         person_path = os.path.join(tempfile.gettempdir(), f"fashn_person_{uuid.uuid4().hex}.jpg")
         garment_path = os.path.join(tempfile.gettempdir(), f"fashn_garment_{uuid.uuid4().hex}.jpg")
         try:
-            with open(person_path, "wb") as f:
-                f.write(person_bytes)
-            with open(garment_path, "wb") as f:
-                f.write(garment_bytes)
+            await awrite_bytes(person_path, person_bytes)
+            await awrite_bytes(garment_path, garment_bytes)
             person_url = await fal_client.upload_file_async(Path(person_path))
             garment_url = await fal_client.upload_file_async(Path(garment_path))
             result = await fal_client.subscribe_async(
@@ -783,7 +780,7 @@ async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optio
 
 async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Optional[bytes], lower_bytes: Optional[bytes]) -> Optional[bytes]:
     """Dress the reference photo via levihsu/OOTDiffusion's dress-code
-    endpoint (process_dc) — unlike yisol/IDM-VTON, this exposes a
+    endpoint (process_dc) - unlike yisol/IDM-VTON, this exposes a
     category selector (Upper-body/Lower-body/Dress), so it can be
     CHAINED: apply the upper garment first, then feed that result back in
     as the new person photo for the lower garment, actually dressing both
@@ -792,7 +789,7 @@ async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Option
     lower-body step run against the original reference). Returns None if
     neither step produced an image, or if there's nothing to apply.
     Quality depends heavily on the reference photo being a plain-
-    background, front-facing, full-body shot — not guaranteed otherwise,
+    background, front-facing, full-body shot - not guaranteed otherwise,
     this is a free shared-GPU community demo, not a production API."""
     try:
         from gradio_client import Client, handle_file
@@ -819,7 +816,7 @@ async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Option
             category=category,
             # 40 steps noticeably sharpens small garment logos/text over the
             # default 20 (confirmed by live comparison). The seed is pinned
-            # (not randomized) — a different seed was observed hallucinating
+            # (not randomized) - a different seed was observed hallucinating
             # an extra object (a bag) onto the shoulder on one test run, so
             # a fixed seed is the safer choice even though it means every
             # generation for a given photo+garment pair looks the same.
@@ -854,8 +851,7 @@ async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Option
 
         if not applied_any:
             return None
-        with open(person_path, "rb") as f:
-            return f.read()
+        return await aread_bytes(person_path)
     finally:
         for p in tmp_paths:
             try:
@@ -865,7 +861,7 @@ async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Option
 
 
 async def generate_outfit_tryon_flux(reference_bytes: bytes, item_images: list[bytes]) -> Optional[bytes]:
-    """Fallback try-on image via Cloudflare Workers AI's FLUX.2 [dev] —
+    """Fallback try-on image via Cloudflare Workers AI's FLUX.2 [dev] -
     a general multi-reference image-editing model (not purpose-built for
     try-on like IDM-VTON, used only when that Space is unavailable). Takes
     the reference photo plus up to 3 item photos as reference images.
@@ -875,7 +871,7 @@ async def generate_outfit_tryon_flux(reference_bytes: bytes, item_images: list[b
     url = CLOUDFLARE_AI_URL.format(account_id=CLOUDFLARE_ACCOUNT_ID, model=CLOUDFLARE_IMAGE_MODEL)
     try:
         # FLUX.2 [dev] requires multipart/form-data even with no file inputs
-        # (confirmed against a live call — a plain JSON body is rejected
+        # (confirmed against a live call - a plain JSON body is rejected
         # with "required properties at '/' are 'multipart'"), with each
         # reference image in its own field: image, image2, image3, image4
         # (up to 4 references total, confirmed working with 2). The
@@ -915,20 +911,20 @@ def _describe_item_for_prompt(item: dict) -> str:
 
 
 async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: Optional[dict], headwear_item: Optional[dict]) -> Optional[bytes]:
-    """Add shoes/headwear via black-forest-labs/FLUX.1-Kontext-Dev — a
+    """Add shoes/headwear via black-forest-labs/FLUX.1-Kontext-Dev - a
     general instruction-based image editor (not garment-category-locked
     like OOTDiffusion/IDM-VTON), so it can place accessories neither of
     those support. Described in TEXT only (color + label), not from the
     actual wardrobe photo, since Kontext takes one image + one instruction,
-    not a reference garment image — so exact styling/logos won't match
+    not a reference garment image - so exact styling/logos won't match
     perfectly, just the general look.
 
     Both accessories are requested in a SINGLE combined call rather than
-    two sequential ones — confirmed via live comparison that chaining
+    two sequential ones - confirmed via live comparison that chaining
     separate hat-then-shoes calls compounds visible distortion (warped
     face/proportions) across each successive edit, while one combined
     instruction stays clean. Returns None if there's nothing to add or
-    the call fails — caller keeps the un-accessorized image rather than
+    the call fails - caller keeps the un-accessorized image rather than
     nothing."""
     if not shoes_item and not headwear_item:
         return None
@@ -948,8 +944,7 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
 
     ref_path = os.path.join(tempfile.gettempdir(), f"kontext_{uuid.uuid4().hex}.jpg")
     try:
-        with open(ref_path, "wb") as f:
-            f.write(reference_bytes)
+        await awrite_bytes(ref_path, reference_bytes)
 
         def _call():
             client = Client(HF_SPACE_ACCESSORIES, token=HF_TOKEN or None)
@@ -963,8 +958,7 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
         result = await asyncio.to_thread(_call)
         output_path = result[0] if isinstance(result, (list, tuple)) else result
         if output_path and os.path.exists(output_path):
-            with open(output_path, "rb") as result_file:
-                return result_file.read()
+            return await aread_bytes(output_path)
         return None
     except Exception as e:
         logging.warning("generate_outfit_tryon_accessories failed: %s", e)
@@ -985,16 +979,16 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
     has layering, e.g. a coat over a t-shirt, since none of these models
     stack multiple garments visually in one region) and one bottom,
     downloads their bytes, and tries FASHN (paid, via fal.ai) first if
-    FAL_KEY is configured — confirmed via live comparison to preserve the
-    actual garment better than the free options — falling back to the
+    FAL_KEY is configured - confirmed via live comparison to preserve the
+    actual garment better than the free options - falling back to the
     free OOTDiffusion Space (chained upper+lower, see
     generate_outfit_tryon_ootd), then to Cloudflare's general FLUX.2
     editing model if neither is available. If the outfit also
     includes shoes/a cap-or-beanie (see _add_mandatory_shoes_and_headwear),
-    one more pass via generate_outfit_tryon_accessories adds them — text-
+    one more pass via generate_outfit_tryon_accessories adds them - text-
     described, not photo-matched, and best-effort: a failure there just
     means the base outfit image goes out without them. Returns None only
-    if the base top/bottom dressing itself produced nothing — caller must
+    if the base top/bottom dressing itself produced nothing - caller must
     degrade to a text-only outfit message in that case."""
     shoes_item = next((it for it in chosen_items if it.get("type") == "shoes"), None)
     headwear_item = next(

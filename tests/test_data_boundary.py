@@ -222,6 +222,8 @@ class PrivacyScreenTests(unittest.TestCase):
                 mock.patch.object(voice, "get_grades", grades), \
                 mock.patch.object(voice, "get_registered_exam_schedule", empty), \
                 mock.patch.object(voice, "get_ai_grades_enabled", lambda uid: False), \
+                mock.patch.object(voice, "get_calendar_events", empty), \
+                mock.patch.object(voice, "get_weather_snapshot", mock.AsyncMock(return_value=None)), \
                 mock.patch.object(voice, "user_tasks", lambda uid: []):
             context = asyncio.run(voice.build_qa_context(user_id=505))
         self.assertEqual(fetched, [])
@@ -350,7 +352,7 @@ class UserScopeTests(unittest.TestCase):
                 {"id": "s2", "user_id": 712, "text": "b"},
                 {"id": "s3", "text": "ownerless"},
             ]))
-        with mock.patch("unibot.config.ALLOWED_USER_IDS", {711}):
+        with mock.patch("unibot.config.PRIMARY_ADMIN_ID", 711):
             owners = db.task_owner_ids()
         self.assertTrue({711, 712} <= set(owners))
         self.assertEqual(sorted(t["id"] for t in db.get_user_scope(711).tasks()), ["s1", "s3"])

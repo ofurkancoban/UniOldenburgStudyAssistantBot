@@ -578,7 +578,16 @@ class ResourceHygieneTests(unittest.TestCase):
         import unibot.config  # noqa: F401 - configures logging on import
         handlers = logging.getLogger().handlers
         self.assertEqual(sum(isinstance(h, RotatingFileHandler) for h in handlers), 1)
-        self.assertEqual(sum(type(h) is logging.StreamHandler for h in handlers), 1)
+        consoles = [h for h in handlers if type(h) is logging.StreamHandler]
+        # INFO to stdout, WARNING and above to stderr (PM2's error log)
+        self.assertEqual(sorted(h.stream.name for h in consoles), ["<stderr>", "<stdout>"])
+        info = logging.LogRecord("x", logging.INFO, "", 0, "m", None, None)
+        warn = logging.LogRecord("x", logging.WARNING, "", 0, "m", None, None)
+        out = next(h for h in consoles if h.stream.name == "<stdout>")
+        err = next(h for h in consoles if h.stream.name == "<stderr>")
+        self.assertTrue(out.filter(info))
+        self.assertFalse(out.filter(warn))
+        self.assertEqual(err.level, logging.WARNING)
 
     def test_logout_and_shutdown_close_connections(self):
         from unibot import auth, state
@@ -979,7 +988,7 @@ class CallerSessionTests(unittest.TestCase):
                 fetched.append(self.label)
                 return Resp()
 
-        async def files(cid):
+        async def files(cid, session=None):
             return [(None, {"name": "slides.pdf", "url": "https://elearning.uni-oldenburg.de/f", "size": "1 MB",
                             "type": "file"})]
 

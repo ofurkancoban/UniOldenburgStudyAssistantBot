@@ -15,7 +15,7 @@ from typing import Any, Optional
 
 from studip_utils import TZ_BERLIN
 from unibot import db
-from unibot.config import ALLOWED_USER_IDS
+from unibot.config import PRIMARY_ADMIN_ID
 from unibot.storage import get_watch_previous_semester_enabled
 
 PREFS_KIND = "preferences"
@@ -140,7 +140,7 @@ def _initial(user_id: int) -> dict:
     the account they were made for (the primary admin), so nothing changes
     for them; everyone else starts from the defaults."""
     prefs: dict = {}
-    if user_id == next(iter(ALLOWED_USER_IDS), None):
+    if user_id == PRIMARY_ADMIN_ID:
         try:
             prefs["watch_previous_semester"] = bool(get_watch_previous_semester_enabled())
         except Exception:

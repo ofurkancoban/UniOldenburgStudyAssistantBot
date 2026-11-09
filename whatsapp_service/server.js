@@ -234,7 +234,7 @@ async function connectToWhatsApp() {
                 console.log('WhatsApp connection confirmed stable (30s+ uninterrupted).');
                 if (disconnectAlertPending) {
                     disconnectAlertPending = false;
-                    sendTextToTelegram('🟢 WhatsApp reconnected — forwarding is back up.', TEST_MESSAGE_KEYBOARD);
+                    sendTextToTelegram('🟢 WhatsApp reconnected - forwarding is back up.', TEST_MESSAGE_KEYBOARD);
                 }
             }, 30000);
         }
@@ -300,7 +300,7 @@ async function connectToWhatsApp() {
             // while already down.
             if (!disconnectAlertPending) {
                 disconnectAlertPending = true;
-                sendTextToTelegram(`🔴 WhatsApp disconnected (${reasonText}) — attempting to reconnect automatically. Forwarding won't work until this recovers.`);
+                sendTextToTelegram(`🔴 WhatsApp disconnected (${reasonText}) - attempting to reconnect automatically. Forwarding won't work until this recovers.`);
             }
 
             // Back off: conflicts start at 30 s; standard blips start at 5 s

@@ -27,7 +27,7 @@ WA_FORWARD_CONFIRM_MARKUP = InlineKeyboardMarkup([[
 
 
 async def handle_forward_wa_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """First tap on any 'Forward to WA' button — swap it for a Yes/No confirmation
+    """First tap on any 'Forward to WA' button - swap it for a Yes/No confirmation
     instead of sending immediately, since these messages can carry personal info."""
     query = update.callback_query
     await query.answer()
@@ -38,7 +38,7 @@ async def handle_forward_wa_ask(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_forward_wa_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User declined forwarding — restore the original button so they can retry."""
+    """User declined forwarding - restore the original button so they can retry."""
     query = update.callback_query
     await query.answer("Cancelled")
     try:
@@ -81,7 +81,7 @@ def _html_to_whatsapp_text(text: str) -> str:
     """Convert the Telegram-style HTML markup used in bot-composed WA
     forwards (e.g. handle_examopen_wa_confirm's "EXAM REGISTRATION OPEN"
     text) into WhatsApp's own plain-text markdown, since WhatsApp doesn't
-    render HTML at all — literal "<b>...</b>" was showing up verbatim in
+    render HTML at all - literal "<b>...</b>" was showing up verbatim in
     forwarded messages instead of being bold. <b>/<strong> become
     WhatsApp's *bold*, <i>/<em> become _italic_, and any other stray tag
     (there shouldn't be any today, but this is the one chokepoint every
@@ -95,13 +95,13 @@ def _html_to_whatsapp_text(text: str) -> str:
 
 async def _send_text_to_whatsapp(text: str) -> tuple[bool, str]:
     """POST plain text to the local WhatsApp microservice's target group.
-    Returns (success, message) — mirrors forward_to_whatsapp's own request,
+    Returns (success, message) - mirrors forward_to_whatsapp's own request,
     factored out so the "EXAM REGISTRATION OPEN"-style notifications (which
     have no single Telegram message to re-read text from, since their WA
     button opens its own confirm step) can send their own composed text
     through the same path.
 
-    The target group is always WA_GROUP_ID — the exact group ID captured
+    The target group is always WA_GROUP_ID - the exact group ID captured
     from a real message via "🔍 Detect WA Groups" (see set_wa_group_handler),
     never a manually-typed group name (fragile: names can collide or drift
     from what WhatsApp actually has stored, which was silently sending

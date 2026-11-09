@@ -296,13 +296,14 @@ class StudyPackTests(unittest.TestCase):
             {"user_id": 999, "text": "someone else's", "course": "Econometrics", "due_time": "2026-11-05T12:00:00+01:00"},
         ]
 
-        async def files(cid):
+        async def files(cid, session=None):
             self.assertEqual(cid, "c1")
             return [("Problem Sets", {"name": "Problem_Set_2.pdf", "url": "p2", "modified_iso": "2026-11-02T10:00:00+01:00"}),
                     (None, {"name": "Lecture_4.pdf", "url": "u4", "modified_iso": "2026-11-03T10:00:00+01:00"})]
 
         cache: dict = {}
         with mock.patch.object(study_plan, "_list_course_files_deep", files), \
+                mock.patch.object(study_plan, "has_stored_login", lambda s: True), \
                 mock.patch.object(study_plan, "user_tasks", lambda uid: [t for t in tasks if t.get("user_id") == uid]), \
                 mock.patch.object(study_plan, "link_cache", cache):
             text, markup = asyncio.run(study_plan.build_study_pack(window, self.UID, now))
@@ -589,6 +590,7 @@ class CatchUpTests(unittest.TestCase):
                 mock.patch.object(schedule, "load_reminders_cache", lambda user_id=None: {}), \
                 mock.patch.object(schedule, "save_reminders_cache", lambda data, user_id=None: None), \
                 mock.patch.object(study_plan, "_list_course_files_deep", files), \
+                mock.patch.object(study_plan, "has_stored_login", lambda s: True), \
                 mock.patch.object(study_plan, "link_cache", cache):
             asyncio.run(schedule.check_calendar_reminders(bot, 4242, silent=True))
         (lecture,) = [m for m in sent if "LECTURE REMINDER" in m["text"]]
@@ -596,7 +598,16 @@ class CatchUpTests(unittest.TestCase):
         labels = [row[0].text for row in lecture["reply_markup"].inline_keyboard]
         self.assertEqual(labels, ["🎥 Lecture_5.webm", "📊 Lecture_5.pdf"])
         self.assertEqual({e["user_id"] for e in cache.values()}, {4242})
-        files.assert_awaited_once_with("c1")
+        files.assert_awaited_once()
+        self.assertEqual(files.await_args.args, ("c1",))
+        self.assertIsNotNone(files.await_args.kwargs.get("session"))  # the student's own session
+
+    def test_no_listing_without_the_students_own_login(self):
+        files = mock.AsyncMock(return_value=[])
+        with mock.patch.object(study_plan, "_list_course_files_deep", files), \
+                mock.patch.object(study_plan, "has_stored_login", lambda s: False):
+            self.assertIsNone(asyncio.run(study_plan.build_catch_up_buttons({"course_id": "c1"}, 1)))
+        files.assert_not_awaited()  # never someone else's login
 
     def test_no_files_no_buttons(self):
         with mock.patch.object(study_plan, "_list_course_files_deep", mock.AsyncMock(side_effect=RuntimeError("down"))):
@@ -738,7 +749,9 @@ class CompanionCourseTests(unittest.TestCase):
     def test_catch_up_falls_back_to_the_lecture_course(self):
         listings = {"ex": [], "lec": [(None, {"name": "slides_intro.pdf", "url": "s1", "modified_iso": "2026-11-03T09:00:00+01:00"})]}
         cache: dict = {}
-        with mock.patch.object(study_plan, "_list_course_files_deep", mock.AsyncMock(side_effect=lambda cid: listings[cid])), \
+        with mock.patch.object(study_plan, "_list_course_files_deep",
+                               mock.AsyncMock(side_effect=lambda cid, session=None: listings[cid])), \
+                mock.patch.object(study_plan, "has_stored_login", lambda s: True), \
                 mock.patch.object(study_plan, "link_cache", cache), \
                 mock.patch.object(study_plan.state, "user_courses_map", {7: self.COURSES}):
             markup = asyncio.run(study_plan.build_catch_up_buttons({"course_id": "ex"}, 7))

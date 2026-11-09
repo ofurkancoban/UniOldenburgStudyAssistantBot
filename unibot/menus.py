@@ -30,8 +30,8 @@ from unibot.preferences import get_pref, set_pref
 from unibot.storage import (
     cleanup_link_cache,
     get_travel_mode,
+    get_user_name,
     set_travel_mode,
-    get_primary_user_name,
     get_weekly_study_plan_enabled,
     link_cache,
     load_default_semester,
@@ -55,6 +55,7 @@ from unibot.telegram_ui import (
 )
 from unibot.auth import _perform_logout, _send_login_prompt, get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import (
+    ZIP_RAW_LIMIT_BYTES,
     _api_message,
     _api_names,
     _normalize_url,
@@ -97,8 +98,8 @@ def _status_group_view(group: str, user_id: Optional[int] = None) -> tuple:
     the on/off toggles, which go through status_group_toggle so the
     submenu redraws in place instead of being replaced by a confirmation."""
     if group == "profile":
-        studip_name = get_primary_user_name() or "Connected"
-        title = f"👤 <b>Profile</b>\n\nName: <b>{studip_name}</b>\n<i>(Automatically synced from Stud.IP)</i>"
+        studip_name = (get_user_name(user_id) if user_id is not None else None) or "Connected"
+        title = f"👤 <b>Profile</b>\n\nName: <b>{_h(studip_name)}</b>\n<i>(Automatically synced from Stud.IP)</i>"
         rows = [
             [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
         ]
@@ -422,7 +423,7 @@ async def send_folder(query, files, cid, user_id, current_url=None):
             "user_id": user_id,
         }
 
-        # URL'yi normalize et ve cache'e kaydet
+        # Normalize the URL and store it in the link cache
         if f.get("url"):
             cache_entry["url"] = _normalize_url(f["url"])
             logging.info("💾 Caching %s: %s -> %s", f['type'], f['name'], cache_entry['url'])
@@ -481,7 +482,7 @@ async def send_folder(query, files, cid, user_id, current_url=None):
         }
         keyboard.append([InlineKeyboardButton("📦 Download Entire Folder (ZIP)", callback_data=f"nav|{zip_id}")])
 
-    # Son cache cleanup
+    # Final link cache cleanup
     cleanup_link_cache()
 
     # Title (breadcrumb)
@@ -955,7 +956,7 @@ async def _selection_nav(update, context, query, data, user_id):
             "━━━━━━━━━━━━━━━━━━"
         )
 
-        if len(buf.getvalue()) > 48 * 1024 * 1024:
+        if total_size > ZIP_RAW_LIMIT_BYTES or len(buf.getvalue()) > 48 * 1024 * 1024:
             await msg.edit_text("⚠️ ZIP too large for Telegram (>48MB).")
             await query.message.reply_text(summary, parse_mode="HTML")
             return
@@ -1050,13 +1051,14 @@ async def _selection_message(update, context, query, data, user_id):
             "✉️ <b>FULL MESSAGE</b>\n"
             "                  \n"
             "━━━━━━━━━━━━━━━━━━\n"
-            f"📬 <b>Subject:</b> {subject}\n"
-            f"👤 <b>From:</b> {sender_name}\n"
-            f"📅 <b>Date:</b> {date_str}\n"
+            f"📬 <b>Subject:</b> {_h(subject)}\n"
+            f"👤 <b>From:</b> {_h(sender_name)}\n"
+            f"📅 <b>Date:</b> {_h(date_str)}\n"
             "━━━━━━━━━━━━━━━━━━\n"
         )
 
-        chunks = [content[i:i + 4000] for i in range(0, len(content), 4000)]
+        # split the plain text first, then escape each part, so no entity is cut
+        chunks = [_h(content[i:i + 3500]) for i in range(0, len(content), 3500)]
         if chunks:
             await query.message.reply_text(f"{header}{chunks[0]}", parse_mode="HTML")
             for part in chunks[1:]:
@@ -1419,7 +1421,7 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await _show_typing(query)
     stop_evt, anim_task = _start_loading_animation(status_msg, f"Loading {course_name}...")
 
-    lines = [f"📘 <b>{course_name}</b>", "━━━━━━━━━━━━━━━━━"]
+    lines = [f"📘 <b>{_h(course_name)}</b>", "━━━━━━━━━━━━━━━━━"]
 
     course_tasks = [t for t in user_tasks(user_id) if t.get("course") == course_name]
     if course_tasks:
@@ -1427,9 +1429,9 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for t in sorted(course_tasks, key=lambda t: t.get("due_time") or ""):
             if t.get("due_time"):
                 due = datetime.fromisoformat(t["due_time"])
-                lines.append(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} - {t['text']}")
+                lines.append(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} - {_h(t['text'])}")
             else:
-                lines.append(f"• {t['text']}")
+                lines.append(f"• {_h(t['text'])}")
         lines.append("━━━━━━━━━━━━━━━━━")
     else:
         lines.append("📝 <b>Tasks:</b> none")
@@ -1459,7 +1461,7 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
             title = exam["title"]
             if exam.get("group_label"):
                 title += f" ({exam['group_label']})"
-            lines.append(f"{title} - {exam['exam_date_display']}")
+            lines.append(f"{_h(title)} - {_h(exam['exam_date_display'])}")
 
     await query.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -1486,9 +1488,9 @@ async def handle_set_user_name(update: Update, context: ContextTypes.DEFAULT_TYP
         logging.debug("Stud.IP profile lookup failed", exc_info=True)
         name = None
     if not name:
-        name = get_primary_user_name() or "Stud.IP"
+        name = get_user_name(user_id) or "Stud.IP"
     await query.message.reply_text(
-        f"👤 Your name is automatically synchronized from Stud.IP: <b>{name}</b>",
+        f"👤 Your name is automatically synchronized from Stud.IP: <b>{_h(name)}</b>",
         parse_mode="HTML",
     )
 

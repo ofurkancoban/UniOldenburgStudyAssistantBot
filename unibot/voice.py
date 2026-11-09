@@ -26,12 +26,10 @@ from exam_reminder import (
 from fast_enroll import get_open_courses
 from studip_utils import TZ_BERLIN, berlin_now
 
-from unibot import state
 from unibot.storage import (
     get_ai_grades_enabled,
     add_wardrobe_item,
     cleanup_link_cache,
-    get_primary_user_name,
     get_user_name,
     link_cache,
     load_default_semester,
@@ -87,7 +85,7 @@ VOICE_INTENTS = [
 
 # Friendly button labels for every real (non-"unclear") intent, used both by
 # the "did you mean...?" clarification buttons (see _route_voice_intent) and
-# nowhere else — kept as a single source of truth so a new intent only needs
+# nowhere else - kept as a single source of truth so a new intent only needs
 # one label added here to work in both places.
 INTENT_LABELS = {
     "create_task": "📝 Create a task",
@@ -118,42 +116,42 @@ INTENT_LABELS = {
 CLASSIFY_INTENT_SYSTEM_PROMPT = """You classify a spoken command (transcribed from Turkish or English) sent to a university assistant Telegram bot into exactly one intent.
 
 Intents, each with example phrasings in both languages:
-- create_task: "yeni görev ekle, yarın rapor teslim et" / "add a task, submit the report tomorrow" — a plain to-do, not tied to a specific exam's date
-- create_exam_reminder_task: "Computational Intelligence sınavından 3 gün önce hatırlat" / "remind me about the Computational Intelligence exam 3 days before" / "sınav günü hatırlat" — specifically asks to be reminded relative to a named exam's date (N days/hours before it, or on the day)
+- create_task: "yeni görev ekle, yarın rapor teslim et" / "add a task, submit the report tomorrow" - a plain to-do, not tied to a specific exam's date
+- create_exam_reminder_task: "Computational Intelligence sınavından 3 gün önce hatırlat" / "remind me about the Computational Intelligence exam 3 days before" / "sınav günü hatırlat" - specifically asks to be reminded relative to a named exam's date (N days/hours before it, or on the day)
 - course_enroll: "Computational Economics dersine kayıt olmak istiyorum" / "sign me up for Computational Economics"
 - course_deenroll: "Lineer Cebir dersinden kaydımı sil" / "unenroll me from Linear Algebra"
 - exam_register: "Makro İktisat sınavına kayıt ol" / "register me for the Macroeconomics exam"
 - exam_deregister: "sınav kaydımı iptal et" / "deregister me from my exam"
 - check_grades: "notlarımı göster" / "show me my grades" / "transkriptimi göster"
-- check_exam_dates: "yaklaşan sınavlarım neler" / "what are my upcoming exams" — only MY registered exams
+- check_exam_dates: "yaklaşan sınavlarım neler" / "what are my upcoming exams" - only MY registered exams
 - check_status: "bot durumunu göster" / "show bot status"
-- show_menu: "bugünün yemek menüsünü göster" / "what's on the menu today" / "yemekhanede ne var" — wants to see the full menu
-- recommend_meal: "bugün ne yesem" / "what should I eat today" / "recommend me something for lunch" / "yemekhaneden ne önerirsin" — wants ONE dish picked for them, not the full menu
-- show_last_file: "Computational Intelligence dersinin son dosyasını göster" / "list the last file of Computational Intelligence" / "show me the latest file for Linear Algebra" — asks for only the single most recently uploaded file of a named course
-- list_course_files: "Linear Algebra dersinin dosyalarını listele" / "list the files of Linear Algebra" / "show me all files for Computational Economics" — asks to see every file of a named course, not just the latest one
-- exam_dates_all: "tüm sınav tarihlerini göster" / "show every exam date" / "list all exams in the curriculum" — every exam across the whole curriculum, not just mine
-- upcoming_dashboard: "önümüzdeki günlerde neler var" / "what's coming up" / "show my upcoming schedule" — a combined view of tasks, exam dates and deadlines
-- calendar_today: "bugünkü derslerim neler" / "what's my schedule today" / "show today's lectures" — wants to SEE today's schedule as text
-- read_daily_plan: "günlük planımı sesli oku" / "read me today's schedule" / "read my daily plan out loud" / "tell me what I have today" — specifically wants today's schedule spoken aloud as a voice message, not shown as text
-- read_weekly_plan: "haftalık planımı sesli oku" / "read me this week's schedule" / "read my week out loud" — same, but for the whole week
-- ask_question: "toplam kaç kredim var" / "what's my GPA" / "when is my next exam" / "do I have any free time this week" / "kaç görevim kaldı" / "what should I wear today" / "is it going to rain" / "bugün şemsiye alsam mı" / "do I need a jacket today" — an open-ended question that needs combining, reasoning, or judgment over their data (including weather), not a direct "show me X" request matching one of the other intents above. This is its own clear intent, not something to hedge into "unclear" — weather/clothing questions ALWAYS belong here even though the word "today" appears in them (that alone doesn't make it calendar_today, which is specifically for wanting to see the schedule as text)
+- show_menu: "bugünün yemek menüsünü göster" / "what's on the menu today" / "yemekhanede ne var" - wants to see the full menu
+- recommend_meal: "bugün ne yesem" / "what should I eat today" / "recommend me something for lunch" / "yemekhaneden ne önerirsin" - wants ONE dish picked for them, not the full menu
+- show_last_file: "Computational Intelligence dersinin son dosyasını göster" / "list the last file of Computational Intelligence" / "show me the latest file for Linear Algebra" - asks for only the single most recently uploaded file of a named course
+- list_course_files: "Linear Algebra dersinin dosyalarını listele" / "list the files of Linear Algebra" / "show me all files for Computational Economics" - asks to see every file of a named course, not just the latest one
+- exam_dates_all: "tüm sınav tarihlerini göster" / "show every exam date" / "list all exams in the curriculum" - every exam across the whole curriculum, not just mine
+- upcoming_dashboard: "önümüzdeki günlerde neler var" / "what's coming up" / "show my upcoming schedule" - a combined view of tasks, exam dates and deadlines
+- calendar_today: "bugünkü derslerim neler" / "what's my schedule today" / "show today's lectures" - wants to SEE today's schedule as text
+- read_daily_plan: "günlük planımı sesli oku" / "read me today's schedule" / "read my daily plan out loud" / "tell me what I have today" - specifically wants today's schedule spoken aloud as a voice message, not shown as text
+- read_weekly_plan: "haftalık planımı sesli oku" / "read me this week's schedule" / "read my week out loud" - same, but for the whole week
+- ask_question: "toplam kaç kredim var" / "what's my GPA" / "when is my next exam" / "do I have any free time this week" / "kaç görevim kaldı" / "what should I wear today" / "is it going to rain" / "bugün şemsiye alsam mı" / "do I need a jacket today" - an open-ended question that needs combining, reasoning, or judgment over their data (including weather), not a direct "show me X" request matching one of the other intents above. This is its own clear intent, not something to hedge into "unclear" - weather/clothing questions ALWAYS belong here even though the word "today" appears in them (that alone doesn't make it calendar_today, which is specifically for wanting to see the schedule as text)
 - calendar_weekly: "bu haftaki ders programımı göster" / "show this week's schedule" / "what's my week plan"
-- set_default_semester: "varsayılan dönemi ayarla" / "set my default semester" / "change my default semester" — opens the semester picker, doesn't require a semester to be named
-- run_check: "her şeyi manuel kontrol et" / "run a manual sync" / "check for updates now" — force-refreshes messages/announcements/files/forum right now
+- set_default_semester: "varsayılan dönemi ayarla" / "set my default semester" / "change my default semester" - opens the semester picker, doesn't require a semester to be named
+- run_check: "her şeyi manuel kontrol et" / "run a manual sync" / "check for updates now" - force-refreshes messages/announcements/files/forum right now
 - fastenroll_list: "planlanmış fast enroll işlerimi listele" / "list my scheduled fast enroll jobs" / "show my pending enrollments"
 - unclear: anything that doesn't clearly match one of the above
 
 For course_enroll, course_deenroll, exam_register, exam_deregister, create_exam_reminder_task, show_last_file, and list_course_files, also extract the course or exam name mentioned (in whatever language it was said) as "query"; otherwise "query" is null.
 
-If — and only if — you pick "unclear", also set "alternatives" to an array of the 1-2 intents (from the list above, excluding "unclear") that are the next most plausible reading of the phrase; use an empty array if nothing else is remotely plausible. For every other intent, "alternatives" is an empty array.
+If - and only if - you pick "unclear", also set "alternatives" to an array of the 1-2 intents (from the list above, excluding "unclear") that are the next most plausible reading of the phrase; use an empty array if nothing else is remotely plausible. For every other intent, "alternatives" is an empty array.
 
 Respond with strict JSON only, no other text: {"intent": "<intent>", "query": "<name or null>", "alternatives": ["<intent>", ...]}"""
 
 
 async def build_qa_context(user_id=None) -> str:
     """Gather a compact plain-text snapshot of the student's current
-    academic data — this week's schedule, registered upcoming exams,
-    transcript summary, personal tasks — for the free-form ask_question
+    academic data - this week's schedule, registered upcoming exams,
+    transcript summary, personal tasks - for the free-form ask_question
     intent to answer against. Each source is independently best-effort
     (fetched inside its own try/except): one failing (e.g. a slow StuMS
     page) just leaves that section out of the context rather than blocking
@@ -171,7 +169,9 @@ async def build_qa_context(user_id=None) -> str:
     try:
         today = berlin_now().date()
         week_start = today - timedelta(days=today.weekday())
-        events = await get_calendar_events(session=state.global_session, week_start=week_start)
+        # the asking student's own timetable; none without their login
+        events = await get_calendar_events(session=session, week_start=week_start, user_id=user_id) \
+            if session is not None else []
         if events:
             lines = [
                 f"- {ev.get('date_key')}: {clean_course_title(ev.get('title', '')) or 'event'} at {ev.get('time', '')}"
@@ -234,12 +234,12 @@ QA_SYSTEM_PROMPT = """You are a helpful university assistant answering a spoken 
 
 async def answer_question_with_context(question: str, context_data: str, name: Optional[str] = None) -> Optional[str]:
     """Ask the chat LLM (OpenRouter) to answer a free-form spoken question
-    using the snapshot from build_qa_context. Returns None on any failure —
+    using the snapshot from build_qa_context. Returns None on any failure -
     callers should tell the user to try again rather than send a blank or
     made-up answer."""
     system_prompt = QA_SYSTEM_PROMPT
     if name:
-        system_prompt += f" The student's name is {name} — you may address them by it naturally, but don't force it into every sentence."
+        system_prompt += f" The student's name is {name} - you may address them by it naturally, but don't force it into every sentence."
     user_prompt = f"Data:\n{context_data}\n\nQuestion: {question}"
     answer = await _call_openrouter(system_prompt, user_prompt, temperature=0.7)
     return answer.strip() if answer else None
@@ -250,10 +250,10 @@ async def classify_voice_intent(transcript: str) -> dict:
     VOICE_INTENTS. Always returns {"intent", "query", "alternatives"};
     falls back to {"intent": "unclear", "query": None, "alternatives": []}
     on any failure. "alternatives" is only ever non-empty when "intent" is
-    "unclear" — see _route_voice_intent for how those become "did you
+    "unclear" - see _route_voice_intent for how those become "did you
     mean...?" buttons instead of silently defaulting to task creation.
 
-    Retries once on a malformed/unparseable response before giving up —
+    Retries once on a malformed/unparseable response before giving up -
     the free-tier model occasionally returns something _extract_json_object
     can't parse (truncated, prose-wrapped, etc), and a single retry clears
     most of those without meaningfully hurting latency."""
@@ -271,7 +271,7 @@ async def classify_voice_intent(transcript: str) -> dict:
 async def _upcoming_exams(session):
     """Return [(title, exam_datetime), ...] for every still-upcoming exam
     among the student's own registered exams (get_registered_exam_schedule
-    — deliberately not the full curriculum's exam dates, since a countdown
+    - deliberately not the full curriculum's exam dates, since a countdown
     should reflect what the student is actually sitting), sorted
     soonest-first. [] if there are none / the fetch failed. Used for the
     morning summary's "⏳ N days until <exam>" countdown lines (one per
@@ -304,11 +304,11 @@ async def _find_exam_datetime(session, query_text: Optional[str]):
     scores confidently enough. Pools candidates from both the student's own
     registered exams (get_registered_exam_schedule, which can carry an exact
     start time) and the full curriculum's exam dates (get_all_exam_dates,
-    date only — defaults to 09:00 local).
+    date only - defaults to 09:00 local).
 
     The same title can appear more than once across semesters (a retake, or
     a past sitting still listed), so among near-equally good text matches a
-    today-or-later one is preferred — silently picking a past sitting would
+    today-or-later one is preferred - silently picking a past sitting would
     create a reminder that's already overdue. But recency never overrides a
     clearly better text match: a much stronger match wins even if its date
     has already passed, since substituting a different, worse-matching
@@ -400,7 +400,7 @@ async def _match_course(course_query: Optional[str]):
 async def _find_latest_file(course_query: Optional[str]):
     """Fuzzy-match a spoken course name (via _match_course) and return
     (course_name, cid, file_item) for the most recently modified file at
-    that course's top-level Stud.IP file listing (list_files) — a live
+    that course's top-level Stud.IP file listing (list_files) - a live
     fetch, not the cached "last 5 files across all courses" that
     show_last_files uses, so it reflects the course's actual current state
     even if the watcher hasn't noticed a given file yet.
@@ -430,7 +430,7 @@ def _best_title_match(query: Optional[str], candidates: list, min_score: float =
     """Fuzzy-match a spoken course/exam name against a list of (title, payload)
     candidates (e.g. (course_name, sem_id), (exam_title, exam_dict)). Returns
     the payload of the best match, or None if nothing scores at least
-    `min_score` — callers must fall back to showing the full list in that
+    `min_score` - callers must fall back to showing the full list in that
     case. Raise min_score for a path with no visible "is this what you
     meant?" checkpoint before acting (e.g. Stud.IP course names vs. StuMS
     exam titles for the same module often share only a generic word like
@@ -460,7 +460,7 @@ def _best_title_match(query: Optional[str], candidates: list, min_score: float =
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route an incoming photo by whatever pending_step is waiting (same
     context.user_data field the text/voice wizards use, just a new reader
-    of it — there's no generic photo-wizard router like handle_pending_step,
+    of it - there's no generic photo-wizard router like handle_pending_step,
     since only the wardrobe feature expects photos today)."""
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None or not is_user_allowed(user_id):
@@ -474,7 +474,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         image_bytes = await _download_telegram_file(context.bot, file_id)
         tags = await tag_wardrobe_item(image_bytes) if image_bytes else None
         if not tags:
-            await status_msg.edit_text("⚠️ Couldn't recognize that item — try a clearer photo of just this one piece of clothing, or /status to cancel.")
+            await status_msg.edit_text("⚠️ Couldn't recognize that item - try a clearer photo of just this one piece of clothing, or /status to cancel.")
             return  # pending_step stays set so a retry just works
         # Best effort: without it the GWDG try-on describes the item later.
         tags["description"] = await describe_wardrobe_item(tags, image_bytes or b"")
@@ -487,10 +487,10 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if step == "wardrobe_set_reference":
         set_wardrobe_reference_photo(user_id, file_id)
         context.user_data.pop("pending_step", None)
-        await update.message.reply_text("🖼️ Reference photo updated — I'll reuse it every morning.", reply_markup=get_main_keyboard())
+        await update.message.reply_text("🖼️ Reference photo updated - I'll reuse it every morning.", reply_markup=get_main_keyboard())
         return
 
-    await update.message.reply_text("📸 Got a photo — if you want to add it to your wardrobe, go to /status → 👔 My Wardrobe → 📸 Add Clothing Item first.")
+    await update.message.reply_text("📸 Got a photo - if you want to add it to your wardrobe, go to /status → 👔 My Wardrobe → 📸 Add Clothing Item first.")
 
 
 async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -507,7 +507,7 @@ async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
     pending = context.user_data.pop("pending_voice", None)
     if not pending:
-        await query.edit_message_text("⚠️ This confirmation has expired — please send a new voice note.")
+        await query.edit_message_text("⚠️ This confirmation has expired - please send a new voice note.")
         return
 
     chat_id = update.effective_chat.id
@@ -526,7 +526,7 @@ async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def handle_voice_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """User said the transcription was wrong — discard it and let them retry."""
+    """User said the transcription was wrong - discard it and let them retry."""
     query = update.callback_query
     await query.answer("Discarded")
 
@@ -535,14 +535,14 @@ async def handle_voice_reject(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     context.user_data.pop("pending_voice", None)
-    await query.edit_message_text("🎙️ Okay — send another voice note, or type your answer instead.")
+    await query.edit_message_text("🎙️ Okay - send another voice note, or type your answer instead.")
 
 
 class _UpdateMessageShim:
     """Wraps a callback-query-originated Update so handlers written for a
     plain message update (which read update.message) can be reused as-is.
     python-telegram-bot's Update.message is the raw message field and is
-    None for callback-query updates — update.effective_message is the one
+    None for callback-query updates - update.effective_message is the one
     that resolves across both, so this shim exposes that as .message while
     forwarding every other attribute to the real update."""
 
@@ -566,7 +566,7 @@ async def _voice_intent_create_task(update, context, result, transcript, intent,
 async def _voice_intent_unclear(update, context, result, transcript, intent, query_text, alternatives, message):
     """Voice intent: unclear."""
     if not alternatives:
-        # Nothing plausible enough to even guess at — the old default of
+        # Nothing plausible enough to even guess at - the old default of
         # silently turning it into a task would just create garbage, so
         # ask instead of assuming.
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("📝 Just make it a task", callback_data="voice_clarify|create_task")]])
@@ -579,7 +579,7 @@ async def _voice_intent_unclear(update, context, result, transcript, intent, que
         [[InlineKeyboardButton(INTENT_LABELS[alt], callback_data=f"voice_clarify|{alt}")] for alt in alternatives]
         + [[InlineKeyboardButton("📝 Just make it a task", callback_data="voice_clarify|create_task")]]
     )
-    await message.reply_text("🤔 Not quite sure what you meant — did you mean:", reply_markup=keyboard)
+    await message.reply_text("🤔 Not quite sure what you meant - did you mean:", reply_markup=keyboard)
     return True
 
 
@@ -591,7 +591,7 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
     offset_value = extracted["offset_value"]
     if not course_query or offset_value is None:
         await message.reply_text(
-            "🤷 Couldn't tell which exam or how far ahead to remind you — try e.g. "
+            "🤷 Couldn't tell which exam or how far ahead to remind you - try e.g. "
             "\"remind me about the Computational Intelligence exam 3 days before\"."
         )
         return True
@@ -604,7 +604,7 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
         return True
     if not exam_title:
         await message.reply_text(
-            f"🎙️ Couldn't find an exam matching \"{course_query}\" — check the spelling, "
+            f"🎙️ Couldn't find an exam matching \"{course_query}\" - check the spelling, "
             "or set the reminder manually via ➕ Add Task."
         )
         return True
@@ -623,9 +623,9 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
     add_user_task(update.effective_user.id, task)
 
     exam_when = exam_dt.strftime("%d.%m.%Y %H:%M") if has_time else exam_dt.strftime("%d.%m.%Y (time unknown)")
-    past_warning = "\n⚠️ That exam date has already passed — double-check this is the sitting you meant." if exam_dt.date() < berlin_now().date() else ""
+    past_warning = "\n⚠️ That exam date has already passed - double-check this is the sitting you meant." if exam_dt.date() < berlin_now().date() else ""
     await message.reply_text(
-        f"✅ Reminder set for {due_dt.strftime('%d.%m.%Y %H:%M')} — {exam_title} exam ({exam_when}){past_warning}"
+        f"✅ Reminder set for {due_dt.strftime('%d.%m.%Y %H:%M')} - {exam_title} exam ({exam_when}){past_warning}"
     )
     return True
 
@@ -661,7 +661,7 @@ async def _voice_intent_show_last_file(update, context, result, transcript, inte
         await message.reply_text(f"❌ Error: {str(e)[:200]}")
         return True
     if not cid:
-        await message.reply_text(f"🎙️ Couldn't match a course to \"{query_text}\" — try ⬇️ Files from the menu instead.")
+        await message.reply_text(f"🎙️ Couldn't match a course to \"{query_text}\" - try ⬇️ Files from the menu instead.")
         return True
     if not file_item:
         await message.reply_text(f"ℹ️ No files found at the top level of {course_name}.")
@@ -699,7 +699,7 @@ async def _voice_intent_list_course_files(update, context, result, transcript, i
         await message.reply_text(f"❌ Error: {str(e)[:200]}")
         return True
     if not cid:
-        await message.reply_text(f"🎙️ Couldn't match a course to \"{query_text}\" — try ⬇️ Files from the menu instead.")
+        await message.reply_text(f"🎙️ Couldn't match a course to \"{query_text}\" - try ⬇️ Files from the menu instead.")
         return True
     try:
         root_url = f"{BASE_URL}/dispatch.php/course/files?cid={cid}"
@@ -772,7 +772,7 @@ async def _voice_intent_course_enroll(update, context, result, transcript, inten
     from unibot.menus import _show_semester_picker
     default = load_default_semester()
     if not default.get("id"):
-        await message.reply_text("🎙️ No default semester set, so I can't match a course by name yet — pick a semester:")
+        await message.reply_text("🎙️ No default semester set, so I can't match a course by name yet - pick a semester:")
         await _show_semester_picker(message, "course_sem", "📚 Pick a semester to see courses currently open for enrolment:")
         return True
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
@@ -791,7 +791,7 @@ async def _voice_intent_course_enroll(update, context, result, transcript, inten
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"✅ Enroll in {matched['course'][:40]}?", callback_data=f"course_enroll_ask|{match_sem_id}")]])
         await message.reply_text(f"🎙️ Found a match: {matched['course']}", reply_markup=keyboard)
     else:
-        await message.reply_text("🎙️ Couldn't confidently match that course — here's the full list:")
+        await message.reply_text("🎙️ Couldn't confidently match that course - here's the full list:")
         await _render_open_courses_for_semester(message, default["id"])
     return True
 
@@ -814,10 +814,10 @@ async def _voice_intent_course_deenroll(update, context, result, transcript, int
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"🚪 Sign out of {title[:40]}?", callback_data=f"course_deenroll_ask|{match_cid}")]])
         await message.reply_text(f"🎙️ Found a match: {title}", reply_markup=keyboard)
     elif semester_id:
-        await message.reply_text("🎙️ Couldn't confidently match that course — here's your enrolled list:")
+        await message.reply_text("🎙️ Couldn't confidently match that course - here's your enrolled list:")
         await _render_enrolled_courses_for_semester(message, semester_id)
     else:
-        await message.reply_text("🎙️ Couldn't confidently match that course — pick a semester:")
+        await message.reply_text("🎙️ Couldn't confidently match that course - pick a semester:")
         await _show_semester_picker(message, "deenroll_sem", "🚪 Pick a semester to see its enrolled courses:")
     return True
 
@@ -846,7 +846,7 @@ async def _voice_intent_exam_register(update, context, result, transcript, inten
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"{label}: {matched_exam['title'][:40]}?", callback_data=f"exam_ask|{sid}")]])
         await message.reply_text(f"🎙️ Found a match: {matched_exam['title']}", reply_markup=keyboard)
     else:
-        await message.reply_text("🎙️ Couldn't confidently match that exam — here's the full list:")
+        await message.reply_text("🎙️ Couldn't confidently match that exam - here's the full list:")
         await send_exam_registration_menu(message, user_id=update.effective_user.id)
     return True
 
@@ -884,8 +884,10 @@ async def _voice_intent_read_daily_plan(update, context, result, transcript, int
     try:
         today = berlin_now().date()
         week_start = today - timedelta(days=today.weekday())
-        events = await get_calendar_events(session=state.global_session, week_start=week_start)
         voice_user_id = update.effective_user.id if update.effective_user else None
+        own = get_user_session(voice_user_id) if voice_user_id is not None else None
+        events = await get_calendar_events(session=own, week_start=week_start, user_id=voice_user_id) \
+            if own is not None else []
         await send_daily_plan_voice(message, events, today, user_id=voice_user_id)
     except Exception as e:
         logging.error("_route_voice_intent: read_daily_plan failed: %s", e)
@@ -898,8 +900,10 @@ async def _voice_intent_read_weekly_plan(update, context, result, transcript, in
     try:
         today = berlin_now().date()
         week_start = today - timedelta(days=today.weekday())
-        events = await get_calendar_events(session=state.global_session, week_start=week_start)
         voice_user_id = update.effective_user.id if update.effective_user else None
+        own = get_user_session(voice_user_id) if voice_user_id is not None else None
+        events = await get_calendar_events(session=own, week_start=week_start, user_id=voice_user_id) \
+            if own is not None else []
         await send_weekly_plan_voice(message, events, week_start, user_id=voice_user_id)
     except Exception as e:
         logging.error("_route_voice_intent: read_weekly_plan failed: %s", e)
@@ -918,14 +922,14 @@ async def _voice_intent_ask_question(update, context, result, transcript, intent
             context_data += "\n\nCourse material excerpts (from the student's Stud.IP course files, closest to the question first):\n" + "\n\n".join(
                 f"[{p['course']} | {p['file']}]\n{p['text']}" for p in passages
             )
-        name = (get_user_name(qa_user_id) if qa_user_id is not None else None) or get_primary_user_name()
+        name = get_user_name(qa_user_id)
         answer = await answer_question_with_context(transcript, context_data, name=name)
     except Exception as e:
         logging.error("_route_voice_intent: ask_question failed: %s", e)
         await message.reply_text(f"❌ Error answering that: {str(e)[:200]}")
         return True
     if not answer:
-        await message.reply_text("🤷 Couldn't come up with an answer right now — try again in a bit.")
+        await message.reply_text("🤷 Couldn't come up with an answer right now - try again in a bit.")
         return True
     await send_text_and_voice(message, answer)
     return True
@@ -984,7 +988,7 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
     the matching existing action.
 
     Destructive actions (enroll, sign out, exam register/deregister) are
-    never executed directly here — this only figures out which existing
+    never executed directly here - this only figures out which existing
     button the user meant, by fuzzy-matching the spoken course/exam name
     against the same candidate lists the real menus use, and presents that
     one button using the exact callback_data the real menu would generate.
@@ -1012,7 +1016,7 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_voice_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """User tapped one of the "did you mean...?" buttons offered when
-    classify_voice_intent came back "unclear" — re-run the same routing
+    classify_voice_intent came back "unclear" - re-run the same routing
     logic, this time with the intent forced to whichever one they picked."""
     query = update.callback_query
     await query.answer()
@@ -1023,7 +1027,7 @@ async def handle_voice_clarify(update: Update, context: ContextTypes.DEFAULT_TYP
 
     pending = context.user_data.pop("pending_voice_clarify", None)
     if not pending:
-        await query.edit_message_text("⚠️ This suggestion has expired — please send a new voice note.")
+        await query.edit_message_text("⚠️ This suggestion has expired - please send a new voice note.")
         return
 
     await query.edit_message_reply_markup(reply_markup=None)

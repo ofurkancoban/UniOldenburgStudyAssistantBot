@@ -32,7 +32,7 @@ WEATHER_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 
 def load_weather_location() -> Optional[dict]:
     """Return {"name", "country", "latitude", "longitude"} for the location
-    set via /status's "📍 Set Location", or None if unset — in which case
+    set via /status's "📍 Set Location", or None if unset - in which case
     get_weather_snapshot falls back to WEATHER_LATITUDE/WEATHER_LONGITUDE
     (Uni Oldenburg's coordinates by default)."""
     if db.exists(WEATHER_LOCATION_CACHE_PATH):
@@ -53,7 +53,7 @@ def save_weather_location(name: str, country: str, latitude: float, longitude: f
 async def geocode_location(query: str) -> Optional[dict]:
     """Resolve a free-text place name to {"name", "country", "latitude",
     "longitude"} via Open-Meteo's free, keyless geocoding API. Returns the
-    single best match, or None if nothing matched or the request failed —
+    single best match, or None if nothing matched or the request failed -
     callers should ask the user to try a different/more specific name
     rather than silently keeping the old location."""
     try:
@@ -83,7 +83,7 @@ async def geocode_location(query: str) -> Optional[dict]:
 
 
 async def handle_set_weather_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle set_weather_location callback (from /status) — ask for a
+    """Handle set_weather_location callback (from /status) - ask for a
     place name, geocoded via Open-Meteo (see geocode_location) and stored
     for get_weather_snapshot to use instead of the WEATHER_LATITUDE/
     WEATHER_LONGITUDE default."""
@@ -113,7 +113,7 @@ WEATHER_CODE_DESCRIPTIONS = {
     95: ("thunderstorm", "⛈️"), 96: ("thunderstorm with hail", "⛈️"), 99: ("severe thunderstorm", "⛈️"),
 }
 # WMO weather codes 51 and up are all some form of precipitation (drizzle,
-# rain, snow, showers, thunderstorm) — below that is dry (clear/cloudy/fog).
+# rain, snow, showers, thunderstorm) - below that is dry (clear/cloudy/fog).
 WEATHER_WET_CODE_THRESHOLD = 51
 
 
@@ -133,13 +133,13 @@ async def get_weather_snapshot(target_date=None) -> Optional[dict]:
     default) if none is set, via Open-Meteo (free, no API key needed).
 
     Deliberately focused on the 8–11 AM "leaving home" window rather than a
-    whole-day aggregate — a stormy afternoon shouldn't make an otherwise
+    whole-day aggregate - a stormy afternoon shouldn't make an otherwise
     clear morning commute look bad, and vice versa. Picks the worst
     (highest) weather code in that window, so a "will I get wet leaving
     the house" read is conservative rather than averaged-away.
 
     Returns {"description", "emoji", "is_wet", "precip_chance", "temp_min",
-    "temp_max"}, or None on any failure — callers should just omit the
+    "temp_max"}, or None on any failure - callers should just omit the
     weather section rather than block the rest of the message on it.
     `target_date` defaults to today; only today/tomorrow are meaningfully
     forecastable, so this isn't meant for the weekly plan.
@@ -206,7 +206,7 @@ async def get_weather_snapshot(target_date=None) -> Optional[dict]:
 
 
 def build_weather_text_line(weather: dict) -> str:
-    """Short, deterministic weather + clothing line for the text message —
+    """Short, deterministic weather + clothing line for the text message -
     LLM-independent, so it's always available even when OpenRouter isn't.
     The voice narration gets the raw snapshot instead and phrases its own
     advice (see build_ai_daily_plan_narration)."""
@@ -220,12 +220,12 @@ def build_weather_text_line(weather: dict) -> str:
     tip_text = ", ".join(tips) if tips else "no special prep needed"
     return (
         f"{weather['emoji']} Weather in {weather['location_name']}: {weather['description']}, {weather['temp_min']:.0f}–{weather['temp_max']:.0f}°C, "
-        f"{weather['precip_chance']}% chance of rain — {tip_text}"
+        f"{weather['precip_chance']}% chance of rain - {tip_text}"
     )
 
 
 async def check_weather_health() -> tuple[bool, str]:
-    """(ok, detail) — free/keyless, so just confirms Open-Meteo itself is
+    """(ok, detail) - free/keyless, so just confirms Open-Meteo itself is
     reachable right now, same endpoint get_weather_snapshot calls."""
     try:
         url = f"https://api.open-meteo.com/v1/forecast?latitude={WEATHER_LATITUDE}&longitude={WEATHER_LONGITUDE}&current_weather=true"

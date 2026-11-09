@@ -30,6 +30,8 @@ from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from studip_utils import html_escape as _h
+
 from stums_parsers import (  # noqa: F401 - the parsing layer, re-exported for callers
     ACTION_ONCLICK_RE,
     ACTION_PARAM_PAIR_RE,
@@ -284,7 +286,7 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
                 text = (
                     "📚 <b>UPCOMING EXAM</b>\n"
                     "━━━━━━━━━━━━━━━━━\n"
-                    f"📘 <b>Course:</b> {exam['title']}\n"
+                    f"📘 <b>Course:</b> {_h(exam['title'])}\n"
                     f"📅 <b>Date:</b> {exam['date_line']}\n"
                     f"{form_line}"
                     f"{examiner_line}"
@@ -310,7 +312,7 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
                 text = (
                     "⏰ <b>EXAM STARTING SOON</b>\n"
                     "━━━━━━━━━━━━━━━━━\n"
-                    f"📘 <b>Course:</b> {exam['title']}\n"
+                    f"📘 <b>Course:</b> {_h(exam['title'])}\n"
                     f"📅 <b>Date:</b> {exam['date_line']}\n"
                     f"{form_line}"
                     f"⌛ <b>Starts in ~{int(hours_left)} hour(s)</b>\n"
@@ -343,7 +345,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
 
     `broadcast_fn` must be an async callable with signature (bot, text, parse_mode="HTML"),
     matching studip_bot.broadcast. `exam_action_cache` is studip_bot's short_id -> {unit_id,
-    action_type, title, ...} cache (the same one the Exam Registration menu's buttons use) —
+    action_type, title, ...} cache (the same one the Exam Registration menu's buttons use) -
     each notification gets its own short id registered here so its "Register" button can
     reuse the existing exam_ask/exam_do confirm flow instead of a new one.
     """
@@ -383,9 +385,9 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
         if code in muted_codes:
             continue
         end_date = datetime.fromisoformat(exam["end_date"]) if exam["end_date"] else None
-        class_line = f"👥 <b>Class:</b> {exam['group_label']}\n" if exam.get("group_label") else ""
-        room_line = f"📍 <b>Room:</b> {exam['room']}\n" if exam.get("room") else ""
-        exam_date_line = f"📅 <b>Exam Date:</b> {exam['exam_date_display']}\n" if exam.get("exam_date_display") else ""
+        class_line = f"👥 <b>Class:</b> {_h(exam['group_label'])}\n" if exam.get("group_label") else ""
+        room_line = f"📍 <b>Room:</b> {_h(exam['room'])}\n" if exam.get("room") else ""
+        exam_date_line = f"📅 <b>Exam Date:</b> {_h(exam['exam_date_display'])}\n" if exam.get("exam_date_display") else ""
 
         sid = str(uuid.uuid4())[:8]
         exam_action_cache[sid] = {
@@ -412,7 +414,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
             text = (
                 "🆕 <b>EXAM REGISTRATION OPEN</b>\n"
                 "━━━━━━━━━━━━━━━━━\n"
-                f"📘 <b>Course:</b> {exam['title']}\n"
+                f"📘 <b>Course:</b> {_h(exam['title'])}\n"
                 f"{exam_date_line}"
                 f"{class_line}"
                 f"{room_line}"
@@ -438,7 +440,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
                     text = (
                         "⏰ <b>EXAM REGISTRATION CLOSING SOON</b>\n"
                         "━━━━━━━━━━━━━━━━━\n"
-                        f"📘 <b>Course:</b> {exam['title']}\n"
+                        f"📘 <b>Course:</b> {_h(exam['title'])}\n"
                         f"{exam_date_line}"
                         f"{class_line}"
                         f"{room_line}"
@@ -460,7 +462,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
     # window ended; clear its notification state so a future re-opening (e.g. a
     # resit period) is treated as new again. But if its unit's detail-page fetch
     # simply failed this cycle (in failed_codes), we don't actually know it
-    # closed — purging it here would make the next successful check treat it
+    # closed - purging it here would make the next successful check treat it
     # as newly-opened again and resend the "registration open" notification
     # for an exam that was never actually closed.
     # a legacy unit whose sittings were not in this result keeps its old key
@@ -503,7 +505,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
 
 # Terminal grade statuses worth notifying about (as opposed to interim states
 # like "Coursework submitted/registered" or "admission"). The grades page spells
-# the failing one "not passed", not "failed" — matched exactly since "passed" is
+# the failing one "not passed", not "failed" - matched exactly since "passed" is
 # a substring of "not passed".
 FINAL_GRADE_STATUSES = {"passed", "not passed"}
 

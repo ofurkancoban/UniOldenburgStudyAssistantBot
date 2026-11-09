@@ -3,6 +3,7 @@
 Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
+import asyncio
 import json
 import logging
 import posixpath
@@ -37,7 +38,7 @@ from unibot.storage import (
     save_studip_user_name,
 )
 
-from unibot.config import ALLOWED_USER_IDS  # noqa: E402
+from unibot.config import PRIMARY_ADMIN_ID  # noqa: E402
 from unibot.preferences import get_pref  # noqa: E402
 
 BASE_URL = "https://elearning.uni-oldenburg.de"
@@ -275,7 +276,7 @@ async def _ensure_watched_courses_map(session) -> None:
     depends on whatever semester some unrelated browsing interaction
     (Files/Enroll/Sign Out's own semester pickers) last left the shared
     session's filter pointed at, which isn't reliable here."""
-    owner = getattr(session, "user_id", None) or next(iter(ALLOWED_USER_IDS), None)
+    owner = getattr(session, "user_id", None) or PRIMARY_ADMIN_ID
     want_prev = bool(get_pref(owner, "watch_previous_semester"))
     if state.courses_map and state._courses_map_built_with_prev == want_prev:
         return
@@ -429,6 +430,8 @@ async def get_studip_user_profile(user_id: Optional[int] = None, session: Any = 
                 save_studip_user_name(display_name)
         elif studip_id and user_id is not None:
             _user_profiles[user_id] = profile
+            if display_name:
+                save_studip_user_name(display_name, user_id=user_id)
         return profile
     except Exception as exc:
         logging.warning("Could not fetch Stud.IP user profile: %s", exc)
@@ -763,9 +766,19 @@ async def get_fresh_file_url(cid, filename, current_url=None, session=None, user
 
 
 # ── recursive ZIP (downloads all files + subfolders) ───────────────────────────
+# Downloads stop once this much raw data is collected: Telegram takes 50 MB at
+# most, and the whole archive is built in memory.
+ZIP_RAW_LIMIT_BYTES = 150 * 1024 * 1024
+
+
 async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=None, session=None, user_id=None):
-    """Download all files (including subfolders) recursively browser-less."""
-    active_session: Any = session or get_user_session(user_id) or state.global_session
+    """Download all files (including subfolders) recursively browser-less.
+    Stops at ZIP_RAW_LIMIT_BYTES (the returned total_size then exceeds it)
+    and compresses off the event loop, so a huge folder can't freeze the bot."""
+    # a student's own session only: never someone else's login
+    active_session: Any = session or get_user_session(user_id) or (state.global_session if user_id is None else None)
+    if active_session is None:
+        return BytesIO(), 0, root_name, 0, 0
 
     async def _crawl(url, path_prefix, collected, empty_folders):
         try:
@@ -814,13 +827,20 @@ async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=
                 logging.warning("⚠️ No URL found for %s, skipping.", filename)
                 continue
 
+            if total_size > ZIP_RAW_LIMIT_BYTES:
+                logging.info("ZIP stopped at %s files: over %s bytes", i - 1, ZIP_RAW_LIMIT_BYTES)
+                break
             try:
                 file_url = _normalize_url(file_url)
                 async with await active_session.get(file_url) as resp:
+                    length = resp.content_length
+                    if resp.status == 200 and length and total_size + length > ZIP_RAW_LIMIT_BYTES:
+                        total_size += length  # too big: counted, not downloaded
+                        continue
                     if resp.status == 200:
                         content = await resp.read()
                         total_size += len(content)
-                        zipf.writestr(zip_path, content)
+                        await asyncio.to_thread(zipf.writestr, zip_path, content)
                         success_count += 1
                     else:
                         logging.warning("⚠️ Failed to download %s (Status: %s)", filename, resp.status)

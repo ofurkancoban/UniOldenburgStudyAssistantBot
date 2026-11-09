@@ -6,7 +6,9 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 import logging
 import os
 import secrets
+import sys
 import tempfile
+import time
 from logging.handlers import RotatingFileHandler
 
 
@@ -15,6 +17,14 @@ from logging.handlers import RotatingFileHandler
 # a shell elsewhere) never scatters or loses state.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.chdir(PROJECT_ROOT)
+
+# Local times in logs and the few naive datetimes are Berlin time whatever
+# the host's zone is. An explicit TZ wins (the tests run with TZ=UTC to prove
+# the bot does not depend on it).
+if not os.environ.get("TZ"):
+    os.environ["TZ"] = "Europe/Berlin"
+    if hasattr(time, "tzset"):
+        time.tzset()
 
 try:
     from dotenv import load_dotenv
@@ -79,7 +89,16 @@ except (PermissionError, OSError):
 # Exactly one console and one file handler with one format (basicConfig plus
 # an extra StreamHandler used to print every line twice in two formats).
 _LOG_FORMAT = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
-_console_handler = logging.StreamHandler()
+# INFO goes to stdout and WARNING and above to stderr, so PM2's error log
+# holds only problems (it used to get every line).
+_console_handler = logging.StreamHandler(sys.stdout)
+_error_console_handler = logging.StreamHandler(sys.stderr)
+_error_console_handler.setLevel(logging.WARNING)
+
+
+class _BelowWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno < logging.WARNING
 
 
 class TransientTelegramErrorFilter(logging.Filter):
@@ -100,15 +119,17 @@ class TransientTelegramErrorFilter(logging.Filter):
         return True
 
 
-for _handler in (_file_handler, _console_handler):
+for _handler in (_file_handler, _console_handler, _error_console_handler):
     _handler.setFormatter(_LOG_FORMAT)
     _handler.addFilter(TransientTelegramErrorFilter())
+_console_handler.addFilter(_BelowWarningFilter())  # after the level rewrite above
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
 for _old_handler in list(root_logger.handlers):
     root_logger.removeHandler(_old_handler)
 root_logger.addHandler(_file_handler)
 root_logger.addHandler(_console_handler)
+root_logger.addHandler(_error_console_handler)
 # httpx logs every request URL at INFO, and Telegram's URLs carry the bot
 # token (api.telegram.org/bot<token>/...), so it would end up in the logs.
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -139,7 +160,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "cohere/north-mini-code:free")
 # Dedicated text-to-speech models (a separate OpenRouter API surface from
-# chat/completions — see synthesize_speech). deepgram/flux-tts:free requires
+# chat/completions - see synthesize_speech). deepgram/flux-tts:free requires
 # an explicit "voice"; fish-audio/s2.1-pro-free:free doesn't need one.
 OPENROUTER_TTS_MODEL = os.getenv("OPENROUTER_TTS_MODEL", "fish-audio/s2.1-pro-free:free")
 OPENROUTER_TTS_VOICE = os.getenv("OPENROUTER_TTS_VOICE", "")  # fish-audio/s2.1-pro-free:free has no selectable voice param - OpenRouter's previous free TTS model (deepgram/flux-tts:free) was discontinued and this replaced it; passing a "voice" value this model doesn't support (e.g. the old "flux-elise-en") causes a 400
@@ -164,7 +185,7 @@ GWDG_WHISPER_MODEL = os.getenv("GWDG_WHISPER_MODEL", "whisper-large-v3")
 # slow thinking phase; in a live comparison this model got the layering
 # right every time in 2-3 s, where the default model broke the rules.
 OUTFIT_OPENROUTER_MODEL = os.getenv("OUTFIT_OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
-# Free-tier providers for the "👔 My Wardrobe" daily outfit feature — kept
+# Free-tier providers for the "👔 My Wardrobe" daily outfit feature - kept
 # separate from OpenRouter since neither vision tagging nor image generation
 # runs on OpenRouter's free text models; both of these have a genuinely free
 # tier instead (Cloudflare Workers AI's daily Neuron allowance, HF's shared
@@ -195,7 +216,7 @@ GWDG_EMBEDDING_MODEL = os.getenv("GWDG_EMBEDDING_MODEL", "e5-mistral-7b-instruct
 
 # ── weather ───────────────────────────────────────────────────────────────────
 # University of Oldenburg's coordinates, for the daily-plan weather snapshot
-# (see get_weather_snapshot) — configurable in case the bot is ever reused
+# (see get_weather_snapshot) - configurable in case the bot is ever reused
 # for a different campus.
 WEATHER_LATITUDE = os.getenv("WEATHER_LATITUDE", "53.1435")
 WEATHER_LONGITUDE = os.getenv("WEATHER_LONGITUDE", "8.2146")

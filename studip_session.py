@@ -36,6 +36,11 @@ from studip_utils import redact_url, route_proxy_url, unroute_proxy_url
 LOGIN_STATE_LISTENERS: list = []
 
 
+def _read_json_file(path: str):
+    with open(path, "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
 def _report_login_state(user_id, ok: bool) -> None:
     if not user_id:
         return
@@ -67,6 +72,7 @@ async def _worker_refusal(resp) -> str:
     try:
         body = (await resp.text())[:120]
     except Exception:
+        logging.debug("Worker error body unreadable", exc_info=True)
         return ""
     if body.startswith("Forbidden: host") or body.strip() == "Unauthorized":
         return body.strip()
@@ -539,10 +545,9 @@ class StudIPSession(SsoFlowMixin):
         if data is None and self.cookie_file and os.path.exists(self.cookie_file):
             try:
                 from studip_vault import read_vault_file
-                data = read_vault_file(self.cookie_file, auto_migrate=True)
+                data = await asyncio.to_thread(read_vault_file, self.cookie_file, True)
                 if data is None:
-                    with open(self.cookie_file, "r", encoding="utf-8") as f:
-                        data = json.load(f)
+                    data = await asyncio.to_thread(_read_json_file, self.cookie_file)
                 if data:
                     self.logger.info("Encrypted cookies loaded from %s", self.cookie_file)
                     migrate_to_db = bool(getattr(self, "user_id", None))

@@ -32,6 +32,11 @@ URL_WAIT_SECONDS = 90
 STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cloudflared")
 
 
+def _read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -116,21 +121,18 @@ class QuickTunnel:
 
     def _read_existing(self) -> tuple[Optional[int], str]:
         pid = None
-        if os.path.exists(self._pid_file):
-            try:
-                with open(self._pid_file, "r", encoding="utf-8") as fh:
-                    pid = int(fh.read().strip())
-            except (OSError, ValueError):
-                pid = None
+        try:
+            pid = int(_read_text(self._pid_file).strip())
+        except (OSError, ValueError):
+            pid = None
         if not pid or not _pid_alive(pid):
             return None, ""
         url = ""
         if os.path.exists(self._log_file):
             try:
-                with open(self._log_file, "r", encoding="utf-8", errors="replace") as fh:
-                    matches = URL_RE.findall(fh.read())
-                    if matches:
-                        url = matches[-1]
+                matches = URL_RE.findall(_read_text(self._log_file))
+                if matches:
+                    url = matches[-1]
             except OSError:
                 pass
         return pid, url
@@ -191,7 +193,8 @@ class QuickTunnel:
                             res = self.on_url_change(self._url)
                             if asyncio.iscoroutine(res):
                                 await res
-                    while not self._stopping and _pid_alive(pid):
+                    # cloudflared is another process: polling its pid is the only signal
+                    while not self._stopping and _pid_alive(pid):  # noqa: ASYNC110
                         await asyncio.sleep(2.0)
                 elif pid:
                     # Running but no URL yet: give it time instead of spawning
@@ -234,32 +237,29 @@ class QuickTunnel:
             check=False,
         )
         pid = None
-        if os.path.exists(self._pid_file):
-            try:
-                with open(self._pid_file, "r", encoding="utf-8") as fh:
-                    pid = int(fh.read().strip())
-            except (OSError, ValueError):
-                pid = None
+        try:
+            pid = int((await asyncio.to_thread(_read_text, self._pid_file)).strip())
+        except (OSError, ValueError):
+            pid = None
         self._pid = pid
 
         for _ in range(120):
             if self._stopping or (pid and not _pid_alive(pid)):
                 break
             try:
-                with open(self._log_file, "r", encoding="utf-8", errors="replace") as fh:
-                    matches = URL_RE.findall(fh.read())
-                    if matches:
-                        new_url = matches[-1]
-                        if new_url != self._url:
-                            self._url = new_url
-                            logging.info("🌐 Public login URL: %s", self._url)
-                            if self.on_url_change:
-                                res = self.on_url_change(self._url)
-                                if asyncio.iscoroutine(res):
-                                    await res
-                        break
+                matches = URL_RE.findall(await asyncio.to_thread(_read_text, self._log_file))
             except OSError:
-                pass
+                matches = []
+            if matches:
+                new_url = matches[-1]
+                if new_url != self._url:
+                    self._url = new_url
+                    logging.info("🌐 Public login URL: %s", self._url)
+                    if self.on_url_change:
+                        res = self.on_url_change(self._url)
+                        if asyncio.iscoroutine(res):
+                            await res
+                break
             await asyncio.sleep(0.25)
 
 
@@ -283,12 +283,10 @@ class NamedTunnel(QuickTunnel):
 
     def _read_existing(self) -> tuple[Optional[int], str]:
         pid = None
-        if os.path.exists(self._pid_file):
-            try:
-                with open(self._pid_file, "r", encoding="utf-8") as fh:
-                    pid = int(fh.read().strip())
-            except (OSError, ValueError):
-                pid = None
+        try:
+            pid = int(_read_text(self._pid_file).strip())
+        except (OSError, ValueError):
+            pid = None
         if not pid or not _pid_alive(pid):
             return None, ""
         return pid, self.public_url

@@ -289,7 +289,7 @@ def _parse_examination_periods(body_text: str, now: Optional[datetime] = None) -
 
             if exam_date_obj:
                 # Day/month/year + 24h, not the page's scraped "Nov 27,
-                # 2026" / "4:00 PM" — matches the rest of the bot's date
+                # 2026" / "4:00 PM" - matches the rest of the bot's date
                 # formatting conventions.
                 exam_date = exam_date_obj.isoformat()
                 exam_date_display = exam_date_obj.strftime("%a, %d.%m.%Y")

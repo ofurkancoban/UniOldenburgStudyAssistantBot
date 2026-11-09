@@ -21,6 +21,7 @@ import hashlib
 import html
 import json
 import logging
+import re
 import time
 from datetime import datetime
 from typing import Awaitable, Callable, Optional
@@ -30,7 +31,7 @@ from telegram.ext import ContextTypes
 
 from studip_utils import TZ_BERLIN
 from unibot import db, state
-from unibot.auth import has_stored_login, is_user_allowed
+from unibot.auth import ACTIVE, has_stored_login, is_user_allowed, lifecycle_state
 from unibot.preferences import DIGEST_HOUR, get_pref, in_quiet_hours, morning_send_time
 from unibot.storage import load_default_semester
 from unibot.studip_api import BASE_URL
@@ -166,6 +167,7 @@ def _semester_label() -> Optional[str]:
     try:
         return load_default_semester().get("label")
     except Exception:
+        logging.debug("Default semester unavailable", exc_info=True)
         return None
 
 
@@ -235,6 +237,9 @@ def delivery_format(uid: int, cid: Optional[str], kind: str) -> Optional[str]:
 
 ALERT_QUEUE_KIND = "alert_queue"
 QUEUE_BUTTON_LIMIT = 8
+QUEUE_MAX_ITEMS = 100                 # a student away for long keeps the newest
+QUEUE_MAX_AGE_SECONDS = 3 * 86400     # older held alerts are dropped, not sent
+DIGEST_TEXT_LIMIT = 3800              # below Telegram's 4096, whole lines only
 
 
 def files_link_markup(cid: Optional[str]) -> Optional[InlineKeyboardMarkup]:
@@ -271,10 +276,19 @@ def _hold_reason(uid: int, now: datetime) -> Optional[str]:
 def queue_alert(uid: int, kind: str, cid: Optional[str], title_text: str, markup, reason: str,
                 now: Optional[datetime] = None) -> None:
     scope = db.get_user_scope(uid)
+    now = now or datetime.now(TZ_BERLIN)
     queue = list(scope.private(ALERT_QUEUE_KIND) or [])
     queue.append({"kind": kind, "cid": cid, "title": title_text, "button": _first_button(markup),
-                  "reason": reason, "ts": (now or datetime.now(TZ_BERLIN)).timestamp()})
-    scope.save_private(ALERT_QUEUE_KIND, queue)
+                  "reason": reason, "ts": now.timestamp()})
+    scope.save_private(ALERT_QUEUE_KIND, _prune_queue(queue, now))
+
+
+def _prune_queue(queue: list, now: datetime) -> list:
+    """Drop held alerts older than QUEUE_MAX_AGE_SECONDS and keep at most
+    QUEUE_MAX_ITEMS (the newest)."""
+    cutoff = now.timestamp() - QUEUE_MAX_AGE_SECONDS
+    fresh = [item for item in queue if not isinstance(item.get("ts"), (int, float)) or item["ts"] >= cutoff]
+    return fresh[-QUEUE_MAX_ITEMS:]
 
 
 async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str, *,
@@ -323,25 +337,48 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
     return counts
 
 
-def _queue_due(uid: int, item: dict, now: datetime) -> bool:
-    """A held alert goes out once the reason is over: quiet hours ended and
-    the student's morning summary time passed (or quiet end without one);
-    digest items at DIGEST_HOUR, never inside quiet hours."""
+def _queue_due(uid: int, item: dict, now: datetime, with_morning: bool = False) -> bool:
+    """A held alert goes out once the reason is over: right after the
+    student's morning summary (with_morning, even inside quiet hours: they
+    are up), else when quiet hours ended and the morning summary time passed
+    (or quiet end without one); digest items at DIGEST_HOUR, never inside
+    quiet hours."""
+    local = now.astimezone(TZ_BERLIN)
+    is_digest = item.get("reason") == "digest" and get_pref(uid, "delivery_mode") == "digest"
+    if with_morning and not is_digest:
+        return True
     if in_quiet_hours(uid, now):
         return False
-    local = now.astimezone(TZ_BERLIN)
-    if item.get("reason") == "digest" and get_pref(uid, "delivery_mode") == "digest":
+    if is_digest:
         return local.hour >= DIGEST_HOUR
     morning = morning_send_time(uid)
     return morning is None or local.time() >= morning or local.hour >= DIGEST_HOUR
 
 
 def digest_text(items: list) -> str:
+    """The digest message for `items` (see digest_batch for the size limit)."""
     kinds = {"files": "📄", "announcements": "📢", "forum": "💬"}
     lines = [f"🗞️ <b>Course updates</b> ({len(items)})", ""]
     for item in items:
         lines.append(item.get("title") or f"{kinds.get(item.get('kind'), '•')} update")
-    return "\n".join(lines)[:4000]
+    return "\n".join(lines)
+
+
+def digest_batch(items: list) -> list:
+    """The leading items whose digest fits DIGEST_TEXT_LIMIT. Whole lines
+    only: cutting the text could split an HTML tag and Telegram would reject
+    the message. The rest stays queued for the next digest."""
+    batch: list = []
+    for item in items:
+        if batch and len(digest_text(batch + [item])) > DIGEST_TEXT_LIMIT:
+            break
+        batch.append(item)
+    return batch
+
+
+def _plain(text: str) -> str:
+    """HTML digest text as plain text (fallback when Telegram rejects it)."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
 def digest_markup(items: list) -> Optional[InlineKeyboardMarkup]:
@@ -357,24 +394,42 @@ def digest_markup(items: list) -> Optional[InlineKeyboardMarkup]:
     return InlineKeyboardMarkup(rows) if rows else None
 
 
-async def flush_alert_queues(bot, now: Optional[datetime] = None) -> int:
+async def flush_alert_queues(bot, now: Optional[datetime] = None, user_ids=None,
+                             with_morning: bool = False) -> int:
     """Send each student's due held alerts as one digest message; returns
-    how many students got one."""
+    how many students got one. `user_ids` limits it to those students and
+    `with_morning` sends their quiet-hours alerts right after the morning
+    summary. Paused students (not ACTIVE) keep their queue until /start."""
+    from telegram.error import BadRequest
+
     now = now or datetime.now(TZ_BERLIN)
     sent = 0
-    for uid in db.private_owner_ids(ALERT_QUEUE_KIND):
-        scope = db.get_user_scope(uid)
-        queue = list(scope.private(ALERT_QUEUE_KIND) or [])
-        due = [item for item in queue if _queue_due(uid, item, now)]
-        if not due:
+    owners = db.private_owner_ids(ALERT_QUEUE_KIND)
+    for uid in owners if user_ids is None else [u for u in owners if u in set(user_ids)]:
+        if lifecycle_state(uid) != ACTIVE:
             continue
+        scope = db.get_user_scope(uid)
+        stored = list(scope.private(ALERT_QUEUE_KIND) or [])
+        queue = _prune_queue(stored, now)
+        if queue != stored:
+            scope.save_private(ALERT_QUEUE_KIND, queue)
+        batch = digest_batch([item for item in queue if _queue_due(uid, item, now, with_morning)])
+        if not batch:
+            continue
+        text, markup = digest_text(batch), digest_markup(batch)
         try:
-            await bot.send_message(chat_id=uid, text=digest_text(due), parse_mode="HTML",
-                                   disable_notification=False, reply_markup=digest_markup(due))
+            try:
+                await bot.send_message(chat_id=uid, text=text, parse_mode="HTML",
+                                       disable_notification=False, reply_markup=markup)
+            except BadRequest as e:
+                # a title Telegram can't parse must not hold the queue forever
+                logging.warning("Course digest for %s rejected (%s); sending it as plain text", uid, e)
+                await bot.send_message(chat_id=uid, text=_plain(text), disable_notification=False,
+                                       reply_markup=markup)
         except Exception as e:
             logging.warning("Course digest for %s failed: %s", uid, e)
             continue
-        scope.save_private(ALERT_QUEUE_KIND, [item for item in queue if item not in due])
+        scope.save_private(ALERT_QUEUE_KIND, [item for item in queue if item not in batch])
         sent += 1
         await asyncio.sleep(0.3)  # Telegram rate limit safety between students
     return sent

@@ -351,8 +351,10 @@ def upsert_user(
     username: Optional[str] = None,
     full_name: Optional[str] = None,
     studip_username: Optional[str] = None,
-    is_active: int = 1,
+    is_active: Optional[int] = None,
 ) -> dict:
+    """Create or update a user. `is_active` None keeps an existing user's
+    state (a blocked user stays blocked) and makes a new user active."""
     now = time.time()
     with _lock:
         existing = get_user(telegram_id)
@@ -361,16 +363,17 @@ def upsert_user(
             effective_uname = username if username is not None else existing.get("username")
             effective_fname = full_name if full_name is not None else existing.get("full_name")
             effective_studip = studip_username if studip_username is not None else existing.get("studip_username")
+            effective_active = is_active if is_active is not None else (1 if existing.get("is_active") else 0)
             _connection().execute(
                 "UPDATE users SET role = ?, username = ?, full_name = ?, studip_username = ?, is_active = ?, last_active_at = ? "
                 "WHERE telegram_id = ?",
-                (effective_role, effective_uname, effective_fname, effective_studip, is_active, now, telegram_id),
+                (effective_role, effective_uname, effective_fname, effective_studip, effective_active, now, telegram_id),
             )
         else:
             _connection().execute(
                 "INSERT INTO users (telegram_id, role, username, full_name, studip_username, is_active, created_at, last_active_at, interaction_count) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (telegram_id, role, username, full_name, studip_username, is_active, now, now, 0),
+                (telegram_id, role, username, full_name, studip_username, 1 if is_active is None else is_active, now, now, 0),
             )
         user = get_user(telegram_id)
         assert user is not None  # just written in this transaction
@@ -468,6 +471,12 @@ def redeem_invite_token(code: str, telegram_id: int, full_name: Optional[str] = 
             return False, "This invite code has already been used."
         if now > row[3]:  # expires_at
             return False, "This invite code has expired."
+        existing = get_user(telegram_id)
+        if existing and not existing.get("is_active"):
+            # an invite code never lifts a block set by an administrator
+            return False, "This account was blocked by an administrator."
+        if existing:
+            return True, "You already have access."  # no quota used
 
         uses = row[6] + 1
         _connection().execute(
@@ -479,7 +488,6 @@ def redeem_invite_token(code: str, telegram_id: int, full_name: Optional[str] = 
             role="user",
             username=username,
             full_name=full_name,
-            is_active=1,
         )
         set_lifecycle(telegram_id, "active", "invite redeemed")
         return True, "Invite code verified successfully. Welcome!"
@@ -929,8 +937,8 @@ def _migrate_shared_tasks() -> None:
         except Exception:
             logging.warning("The shared task list could not be read; left in place")
             return
-        from unibot.config import ALLOWED_USER_IDS
-        fallback = next(iter(ALLOWED_USER_IDS), None)
+        from unibot.config import PRIMARY_ADMIN_ID
+        fallback = PRIMARY_ADMIN_ID
         by_owner: dict[int, list] = {}
         for task in shared if isinstance(shared, list) else []:
             owner = task.get("user_id") if isinstance(task.get("user_id"), int) else fallback

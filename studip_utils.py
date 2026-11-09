@@ -6,6 +6,7 @@ anywhere and unit-tested without starting the bot.
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -224,3 +225,24 @@ def unroute_proxy_url(url: str) -> str:
         logging.debug("Ignored a non-critical error", exc_info=True)
 
     return str(url)
+
+
+# ── file I/O off the event loop ───────────────────────────────────────────────
+def _read_bytes(path: str) -> bytes:
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _write_bytes(path: str, data: bytes) -> None:
+    with open(path, "wb") as fh:
+        fh.write(data)
+
+
+async def aread_bytes(path: str) -> bytes:
+    """Read a whole file in a worker thread (async code must not block)."""
+    return await asyncio.to_thread(_read_bytes, path)
+
+
+async def awrite_bytes(path: str, data: bytes) -> None:
+    """Write a whole file in a worker thread (async code must not block)."""
+    await asyncio.to_thread(_write_bytes, path, data)

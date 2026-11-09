@@ -4,6 +4,7 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import asyncio
+import logging
 import subprocess
 from datetime import datetime
 from typing import Any, Optional
@@ -13,6 +14,25 @@ import aiohttp
 from studip_login_server import LoginServer
 from studip_session import StudIPSession
 from studip_tunnel import QuickTunnel
+
+
+_background_tasks: set = set()
+
+
+def spawn(coro, name: Optional[str] = None) -> asyncio.Task:
+    """asyncio.create_task that keeps a reference until the task ends (the
+    loop holds only a weak one, so an unreferenced task can vanish) and
+    logs an exception instead of losing it."""
+    task = asyncio.create_task(coro, name=name)
+    _background_tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logging.error("Background task %s failed", t.get_name(), exc_info=t.exception())
+
+    task.add_done_callback(_done)
+    return task
 
 
 last_full_check_time: Optional[datetime] = None

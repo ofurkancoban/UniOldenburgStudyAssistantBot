@@ -14,17 +14,21 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from studip_utils import safe_filename
 from unibot import course_registry, state
 from unibot.auth import get_user_session
-from unibot.config import ALLOWED_USER_IDS
+from unibot.config import PRIMARY_ADMIN_ID
 from unibot.formatting import (
     _short_id,
 )
-from unibot.storage import link_cache
+from unibot.storage import link_cache, persistent_callback_cache
 from unibot.telegram_ui import (  # noqa: F401 - broadcast is re-exported for callers
     broadcast,
 )
 
-task_suggestion_cache: dict[str, dict] = {}  # short_id -> { text, due_time (ISO or None), course }
-announcement_task_cache: dict[str, dict] = {}  # short_id -> { course, subject, body } - raw announcement, converted to a task on demand when "📝 Add as Task" is tapped
+# short_id -> { text, due_time (ISO or None), course }; persisted, so the
+# button works after a restart and for every follower of the course
+task_suggestion_cache = persistent_callback_cache("task_suggestions.json")
+# short_id -> { course, subject, body } - raw announcement, converted to a
+# task on demand when "📝 Add as Task" is tapped
+announcement_task_cache = persistent_callback_cache("announcement_tasks.json")
 
 
 def course_members(cid: Optional[str]):
@@ -126,7 +130,7 @@ async def _send_file_alerts(bot, events: list) -> None:
         try:
             sid = _short_id()
             downloader = next(iter(sorted(course_members(it.get("cid")) or ())), None) \
-                or next(iter(ALLOWED_USER_IDS), None)
+                or PRIMARY_ADMIN_ID
             link_cache[sid] = {
                 "cid": it["cid"],
                 "name": it["name"],

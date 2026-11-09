@@ -8,7 +8,6 @@ import html
 import logging
 import os
 import shutil
-import subprocess
 import sys
 import time
 
@@ -31,7 +30,7 @@ from unibot.config import (
 )
 from unibot.preferences import get_pref
 from unibot.storage import (
-    get_primary_user_name,
+    get_user_name,
     get_wardrobe_feature_enabled,
     get_weekly_study_plan_enabled,
     link_cache,
@@ -63,7 +62,7 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("♻️ Restarting bot...")
     logging.info("Restart requested by user %s.", user_id)
-    asyncio.create_task(_restart_process())
+    state.spawn(_restart_process(), name="restart")
 
 
 async def _restart_process():
@@ -187,14 +186,16 @@ async def healthcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append("━━━━━━━━━━━━━━━━━")
 
     try:
-        commit = subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=PROJECT_ROOT,
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        lines.append(f"📦 Running commit: <code>{commit}</code>")
-    except (OSError, subprocess.SubprocessError):
-        pass
+        proc = await asyncio.create_subprocess_exec(
+            "git", "rev-parse", "--short", "HEAD", cwd=PROJECT_ROOT,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        commit = out.decode().strip()
+        if proc.returncode == 0 and commit:
+            lines.append(f"📦 Running commit: <code>{html.escape(commit)}</code>")
+    except (OSError, asyncio.TimeoutError):
+        logging.debug("Commit lookup skipped", exc_info=True)
 
     await msg.edit_text("\n".join(lines), parse_mode="HTML")
 
@@ -369,8 +370,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         logging.debug("Stud.IP profile lookup failed", exc_info=True)
     if not studip_name:
-        studip_name = get_primary_user_name()
-    text += f"\n👤 Name: {studip_name or 'Not connected'} (from Stud.IP)"
+        studip_name = get_user_name(user_id)
+    text += f"\n👤 Name: {html.escape(studip_name or 'Not connected')} (from Stud.IP)"
 
     weather_location = load_weather_location()
     weather_location_label = f"{weather_location['name']}, {weather_location['country']}" if weather_location else "Uni Oldenburg (default)"
@@ -658,11 +659,11 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 
         text = (
             "━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Student Profile: @{name}</b>\n"
+            f"👤 <b>Student Profile: @{html.escape(str(name))}</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
             f"🆔 <b>Telegram ID:</b> <code>{target_id}</code>\n"
-            f"📛 <b>Full Name:</b> {target.get('full_name') or 'N/A'}\n"
-            f"🎓 <b>Stud.IP Account:</b> <code>{studip_user}</code>\n"
+            f"📛 <b>Full Name:</b> {html.escape(target.get('full_name') or 'N/A')}\n"
+            f"🎓 <b>Stud.IP Account:</b> <code>{html.escape(str(studip_user))}</code>\n"
             f"👑 <b>Role:</b> {'👑 Administrator' if role == 'admin' else '🎓 Student'}\n"
             f"📶 <b>Account Status:</b> {'🟢 Active' if is_active else '🔴 Blocked'}\n"
             f"⚡ <b>Session State:</b> {session_badge}\n"
@@ -803,5 +804,5 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 
     if data == "admin_restart_confirm":
         await query.edit_message_text("♻️ <b>Restarting bot...</b>", parse_mode="HTML")
-        asyncio.create_task(_restart_process())
+        state.spawn(_restart_process(), name="restart")
         return

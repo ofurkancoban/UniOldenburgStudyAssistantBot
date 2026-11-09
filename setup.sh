@@ -18,7 +18,7 @@ if (( $(echo "$PY_VER < 3.10" | bc -l) )); then
 fi
 
 if ! command -v ffmpeg &> /dev/null; then
-  echo "⚠️  ffmpeg not found — voice-message task input won't work without it."
+  echo "⚠️  ffmpeg not found - voice-message task input won't work without it."
   echo "   Install it with: apt install ffmpeg (Linux) or brew install ffmpeg (Mac)."
 fi
 

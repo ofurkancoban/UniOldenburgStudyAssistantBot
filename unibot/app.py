@@ -236,6 +236,7 @@ async def _run_begin_flow(message, user, context: ContextTypes.DEFAULT_TYPE):
         await _send_courses_menu(message, courses)
 
     except Exception as e:
+        logging.warning("Courses menu failed", exc_info=True)
         if temp_message:
             try:
                 await temp_message.delete()
@@ -468,7 +469,7 @@ async def main():
 
         logging.info("🚀 Starting unified watcher...")
         # Run watcher in background task
-        asyncio.create_task(start_unified_watcher(app))
+        state.spawn(start_unified_watcher(app), name="start_unified_watcher")
 
         await restore_pending_fastenroll_jobs(app)
 

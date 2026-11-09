@@ -54,7 +54,6 @@ STUMS_ORIGIN = "https://stums.uni-oldenburg.de"
 # StuMS' own "log in via university SSO" entry; through this proxy it runs the
 # NetIQ login in the bot's cookie jar and lands back on StuMS signed in.
 STUMS_SSO_ENTRY_PATH = "/qisserver/api/identityprovider/redirect/2/login"
-LoginCallback = Callable[[str, str, str], Awaitable[tuple[bool, str]]]
 
 # Rewrite leading scheme+host in HTML attributes (action, href, src) without
 # touching query-string parameters like `redirect_uri=https://...`.
@@ -290,14 +289,13 @@ class _RedactedAccessLogger(AbstractAccessLogger):
 class LoginServer:
     """Runs the Stud.IP + Uni Oldenburg SSO reverse proxy on the bot's event loop."""
 
-    def __init__(self, on_login: LoginCallback, port: Optional[int] = None,
+    def __init__(self, port: Optional[int] = None,
                  host: Optional[str] = None, bot_token: Optional[str] = None,
                  allowed_user_ids: Optional[set[int]] = None,
                  base_url_provider: Optional[Callable[[], str]] = None,
                  session_provider: Optional[Callable[..., object]] = None,
                  on_session_authenticated: Optional[Callable[..., Awaitable[None]]] = None,
                  is_allowed_callback: Optional[Callable[[int], bool]] = None):
-        self.on_login = on_login
         self.port = int(port) if port else int(os.getenv("LOGIN_PORT") or "8899")
         self.host = host or self._default_host()
         self.bot_token: str = bot_token or os.getenv("TELEGRAM_TOKEN") or ""
@@ -312,10 +310,10 @@ class LoginServer:
         # revoke_all() invalidates every proxy cookie handed out before.
         self._cookie_salt = secrets.token_bytes(16)
         self._runner: Optional[web.AppRunner] = None
-        self._busy = False
         # per Telegram user, so two students signing in at once both get
         # their post-login hook (StuMS handoff, profile sync)
         self._last_auth_notify: dict = {}
+        self._hook_tasks: set = set()
         # (method, path, handler) the bot adds before start(), e.g. the
         # calendar feed; they go in front of the catch-all Stud.IP proxy
         self.extra_routes: list[tuple[str, str, Callable]] = []
@@ -566,7 +564,9 @@ class LoginServer:
             return
         self._last_auth_notify[user_id] = now
         if self.on_session_authenticated:
-            asyncio.create_task(self._run_auth_hook(user_id))
+            task = asyncio.create_task(self._run_auth_hook(user_id))
+            self._hook_tasks.add(task)  # keep a reference until it is done
+            task.add_done_callback(self._hook_tasks.discard)
 
     async def _run_auth_hook(self, user_id: Optional[int] = None) -> None:
         try:
@@ -737,33 +737,6 @@ class LoginServer:
     async def _health(self, _request: web.Request) -> web.Response:
         return web.Response(text="ok")
 
-    # ── fallback JSON API login ───────────────────────────────────────────
-    async def _api_login(self, request: web.Request) -> web.Response:
-        user = verify_init_data(request.headers.get("X-Telegram-Init-Data", ""), self.bot_token)
-        if not user:
-            return web.json_response({"ok": False, "error": "Invalid Telegram data."}, status=401)
-        user_id = user.get("id")
-        if not self._is_allowed(user_id):
-            return web.json_response({"ok": False, "error": "Not authorised."}, status=403)
-        try:
-            body = await request.json()
-        except ValueError:
-            return web.json_response({"ok": False, "error": "Invalid request."}, status=400)
-        if self._busy:
-            return web.json_response({"ok": False, "error": "Login already running."}, status=429)
-        self._busy = True
-        try:
-            ok, message = await self.on_login(
-                str(body.get("username", "")).strip(),
-                str(body.get("password", "")),
-                str(body.get("totp", "")).strip().replace(" ", ""),
-            )
-        finally:
-            self._busy = False
-        if not ok:
-            return web.json_response({"ok": False, "error": message}, status=401)
-        return web.json_response({"ok": True})
-
     # ── lifecycle ─────────────────────────────────────────────────────────
     async def start(self) -> None:
         if self._runner is not None:
@@ -773,7 +746,6 @@ class LoginServer:
         app.router.add_post("/_bot/auth", self._bot_auth)
         app.router.add_get("/_bot/entry", self._bot_entry)
         app.router.add_get("/login/{token}", self._token_login)
-        app.router.add_post("/api/login", self._api_login)
         app.router.add_get("/health", self._health)
         for method, path, handler in self.extra_routes:
             app.router.add_route(method, path, handler)

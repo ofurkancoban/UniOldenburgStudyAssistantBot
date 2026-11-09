@@ -33,11 +33,11 @@ from exam_reminder import (
     save_exam_cache,
     submit_exam_action,
 )
-from studip_utils import TZ_BERLIN, berlin_now
+from studip_utils import TZ_BERLIN, berlin_now, html_escape as _h
 
 from unibot import db
 from unibot import state
-from unibot.storage import load_default_semester, single_flight
+from unibot.storage import load_default_semester, recall_user_callback, remember_user_callback, single_flight
 from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, broadcast
 from unibot.auth import get_user_session, is_user_allowed, login_studip, personal_session
 from unibot.studip_api import BASE_URL, _ensure_watched_courses_map, _parse_file_date_v2, list_courses
@@ -47,7 +47,24 @@ from unibot.whatsapp import EXAM_DATES_FOOTER, WA_FORWARD_ASK_MARKUP, _send_text
 from unibot.monitoring import _format_exam_dates_message
 
 
-exam_action_cache: dict[str, dict] = {}  # short_id -> { unit_id, action_type ("anmelden"|"abmelden"), title, ts }
+class _ExamActions(dict):
+    """short_id -> { unit_id, action_type ("anmelden"|"abmelden"), title,
+    user_id, ... }. An action that belongs to a student is also kept in
+    their private record, so the button still works after a restart."""
+
+    def __setitem__(self, sid, info):
+        super().__setitem__(sid, info)
+        if isinstance(info, dict) and info.get("user_id") is not None:
+            remember_user_callback(info["user_id"], f"exam:{sid}", info)
+
+    def pop(self, sid, *default):
+        info = super().pop(sid, *default)
+        if isinstance(info, dict) and info.get("user_id") is not None:
+            recall_user_callback(info["user_id"], f"exam:{sid}", forget=True)
+        return info
+
+
+exam_action_cache: dict[str, dict] = _ExamActions()
 
 
 def _exam_action(sid: str, user_id: int) -> Optional[dict]:
@@ -55,6 +72,12 @@ def _exam_action(sid: str, user_id: int) -> Optional[dict]:
     another student (a button seen in a group chat or a forwarded message
     must not act on someone else's exam list)."""
     info = exam_action_cache.get(sid)
+    if not info:
+        # after a restart: only the tapping student's own record is searched
+        stored = recall_user_callback(user_id, f"exam:{sid}")
+        if stored:
+            info = {k: v for k, v in stored.items() if k != "ts"}
+            dict.__setitem__(exam_action_cache, sid, info)
     if not info:
         return None
     owner = info.get("user_id")
@@ -167,7 +190,7 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             InlineKeyboardButton("❌ No", callback_data="exam_cancel"),
         ]]
         await query.message.reply_text(
-            f"⚠️ Are you sure you want to <b>{verb}</b>:\n<b>{info['title']}</b>?",
+            f"⚠️ Are you sure you want to <b>{verb}</b>:\n<b>{_h(info['title'])}</b>?",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
@@ -217,7 +240,7 @@ async def handle_examopen_wa_ask(update: Update, context: ContextTypes.DEFAULT_T
         InlineKeyboardButton("❌ Cancel", callback_data="examopen_cancel"),
     ]])
     await query.message.reply_text(
-        f"📲 Forward this exam registration notice to WhatsApp?\n<b>{info['title']}</b>",
+        f"📲 Forward this exam registration notice to WhatsApp?\n<b>{_h(info['title'])}</b>",
         parse_mode="HTML",
         reply_markup=keyboard,
     )
@@ -235,14 +258,14 @@ async def handle_examopen_wa_confirm(update: Update, context: ContextTypes.DEFAU
     # check_exam_reminders) instead of just the course title - the WA
     # forward used to carry noticeably less information than what the
     # student actually saw in Telegram.
-    class_line = f"👥 <b>Class:</b> {info['group_label']}\n" if info.get("group_label") else ""
-    room_line = f"📍 <b>Room:</b> {info['room']}\n" if info.get("room") else ""
-    exam_date_line = f"📅 <b>Exam Date:</b> {info['exam_date_display']}\n" if info.get("exam_date_display") else ""
+    class_line = f"👥 <b>Class:</b> {_h(info['group_label'])}\n" if info.get("group_label") else ""
+    room_line = f"📍 <b>Room:</b> {_h(info['room'])}\n" if info.get("room") else ""
+    exam_date_line = f"📅 <b>Exam Date:</b> {_h(info['exam_date_display'])}\n" if info.get("exam_date_display") else ""
     window_line = f"🗓 <b>Window:</b> {info['window_display']}\n" if info.get("window_display") else ""
     text = (
         "🆕 <b>EXAM REGISTRATION OPEN</b>\n"
         "━━━━━━━━━━━━━━━━━\n"
-        f"📘 <b>Course:</b> {info['title']}\n"
+        f"📘 <b>Course:</b> {_h(info['title'])}\n"
         f"{exam_date_line}"
         f"{class_line}"
         f"{room_line}"
@@ -269,7 +292,7 @@ async def handle_examopen_mute_ask(update: Update, context: ContextTypes.DEFAULT
         InlineKeyboardButton("❌ Cancel", callback_data="examopen_cancel"),
     ]])
     await query.message.reply_text(
-        f"🔕 Stop notifying you about this exam's registration open/closing-soon reminders?\n<b>{info['title']}</b>",
+        f"🔕 Stop notifying you about this exam's registration open/closing-soon reminders?\n<b>{_h(info['title'])}</b>",
         parse_mode="HTML",
         reply_markup=keyboard,
     )

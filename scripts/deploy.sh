@@ -45,7 +45,6 @@ echo "ruff, mypy and tests passed"
 
 if [ "${1:-}" = "--worker" ]; then
   step "Cloudflare Worker"
-  cmp -s cloudflare_worker/worker.js worker.js || { echo "worker.js copies differ" >&2; exit 1; }
   (cd cloudflare_worker && npx --no-install wrangler deploy)
 fi
 

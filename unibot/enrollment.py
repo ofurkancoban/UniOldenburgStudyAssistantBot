@@ -60,12 +60,12 @@ def validate_fastenroll_args(sem_id: Optional[str], target_time_str: Optional[st
 
 def _fastenroll_job_line(sem_id: str, job: dict) -> str:
     when = f"{job.get('target_date_str')} {job.get('target_time_str')}" if job.get("target_date_str") else f"{job.get('target_time_str')} (next occurrence)"
-    return f"• {sem_id} — {when}"
+    return f"• {sem_id} - {when}"
 
 
 def _build_fastenroll_list_content(chat_id: int):
     """Return (text, InlineKeyboardMarkup | None) for the jobs across every Telegram
-    chat connected to this bot, not just `chat_id` — the bot logs into a single
+    chat connected to this bot, not just `chat_id` - the bot logs into a single
     shared Stud.IP account regardless of which chat scheduled a job, so a job set
     up from one chat/device should be visible (and cancellable) from any other."""
     all_pending = load_pending()
@@ -163,7 +163,7 @@ async def fastenroll_cancel_callback(update: Update, context: ContextTypes.DEFAU
 
 
 async def fastenroll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Usage: /fastenroll <sem_id_or_link> <HH:MM:SS> [DD.MM.YYYY]  — waits until the
+    """Usage: /fastenroll <sem_id_or_link> <HH:MM:SS> [DD.MM.YYYY]  - waits until the
     given Berlin-time clock reading (tracked from the site's own clock widget, not
     the local machine's clock), then submits the course enrollment the instant it
     arrives. If the date is omitted, the next occurrence of that time (today or
@@ -214,7 +214,7 @@ async def handle_browse_courses(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_course_semester_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle course_sem|<id> callback — list this semester's currently
+    """Handle course_sem|<id> callback - list this semester's currently
     open-for-enrolment courses within the student's own degree programme."""
     query = update.callback_query
     await query.answer()
@@ -228,7 +228,7 @@ async def handle_course_semester_pick(update: Update, context: ContextTypes.DEFA
 
 
 async def handle_toggle_prev_sem_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle toggle_prev_sem_scan|<semester_id> — flip the "include the
+    """Handle toggle_prev_sem_scan|<semester_id> - flip the "include the
     previous semester too" setting (see get_scan_previous_semester_enabled)
     and re-render the same semester's open-courses view with the new
     setting applied."""
@@ -322,7 +322,7 @@ async def handle_browse_my_courses_for_deenroll(update: Update, context: Context
 
 
 async def handle_deenroll_semester_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle deenroll_sem|<id> callback — list that semester's currently
+    """Handle deenroll_sem|<id> callback - list that semester's currently
     enrolled courses so the student can pick one to sign out of."""
     query = update.callback_query
     await query.answer()
@@ -393,7 +393,7 @@ async def handle_course_deenroll_cancel(update: Update, context: ContextTypes.DE
 
 
 async def handle_enrollment_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle enrollment_menu callback (from /status) — submenu grouping the
+    """Handle enrollment_menu callback (from /status) - submenu grouping the
     three course-enrollment-related actions that used to be separate
     top-level /status buttons."""
     query = update.callback_query
@@ -412,7 +412,7 @@ async def handle_enrollment_menu(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_set_default_semester(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle set_default_semester callback (from /status) — show a semester
+    """Handle set_default_semester callback (from /status) - show a semester
     picker; picking one makes Files, Browse Courses (enroll), and Sign Out
     (deenroll) all skip straight to that semester instead of asking each time."""
     query = update.callback_query
@@ -445,7 +445,7 @@ async def handle_set_default_semester(update: Update, context: ContextTypes.DEFA
 
 
 async def handle_default_semester_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle default_sem|<id> callback — save the picked semester as the
+    """Handle default_sem|<id> callback - save the picked semester as the
     default used by Files, Browse Courses, and Sign Out."""
     query = update.callback_query
     await query.answer()
@@ -469,7 +469,7 @@ async def handle_default_semester_pick(update: Update, context: ContextTypes.DEF
 
 
 async def handle_default_semester_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle default_sem_clear callback — go back to asking for a semester
+    """Handle default_sem_clear callback - go back to asking for a semester
     every time in Files, Browse Courses, and Sign Out."""
     query = update.callback_query
     await query.answer()
@@ -483,7 +483,7 @@ async def handle_default_semester_clear(update: Update, context: ContextTypes.DE
 
 
 async def handle_toggle_watch_prev_sem(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle toggle_watch_prev_sem callback (from /status) — flip whether
+    """Handle toggle_watch_prev_sem callback (from /status) - flip whether
     the background watchers (announcements, new files, forum posts) also
     monitor the previous semester's courses, not just the current one
     (see get_watch_previous_semester_enabled). Forces courses_map to be
@@ -501,9 +501,9 @@ async def handle_toggle_watch_prev_sem(update: Update, context: ContextTypes.DEF
     state.courses_map = {}  # force _ensure_watched_courses_map to rebuild on the next watcher cycle
 
     if new_state:
-        await query.edit_message_text("✅ Now also watching the previous semester's courses for new announcements, files, and forum posts — takes effect on the next check cycle.")
+        await query.edit_message_text("✅ Now also watching the previous semester's courses for new announcements, files, and forum posts - takes effect on the next check cycle.")
     else:
-        await query.edit_message_text("🔲 Back to only watching the current semester's courses — takes effect on the next check cycle.")
+        await query.edit_message_text("🔲 Back to only watching the current semester's courses - takes effect on the next check cycle.")
 FASTENROLL_ASK_TIME = "Please type the enrollment time (HH:MM:SS, Europe/Berlin):"
 FASTENROLL_ASK_LINK = "Please paste the course link (or its sem_id):"
 
@@ -526,7 +526,7 @@ async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.
                 "Please use DD.MM.YYYY, 'today', or 'tomorrow'.",
                 reply_markup=get_main_keyboard(),
             )
-            return True  # pending_step stays "fastenroll_date" — ask again
+            return True  # pending_step stays "fastenroll_date" - ask again
         state["target_date_str"] = date_str
         user_data(context)["pending_step"] = "fastenroll_time"
         await update.message.reply_text(FASTENROLL_ASK_TIME, reply_markup=get_main_keyboard())
@@ -538,7 +538,7 @@ async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.
                 "Please use HH:MM:SS (Europe/Berlin), e.g. 08:30:00.",
                 reply_markup=get_main_keyboard(),
             )
-            return True  # pending_step stays "fastenroll_time" — ask again
+            return True  # pending_step stays "fastenroll_time" - ask again
         state["target_time_str"] = text
         user_data(context)["pending_step"] = "fastenroll_link"
         await update.message.reply_text(FASTENROLL_ASK_LINK, reply_markup=get_main_keyboard())

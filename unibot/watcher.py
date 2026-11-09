@@ -30,6 +30,7 @@ from unibot import state
 from unibot.config import (
     ADMIN_USER_IDS,
     ALLOWED_USER_IDS,
+    PRIMARY_ADMIN_ID,
     GWDG_API_KEY,
     LOG_FILE,
 )
@@ -246,6 +247,7 @@ def _personal_due(uid: int, now: datetime) -> Optional[str]:
     try:
         registration_open = bool(load_exam_cache(uid).get("notified_open"))
     except Exception:
+        logging.debug("Exam cache unreadable; assuming no open registration", exc_info=True)
         registration_open = False
     return stagger.due_slot(uid, now, done, stagger.is_grade_season(now.date(), registration_open))
 
@@ -276,7 +278,7 @@ async def _for_each_stums_user(job, accounts=None):
     """Run `job(uid, session)` for every signed-in student (or `accounts`),
     one at a time and spaced out; each runs in that student's user and
     exam-cache context."""
-    admin_id = next(iter(ALLOWED_USER_IDS), None)
+    admin_id = PRIMARY_ADMIN_ID
     for index, account in enumerate(_stums_users() if accounts is None else accounts):
         uid, sess = account.user_id, account.session
         if index:
@@ -290,7 +292,7 @@ async def _for_each_stums_user(job, accounts=None):
 def _single_account_owner(session) -> Optional[int]:
     """Whose StuMS data the single-account setup reads: the watcher session's
     student, else the primary admin."""
-    return getattr(session, "user_id", None) or next(iter(ALLOWED_USER_IDS), None)
+    return getattr(session, "user_id", None) or PRIMARY_ADMIN_ID
 
 
 REAUTH_NOTIFIED_KEY = "reauth_notified"
@@ -522,7 +524,7 @@ async def unified_watcher_controller(app):
     await asyncio.sleep(120)
 
     # Determine admin user
-    admin_id = next(iter(ALLOWED_USER_IDS), None)
+    admin_id = PRIMARY_ADMIN_ID
     if not admin_id:
         logging.error("❌ No allowed users found for watcher")
         return

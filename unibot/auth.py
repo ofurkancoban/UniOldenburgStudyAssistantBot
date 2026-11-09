@@ -332,6 +332,7 @@ def is_user_allowed(user_id: Optional[int]) -> bool:
     try:
         return is_user_allowed_db(user_id)
     except Exception:
+        logging.warning("Access check failed for a user; denied", exc_info=True)
         return False
 
 
@@ -343,6 +344,7 @@ def is_user_admin(user_id: Optional[int]) -> bool:
     try:
         return is_user_admin_db(user_id)
     except Exception:
+        logging.warning("Admin check failed for a user; not an admin", exc_info=True)
         return False
 
 # ── single-instance lock ───────────────────────────────────────────────────────
@@ -428,6 +430,7 @@ def pick_watcher_session(exclude: Optional[int] = None) -> StudIPSession:
         try:
             has_login = bool(db.get_user_scope(uid).credential("cookies"))
         except Exception:
+            logging.debug("Stored login unreadable for an admin candidate", exc_info=True)
             has_login = False
         if has_login or os.path.exists(f"studip_cookies_{uid}.json"):
             sess = StudIPSession(USERNAME, PASSWORD, TOTP_SECRET,
@@ -645,7 +648,6 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
 def _get_login_server() -> LoginServer:
     if state.login_server is None:
         state.login_server = LoginServer(
-            _perform_web_login,
             bot_token=TELEGRAM_TOKEN,
             allowed_user_ids=set(ALLOWED_USER_IDS),
             base_url_provider=_login_public_url,
@@ -709,57 +711,6 @@ async def _start_login_infra(app) -> None:
     await server.start()
     logging.info("🔐 Login page available at %s", server.base_url())
     await _clear_menu_button(app)
-
-
-async def _perform_web_login(username: str, password: str, totp: str) -> tuple[bool, str]:
-    """Log in with credentials typed into the login page, then forget them.
-
-    Called by LoginServer. The password lives only in this call; what survives
-    is the session cookie plus an OAuth refresh token.
-    """
-
-    session = state.global_session
-    if session is None:
-        session = StudIPSession(username, password, "", totp_code=totp or None)
-        state.global_session = session
-    else:
-        session.username = username
-        session.password = password
-        session.totp_code = totp or None
-
-    logging.info("🔐 Login requested from the web login page...")
-    try:
-        ok = await session.login(force=True)
-    except Exception as exc:
-        logging.error("❌ Web login crashed: %s", exc)
-        return False, "Stud.IP login failed. Please try again."
-
-    if not ok:
-        return False, "Stud.IP login failed. Check your credentials and the 2FA code."
-
-    # Drop the credentials immediately - only the cookie survives.
-    session.password = ""
-    session.totp_code = None
-    state._studip_api_user_id = None
-
-    use_oauth = studip_oauth.oauth_enabled()
-    if use_oauth:
-        try:
-            await studip_oauth.authorize_with_session(session)
-        except Exception as exc:
-            logging.warning("⚠️ OAuth consent failed after web login: %s", exc)
-
-    if state._menu_app is not None:
-        for uid in ALLOWED_USER_IDS or []:
-            try:
-                await state._menu_app.bot.send_message(
-                    chat_id=uid,
-                    text="✅ Signed in to Stud.IP.",
-                )
-            except Exception as exc:
-                logging.warning("⚠️ Could not send login confirmation to %s: %s", uid, exc)
-
-    return True, ""
 
 
 async def _send_login_prompt(reply_target, user_id: int) -> None:

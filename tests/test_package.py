@@ -33,7 +33,8 @@ BUILTINS = set(dir(builtins)) | {"__file__", "__name__", "__doc__"}
 
 
 def _module_order():
-    tree = ast.parse(open(os.path.join(PKG_DIR, "__init__.py"), encoding="utf-8").read())
+    with open(os.path.join(PKG_DIR, "__init__.py"), encoding="utf-8") as fh:
+        tree = ast.parse(fh.read())
     for node in tree.body:
         if isinstance(node, ast.Assign) and node.targets[0].id == "MODULE_ORDER":
             return [elt.value for elt in node.value.elts]

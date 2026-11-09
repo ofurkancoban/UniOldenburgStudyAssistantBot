@@ -32,6 +32,7 @@ def _season(user_id: int, day) -> bool:
     try:
         registration_open = bool(load_exam_cache(user_id).get("notified_open"))
     except Exception:
+        logging.debug("Exam cache unreadable; assuming no open registration", exc_info=True)
         registration_open = False
     return stagger.is_grade_season(day, registration_open)
 

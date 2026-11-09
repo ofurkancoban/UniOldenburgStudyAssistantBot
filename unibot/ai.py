@@ -17,7 +17,7 @@ from typing import Optional
 
 import aiohttp
 
-from studip_utils import TZ_BERLIN
+from studip_utils import TZ_BERLIN, aread_bytes, awrite_bytes
 
 from unibot.config import (
     GWDG_API_KEY,
@@ -75,8 +75,7 @@ async def transcribe_with_whisper(ogg_path: str) -> Optional[str]:
     form.add_field("model", GWDG_WHISPER_MODEL)
     form.add_field("response_format", "json")
     form.add_field("prompt", hint)
-    with open(ogg_path, "rb") as f:
-        form.add_field("file", f.read(), filename="voice.ogg", content_type="audio/ogg")
+    form.add_field("file", await aread_bytes(ogg_path), filename="voice.ogg", content_type="audio/ogg")
     try:
         await _gwdg_throttle()
         async with shared_http() as session:
@@ -139,12 +138,12 @@ async def transcribe_voice_message(ogg_path: str) -> str:
         if not candidates:
             if request_error:
                 raise RuntimeError(f"Speech recognition service unavailable: {request_error}")
-            raise RuntimeError("Couldn't understand the audio — please try speaking more clearly.")
+            raise RuntimeError("Couldn't understand the audio - please try speaking more clearly.")
 
         if len(candidates) == 1:
             return next(iter(candidates.values()))
 
-        # Both languages produced something — trust whichever transcript's
+        # Both languages produced something - trust whichever transcript's
         # actual detected language matches the model that produced it.
         from langdetect import detect
         for lang, text in candidates.items():
@@ -287,7 +286,7 @@ async def _call_openrouter_once(system_prompt: str, user_text: str, temperature:
     callers (intent classification, extraction) that need consistent JSON.
     Pass a higher value (e.g. 1.0+) for free-form creative text like the
     daily-plan narration, where 0 would make the model converge on the same
-    wording every time — deterministic sampling with the same prompt tends
+    wording every time - deterministic sampling with the same prompt tends
     to produce the same greedy completion.
 
     `timeout` (seconds) can be raised for slower structured-extraction
@@ -341,13 +340,13 @@ async def synthesize_speech(text: str) -> Optional[tuple]:
 
 async def _synthesize_speech_once(text: str, timeout: float = 30) -> Optional[tuple]:
     """Convert text to speech via OpenRouter's free-tier TTS endpoint
-    (/api/v1/audio/speech — a separate API surface from chat/completions,
+    (/api/v1/audio/speech - a separate API surface from chat/completions,
     so it isn't listed in /api/v1/models and doesn't go through
-    _call_openrouter). Returns (pcm_bytes, sample_rate) — raw 16-bit mono
+    _call_openrouter). Returns (pcm_bytes, sample_rate) - raw 16-bit mono
     PCM, whose exact sample rate is read back from the response's
     Content-Type (e.g. "audio/pcm;rate=24000;channels=1") rather than
     assumed, since it can differ by model. Returns None on any failure
-    (missing key, network error, non-2xx) — callers must degrade
+    (missing key, network error, non-2xx) - callers must degrade
     gracefully (e.g. fall back to sending the plain text)."""
     if not OPENROUTER_API_KEY:
         return None
@@ -382,15 +381,14 @@ async def _synthesize_speech_once(text: str, timeout: float = 30) -> Optional[tu
 
 
 async def _pcm_to_ogg_voice(pcm_bytes: bytes, sample_rate: int) -> Optional[str]:
-    """Convert raw 16-bit mono PCM audio to an OGG/Opus file via ffmpeg —
+    """Convert raw 16-bit mono PCM audio to an OGG/Opus file via ffmpeg -
     the format Telegram's send_voice needs for a proper voice-message
     bubble (not just a generic audio attachment). Returns the temp file
     path (caller must remove it when done), or None if ffmpeg is missing
     or the conversion fails."""
     pcm_path = os.path.join(tempfile.gettempdir(), f"tts_{uuid.uuid4().hex}.pcm")
     ogg_path = pcm_path + ".ogg"
-    with open(pcm_path, "wb") as f:
-        f.write(pcm_bytes)
+    await awrite_bytes(pcm_path, pcm_bytes)
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-f", "s16le", "-ar", str(sample_rate), "-ac", "1", "-i", pcm_path,

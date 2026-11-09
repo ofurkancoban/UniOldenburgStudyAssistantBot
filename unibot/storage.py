@@ -18,7 +18,7 @@ import aiohttp
 
 from studip_utils import TZ_BERLIN, berlin_now
 from unibot import db, state
-from unibot.config import ALLOWED_USER_IDS
+from unibot.config import PRIMARY_ADMIN_ID
 
 # navigation & cache
 LINK_CACHE_PATH = "link_cache.json"
@@ -34,9 +34,11 @@ class _PersistentLinkCache(dict):
 
     FLUSH_DELAY_SECONDS = 2.0
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, ttl_seconds: Optional[float] = None, max_items: Optional[int] = None):
         super().__init__()
         self._path = path
+        self._ttl = ttl_seconds
+        self._max = max_items
         self._flush_handle: Optional[asyncio.TimerHandle] = None
         try:
             data = db.load(path)
@@ -56,14 +58,34 @@ class _PersistentLinkCache(dict):
         if self._flush_handle is None:
             self._flush_handle = loop.call_later(self.FLUSH_DELAY_SECONDS, self.flush)
 
+    def _prune(self) -> None:
+        """Drop entries past the TTL and the oldest beyond max_items."""
+        if self._ttl is None and self._max is None:
+            return
+        now = time.time()
+
+        def ts(key):
+            value = dict.get(self, key)
+            return value.get("ts", now) if isinstance(value, dict) else now
+
+        if self._ttl is not None:
+            for key in [k for k in self if now - ts(k) > self._ttl]:
+                super().pop(key, None)
+        if self._max is not None and len(self) > self._max:
+            for key in sorted(self, key=ts)[: len(self) - self._max]:
+                super().pop(key, None)
+
     def flush(self) -> None:
         self._flush_handle = None
+        self._prune()
         try:
             db.save(self._path, dict(self), indent=None)
         except Exception as exc:
             logging.warning("Could not save %s: %s", self._path, exc)
 
     def __setitem__(self, key, value):
+        if isinstance(value, dict) and "ts" not in value:
+            value = {**value, "ts": time.time()}
         super().__setitem__(key, value)
         self._changed()
 
@@ -80,6 +102,52 @@ class _PersistentLinkCache(dict):
 
 
 link_cache = _PersistentLinkCache(LINK_CACHE_PATH)  # short_id -> { url, cid, name?, action?, user_id?, current_url?, ts }
+
+# Buttons on course alerts (shared course content, no personal data) keep
+# working after a restart; entries go after CALLBACK_TTL_SECONDS.
+CALLBACK_TTL_SECONDS = 14 * 86400
+CALLBACK_MAX_ITEMS = 1000
+
+
+def persistent_callback_cache(path: str) -> "_PersistentLinkCache":
+    return _PersistentLinkCache(path, ttl_seconds=CALLBACK_TTL_SECONDS, max_items=CALLBACK_MAX_ITEMS)
+
+
+# Buttons that act on one student's own data (exam registration actions,
+# fired task reminders) are kept in that student's encrypted private record.
+USER_CALLBACKS_KIND = "callbacks"
+USER_CALLBACK_MAX_ITEMS = 300
+
+
+def remember_user_callback(user_id: int, key: str, value: dict) -> None:
+    try:
+        scope = db.get_user_scope(int(user_id))
+        data = dict(scope.private(USER_CALLBACKS_KIND) or {})
+        now = time.time()
+        data[key] = {**value, "ts": now}
+        data = {k: v for k, v in data.items() if now - v.get("ts", now) <= CALLBACK_TTL_SECONDS}
+        if len(data) > USER_CALLBACK_MAX_ITEMS:
+            data = dict(sorted(data.items(), key=lambda kv: kv[1].get("ts", 0))[-USER_CALLBACK_MAX_ITEMS:])
+        scope.save_private(USER_CALLBACKS_KIND, data)
+    except Exception:
+        logging.warning("Could not keep a button action for user %s", user_id, exc_info=True)
+
+
+def recall_user_callback(user_id: int, key: str, forget: bool = False) -> Optional[dict]:
+    """The student's own stored button action, or None (expired or not theirs)."""
+    try:
+        scope = db.get_user_scope(int(user_id))
+        data = dict(scope.private(USER_CALLBACKS_KIND) or {})
+        value = data.get(key)
+        if value is None or time.time() - value.get("ts", 0) > CALLBACK_TTL_SECONDS:
+            return None
+        if forget:
+            data.pop(key, None)
+            scope.save_private(USER_CALLBACKS_KIND, data)
+        return value
+    except Exception:
+        logging.warning("Could not read a button action for user %s", user_id, exc_info=True)
+        return None
 
 
 # link_cache limits. Entries live long because they're persisted: a stale
@@ -351,15 +419,18 @@ def load_user_names() -> dict:
     return {}
 
 
-def save_studip_user_name(name: str) -> None:
-    """Save the name fetched from Stud.IP for all allowed users so get_user_name()
-    and get_primary_user_name() automatically return it."""
+def save_studip_user_name(name: str, user_id: Optional[int] = None) -> None:
+    """Save the name Stud.IP reports for a student, unless they told the bot
+    what to call them. Without a student it is the watcher account's name
+    (the primary admin's), kept as "studip_name"."""
     if not name:
         return
     names = load_user_names()
-    for uid in ALLOWED_USER_IDS:
-        names[str(uid)] = name
-    names["studip_name"] = name
+    owner = user_id if user_id is not None else PRIMARY_ADMIN_ID
+    if owner is not None and not names.get(str(owner)):
+        names[str(owner)] = name
+    if user_id is None:
+        names["studip_name"] = name
     try:
         db.save(USER_NAMES_CACHE_PATH, names)
     except Exception as e:
@@ -367,22 +438,23 @@ def save_studip_user_name(name: str) -> None:
 
 
 def get_user_name(user_id=None) -> Optional[str]:
+    """The student's own name, or None. Only the primary admin (or no
+    student at all) falls back to the watcher account's Stud.IP name, so no
+    student ever sees or hears someone else's name."""
     names = load_user_names()
-    if user_id is not None and str(user_id) in names:
-        return names[str(user_id)]
-    return names.get("studip_name") or get_primary_user_name()
+    if user_id is not None:
+        own = names.get(str(user_id))
+        if own:
+            return own
+        if user_id != PRIMARY_ADMIN_ID:
+            return None
+    return get_primary_user_name()
 
 
 def get_primary_user_name() -> Optional[str]:
-    """Return name synced from Stud.IP across ALLOWED_USER_IDS."""
+    """The watcher account's (primary admin's) name synced from Stud.IP."""
     names = load_user_names()
-    if names.get("studip_name"):
-        return names["studip_name"]
-    for uid in ALLOWED_USER_IDS:
-        name = names.get(str(uid))
-        if name:
-            return name
-    return None
+    return names.get("studip_name") or (names.get(str(PRIMARY_ADMIN_ID)) if PRIMARY_ADMIN_ID else None)
 
 
 def save_user_name(user_id, name: str) -> None:

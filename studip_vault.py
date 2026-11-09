@@ -42,7 +42,6 @@ ENCRYPTED_MAGIC = "VAULT:v1:"
 
 
 KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".vault_key")
-_LEGACY_FALLBACK_SECRET = "uni-oldenburg-studip-vault-salt-key-2026"
 
 
 def _key_from_secret(secret: str) -> bytes:
@@ -77,12 +76,13 @@ def _primary_key() -> bytes:
 
 
 def _legacy_keys() -> list[bytes]:
-    """Keys older versions encrypted with, accepted for reading only."""
+    """Keys older versions encrypted with, accepted for reading only. (The
+    hard-coded fallback secret of the first versions is gone: no record on
+    it was left once every student's data moved to per-user keys.)"""
     keys = []
     telegram_token = os.getenv("TELEGRAM_TOKEN", "").strip()
     if telegram_token:
         keys.append(_key_from_secret(telegram_token))
-    keys.append(_key_from_secret(_LEGACY_FALLBACK_SECRET))
     return keys
 
 

@@ -23,7 +23,7 @@ from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
 
 import studip_oauth
-from studip_utils import berlin_now
+from studip_utils import TZ_BERLIN, berlin_now
 from unibot import course_registry, db, state
 from unibot.ai import transcribe_voice_message
 from unibot.auth import (
@@ -38,7 +38,7 @@ from unibot.auth import (
     login_studip,
     signed_in_accounts,
 )
-from unibot.config import ALLOWED_USER_IDS
+from unibot.config import PRIMARY_ADMIN_ID
 from unibot.formatting import (
     _course_abbrev,
     _short_id,
@@ -106,6 +106,8 @@ global_message_watcher = None
 global_announcement_watcher = None
 watch_tasks: dict[int, asyncio.Task] = {}  # chat_id -> asyncio.Task
 check_in_progress: set[int] = set()  # chat_id set to prevent concurrent checks
+
+_OLDEST = datetime.fromtimestamp(0, TZ_BERLIN)  # sorts files without a date first (no overflow when compared)
 
 
 def message_cache_key(user_id: Optional[int] = None) -> str:
@@ -180,7 +182,7 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             course = info.get("course") or state.courses_map.get(cid) or cid
             ts = info.get("modified_ts")
-            dt = datetime.fromtimestamp(ts) if isinstance(ts, (int, float)) else datetime.min
+            dt = datetime.fromtimestamp(ts, TZ_BERLIN) if isinstance(ts, (int, float)) else _OLDEST
             all_files.append({
                 "cid": cid,
                 "course": course,
@@ -531,6 +533,7 @@ async def show_last_forum_posts(update: Update, context: ContextTypes.DEFAULT_TY
     try:
         cache = db.load(CACHE_PATH)
     except Exception:
+        logging.warning("Forum history unreadable", exc_info=True)
         await query.edit_message_text("⚠️ Error reading forum history.")
         return
 
@@ -696,15 +699,17 @@ async def message_poll_loop(app) -> None:
     import random
 
     act_as_bot()
-    admin_id = next(iter(ALLOWED_USER_IDS), None)
     last_user_poll: dict[int, float] = {}
     while True:
         await asyncio.sleep(MESSAGE_POLL_SECONDS)
         if state.global_watcher_paused:
             continue
+        # the fast poll reads the watcher session's inbox, so its messages go
+        # to that session's own student (the primary admin before it has one)
+        admin_id = getattr(state.global_session, "user_id", None) or PRIMARY_ADMIN_ID
         with acting_as(None):
             if state.global_session is not None and admin_id is not None and has_stored_login(state.global_session) \
-                    and lifecycle_state(getattr(state.global_session, "user_id", None)) == ACTIVE:
+                    and lifecycle_state(admin_id) == ACTIVE:
                 try:
                     await check_new_messages(app.bot, admin_id, silent=True)
                 except Exception as e:
@@ -1280,6 +1285,7 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await file.download_to_drive(ogg_path)
         transcript = await transcribe_voice_message(ogg_path)
     except Exception as e:
+        logging.warning("Voice message transcription failed", exc_info=True)
         await status_msg.edit_text(f"⚠️ {e}")
         return
 

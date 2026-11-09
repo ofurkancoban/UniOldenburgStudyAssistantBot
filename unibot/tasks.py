@@ -21,7 +21,9 @@ from studip_utils import TZ_BERLIN
 
 from unibot.storage import (
     add_user_task,
+    recall_user_callback,
     record_task_outcome,
+    remember_user_callback,
     remove_user_tasks,
     save_user_tasks,
     students_with_tasks,
@@ -35,7 +37,9 @@ from unibot.schedule import fastenroll_tasks
 from unibot.monitoring import announcement_task_cache, task_suggestion_cache
 
 
-task_reminder_cache: dict[str, dict] = {}  # task_id -> full task dict -- a fired reminder, kept around so its Done/Snooze buttons still work after the task's removed from tasks_cache.json
+# A fired reminder's task is kept in the student's own private record
+# (storage.remember_user_callback, key "task:<id>") so its Done/Snooze
+# buttons still work after the task left the list, and after a restart.
 
 
 async def _run_fastenroll_task(chat_id: int, sem_id: str, target_time_str: str, target_date_str: Optional[str], context: ContextTypes.DEFAULT_TYPE):
@@ -334,7 +338,7 @@ async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAU
         return
 
     sid = query.data.split("|", 1)[1]
-    info = task_suggestion_cache.pop(sid, None)
+    info = task_suggestion_cache.get(sid)  # every follower may add it
     if not info:
         await query.answer("This suggestion has expired.", show_alert=True)
         return
@@ -362,7 +366,7 @@ async def handle_announcement_to_task(update: Update, context: ContextTypes.DEFA
         return
 
     sid = query.data.split("|", 1)[1]
-    info = announcement_task_cache.pop(sid, None)
+    info = announcement_task_cache.get(sid)  # kept: a failed conversion can be retried
     if not info:
         await query.answer("This announcement has expired.", show_alert=True)
         return
@@ -394,7 +398,7 @@ async def check_task_reminders(bot):
     """Send any reminder-tasks whose due time has passed, then drop them (one-shot).
     Plain to-dos (no due_time) are left untouched until the user marks them done.
     Each student's tasks are read and changed in their own scope. The fired
-    task is kept in task_reminder_cache (keyed by its own id, which is unique)
+    task is kept in the student's private record (keyed by its own id)
     so the reminder message's "✔️ Done" / snooze buttons can still act on it
     after it's already been removed from the student's list."""
     now = datetime.now(TZ_BERLIN)
@@ -404,7 +408,7 @@ async def check_task_reminders(bot):
             due = task.get("due_time")
             if not due or datetime.fromisoformat(due) > now:
                 continue
-            task_reminder_cache[task["id"]] = task
+            remember_user_callback(uid, f"task:{task['id']}", task)
             record_task_outcome(uid, task)  # due now; done or not comes later
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✔️ Done", callback_data=f"task_reminder_done|{task['id']}")],
@@ -427,7 +431,7 @@ def _snooze_offset(code: str) -> timedelta:
 async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle task_reminder_done|<id> and task_reminder_snooze|<id>|<code>
     - the buttons on a fired reminder (see check_task_reminders /
-    task_reminder_cache). Snoozing re-saves the task with a new due_time;
+    stored reminder). Snoozing re-saves the task with a new due_time;
     "Done" just acknowledges, since the task is already gone from the list."""
     query = update.callback_query
     await query.answer()
@@ -438,12 +442,11 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
 
     parts = query.data.split("|")
     action, task_id = parts[0], parts[1]
-    task = task_reminder_cache.get(task_id)
-    if task and task.get("user_id") != user_id:
-        logging.warning("Task reminder of user %s tapped by user %s; ignored", task.get("user_id"), user_id)
-        task = None
-    else:
-        task_reminder_cache.pop(task_id, None)
+    # looked up in the tapping student's own record: another student's
+    # reminder button (forwarded, in a group) finds nothing
+    task = recall_user_callback(user_id, f"task:{task_id}", forget=True)
+    if task:
+        task = {k: v for k, v in task.items() if k != "ts"}
     if not task:
         await query.answer("This reminder has expired.", show_alert=True)
         return

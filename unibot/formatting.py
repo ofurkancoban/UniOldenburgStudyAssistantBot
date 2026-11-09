@@ -182,7 +182,7 @@ def _get_day_emoji(day_name: str) -> str:
 
 def _truncate_with_ellipsis(text: str, limit: int) -> str:
     """Cut `text` to at most `limit` characters, appending "…" only when it
-    actually got cut — plain slicing with no marker looks indistinguishable
+    actually got cut - plain slicing with no marker looks indistinguishable
     from a parsing bug (text just stopping mid-sentence)."""
     if len(text) <= limit:
         return text
@@ -251,7 +251,7 @@ def _format_relative(dt: datetime, now: datetime, show_time: bool = True) -> str
     """Render a datetime as a short relative label: 'today [HH:MM]', 'tomorrow
     [HH:MM]', 'in Nd [HH:MM]', or 'overdue'. The clock time is only appended
     when it's meaningfully set (not midnight, i.e. a real reminder/exam time
-    is known) and `show_time` is True — registration deadlines all close at
+    is known) and `show_time` is True - registration deadlines all close at
     23:59, so that time is never worth showing there."""
     days = (dt.date() - now.date()).days
     has_time = show_time and dt.time() != datetime.min.time()

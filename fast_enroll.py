@@ -112,7 +112,7 @@ OFFSET_KEEP_BEST = 2
 async def _measure_offset_once(session) -> tuple:
     """One round-trip: return (offset, round_trip_time). Reads only as much of
     the response as needed to find the clock, then aborts the rest instead of
-    downloading the full ~240KB page — this keeps the round-trip time (and thus
+    downloading the full ~240KB page - this keeps the round-trip time (and thus
     the offset estimate) as close to a pure network measurement as possible."""
     t0 = time.time()
     resp = await (await session.get(f"{BASE_URL}/dispatch.php/start"))
@@ -160,7 +160,7 @@ async def _fetch_security_token(session, sem_id: str) -> str:
     The apply URL redirects rather than showing a dialog in two cases that both
     need to be told apart from "genuinely open": already enrolled (redirects to
     course/overview, which happens to contain an unrelated security_token of its
-    own — a plain page-wide token search would false-positive as still open) and
+    own - a plain page-wide token search would false-positive as still open) and
     not currently enrollable (redirects to course/details with no apply form).
     Only the actual Apply form's own token is used, never one from elsewhere on
     the page.
@@ -290,7 +290,7 @@ STUDENTMODULE_URL = f"{BASE_URL}/plugins.php/studienmodulplugin/studentmodule"
 async def get_semester_options(session) -> list:
     """Return [(semester_id, label), ...] from the student's module overview page
     (Stud.IP's own degree-programme module directory), newest first. Semesters
-    starting before 2022 are dropped — old enough to be irrelevant clutter in
+    starting before 2022 are dropped - old enough to be irrelevant clutter in
     every semester picker (browse/enroll and sign-out)."""
     async with await session.get(STUDENTMODULE_URL) as r:
         html = await r.text()
@@ -328,7 +328,7 @@ MODULE_COMPONENT_TYPE_RE = re.compile(r"course/details\?sem_id=([a-f0-9]{32})")
 
 # Each module's overview table has one row per component type (a module can
 # require e.g. both a Vorlesung *and* a Seminar/Übung, each its own separate
-# course with its own sem_id and its own enrolment) — the type label lives in
+# course with its own sem_id and its own enrolment) - the type label lives in
 # that row's first cell, right next to the component's course link(s).
 COMPONENT_TYPE_TRANSLATIONS = {
     "Vorlesung": "Lecture",
@@ -350,12 +350,12 @@ async def _fetch_module_courses(session, verzeichnis_url: str) -> list:
     verzeichnis link points to. Each is its own independent enrolment.
 
     has_open_access reflects the row's own "Uneingeschränkter Zugang"
-    (unrestricted access) badge — a green status icon Stud.IP already shows
-    per component on this listing page — used by get_open_courses() to tell
+    (unrestricted access) badge - a green status icon Stud.IP already shows
+    per component on this listing page - used by get_open_courses() to tell
     which components offer self-service enrolment at all, entirely from this
     one already-fetched, read-only page. This deliberately replaces an older
     approach that checked each course's Apply dialog directly: for some
-    modules that GET wasn't side-effect-free — merely checking could complete
+    modules that GET wasn't side-effect-free - merely checking could complete
     the enrolment for that course, so browsing "open courses" could silently
     enrol you. Reading this page's own badge instead makes browsing wholly
     read-only; only the explicit "Enroll" -> "Yes" tap ever posts anything.
@@ -379,7 +379,7 @@ async def _fetch_module_courses(session, verzeichnis_url: str) -> list:
             elif len(component_type) > 25 or ":" in component_type:
                 # An occasional row's first cell picks up adjacent, unrelated
                 # text (e.g. a merged/irregular table layout for that module)
-                # rather than a clean type label — fall back to a generic one
+                # rather than a clean type label - fall back to a generic one
                 # instead of showing the garbled text.
                 component_type = "Component"
             has_open_access = "Uneingeschränkter Zugang" in tds[1].get_text(" ", strip=True)
@@ -394,7 +394,7 @@ async def _fetch_module_courses(session, verzeichnis_url: str) -> list:
 async def _is_enrollment_open(session, sem_id: str) -> bool:
     """A course's Apply dialog only contains a security_token while its
     enrolment period is actually open (and the student isn't already
-    enrolled/it isn't full) — this is the same check run() relies on."""
+    enrolled/it isn't full) - this is the same check run() relies on."""
     try:
         await _fetch_security_token(session, sem_id)
         return True
@@ -449,7 +449,7 @@ async def _get_module_course_candidates(session, semester_id: Optional[str] = No
 async def get_course_type_map(session, semester_id: Optional[str] = None) -> dict:
     """Return {sem_id: "Lecture"/"Exercise"/"Seminar"/...} for every course
     component found under the student's own degree-programme modules for the
-    given semester, regardless of whether it's still open for enrolment —
+    given semester, regardless of whether it's still open for enrolment -
     used to label already-enrolled courses (e.g. in the sign-out list) by
     which component they are.
     """
@@ -460,17 +460,17 @@ async def get_course_type_map(session, semester_id: Optional[str] = None) -> dic
 async def get_open_courses(session, semester_id: Optional[str] = None) -> list:
     """Return every course, within the student's own degree-programme modules,
     that offers self-service enrolment for the given semester (or the page's
-    default/current semester if omitted) — determined purely by that
+    default/current semester if omitted) - determined purely by that
     "Uneingeschränkter Zugang" (unrestricted access) badge the module listing
     page already shows per component (see _fetch_module_courses), never by
     probing each course's own Apply dialog.
 
     Each item: {"module": "wir823 - International Finance...", "type": "Lecture",
     "course": "...", "sem_id": "..."}. A module that requires both a Lecture and
-    a separate Seminar/Exercise yields one item per component — each is its own
+    a separate Seminar/Exercise yields one item per component - each is its own
     independent enrolment.
 
-    This does NOT exclude courses the student is already enrolled in — that
+    This does NOT exclude courses the student is already enrolled in - that
     needs the student's own course list, which lives outside this module
     (studip_bot.py's list_courses()); callers should cross-filter the result
     against it themselves. Enrolling in an already-enrolled course via
@@ -500,7 +500,7 @@ async def enroll_now(session, sem_id: str) -> tuple:
     only keeps offering a fresh security_token while enrolment is still
     possible, so its absence now (when it was present a moment ago) means the
     submission actually went through. The response page's own <title> isn't
-    used for this — it isn't guaranteed to reflect the outcome (e.g. it can
+    used for this - it isn't guaranteed to reflect the outcome (e.g. it can
     pick up an unrelated icon's accessibility label instead of the real page
     title), which reads as confusing/wrong even on a successful enrolment.
     """
@@ -516,7 +516,7 @@ async def enroll_now(session, sem_id: str) -> tuple:
 
     still_open = await _is_enrollment_open(session, sem_id)
     if still_open:
-        return False, "The site did not confirm the enrolment — please check your course list manually."
+        return False, "The site did not confirm the enrolment - please check your course list manually."
     return True, "Enrolled successfully."
 
 
@@ -530,7 +530,7 @@ async def decline_course(session, cid: str) -> tuple:
     <form action=".../decline/<cid>?cmd=kill&studipticket=<ticket>"> with
     hidden security_token/cmd/studipticket fields and a submit button
     name="yes". A plain GET to the *first* URl alone never withdraws anything
-    — that only requests the confirmation; the actual withdrawal happens on
+    - that only requests the confirmation; the actual withdrawal happens on
     the POST to the second (cmd=kill) URL with those fields plus yes="".
     Confirmed live: the studipticket is single-use/short-lived per GET, so it
     must be freshly fetched right before the POST, not cached.
@@ -562,5 +562,5 @@ async def decline_course(session, cid: str) -> tuple:
     async with await session.get(f"{BASE_URL}/dispatch.php/my_courses") as r3:
         html3 = await r3.text()
     if cid in html3:
-        return False, "The site did not confirm the sign-out — please check your course list manually."
+        return False, "The site did not confirm the sign-out - please check your course list manually."
     return True, "Signed out of the course successfully."

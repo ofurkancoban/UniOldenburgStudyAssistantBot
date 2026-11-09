@@ -435,6 +435,7 @@ class WatcherCycleTests(unittest.TestCase):
 
         patches = {
             "ALLOWED_USER_IDS": {1},
+            "PRIMARY_ADMIN_ID": 1,
             "login_studip": job("login", result=object()),
             "run_morning_summary_schedule": job("morning"),
             "get_weekly_study_plan_enabled": lambda: False,
@@ -454,6 +455,7 @@ class WatcherCycleTests(unittest.TestCase):
             "check_new_announcements_parallel": job("announcements"),
             "check_new_files_parallel": job("files"),
             "check_new_forum_posts_parallel": job("forum"),
+            "watched_courses": mock.AsyncMock(return_value={}),  # no Stud.IP course lists in a unit test
             "broadcast": broadcast,
             "load_general_cache": lambda: dict(cache),
             "save_general_cache": lambda data: cache.update(data),
@@ -496,7 +498,7 @@ class WatcherCycleTests(unittest.TestCase):
 
         patches = dict(
             load_general_cache=lambda: dict(cache), update_general_cache=lambda d: cache.update(d),
-            load_exam_cache=lambda *a, **k: exam_cache, ALLOWED_USER_IDS={5}, _stums_users=lambda: [],
+            load_exam_cache=lambda *a, **k: exam_cache, ALLOWED_USER_IDS={5}, PRIMARY_ADMIN_ID=5, _stums_users=lambda: [],
             check_calendar_reminders=job("calendar"), check_course_schedule_changes=job("changes"),
             check_task_reminders=job("tasks"), check_exam_reminders=job("registrations"),
             check_grade_reminders=job("grades"), check_tuition_reminders=job("tuition"),

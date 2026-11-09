@@ -49,7 +49,7 @@ class SchemaTests(unittest.TestCase):
     def test_old_global_settings_carry_over_to_the_primary_admin(self):
         db.save("food_preferences.json", {"avoid_codes": ["Kn"], "avoid_keywords": ["mushroom"]})
         self.addCleanup(db.delete, "food_preferences.json")
-        with mock.patch.object(preferences, "ALLOWED_USER_IDS", {8010}), \
+        with mock.patch.object(preferences, "PRIMARY_ADMIN_ID", 8010), \
                 mock.patch.object(preferences, "get_watch_previous_semester_enabled", lambda: True):
             admin = preferences.get_prefs(8010)
             other = preferences.get_prefs(8011)

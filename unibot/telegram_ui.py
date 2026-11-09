@@ -18,9 +18,10 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import RetryAfter, TelegramError
+from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import BaseRateLimiter, ContextTypes
 
+from studip_utils import aread_bytes
 from studip_utils import md_escape as _md
 from studip_utils import safe_filename as _safe_filename
 from unibot import db, state
@@ -67,11 +68,34 @@ async def _send_file_bytes(message, content: bytes, fname: str, sid: str, captio
 
 
 # ── Telegram API safety layer ─────────────────────────────────────────────────
+BLOCKED_MARKERS = ("blocked by the user", "user is deactivated")
+
+
+def mark_blocked_chat(chat_id, error: Exception) -> bool:
+    """A student who blocked the bot (or deleted their account) becomes
+    INACTIVE, so no scan or alert runs for them; /start brings them back.
+    True when a registered student was moved."""
+    if not isinstance(chat_id, int) or chat_id <= 0:
+        return False  # groups and channels are not students
+    if not any(marker in str(error).lower() for marker in BLOCKED_MARKERS):
+        return False
+    try:
+        if db.get_user(chat_id) is None:
+            return False
+        if db.set_lifecycle(chat_id, "inactive", "blocked the bot"):
+            logging.info("User %s blocked the bot: inactive, background work stopped", chat_id)
+            return True
+    except Exception:
+        logging.warning("Could not mark user %s inactive after a block", chat_id, exc_info=True)
+    return False
+
+
 class TelegramSafetyLimiter(BaseRateLimiter):
     """Every Bot API call of the bot goes through here (ApplicationBuilder
     .rate_limiter): calls are spaced at least MIN_INTERVAL apart (Telegram
     allows about 30 messages a second per bot), and a 429 Flood-Wait
-    (RetryAfter) is waited out and retried instead of failing the send."""
+    (RetryAfter) is waited out and retried instead of failing the send. A
+    "blocked by the user" answer makes that student INACTIVE."""
 
     MIN_INTERVAL = 1 / 25
     MAX_RETRIES = 2
@@ -99,6 +123,14 @@ class TelegramSafetyLimiter(BaseRateLimiter):
             await self._wait_turn()
             try:
                 return await callback(*args, **kwargs)
+            except Forbidden as e:
+                chat_id = (data or {}).get("chat_id")
+                try:
+                    chat_id = int(chat_id) if chat_id is not None else None
+                except (TypeError, ValueError):
+                    chat_id = None
+                mark_blocked_chat(chat_id, e)
+                raise
             except RetryAfter as e:
                 if attempt == self.MAX_RETRIES:
                     raise
@@ -295,8 +327,7 @@ async def _download_telegram_file(bot, file_id: str) -> Optional[bytes]:
     try:
         file = await bot.get_file(file_id)
         await file.download_to_drive(path)
-        with open(path, "rb") as f:
-            return f.read()
+        return await aread_bytes(path)
     except Exception as e:
         logging.warning("_download_telegram_file failed: %s", e)
         return None

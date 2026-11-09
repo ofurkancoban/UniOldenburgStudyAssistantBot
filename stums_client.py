@@ -206,6 +206,7 @@ def _has_stums_cookie(session) -> bool:
         from yarl import URL
         return bool(session.session.cookie_jar.filter_cookies(URL(STUDY_PLANNER_URL)))
     except Exception:
+        logging.debug("StuMS cookie check failed; assuming a session", exc_info=True)
         return True
 
 

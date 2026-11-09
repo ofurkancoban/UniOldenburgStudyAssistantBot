@@ -214,7 +214,7 @@ def translate_food_codes(text):
 
 
 async def fetch_todays_menu_items(session, sub_path="2/") -> list:
-    """Fetch today's Mensa menu and return structured dish items — a
+    """Fetch today's Mensa menu and return structured dish items - a
     lighter-weight sibling to get_todays_menu_enhanced() (which builds a
     formatted HTML string for display) for callers that need the raw data
     instead, like build_food_recommendation(). Deliberately a separate,
@@ -280,12 +280,12 @@ async def fetch_todays_menu_items(session, sub_path="2/") -> list:
         return []
 
 
-MEAT_CODES = {"G", "R", "L", "W", "F", "Fi"}  # Poultry (incl. turkey — no separate code for it), Beef, Lamb, Game, Fish (F and Fi both mean Fish in this Mensa's code table) — used to flag/prioritize meat/fish dishes
+MEAT_CODES = {"G", "R", "L", "W", "F", "Fi"}  # Poultry (incl. turkey - no separate code for it), Beef, Lamb, Game, Fish (F and Fi both mean Fish in this Mensa's code table) - used to flag/prioritize meat/fish dishes
 # What a diet leaves out (pork, alcohol, gelatine for halal, ...) is in preferences.diet_filter.
 
-MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only — everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Weigh three things together: (1) prioritize a meat, chicken, turkey, or fish dish when one is available — the [tag] next to a candidate flags this; (2) how nutritious/filling it likely is, judged from its name and description (lean protein, vegetables, a balanced plate > something clearly just a light side or dessert-like); (3) price — a student budget, so don't default to the most expensive option without reason. None of these mechanically overrides the others; weigh the actual tradeoff for today's specific candidates.
+MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only - everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Weigh three things together: (1) prioritize a meat, chicken, turkey, or fish dish when one is available - the [tag] next to a candidate flags this; (2) how nutritious/filling it likely is, judged from its name and description (lean protein, vegetables, a balanced plate > something clearly just a light side or dessert-like); (3) price - a student budget, so don't default to the most expensive option without reason. None of these mechanically overrides the others; weigh the actual tradeoff for today's specific candidates.
 
-Respond with strict JSON only, no other text: {"dish": "<the exact dish name, copied verbatim from the candidate list>", "reasoning": "<1-2 warm, casual sentences naming the dish naturally and explaining the pick (you can mention price/value or how filling it is if that's genuinely part of why) — this will be read aloud as a voice message, so plain spoken-friendly text only: no markdown, no lists, no emojis>"}"""
+Respond with strict JSON only, no other text: {"dish": "<the exact dish name, copied verbatim from the candidate list>", "reasoning": "<1-2 warm, casual sentences naming the dish naturally and explaining the pick (you can mention price/value or how filling it is if that's genuinely part of why) - this will be read aloud as a voice message, so plain spoken-friendly text only: no markdown, no lists, no emojis>"}"""
 
 MENSA_PHOTO_AJAX_URL = "https://sw-oldenburg-spl56.maxmanager.xyz/inc/ajax-php_konnektor.inc.php"
 MENSA_PHOTO_BASE_URL = "https://sw-oldenburg-spl56.maxmanager.xyz/"
@@ -294,7 +294,7 @@ MENSA_PHOTO_BASE_URL = "https://sw-oldenburg-spl56.maxmanager.xyz/"
 async def fetch_dish_photo_candidates(target_date=None, loc_id: str = "2") -> list:
     """Fetch every dish photo available for `target_date` (defaults to
     today) on the Studierendenwerk Oldenburg's public Speiseplan widget
-    (studierendenwerk-oldenburg.de/.../speiseplan-uhlhornsweg) — a
+    (studierendenwerk-oldenburg.de/.../speiseplan-uhlhornsweg) - a
     different source than the Stud.IP mensa widget the rest of this bot's
     menu features scrape, but the same underlying canteen data, so dish
     names match closely enough for fuzzy matching. loc_id="2" is
@@ -378,7 +378,7 @@ async def _fetch_speiseplan_html(loc_id: str, target_date=None) -> Optional[str]
 
 async def fetch_dish_photo_url(dish_name: str, loc_id: str = "2", target_date=None) -> Optional[str]:
     """Look up a photo for a single `dish_name` (see
-    fetch_dish_photo_candidates) — convenience wrapper for callers that
+    fetch_dish_photo_candidates) - convenience wrapper for callers that
     only need one dish; callers matching several dishes for the same day
     should call fetch_dish_photo_candidates once and match against it
     directly instead, to avoid a redundant fetch per dish."""
@@ -389,7 +389,7 @@ async def fetch_dish_photo_url(dish_name: str, loc_id: str = "2", target_date=No
 
 def _format_menu_item_html(item: dict) -> str:
     """Build the HTML caption/message text for one dish_items entry (see
-    get_todays_menu_enhanced) — name, which Counter/Culinarium it's at,
+    get_todays_menu_enhanced) - name, which Counter/Culinarium it's at,
     description, allergens, and price, in the compact layout used for
     both a photo caption (1024-char Telegram limit) and the no-photo
     text fallback."""
@@ -407,15 +407,15 @@ def _format_menu_item_html(item: dict) -> str:
 async def _send_menu_items_individually(sender, dish_items: list, target_date=None, skip_unmatched: bool = False,
                                         loc_id: str = "2"):
     """Send every dish in `dish_items` (see get_todays_menu_enhanced) as
-    its own message — name, Counter/Culinarium location, description,
+    its own message - name, Counter/Culinarium location, description,
     allergens, and price, with a photo attached when one can be matched
     on the Studierendenwerk's public Speiseplan site.
 
     skip_unmatched=False (default): a dish with no matched photo still
-    gets sent as a plain text message with the same info — use this when
+    gets sent as a plain text message with the same info - use this when
     these messages ARE the menu listing (nothing else already showed the
     text). skip_unmatched=True: dishes with no matched photo are skipped
-    entirely instead — use this when the full text menu was already sent
+    entirely instead - use this when the full text menu was already sent
     separately, so this call is purely "here are photos for what could be
     matched", not a second listing.
 
@@ -490,14 +490,14 @@ async def build_food_recommendation(loc_id: str = "2", user_id: Optional[int] = 
     pork/alcohol/wine/gelatine floor per their stated restriction), keep
     only Counter/Culinarium items, and ask the LLM to pick ONE dish,
     weighing meat/chicken/turkey/fish priority, likely nutritional value,
-    and price together (see MEAL_RECOMMENDATION_SYSTEM_PROMPT) — not a
+    and price together (see MEAL_RECOMMENDATION_SYSTEM_PROMPT) - not a
     random pick, a real judged one.
 
-    Returns {"dish", "category" (raw, e.g. "COUNTER TWO" — pass through
+    Returns {"dish", "category" (raw, e.g. "COUNTER TWO" - pass through
     _friendly_menu_category_label for display), "reasoning"}, or None on
     any failure (no menu data reachable). If the menu loaded but nothing
     survived filtering, "category" is None and "reasoning" carries an
-    explanatory message instead of a real pick — callers should still
+    explanatory message instead of a real pick - callers should still
     just speak/show "reasoning" either way.
     """
     from unibot.voice import _best_title_match
@@ -546,7 +546,7 @@ async def build_food_recommendation(loc_id: str = "2", user_id: Optional[int] = 
     for it in candidates:
         meat_tags = sorted({ALLERGEN_CODE_NAMES.get(c, c) for c in it["codes"] if c in MEAT_CODES})
         tag_note = f" [{', '.join(meat_tags)}]" if meat_tags else ""
-        price_part = f" — {it['price']}" if it["price"] else ""
+        price_part = f" - {it['price']}" if it["price"] else ""
         desc_part = f": {it['description']}" if it["description"] else ""
         lines.append(f"- {it['name']} ({it['category']}){tag_note}{price_part}{desc_part}")
         lookup.append((it["name"], it))
@@ -576,11 +576,11 @@ async def _deliver_food_recommendation(sender, result: dict):
     message (quick to glance at, no need to replay the audio for it), a
     photo of the dish when one can be matched on the Studierendenwerk's
     public Speiseplan site, and the actual pick + reasoning spoken as a
-    full voice message — falling back to text if TTS/ffmpeg is
+    full voice message - falling back to text if TTS/ffmpeg is
     unavailable, so it's never silently dropped."""
     from unibot.morning import _try_send_voice
     if result["category"] and result["dish"]:
-        await sender.reply_text(f"📍 {_friendly_menu_category_label(result['category'])} — {result['dish']}")
+        await sender.reply_text(f"📍 {_friendly_menu_category_label(result['category'])} - {result['dish']}")
 
         photo_url = await fetch_dish_photo_url(result["dish"], loc_id=result.get("loc_id") or "2")
         if photo_url:
@@ -646,7 +646,7 @@ def _menu_date_text(soup, effective_ts: int) -> str:
         date_page_text = date_element.get_text(strip=True)
         if re.search(r"\d{2}\.\d{2}\.\d{4}", date_page_text):
             return date_page_text
-    return datetime.fromtimestamp(effective_ts).strftime("%A, %d.%m.%Y")
+    return datetime.fromtimestamp(effective_ts, TZ_BERLIN).strftime("%A, %d.%m.%Y")
 
 
 def _menu_category_name(category_table) -> str:
@@ -820,7 +820,7 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
         menu_text += _format_allergen_guide(codes_used, hidden_count)
 
         dish_items.sort(key=lambda d: d["priority"])
-        return menu_text, prev_link, next_link, datetime.fromtimestamp(effective_ts).date(), dish_items, header_text
+        return menu_text, prev_link, next_link, datetime.fromtimestamp(effective_ts, TZ_BERLIN).date(), dish_items, header_text
 
     except Exception as e:
         logging.error("Enhanced menu fetch error: %s", e)
@@ -943,7 +943,7 @@ async def handle_mensa_location_button(update: Update, context: ContextTypes.DEF
 def get_menu_navigation_keyboard(prev_path=None, next_path=None, current_path="2/"):
     """Create navigation keyboard for Mensa menu. `current_path` is the
     sub_path of the day currently being shown (matching menu_nav's own
-    path format) — needed so the "📸 Show Dish Photos" button re-fetches
+    path format) - needed so the "📸 Show Dish Photos" button re-fetches
     photos for the right day rather than always today's."""
     row = []
     if prev_path:
@@ -992,7 +992,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         # Dish photos are opt-in via the "📸 Show Dish Photos" button below,
-        # not sent automatically — see handle_menu_photos_button.
+        # not sent automatically - see handle_menu_photos_button.
         await message.reply_text(
             menu_text,
             parse_mode="HTML",
@@ -1187,7 +1187,7 @@ def _food_preferences_management_view(category="main"):
 
 
 async def handle_menu_preferences_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle menu_prefs callback — show the interactive legend management view."""
+    """Handle menu_prefs callback - show the interactive legend management view."""
     query = update.callback_query
     await query.answer()
 
@@ -1203,7 +1203,7 @@ async def handle_menu_preferences_button(update: Update, context: ContextTypes.D
 
 
 async def handle_menu_photos_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle menu_photos|<sub_path> callback ("📸 Show Dish Photos") — opt-in
+    """Handle menu_photos|<sub_path> callback ("📸 Show Dish Photos") - opt-in
     photos for the day currently being viewed, re-fetching that day's menu
     to get dish_items/menu_date (not carried in the button itself) and
     sending one labeled message per dish that has a matched photo."""
@@ -1233,7 +1233,7 @@ async def handle_menu_photos_button(update: Update, context: ContextTypes.DEFAUL
 
 
 async def handle_menu_recommend_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle menu_recommend callback ("🍽️ What should I eat?") — ask the
+    """Handle menu_recommend callback ("🍽️ What should I eat?") - ask the
     chat LLM to pick one recommended dish from today's Counter/Culinarium
     options via build_food_recommendation()."""
     query = update.callback_query
@@ -1254,13 +1254,13 @@ async def handle_menu_recommend_button(update: Update, context: ContextTypes.DEF
         await _stop_loading_animation(stop_evt, anim_task)
 
     if not result:
-        await query.message.reply_text("❌ Couldn't reach the Mensa menu right now — try again in a bit.")
+        await query.message.reply_text("❌ Couldn't reach the Mensa menu right now - try again in a bit.")
         return
     await _deliver_food_recommendation(query.message, result)
 
 
 async def handle_foodpref_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle foodpref_cat|<cat_name> callback — navigate to a legend category or back to main."""
+    """Handle foodpref_cat|<cat_name> callback - navigate to a legend category or back to main."""
     query = update.callback_query
     await query.answer()
 
@@ -1277,7 +1277,7 @@ async def handle_foodpref_category(update: Update, context: ContextTypes.DEFAULT
 
 
 async def handle_foodpref_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle foodpref_toggle|<cat_name>|<item_key> callback — toggle avoidance of an ingredient."""
+    """Handle foodpref_toggle|<cat_name>|<item_key> callback - toggle avoidance of an ingredient."""
     query = update.callback_query
 
     user_id = query.from_user.id
@@ -1314,7 +1314,7 @@ async def handle_foodpref_toggle(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def handle_foodpref_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Tapped "Remove" — remove that one code/keyword and re-render
+    """Tapped "Remove" - remove that one code/keyword and re-render
     the management view in place."""
     query = update.callback_query
     await query.answer()

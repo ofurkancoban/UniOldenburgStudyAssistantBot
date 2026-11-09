@@ -68,3 +68,6 @@ whatsapp_service/baileys_auth.broken-*/
 reminders_cache.json
 watch_log.txt.*
 .deploy.env
+
+# migration leftovers (personal data, already in SQLite)
+*.imported

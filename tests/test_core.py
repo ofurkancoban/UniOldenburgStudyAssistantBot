@@ -305,7 +305,7 @@ class LoginServerTests(unittest.TestCase):
 
     def _server(self, allowed):
         return studip_login_server.LoginServer(
-            on_login=None, bot_token=self.BOT_TOKEN, allowed_user_ids=allowed, host="127.0.0.1")
+            bot_token=self.BOT_TOKEN, allowed_user_ids=allowed, host="127.0.0.1")
 
     def _init_data(self, user_id: int, age: int = 0) -> str:
         fields = {"auth_date": str(int(time.time()) - age), "user": json.dumps({"id": user_id})}
@@ -435,7 +435,6 @@ class MultiUserSessionTests(unittest.TestCase):
             return uid == 777
 
         srv = studip_login_server.LoginServer(
-            on_login=None,
             session_provider=provider,
             is_allowed_callback=is_allowed,
         )
@@ -485,7 +484,23 @@ class MultiUserSessionTests(unittest.TestCase):
             self.assertEqual(self.state.user_courses_map[4001]["cid_dist_sys"], "Distributed Systems")
 
     def test_status_command_student_and_admin(self):
+        from unibot import system
         from unibot.system import status_command
+
+        offline = types.SimpleNamespace(is_logged_in=mock.AsyncMock(return_value=False))
+        no_network = [mock.patch.object(system, "get_user_session", lambda uid=None: offline),
+                      mock.patch.object(system.state, "global_session", offline),
+                      mock.patch.object(system, "get_studip_user_profile", mock.AsyncMock(return_value={}))]
+        for patcher in no_network:  # a status screen test must not reach Stud.IP
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        from unibot import storage
+
+        async def status(update):
+            try:
+                await status_command(update, None)
+            finally:
+                await storage.close_shared_http()  # the WhatsApp status check's session
 
         student_update = types.SimpleNamespace(
             effective_user=types.SimpleNamespace(id=5001),
@@ -493,7 +508,7 @@ class MultiUserSessionTests(unittest.TestCase):
         )
         with mock.patch("unibot.system.is_user_admin", return_value=False), \
              mock.patch("unibot.auth.is_user_admin", return_value=False):
-            asyncio.run(status_command(student_update, None))
+            asyncio.run(status(student_update))
             sent_text = student_update.message.reply_text.call_args[0][0]
             self.assertIn("Student Account Status", sent_text)
             self.assertNotIn("Bot Memory", sent_text)
@@ -505,7 +520,7 @@ class MultiUserSessionTests(unittest.TestCase):
         )
         with mock.patch("unibot.system.is_user_admin", return_value=True), \
              mock.patch("unibot.auth.is_user_admin", return_value=True):
-            asyncio.run(status_command(admin_update, None))
+            asyncio.run(status(admin_update))
             sent_text = admin_update.message.reply_text.call_args[0][0]
             self.assertIn("Bot Status", sent_text)
             self.assertIn("Bot Memory", sent_text)
