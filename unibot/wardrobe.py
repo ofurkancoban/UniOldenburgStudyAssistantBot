@@ -496,6 +496,9 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
 async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stateless flip toggle, same template as handle_toggle_watch_prev_sem."""
     query = update.callback_query
+    if not is_user_admin(query.from_user.id):
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
+        return
     await query.answer()
     new_state = not get_wardrobe_feature_enabled()
     set_wardrobe_feature_enabled(new_state)
@@ -522,11 +525,11 @@ async def handle_outfit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     intact, same as wardrobe_menu); outfit_menu_toggle flips the daily
     suggestion and redraws the submenu in place."""
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
     if not is_user_admin(user_id):
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
+    await query.answer()
     if query.data == "outfit_menu_toggle":
         set_wardrobe_feature_enabled(not get_wardrobe_feature_enabled())
         text, keyboard = _outfit_menu_view()

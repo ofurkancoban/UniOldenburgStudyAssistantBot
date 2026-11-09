@@ -518,13 +518,15 @@ async def main():
             except Exception:
                 logging.debug("Login server stop failed", exc_info=True)
 
-        # write out a debounced link_cache change that hasn't fired yet
-        link_cache.flush()
-        await close_shared_http()
-
-        await close_all_sessions()
-
-        release_instance_lock()
+        try:
+            # write out a debounced link_cache change that hasn't fired yet
+            link_cache.flush()
+            await close_shared_http()
+            await close_all_sessions()
+        except Exception:
+            logging.error("Error while closing sessions", exc_info=True)
+        finally:
+            release_instance_lock()
         logging.info("✅ Bot shutdown complete")
 
 def _cleanup_stale_whatsapp_service(wa_dir: str):

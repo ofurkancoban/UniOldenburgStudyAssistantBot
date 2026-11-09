@@ -1,6 +1,7 @@
 # Core (versions tested together; upper bounds stop a future major release
 # from silently breaking the bot on a fresh install)
 aiohttp>=3.13,<4
+Brotli>=1.1,<2             # aiohttp needs it to decode "br" responses (Stud.IP sends them)
 python-telegram-bot>=22.5,<23
 python-dotenv>=1.1,<2
 beautifulsoup4>=4.14,<5

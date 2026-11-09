@@ -35,9 +35,11 @@ from unibot.config import (
     LOG_FILE,
 )
 from unibot.diagnostics import daily_digest, traffic_snapshot
+from unibot.preferences import get_pref
 from unibot.storage import (
-    get_weekly_study_plan_enabled,
     load_general_cache,
+    personal_record,
+    save_personal_record,
     save_general_cache,
     update_general_cache,
 )
@@ -170,10 +172,11 @@ async def _run_scheduled_jobs(bot, session, now: datetime):
     await _guarded("Morning summary", run_morning_summary_schedule, bot, active_uids, now)
 
     # Weekly content-aware study plan (Sunday evening, opt-in toggle).
-    if now.weekday() == 6 and now.hour >= 18 and get_weekly_study_plan_enabled():
+    plan_uids = [uid for uid in active_uids if get_pref(uid, "weekly_study_plan")]
+    if now.weekday() == 6 and now.hour >= 18 and plan_uids:
         await _run_once_per_period(
             "last_weekly_study_plan", now.strftime("%G-W%V"), "Weekly study plan",
-            "📘 Generating weekly study plan...", _run_weekly_study_plan_all_users, bot, active_uids, session,
+            "📘 Generating weekly study plan...", _run_weekly_study_plan_all_users, bot, plan_uids, session,
         )
 
     # Exam dates from course files (syllabus, info sheets, slides): once a day.
@@ -243,7 +246,7 @@ PERSONAL_SLOTS_KEY = "personal_check_slots"
 
 def _personal_due(uid: int, now: datetime) -> Optional[str]:
     """The student's due check slot (stagger.due_slot), or None."""
-    done = (load_general_cache().get(PERSONAL_SLOTS_KEY) or {}).get(str(uid))
+    done = personal_record(uid, PERSONAL_SLOTS_KEY)
     try:
         registration_open = bool(load_exam_cache(uid).get("notified_open"))
     except Exception:
@@ -258,16 +261,9 @@ PERSONAL_LAST_KEY = "personal_check_last"
 def mark_personal_check(uid: int, slot: Optional[str] = None, ts: Optional[float] = None) -> None:
     """Record a personal check of the student: the slot it covered (if a
     scheduled one) and when it ran."""
-    cache = load_general_cache()
-    updates = {}
     if slot is not None:
-        slots = dict(cache.get(PERSONAL_SLOTS_KEY) or {})
-        slots[str(uid)] = slot
-        updates[PERSONAL_SLOTS_KEY] = slots
-    last = dict(cache.get(PERSONAL_LAST_KEY) or {})
-    last[str(uid)] = ts if ts is not None else time.time()
-    updates[PERSONAL_LAST_KEY] = last
-    update_general_cache(updates)
+        save_personal_record(uid, PERSONAL_SLOTS_KEY, slot)
+    save_personal_record(uid, PERSONAL_LAST_KEY, ts if ts is not None else time.time())
 
 
 def _mark_personal_slot(uid: int, slot: str) -> None:
@@ -413,8 +409,15 @@ def _privacy_digest_line(now: datetime) -> str:
     """Counts only: encrypted records and how many students had a personal
     check in the last 24 h. No names, grades or amounts."""
     counts = db.privacy_counts()
-    last = load_general_cache().get(PERSONAL_LAST_KEY) or {}
-    recent = sum(1 for ts in last.values() if isinstance(ts, (int, float)) and now.timestamp() - ts < 86400)
+    recent = 0
+    for user in db.get_all_users():
+        try:
+            ts = personal_record(user["telegram_id"], PERSONAL_LAST_KEY)
+        except Exception:
+            logging.debug("Last check time unreadable", exc_info=True)
+            continue
+        if isinstance(ts, (int, float)) and now.timestamp() - ts < 86400:
+            recent += 1
     line = (f"🔒 Privacy: {counts['credentials_own_key']} logins under per-student keys, "
             f"{counts['private_rows']} private records for {counts['private_students']} students, "
             f"{recent} students checked in 24 h")

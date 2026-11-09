@@ -3,6 +3,7 @@
 Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
+import asyncio
 import html
 import io
 import logging
@@ -180,17 +181,14 @@ async def extract_text_from_file_async(filename: str, content: bytes) -> Optiona
     """extract_text_from_file, with GWDG Docling as the fallback for PDFs
     and PPTX files the local parsers get (almost) no text from, typically
     scans and handwritten notes. Typed files never use the quota."""
-    text = extract_text_from_file(filename, content)
+    # pypdf and python-pptx are pure Python and slow on big decks: keep them off the event loop
+    text = await asyncio.to_thread(extract_text_from_file, filename, content)
     ext = os.path.splitext(filename)[1].lower()
     if ext not in (".pdf", ".pptx"):
         return text
     pages = 1
     if ext == ".pdf":
-        try:
-            import pypdf
-            pages = max(1, len(pypdf.PdfReader(io.BytesIO(content)).pages))
-        except Exception:
-            logging.debug("PDF page count failed", exc_info=True)
+        pages = await asyncio.to_thread(_pdf_page_count, content)
     if text and len(text.strip()) >= DOCLING_MIN_CHARS_PER_PAGE * pages:
         return text
     converted = await convert_with_docling(filename, content)
@@ -198,6 +196,15 @@ async def extract_text_from_file_async(filename: str, content: bytes) -> Optiona
         logging.info("Docling read %s: %s -> %s characters", filename, len((text or '').strip()), len(converted))
         return converted
     return text
+
+
+def _pdf_page_count(content: bytes) -> int:
+    try:
+        import pypdf
+        return max(1, len(pypdf.PdfReader(io.BytesIO(content)).pages))
+    except Exception:
+        logging.debug("PDF page count failed", exc_info=True)
+        return 1
 
 
 def extract_text_from_file(filename: str, content: bytes) -> Optional[str]:

@@ -5,6 +5,8 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 
 import asyncio
 import html
+import operator
+from array import array
 import io
 import logging
 import os
@@ -33,19 +35,17 @@ from unibot.config import (
 )
 from unibot import state
 from unibot.study_day import plan_day
-from unibot.preferences import campus_anchor
+from unibot.preferences import campus_anchor, get_pref, set_pref
 from unibot.storage import (
-    get_scan_previous_semester_enabled,
     link_cache,
     user_tasks,
     record_study_block,
     study_block_log,
-    get_weekly_study_plan_enabled,
     load_study_plan_cache,
     save_study_plan_cache,
-    set_weekly_study_plan_enabled,
     shared_http,
     single_flight,
+    student_courses,
 )
 from unibot.formatting import _course_abbrev, _hours, _progress_bar, _short_id, clean_course_title
 from unibot.telegram_ui import (
@@ -77,7 +77,7 @@ from unibot.schedule import (
     schedule_study_sessions,
     user_travel,
 )
-from unibot.monitoring import render_weekly_study_plan_message
+from unibot.monitoring import render_weekly_study_plan_message, watched_courses
 from unibot.exams import STUDY_PLAN_MAX_FILE_MB, STUDY_PLAN_SUPPORTED_EXTENSIONS, get_file_exam_events
 
 
@@ -85,8 +85,8 @@ async def handle_toggle_weekly_study_plan(update: Update, context: ContextTypes.
     """Stateless flip toggle, same template as handle_toggle_wardrobe_feature."""
     query = update.callback_query
     await query.answer()
-    new_state = not get_weekly_study_plan_enabled()
-    set_weekly_study_plan_enabled(new_state)
+    uid = query.from_user.id
+    new_state = set_pref(uid, "weekly_study_plan", not get_pref(uid, "weekly_study_plan"))
     await query.edit_message_text(
         f"📘 Weekly Study Plan is now {'✅ On' if new_state else '🔲 Off'}.\nRun /status to see the full menu again."
     )
@@ -103,7 +103,7 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
     (explicit picker) and handle_browse_courses (when a default semester is
     set, skipping the picker).
 
-    If "include previous semester" is toggled on (get_scan_previous_semester_enabled,
+    If "include previous semester" is toggled on (the scan_previous_semester preference,
     see handle_toggle_prev_sem_scan), the semester right before this one is
     scanned too and merged in - a module can still have an open retake slot
     on a prior term's course instance. Off by default, since most of the
@@ -113,7 +113,8 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
     # rows) live and tappable during this network wait, which let an
     # impatient tap land on stale "Enroll" buttons and silently enroll in the
     # wrong course from the old list.
-    scan_prev = get_scan_previous_semester_enabled()
+    sender_user = getattr(sender, "from_user", None)
+    scan_prev = bool(sender_user and get_pref(sender_user.id, "scan_previous_semester"))
     loading_text = "📚 Checking which courses are open for enrolment" + (" (this and the previous semester)" if scan_prev else "") + "... this may take a moment."
     status_msg = await _reply_or_edit(sender, loading_text, reply_markup=InlineKeyboardMarkup([]))
     await _show_typing(sender)
@@ -293,19 +294,19 @@ async def _render_enrolled_courses_for_semester(sender, semester_id: str):
     )
 
 
-async def _list_course_files(cid, skip_folder_re=None) -> list:
+async def _list_course_files(cid, skip_folder_re=None, session=None) -> list:
     """[(folder_name or None, file_item)] for a course's top level plus one
     folder level down, skipping folders whose name matches skip_folder_re
     (default _SKIPPED_FOLDER_RE: side material like books, literature,
-    code, problem sets)."""
+    code, problem sets); read with `session` (the acting user's when None)."""
     skip_folder_re = skip_folder_re or _SKIPPED_FOLDER_RE
     out = []
-    for item in await list_files(cid):
+    for item in await list_files(cid, session=session):
         if item.get("type") == "file":
             out.append((None, item))
         elif item.get("type") == "folder" and item.get("url") and not skip_folder_re.match(item.get("name", "")):
             try:
-                sub = await list_files(cid, item["url"])
+                sub = await list_files(cid, item["url"], session=session)
             except Exception as e:
                 logging.warning("_list_course_files: list_files failed for folder %s: %s", item.get('name'), e)
                 continue
@@ -334,23 +335,63 @@ COURSE_SEARCH_MIN_SCORE = 0.65
 COURSE_SEARCH_INSTRUCTION = "Instruct: Given a student's question, retrieve passages from the course material that answer it\nQuery: "
 
 
+# The index is tens of MB of JSON: it is read from the database once and
+# kept in memory (this process is its only writer), with every chunk's
+# vector unpacked once for the searches.
+_course_index_cache: Optional[dict] = None
+_course_vectors_cache: Optional[list] = None  # [(cid, entry, chunk, array of floats)]
+COURSE_INDEX_SAVE_EVERY = 10  # files indexed between two saves
+
+
 def load_course_index() -> dict:
     """{"files": {"<cid>|<rel_path>": {"course", "file", "size",
     "modified_ts", "chunks": [{"text", "vec"}]}}}, vec being the
     normalized embedding as base64 float16."""
+    global _course_index_cache
+    if _course_index_cache is not None:
+        return _course_index_cache
+    data: dict = {"files": {}}
     if db.exists(COURSE_INDEX_PATH):
         try:
-            return db.load(COURSE_INDEX_PATH)
+            data = db.load(COURSE_INDEX_PATH) or {"files": {}}
         except Exception as e:
             logging.warning("Could not load course index: %s", e)
-    return {"files": {}}
+    _course_index_cache = data
+    return data
 
 
 def save_course_index(data: dict) -> None:
+    global _course_index_cache, _course_vectors_cache
+    _course_index_cache, _course_vectors_cache = data, None
     try:
         db.save(COURSE_INDEX_PATH, data)
     except Exception as e:
         logging.error("Failed to save course index: %s", e)
+
+
+async def _load_course_index_async() -> dict:
+    return load_course_index() if _course_index_cache is not None else await asyncio.to_thread(load_course_index)
+
+
+def _course_vectors(index: dict) -> list:
+    global _course_vectors_cache
+    if _course_vectors_cache is None:
+        rows = []
+        for key, entry in (index.get("files") or {}).items():
+            cid = key.split("|", 1)[0]
+            for chunk in entry.get("chunks", []):
+                rows.append((cid, entry, chunk, array("f", _unpack_vector(chunk["vec"]))))
+        _course_vectors_cache = rows
+    return _course_vectors_cache
+
+
+def _score_chunks(index: dict, query: "array[float]", allowed: set) -> list:
+    """(score, entry, chunk) for every chunk of the allowed courses, best
+    first; plain CPU work, run in a thread."""
+    scored = [(sum(map(operator.mul, query, vec)), entry, chunk)
+              for cid, entry, chunk, vec in _course_vectors(index) if cid in allowed]
+    scored.sort(key=lambda x: -x[0])
+    return scored
 
 
 def _pack_vector(vec: list) -> str:
@@ -421,16 +462,20 @@ async def index_course_files(session) -> dict:
     COURSE_INDEX_MAX_CALLS embedding requests and continues next run.
     Returns {"indexed": n_files, "chunks": n_chunks, "removed": n}."""
     stats = {"indexed": 0, "chunks": 0, "removed": 0}
-    http = session or state.global_session  # downloads use the caller's session
-    if not GWDG_API_KEY or http is None:
+    if not GWDG_API_KEY:
         return stats
-    await _ensure_watched_courses_map(session)
-    index = load_course_index()
+    # every followed course, each read with one of its own members' sessions
+    # (course_registry.pick_scanner): students' courses are indexed too, and
+    # nobody's login reads a course they don't take
+    plan = await watched_courses()
+    if not plan:
+        return stats  # nothing signed in: keep the index as it is
+    index = await _load_course_index_async()
     files_index = index.setdefault("files", {})
-    seen, calls = set(), 0
-    for cid, course_name in list(state.courses_map.items()):
+    seen, calls, unsaved = set(), 0, 0
+    for course_name, cid, http in plan:
         try:
-            files = await _list_course_files(cid)
+            files = await _list_course_files(cid, session=http)
         except Exception as e:
             logging.warning("index_course_files: list_files failed for %s: %s", cid, e)
             continue
@@ -478,38 +523,40 @@ async def index_course_files(session) -> dict:
             }
             stats["indexed"] += 1
             stats["chunks"] += len(chunks)
-            save_course_index(index)
-    enrolled = set(state.courses_map)
+            unsaved += 1
+            if unsaved >= COURSE_INDEX_SAVE_EVERY:
+                await asyncio.to_thread(save_course_index, index)
+                unsaved = 0
+    enrolled = {cid for _, cid, _ in plan}
     for key in [k for k in files_index if k not in seen and k.split("|", 1)[0] in enrolled]:
         del files_index[key]
         stats["removed"] += 1
     for key in [k for k in files_index if k.split("|", 1)[0] not in enrolled]:
         del files_index[key]
         stats["removed"] += 1
-    save_course_index(index)
+    await asyncio.to_thread(save_course_index, index)
     logging.info("index_course_files: %s, %s embedding calls", stats, calls)
     return stats
 
 
-async def search_course_material(question: str, top_k: int = COURSE_SEARCH_TOP_K) -> list:
-    """The top_k indexed passages closest to the question that clear
-    COURSE_SEARCH_MIN_SCORE, as [{"course", "file", "text", "score"}],
-    best first; [] if there is no index or the query couldn't be
-    embedded."""
-    files_index = load_course_index().get("files", {})
-    if not files_index:
+async def search_course_material(question: str, user_id: Optional[int] = None,
+                                 top_k: int = COURSE_SEARCH_TOP_K) -> list:
+    """The top_k indexed passages of the student's own courses closest to
+    the question that clear COURSE_SEARCH_MIN_SCORE, as [{"course", "file",
+    "text", "score"}], best first; [] without a student, an index or a
+    query embedding."""
+    allowed = set(student_courses(user_id))
+    if not allowed:
+        return []
+    index = await _load_course_index_async()
+    if not index.get("files"):
         return []
     vectors = await embed_texts([COURSE_SEARCH_INSTRUCTION + question])
     if not vectors:
         return []
     norm = sum(x * x for x in vectors[0]) ** 0.5 or 1.0
-    query = [x / norm for x in vectors[0]]
-    scored = []
-    for entry in files_index.values():
-        for chunk in entry.get("chunks", []):
-            score = sum(a * b for a, b in zip(query, _unpack_vector(chunk["vec"])))
-            scored.append((score, entry, chunk))
-    scored.sort(key=lambda x: -x[0])
+    query = array("f", (x / norm for x in vectors[0]))
+    scored = await asyncio.to_thread(_score_chunks, index, query, allowed)
     return [{"course": e["course"], "file": e["file"], "text": c["text"], "score": round(sc, 3)} for sc, e, c in scored[:top_k] if sc >= COURSE_SEARCH_MIN_SCORE]
 
 
@@ -531,7 +578,7 @@ async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
     if user_id is None or is_user_admin(user_id):
         await _ensure_watched_courses_map(session)
     tracked = load_study_progress(user_id=user_id).get("tracked")
-    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = (student_courses(user_id) if user_id else state.courses_map)
     courses = [(name, cid) for cid, name in courses_dict.items() if tracked is None or cid in tracked]
     if not courses:
         return {}
@@ -846,7 +893,7 @@ async def collect_course_workload(session, cids: list) -> dict:
                 except Exception as e:
                     logging.warning("collect_course_workload: download failed for %s: %s", key, e)
                     continue
-                entries[key] = {"kind": kind, "size": cur_size, "modified_ts": modified_ts, **_measure_workload_file(kind, name, content)}
+                entries[key] = {"kind": kind, "size": cur_size, "modified_ts": modified_ts, **(await asyncio.to_thread(_measure_workload_file, kind, name, content))}
             cache[cid] = entries
 
     await asyncio.gather(*(process_course(cid) for cid in cids))
@@ -1089,7 +1136,7 @@ async def _get_lectures_held(session, progress: dict, refresh: bool = False, use
     today_iso = datetime.now(TZ_BERLIN).date().isoformat()
     if not refresh and progress.get("held_date") == today_iso and "held" in progress:
         return progress["held"]
-    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = (student_courses(user_id) if user_id else state.courses_map)
     course_candidates = [(name, cid) for cid, name in courses_dict.items()]
     held = await count_lectures_held(session, course_candidates)
     progress["held"] = held
@@ -1244,7 +1291,7 @@ async def gather_weekly_study_inputs(session, user_id: Optional[int] = None) -> 
         raw_exams = []
 
     course_files = await collect_course_topics(session, user_id=user_id)
-    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = (student_courses(user_id) if user_id else state.courses_map)
     course_candidates = [(name, cid) for cid, name in courses_dict.items()]
     exams = []
     for exam in raw_exams:
@@ -1420,24 +1467,36 @@ async def handle_study_plan_toggle(update: Update, context: ContextTypes.DEFAULT
         logging.debug("handle_study_plan_toggle: keyboard refresh skipped: %s", e)
 
 
+async def _own_session(user_id: Optional[int]):
+    """The student's own signed-in session, renewed when it lapsed. Raises
+    RuntimeError when they have to sign in again: a student's plan or
+    progress is never built from someone else's login. Without a student
+    (a background job) it is the watcher session."""
+    if not user_id:
+        return state.global_session
+    session = get_user_session(user_id)
+    if await session.is_logged_in():
+        return session
+    session = await login_studip(user_id=user_id)  # raises when that fails too
+    if not await session.is_logged_in():
+        raise RuntimeError("Your Stud.IP session has expired. Sign in again with /login.")
+    return session
+
+
 async def _load_progress_rows(refresh: bool = False, user_id: Optional[int] = None) -> tuple:
     """(rows, progress). With refresh, the tracked courses' files are
     rescanned first (only new/changed files are summarized/measured, so
     this is mostly listing requests) and held-lecture counts are
     recomputed; without it, cached data is used so per-lecture toggle
     buttons stay instant."""
-    user_session = get_user_session(user_id) if user_id else None
-    active_session = user_session or state.global_session
-    if not active_session or not await active_session.is_logged_in():
-        await login_studip()
-        active_session = state.global_session
+    active_session = await _own_session(user_id)
     await _ensure_watched_courses_map(active_session)
     if user_id and user_id not in state.user_courses_map:
         try:
             await list_courses(session=active_session, user_id=user_id)
         except Exception as e:
             logging.warning("_load_progress_rows: failed to fetch courses for user %s: %s", user_id, e)
-    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = (student_courses(user_id) if user_id else state.courses_map)
     if refresh:
         await collect_course_topics(active_session, user_id=user_id)
     progress = load_study_progress(user_id=user_id)
@@ -1484,7 +1543,7 @@ def _auto_tracked_cids(progress: dict, user_id: Optional[int] = None) -> list:
     semester or with progress already logged."""
     held = progress.get("held", {})
     studied = progress.get("studied", {})
-    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = (student_courses(user_id) if user_id else state.courses_map)
     return [cid for cid in courses_dict if held.get(cid, 0) > 0 or studied.get(cid)]
 
 
@@ -1501,7 +1560,7 @@ def render_track_menu(progress: dict, user_id: Optional[int] = None) -> tuple:
         "Tap a course to add or remove it.",
     ]
     keyboard = []
-    courses_dict = state.user_courses_map[user_id] if (user_id and user_id in state.user_courses_map) else state.courses_map
+    courses_dict = (student_courses(user_id) if user_id else state.courses_map)
     for cid, name in sorted(courses_dict.items(), key=lambda kv: (kv[0] not in selected, kv[1].lower())):
         mark = "✅" if cid in selected else "⬜"
         n = held.get(cid, 0)
@@ -1514,11 +1573,7 @@ def render_track_menu(progress: dict, user_id: Optional[int] = None) -> tuple:
 
 
 async def _load_track_menu_progress(user_id: Optional[int] = None) -> dict:
-    user_session = get_user_session(user_id) if user_id else None
-    active_session = user_session or state.global_session
-    if not active_session or not await active_session.is_logged_in():
-        await login_studip()
-        active_session = state.global_session
+    active_session = await _own_session(user_id)
     await _ensure_watched_courses_map(active_session)
     if user_id and user_id not in state.user_courses_map:
         try:
@@ -1693,12 +1748,7 @@ async def study_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "📘 Building your weekly study plan...\n\n📚 Scanning course files...",
             disable_notification=True,
         )
-        user_session = get_user_session(user_id) if user_id else None
-        active_session = user_session or state.global_session
-        if not active_session or not await active_session.is_logged_in():
-            await status_msg.edit_text("🔄 Session expired, re-logging...")
-            await login_studip()
-            active_session = state.global_session
+        active_session = await _own_session(user_id)
         await run_weekly_study_plan_job(context.bot, [user_id], active_session, status_msg=status_msg, user_id=user_id)
         await status_msg.edit_text("✅ Study plan ready, see below 👇")
     except Exception as e:
@@ -1755,7 +1805,7 @@ async def course_file_buttons(cid: str, course_name: str, user_id: int,
     own = get_user_session(user_id)
     if not has_stored_login(own):
         return []  # listed with the student's own login only, never someone else's
-    courses = state.user_courses_map.get(user_id) or state.courses_map
+    courses = (student_courses(user_id) if user_id else state.courses_map)
     picked: list[dict] = []
     for source in [cid, *companion_courses(cid, courses)]:
         try:
@@ -1785,7 +1835,7 @@ async def build_catch_up_buttons(event: dict, user_id: int) -> Optional[InlineKe
     cid = event.get("course_id")
     if not cid:
         return None
-    courses = state.user_courses_map.get(user_id) or state.courses_map
+    courses = (student_courses(user_id) if user_id else state.courses_map)
     buttons = await course_file_buttons(cid, courses.get(cid) or event.get("title") or "your course", user_id, CATCH_UP_KINDS)
     return InlineKeyboardMarkup(buttons) if buttons else None
 
@@ -1811,7 +1861,7 @@ def study_pack_course(window: dict, user_id: int, now: datetime) -> Optional[tup
     """(cid, course name) the block is for: preparing the next class, else
     reviewing the one that just ended, else the course with the nearest
     deadline. None when nothing points to a course."""
-    courses = state.user_courses_map.get(user_id) or state.courses_map
+    courses = (student_courses(user_id) if user_id else state.courses_map)
     for key, title_key in (("before_cid", "before"), ("after_cid", "after")):
         cid = window.get(key)
         if cid:

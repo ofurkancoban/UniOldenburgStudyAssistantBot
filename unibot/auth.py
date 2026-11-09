@@ -3,12 +3,14 @@
 Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
+import atexit
 import contextlib
 import contextvars
 import errno
 import html
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -241,6 +243,11 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     _current_user.set(None)
     set_request_priority(BACKGROUND)
     if user is not None and is_user_allowed(user.id):
+        chat = update.effective_chat
+        if chat is not None and chat.type != "private":
+            # replies carry private data (grades, files, schedule): never answer in a group
+            logging.info("Ignored an update from a non-private chat")
+            raise ApplicationHandlerStop
         if await _rate_limited(update, user.id):
             raise ApplicationHandlerStop
         await _lifecycle_on_interaction(update, user.id)
@@ -351,20 +358,41 @@ def is_user_admin(user_id: Optional[int]) -> bool:
 LOCK_FILE = ".bot_instance.lock"
 
 
+def _is_bot_process(pid: int) -> bool:
+    """Whether `pid` is another running copy of this bot. A PID alone is not
+    enough: after a reboot or a crash the number can belong to any process,
+    and a stale lock would then block every start."""
+    if pid == os.getpid():
+        return False  # our own lock, left behind by an os.execv restart
+    try:
+        proc = psutil.Process(pid)
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            return False
+        cmdline = proc.cmdline()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+    except psutil.AccessDenied:
+        return True  # can't tell: assume it is the bot rather than run twice
+    script = os.path.basename(sys.argv[0] or "")
+    if not script:
+        return True
+    return any(os.path.basename(arg) == script for arg in cmdline)
+
+
 def acquire_instance_lock():
     """Ensure only one process instance runs (prevents getUpdates 409)."""
     try:
-        # Check if lock exists and if the PID is still running
+        # Check if lock exists and if its PID is still this bot
         if os.path.exists(LOCK_FILE):
             try:
                 with open(LOCK_FILE, "r") as f:
                     pid = int(f.read().strip())
-                if psutil.pid_exists(pid):
+                if _is_bot_process(pid):
                     logging.error("❌ Another bot instance is actually running (PID %s). Exiting.", pid)
                     return False
                 else:
                     # normal after every restart (PM2 stops the old process first)
-                    logging.info("Stale lock file found (PID %s not running). Removing it.", pid)
+                    logging.info("Stale lock file found (PID %s is not this bot). Removing it.", pid)
                     os.remove(LOCK_FILE)
             except Exception as e:
                 logging.warning("⚠️ Failed to read/validate lock file: %s. Attempting to overwrite.", e)
@@ -374,6 +402,7 @@ def acquire_instance_lock():
         fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w") as f:
             f.write(str(os.getpid()))
+        atexit.register(release_instance_lock)  # also on an exit that skips main's cleanup
         return True
     except OSError as e:
         if e.errno == errno.EEXIST:
@@ -383,10 +412,13 @@ def acquire_instance_lock():
 
 
 def release_instance_lock():
+    """Remove the lock, but only when it is ours (never another instance's)."""
     try:
-        if os.path.exists(LOCK_FILE):
+        with open(LOCK_FILE, "r") as f:
+            owner = f.read().strip()
+        if owner == str(os.getpid()):
             os.remove(LOCK_FILE)
-    except OSError:
+    except (OSError, ValueError):
         pass
 
 

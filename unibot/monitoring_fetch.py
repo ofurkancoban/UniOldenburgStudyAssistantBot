@@ -17,7 +17,6 @@ from unibot.formatting import (
 )
 from unibot.studip_api import (
     BASE_URL,
-    StudipApiError,
     _api_berlin,
     _api_html_to_text,
     _api_message,
@@ -140,8 +139,6 @@ MESSAGE_CHECK_LIMIT = 20
 async def _fetch_messages_api(limit: int = MESSAGE_CHECK_LIMIT, session=None) -> list:
     """The newest `limit` inbox messages, newest first, bodies included."""
     uid = await studip_api_user_id(session=session)
-    if not uid:
-        raise StudipApiError("Stud.IP user id unknown")
     page = await studip_api_get(f"/users/{uid}/inbox", {"page[limit]": limit, "include": "sender"}, session=session)
     names = _api_names(page.get("included", []))
     return [_api_message(m, names) for m in page.get("data", [])]

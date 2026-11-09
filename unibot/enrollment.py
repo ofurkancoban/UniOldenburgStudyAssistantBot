@@ -3,7 +3,6 @@
 Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
-import asyncio
 import logging
 import re
 from datetime import datetime, timedelta
@@ -20,10 +19,8 @@ from unibot import state
 from unibot.preferences import get_pref, set_pref
 from unibot.storage import (
     clear_default_semester,
-    get_scan_previous_semester_enabled,
     load_default_semester,
     save_default_semester,
-    set_scan_previous_semester_enabled,
 )
 from unibot.telegram_ui import (
     user_data,
@@ -32,7 +29,7 @@ from unibot.telegram_ui import (
     _stop_loading_animation,
     get_main_keyboard,
 )
-from unibot.auth import is_user_allowed, login_studip
+from unibot.auth import ACTIVE, is_user_allowed, lifecycle_state, login_studip
 from unibot.schedule import fastenroll_tasks, schedule_fastenroll_job
 from unibot.study_plan import _render_enrolled_courses_for_semester, _render_open_courses_for_semester
 from unibot.tasks import _run_fastenroll_task
@@ -229,7 +226,7 @@ async def handle_course_semester_pick(update: Update, context: ContextTypes.DEFA
 
 async def handle_toggle_prev_sem_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle toggle_prev_sem_scan|<semester_id> - flip the "include the
-    previous semester too" setting (see get_scan_previous_semester_enabled)
+    previous semester too" setting (the scan_previous_semester preference)
     and re-render the same semester's open-courses view with the new
     setting applied."""
     query = update.callback_query
@@ -240,7 +237,7 @@ async def handle_toggle_prev_sem_scan(update: Update, context: ContextTypes.DEFA
         return
 
     semester_id = query.data.split("|", 1)[1]
-    set_scan_previous_semester_enabled(not get_scan_previous_semester_enabled())
+    set_pref(user_id, "scan_previous_semester", not get_pref(user_id, "scan_previous_semester"))
     await _render_open_courses_for_semester(query, semester_id)
 
 
@@ -564,6 +561,9 @@ async def restore_pending_fastenroll_jobs(app):
     pending = load_pending()
     for chat_id_str, jobs in pending.items():
         chat_id = int(chat_id_str)
+        if not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE:
+            logging.info("Pending fastenroll jobs of %s not resumed: no longer allowed or active", chat_id)
+            continue
         for sem_id, job in jobs.items():
             target_time_str = job.get("target_time_str")
             target_date_str = job.get("target_date_str")
@@ -573,5 +573,6 @@ async def restore_pending_fastenroll_jobs(app):
                 await app.bot.send_message(chat_id=chat_id, text=f"🔄 Resuming previously scheduled fast enroll for course {sem_id} at {target_time_str}.")
             except Exception:
                 logging.warning("Could not notify chat %s about resumed fastenroll job", chat_id, exc_info=True)
-            task = asyncio.create_task(_run_fastenroll_task(chat_id, sem_id, target_time_str, target_date_str, context))
+            task = state.spawn(_run_fastenroll_task(chat_id, sem_id, target_time_str, target_date_str, context),
+                               name=f"fastenroll:{chat_id}:{sem_id}")
             fastenroll_tasks.setdefault(chat_id, {})[sem_id] = task

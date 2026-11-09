@@ -32,7 +32,6 @@ from unibot.preferences import get_pref
 from unibot.storage import (
     get_user_name,
     get_wardrobe_feature_enabled,
-    get_weekly_study_plan_enabled,
     link_cache,
     load_default_semester,
     shared_http,
@@ -79,11 +78,8 @@ async def _restart_process():
     # needed. execv also skips atexit handlers, which is why the WhatsApp
     # subprocess is stopped explicitly above.
     #
-    # The lock file must still be released here even though the PID will be
-    # identical after execv: acquire_instance_lock() only checks "does a
-    # process with this PID exist", and since our own PID trivially exists,
-    # a stale lock left in place makes the re-exec'd process think another
-    # instance is already running and refuse to start.
+    # The lock file is released here as well, although acquire_instance_lock()
+    # already treats a lock holding its own PID (identical after execv) as stale.
     release_instance_lock()
     logging.info("Re-executing process for restart...")
     os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -237,7 +233,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         default_semester_label = default_semester.get("label") or "Not set"
         weather_location = load_weather_location()
         weather_location_label = f"{weather_location['name']}, {weather_location['country']}" if weather_location else "Uni Oldenburg (default)"
-        study_plan_enabled = get_weekly_study_plan_enabled()
+        study_plan_enabled = get_pref(user_id, "weekly_study_plan")
 
         text = (
             "━━━━━━━━━━━━━━━━━\n"
@@ -380,7 +376,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wardrobe_enabled = get_wardrobe_feature_enabled()
     text += f"\n👔 Daily Outfit Suggestion: {'✅ On' if wardrobe_enabled else '🔲 Off'}"
 
-    study_plan_enabled = get_weekly_study_plan_enabled()
+    study_plan_enabled = get_pref(user_id, "weekly_study_plan")
     text += f"\n📘 Weekly Study Plan: {'✅ On' if study_plan_enabled else '🔲 Off'}"
 
     row_tools = [

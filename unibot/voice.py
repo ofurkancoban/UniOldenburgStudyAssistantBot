@@ -917,7 +917,7 @@ async def _voice_intent_ask_question(update, context, result, transcript, intent
     qa_user_id = update.effective_user.id if update.effective_user else None
     try:
         context_data = await build_qa_context(user_id=qa_user_id)
-        passages = await search_course_material(transcript)
+        passages = await search_course_material(transcript, user_id=qa_user_id)
         if passages:
             context_data += "\n\nCourse material excerpts (from the student's Stud.IP course files, closest to the question first):\n" + "\n\n".join(
                 f"[{p['course']} | {p['file']}]\n{p['text']}" for p in passages

@@ -25,12 +25,13 @@ from unibot.storage import (
     get_user_name,
     get_wardrobe_entry,
     get_wardrobe_feature_enabled,
+    personal_record,
+    save_personal_record,
     load_general_cache,
     user_tasks,
     record_worn_items,
     save_cached_outfit_today,
     save_general_cache,
-    update_general_cache,
 )
 from unibot.formatting import _get_course_icon, _get_location_emoji, _safe_loc, clean_course_title
 from unibot.telegram_ui import _download_telegram_file, _show_typing
@@ -374,9 +375,6 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
     # since pin state is per-chat) before pinning the new one. Best-effort:
     # a pin/unpin failure (e.g. missing chat permission) never blocks the
     # summary itself from going out.
-    pin_cache = load_general_cache()
-    pinned = pin_cache.get("pinned_morning_summary", {})
-    pin_cache_dirty = False
     delivered: list = []
 
     texts = prepared.get("texts") or {}
@@ -396,7 +394,7 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
             continue
         delivered.append(uid)
 
-        prev_msg_id = pinned.get(str(uid))
+        prev_msg_id = personal_record(uid, "pinned_morning_summary")
         if prev_msg_id:
             try:
                 await bot.unpin_chat_message(chat_id=uid, message_id=prev_msg_id)
@@ -404,13 +402,9 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
                 logging.warning("Failed to unpin previous morning summary for %s: %s", uid, e)
         try:
             await bot.pin_chat_message(chat_id=uid, message_id=sent_msg.message_id, disable_notification=True)
-            pinned[str(uid)] = sent_msg.message_id
-            pin_cache_dirty = True
+            save_personal_record(uid, "pinned_morning_summary", sent_msg.message_id)
         except Exception as e:
             logging.warning("Failed to pin morning summary for %s: %s", uid, e)
-
-    if pin_cache_dirty:
-        update_general_cache({"pinned_morning_summary": pinned})
 
     for uid in user_ids:
         photo_url, caption = (prepared.get("photos") or {}).get(uid) or (None, None)

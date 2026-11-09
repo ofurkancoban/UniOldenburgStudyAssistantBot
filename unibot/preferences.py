@@ -16,7 +16,11 @@ from typing import Any, Optional
 from studip_utils import TZ_BERLIN
 from unibot import db
 from unibot.config import PRIMARY_ADMIN_ID
-from unibot.storage import get_watch_previous_semester_enabled
+from unibot.storage import (
+    get_scan_previous_semester_enabled,
+    get_watch_previous_semester_enabled,
+    get_weekly_study_plan_enabled,
+)
 
 PREFS_KIND = "preferences"
 
@@ -69,6 +73,8 @@ BUDGET_MAX_PRICE = 3.50
 
 DEFAULTS: dict[str, Any] = {
     "watch_previous_semester": False,
+    "scan_previous_semester": False,
+    "weekly_study_plan": False,
     "exam_thresholds": "standard",
     "tuition_reminders": "smart",
     "campus_anchor": "both",
@@ -111,7 +117,7 @@ def validate(key: str, value) -> Any:
         if value not in choices[key]:
             raise ValueError(f"{key} must be one of {sorted(choices[key])}")
         return value
-    if key in ("watch_previous_semester", "outfit"):
+    if key in ("watch_previous_semester", "scan_previous_semester", "weekly_study_plan", "outfit"):
         return bool(value)
     if key == "morning_time":
         if value != "off" and value not in morning_time_options():
@@ -135,6 +141,24 @@ def validate(key: str, value) -> Any:
     raise ValueError(f"no validator for {key!r}")
 
 
+# Settings that used to be one switch for the whole bot; the old value
+# carries over to the primary admin, everyone else starts from the default.
+_LEGACY_GLOBAL_SWITCHES = {
+    "scan_previous_semester": get_scan_previous_semester_enabled,
+    "weekly_study_plan": get_weekly_study_plan_enabled,
+}
+
+
+def _legacy_switches() -> dict:
+    values = {}
+    for key, getter in _LEGACY_GLOBAL_SWITCHES.items():
+        try:
+            values[key] = bool(getter())
+        except Exception:
+            logging.debug("No global %s setting to carry over", key, exc_info=True)
+    return values
+
+
 def _initial(user_id: int) -> dict:
     """First preferences of a student: the old global settings carry over to
     the account they were made for (the primary admin), so nothing changes
@@ -145,6 +169,7 @@ def _initial(user_id: int) -> dict:
             prefs["watch_previous_semester"] = bool(get_watch_previous_semester_enabled())
         except Exception:
             logging.debug("No previous-semester setting to carry over", exc_info=True)
+        prefs.update(_legacy_switches())
         try:
             if db.exists("food_preferences.json"):
                 food = db.load("food_preferences.json") or {}
@@ -163,6 +188,10 @@ def get_prefs(user_id: int) -> dict:
     stored = scope.private(PREFS_KIND)
     if stored is None:
         stored = _initial(user_id)
+        scope.save_private(PREFS_KIND, stored)
+    elif user_id == PRIMARY_ADMIN_ID and any(k not in stored for k in _LEGACY_GLOBAL_SWITCHES):
+        # preferences made before these switches became per student
+        stored = {**_legacy_switches(), **stored}
         scope.save_private(PREFS_KIND, stored)
     merged = {**DEFAULTS, **{k: v for k, v in stored.items() if k in DEFAULTS}}
     merged["morning_sections"] = {**DEFAULTS["morning_sections"], **(stored.get("morning_sections") or {})}

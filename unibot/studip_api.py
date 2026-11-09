@@ -445,15 +445,21 @@ def forget_user_profile(user_id: Optional[int]) -> None:
 
 
 async def studip_api_user_id(session: Any = None, user_id: Optional[int] = None) -> str:
+    """The Stud.IP user id of the session's student. Raises StudipApiError
+    when it is unknown, so no caller builds a /users//... path."""
     if user_id is None:
         user_id = getattr(session, "user_id", None) if session is not None else current_user_id()
     if user_id is not None and not _uses_global_profile(user_id):
         profile = await get_studip_user_profile(user_id=user_id, session=session)
-        return profile.get("id") or ""
-    if not state._studip_api_user_id:
-        profile = await get_studip_user_profile()
-        state._studip_api_user_id = profile.get("id")
-    return state._studip_api_user_id or ""
+        uid = profile.get("id") or ""
+    else:
+        if not state._studip_api_user_id:
+            profile = await get_studip_user_profile()
+            state._studip_api_user_id = profile.get("id")
+        uid = state._studip_api_user_id or ""
+    if not uid:
+        raise StudipApiError("Stud.IP user id unknown")
+    return uid
 
 
 def _api_rel_id(resource: dict, name: str) -> Optional[str]:

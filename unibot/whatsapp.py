@@ -16,6 +16,7 @@ from unibot.config import (
     get_wa_group_id,
     set_wa_group_id,
 )
+from unibot.auth import is_user_admin
 from unibot.storage import shared_http
 
 
@@ -63,6 +64,9 @@ async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def set_wa_group_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Persist a WhatsApp group ID discovered by the Node.js microservice as WA_GROUP_ID."""
     query = update.callback_query
+    if not is_user_admin(query.from_user.id):
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
+        return
     group_id = query.data.split("|", 1)[1]
 
     set_wa_group_id(group_id)

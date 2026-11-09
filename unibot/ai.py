@@ -31,7 +31,8 @@ from unibot.config import (
     OPENROUTER_TTS_VOICE,
 )
 from unibot import state
-from unibot.storage import save_wardrobe_item_descriptions, shared_http
+from unibot.auth import current_user_id
+from unibot.storage import save_wardrobe_item_descriptions, shared_http, student_courses
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -70,7 +71,8 @@ async def transcribe_with_whisper(ogg_path: str) -> Optional[str]:
     as a vocabulary hint. None if GWDG is unset or the call failed."""
     if not GWDG_API_KEY or time.monotonic() < state._gwdg_blocked_until:
         return None
-    hint = ", ".join(["Stud.IP", "StuMS", "Mensa"] + sorted(set(state.courses_map.values())))[:800]
+    # the speaking student's own course names help the transcription
+    hint = ", ".join(["Stud.IP", "StuMS", "Mensa"] + sorted(set(student_courses(current_user_id()).values())))[:800]
     form = aiohttp.FormData()
     form.add_field("model", GWDG_WHISPER_MODEL)
     form.add_field("response_format", "json")
@@ -112,8 +114,15 @@ async def transcribe_voice_message(ogg_path: str) -> str:
     from pydub import AudioSegment
 
     wav_path = ogg_path + ".wav"
-    try:
+    def _convert() -> None:
         AudioSegment.from_file(ogg_path).export(wav_path, format="wav")
+
+    def _record(recognizer):
+        with sr.AudioFile(wav_path) as source:
+            return recognizer.record(source)
+
+    try:
+        await asyncio.to_thread(_convert)
     except FileNotFoundError as e:
         raise RuntimeError("ffmpeg is not installed on the server, so voice messages can't be converted. Install it with `apt install ffmpeg` (Linux) or `brew install ffmpeg` (Mac).") from e
     except Exception as e:
@@ -121,8 +130,7 @@ async def transcribe_voice_message(ogg_path: str) -> str:
 
     try:
         recognizer = sr.Recognizer()
-        with sr.AudioFile(wav_path) as source:
-            audio = recognizer.record(source)
+        audio = await asyncio.to_thread(_record, recognizer)
 
         results = await asyncio.gather(
             *(_recognize_in_language(recognizer, audio, lang) for lang in VOICE_TASK_LANGUAGES)

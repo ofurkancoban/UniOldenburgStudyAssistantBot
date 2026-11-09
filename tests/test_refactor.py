@@ -438,7 +438,7 @@ class WatcherCycleTests(unittest.TestCase):
             "PRIMARY_ADMIN_ID": 1,
             "login_studip": job("login", result=object()),
             "run_morning_summary_schedule": job("morning"),
-            "get_weekly_study_plan_enabled": lambda: False,
+            "get_pref": lambda uid, key: False,
             "check_calendar_reminders": job("calendar"),
             "check_course_schedule_changes": job("schedule_changes", fails=True),
             "check_task_reminders": job("tasks"),

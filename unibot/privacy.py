@@ -18,9 +18,9 @@ from unibot.exams import exam_action_cache
 from unibot.storage import (
     forget_personal_cache,
     get_ai_grades_enabled,
-    load_general_cache,
+    personal_record,
+    save_personal_record,
     set_ai_grades_enabled,
-    update_general_cache,
 )
 from unibot.watcher import PERSONAL_LAST_KEY, _run_stums_checks, _user_sender, mark_personal_check
 
@@ -45,7 +45,7 @@ def _fmt_ts(ts) -> str:
 
 def manual_check_wait(user_id: int, now_ts: Optional[float] = None) -> int:
     """Seconds until "Check now" may run again (0 when it may run)."""
-    last = (load_general_cache().get(MANUAL_CHECK_KEY) or {}).get(str(user_id))
+    last = personal_record(user_id, MANUAL_CHECK_KEY)
     if not isinstance(last, (int, float)):
         return 0
     now_ts = now_ts if now_ts is not None else time.time()
@@ -56,7 +56,7 @@ def privacy_view(user_id: int, now: Optional[datetime] = None, note: str = "") -
     now = now or datetime.now(TZ_BERLIN)
     season = _season(user_id, now.date())
     times = stagger.describe_slots(user_id, now.date(), season)
-    last = (load_general_cache().get(PERSONAL_LAST_KEY) or {}).get(str(user_id))
+    last = personal_record(user_id, PERSONAL_LAST_KEY)
     ai_on = get_ai_grades_enabled(user_id)
     mode = "exam season, 4 a day" if season else "2 a day"
     text = (
@@ -117,10 +117,7 @@ async def run_manual_check(bot, user_id: int) -> str:
     session = personal_session(user_id)
     if not has_stored_login(session):
         return "🔐 Sign in first (/login), then your checks can run."
-    cache = load_general_cache()
-    manual = dict(cache.get(MANUAL_CHECK_KEY) or {})
-    manual[str(user_id)] = time.time()
-    update_general_cache({MANUAL_CHECK_KEY: manual})
+    save_personal_record(user_id, MANUAL_CHECK_KEY, time.time())
     with acting_as(user_id), exam_cache_user(user_id):
         await _run_stums_checks(bot, session, _user_sender(user_id))
     mark_personal_check(user_id)

@@ -160,8 +160,6 @@ class PrivacyScreenTests(unittest.TestCase):
         self.privacy, self.storage = privacy, storage
         self.cache = {}
         self.patches = [
-            mock.patch.object(privacy, "load_general_cache", lambda: dict(self.cache)),
-            mock.patch.object(privacy, "update_general_cache", lambda d: self.cache.update(d)),
             mock.patch.object(storage, "load_general_cache", lambda: self.cache),
             mock.patch.object(storage, "save_general_cache", lambda d: self.cache.update(d)),
         ]
@@ -236,6 +234,7 @@ class PrivacyScreenTests(unittest.TestCase):
         er.save_exam_cache({"known_grades": {"M": "1.0"}}, user_id=uid)
         db.get_user_scope(uid).sync_courses({"c1"})
         self.cache.update({"study_blocks": {str(uid): {"1": {}}, "9": {"1": {}}}, "ai_grades": {str(uid): True}})
+        self.storage.set_travel_mode(uid, "bus")  # a personal record
         exams.exam_action_cache["s1"] = {"user_id": uid}
         exams.exam_action_cache["s2"] = {"user_id": 9}
         logged_out = []
@@ -250,6 +249,7 @@ class PrivacyScreenTests(unittest.TestCase):
         self.assertEqual(db.get_user_scope(uid).course_ids(), [])
         self.assertNotIn(str(uid), self.cache["study_blocks"])
         self.assertIn("9", self.cache["study_blocks"])  # other students untouched
+        self.assertEqual(self.storage.get_travel_mode(uid), "bike")  # the record is gone too
         self.assertNotIn("s1", exams.exam_action_cache)
         self.assertIn("s2", exams.exam_action_cache)
         exams.exam_action_cache.pop("s2", None)
@@ -281,8 +281,8 @@ class PrivacyDigestTests(unittest.TestCase):
         from datetime import datetime
         from unibot import watcher
         db.get_user_scope(601).save_credential("cookies", [{"value": "x"}])
-        with mock.patch.object(watcher, "load_general_cache",
-                               lambda: {"personal_check_last": {"601": datetime(2026, 11, 9, 9).timestamp()}}):
+        watcher.mark_personal_check(601, ts=datetime(2026, 11, 9, 9).timestamp())
+        with mock.patch.object(watcher.db, "get_all_users", lambda: [{"telegram_id": 601}, {"telegram_id": 602}]):
             line = watcher._privacy_digest_line(datetime(2026, 11, 9, 12, tzinfo=watcher.TZ_BERLIN))
         self.assertIn("logins under per-student keys", line)
         self.assertIn("1 students checked in 24 h", line)

@@ -6,13 +6,14 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 import asyncio
 import contextlib
 import functools
+import hashlib
 import hmac
 import logging
 import secrets
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 
@@ -102,6 +103,37 @@ class _PersistentLinkCache(dict):
 
 
 link_cache = _PersistentLinkCache(LINK_CACHE_PATH)  # short_id -> { url, cid, name?, action?, user_id?, current_url?, ts }
+
+
+def student_courses(user_id: Optional[int]) -> dict:
+    """{cid: title} of the student's own courses: their fetched course list,
+    else the courses the registry knows they follow (titles from the
+    shared course table). Only the watcher session's own student falls back
+    to the watcher's map. Never another student's courses."""
+    if user_id is None:
+        return {}
+    own = state.user_courses_map.get(user_id)
+    if own:
+        return dict(own)
+    try:
+        cids = db.get_user_scope(int(user_id)).course_ids()
+    except Exception:
+        logging.debug("Course registry unavailable for a student", exc_info=True)
+        cids = []
+    if cids:
+        titles = {}
+        for cid in cids:
+            row = None
+            try:
+                row = db.get_global_course(cid)
+            except Exception:
+                logging.debug("Course title unavailable", exc_info=True)
+            titles[cid] = (row or {}).get("title") or state.courses_map.get(cid) or cid
+        return titles
+    watcher = state.global_session
+    if watcher is not None and getattr(watcher, "user_id", None) == user_id:
+        return dict(state.courses_map)
+    return {}
 
 # Buttons on course alerts (shared course content, no personal data) keep
 # working after a restart; entries go after CALLBACK_TTL_SECONDS.
@@ -591,6 +623,55 @@ def set_weekly_study_plan_enabled(enabled: bool) -> None:
     save_general_cache(cache)
 
 
+# ── personal records (per student, encrypted) ──────────────────────────────────
+# These used to be sections of the shared, unencrypted general cache, keyed by
+# the student's id. Each now lives in the student's own private record; the
+# first read moves an old entry over and removes it from the shared cache.
+PERSONAL_RECORD_PREFIX = "cache."
+_legacy_checked: set = set()  # (user, section) pairs whose shared entry was already looked for
+
+
+def personal_record(user_id, section: str, default: Any = None) -> Any:
+    """The student's value of a former general-cache section (`default` if none)."""
+    uid = int(user_id)
+    scope = db.get_user_scope(uid)
+    kind = PERSONAL_RECORD_PREFIX + section
+    value = scope.private(kind)
+    if value is None and (uid, section) not in _legacy_checked and not scope.has_private(kind):
+        cache = load_general_cache()
+        entries = cache.get(section)
+        if isinstance(entries, dict) and str(uid) in entries:
+            value = entries.pop(str(uid))
+            scope.save_private(kind, value)
+            save_general_cache(cache)
+        _legacy_checked.add((uid, section))
+    return default if value is None else value
+
+
+def save_personal_record(user_id, section: str, value: Any) -> None:
+    uid = int(user_id)
+    db.get_user_scope(uid).save_private(PERSONAL_RECORD_PREFIX + section, value)
+    if (uid, section) in _legacy_checked:
+        return
+    # a legacy entry must not come back on a later first read
+    cache = load_general_cache()
+    entries = cache.get(section)
+    if isinstance(entries, dict) and str(uid) in entries:
+        entries.pop(str(uid))
+        save_general_cache(cache)
+    _legacy_checked.add((uid, section))
+
+
+def delete_personal_record(user_id, section: str) -> None:
+    uid = int(user_id)
+    db.get_user_scope(uid).delete_private(PERSONAL_RECORD_PREFIX + section)
+    cache = load_general_cache()
+    entries = cache.get(section)
+    if isinstance(entries, dict) and str(uid) in entries:
+        entries.pop(str(uid))
+        save_general_cache(cache)
+
+
 STUDY_BLOCK_LOG_DAYS = 35  # how long sent study blocks and their feedback are kept
 STUDY_BLOCK_STATUSES = ("sent", "done", "skipped")
 
@@ -601,8 +682,7 @@ def record_study_block(user_id, start_ts: int, status: str, course: Optional[str
     "skipped" from the student's answer (course and minutes are kept from "sent")."""
     if status not in STUDY_BLOCK_STATUSES:
         raise ValueError(status)
-    cache = load_general_cache()
-    log = cache.setdefault("study_blocks", {}).setdefault(str(user_id), {})
+    log = dict(personal_record(user_id, "study_blocks", {}))
     entry = log.get(str(start_ts), {})
     entry["status"] = status
     if course is not None:
@@ -613,12 +693,12 @@ def record_study_block(user_id, start_ts: int, status: str, course: Optional[str
     cutoff = time.time() - STUDY_BLOCK_LOG_DAYS * 86400
     for key in [k for k in log if int(k) < cutoff]:
         del log[key]
-    save_general_cache(cache)
+    save_personal_record(user_id, "study_blocks", log)
 
 
 def study_block_log(user_id, since_ts: float, until_ts: float) -> list[dict]:
     """[{"ts", "status", "course"}] of the student's blocks in [since, until), oldest first."""
-    log = (load_general_cache().get("study_blocks") or {}).get(str(user_id)) or {}
+    log = personal_record(user_id, "study_blocks", {}) or {}
     return [{"ts": int(k), **v} for k, v in sorted(log.items(), key=lambda kv: int(kv[0]))
             if since_ts <= int(k) < until_ts]
 
@@ -633,8 +713,7 @@ def record_task_outcome(user_id, task: dict, done_ts: Optional[float] = None) ->
     finished later still counts as late."""
     if not task.get("due_time") or not task.get("id"):
         return
-    cache = load_general_cache()
-    log = cache.setdefault("task_outcomes", {}).setdefault(str(user_id), {})
+    log = dict(personal_record(user_id, "task_outcomes", {}))
     entry = log.get(task["id"]) or {"due": task["due_time"], "text": str(task.get("text") or "")[:120]}
     if done_ts is not None and not entry.get("done"):
         entry["done"] = int(done_ts)
@@ -642,12 +721,12 @@ def record_task_outcome(user_id, task: dict, done_ts: Optional[float] = None) ->
     cutoff = time.time() - TASK_OUTCOME_KEEP_DAYS * 86400
     for key in [k for k, v in log.items() if _iso_ts(v.get("due")) < cutoff]:
         del log[key]
-    save_general_cache(cache)
+    save_personal_record(user_id, "task_outcomes", log)
 
 
 def task_outcomes(user_id) -> list[dict]:
     """[{"due" (ISO), "done" (timestamp or None), "text"}] of the student's deadline tasks."""
-    log = (load_general_cache().get("task_outcomes") or {}).get(str(user_id)) or {}
+    log = personal_record(user_id, "task_outcomes", {}) or {}
     return [{"id": k, **v} for k, v in log.items()]
 
 
@@ -659,60 +738,95 @@ def _iso_ts(value) -> float:
 
 
 # ── calendar feed and study buddy (per user) ──────────────────────────────────
+# The token itself is in the student's private record; the shared cache only
+# maps a hash of it to the student, so the feed URL can find its owner.
+CALENDAR_TOKEN_INDEX = "calendar_token_index"
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _index_calendar_token(user_id, token: Optional[str], old: Optional[str] = None) -> None:
+    cache = load_general_cache()
+    index = dict(cache.get(CALENDAR_TOKEN_INDEX) or {})
+    if old:
+        index.pop(_token_digest(old), None)
+    if token:
+        index[_token_digest(token)] = int(user_id)
+    cache[CALENDAR_TOKEN_INDEX] = index
+    save_general_cache(cache)
+
+
 def calendar_token(user_id, create: bool = True) -> Optional[str]:
     """The secret in the student's calendar feed link (made on first use)."""
-    cache = load_general_cache()
-    tokens = cache.setdefault("calendar_tokens", {})
-    token = tokens.get(str(user_id))
+    had_record = db.get_user_scope(int(user_id)).has_private(PERSONAL_RECORD_PREFIX + "calendar_tokens")
+    token = personal_record(user_id, "calendar_tokens")
+    if token is not None and not had_record:
+        _index_calendar_token(user_id, token)  # moved over from the shared cache just now
     if token is None and create:
-        token = tokens[str(user_id)] = secrets.token_urlsafe(24)
-        save_general_cache(cache)
+        token = secrets.token_urlsafe(24)
+        save_personal_record(user_id, "calendar_tokens", token)
+        _index_calendar_token(user_id, token)
     return token
 
 
 def reset_calendar_token(user_id) -> str:
     """A new feed link; the old one stops working."""
-    cache = load_general_cache()
-    cache.setdefault("calendar_tokens", {}).pop(str(user_id), None)
-    save_general_cache(cache)
-    return calendar_token(user_id) or ""
+    old = personal_record(user_id, "calendar_tokens")
+    token = secrets.token_urlsafe(24)
+    save_personal_record(user_id, "calendar_tokens", token)
+    _index_calendar_token(user_id, token, old=old)
+    return token
+
+
+def forget_calendar_token(user_id) -> None:
+    old = personal_record(user_id, "calendar_tokens")
+    delete_personal_record(user_id, "calendar_tokens")
+    if old:
+        _index_calendar_token(user_id, None, old=old)
 
 
 def user_for_calendar_token(token: str) -> Optional[int]:
-    for uid, known in (load_general_cache().get("calendar_tokens") or {}).items():
-        if token and hmac.compare_digest(known, token):
-            return int(uid)
-    return None
+    if not token:
+        return None
+    uid = (load_general_cache().get(CALENDAR_TOKEN_INDEX) or {}).get(_token_digest(token))
+    if uid is None:
+        # a link from before the move: its token is still in the shared cache
+        for legacy_uid, known in (load_general_cache().get("calendar_tokens") or {}).items():
+            if hmac.compare_digest(str(known), token):
+                return int(legacy_uid) if calendar_token(int(legacy_uid), create=False) == token else None
+        return None
+    known = personal_record(uid, "calendar_tokens")
+    return int(uid) if known and hmac.compare_digest(str(known), token) else None
 
 
 def get_study_buddy_enabled(user_id) -> bool:
     """Opt in: only then are the student's common free windows shown to
     classmates who opted in too (never their timetable itself)."""
-    return bool((load_general_cache().get("study_buddy") or {}).get(str(user_id)))
+    return bool(personal_record(user_id, "study_buddy", False))
 
 
 def set_study_buddy_enabled(user_id, enabled: bool) -> None:
-    cache = load_general_cache()
-    cache.setdefault("study_buddy", {})[str(user_id)] = bool(enabled)
-    save_general_cache(cache)
+    save_personal_record(user_id, "study_buddy", bool(enabled))
 
 
 def get_ai_grades_enabled(user_id) -> bool:
     """Opt in: only then may a free question to the assistant include the
     student's grade average and module results (they leave the server for the
     AI provider)."""
-    return bool((load_general_cache().get("ai_grades") or {}).get(str(user_id)))
+    return bool(personal_record(user_id, "ai_grades", False))
 
 
 def set_ai_grades_enabled(user_id, enabled: bool) -> None:
-    cache = load_general_cache()
-    cache.setdefault("ai_grades", {})[str(user_id)] = bool(enabled)
-    save_general_cache(cache)
+    save_personal_record(user_id, "ai_grades", bool(enabled))
 
 
-# general cache sections keyed by the student's id; "Delete my data" clears them
+# former general cache sections keyed by the student's id (now personal
+# records); "Delete my data" clears any entry still left in the shared cache
 PERSONAL_CACHE_SECTIONS = ("study_blocks", "task_outcomes", "calendar_tokens", "study_buddy", "travel_modes",
-                           "ai_grades", "personal_check_slots", "personal_check_last", "personal_check_manual")
+                           "ai_grades", "personal_check_slots", "personal_check_last", "personal_check_manual",
+                           "outfit_history", "outfit_today_cache", "pinned_morning_summary", "user_schedule_slots")
 
 
 def forget_personal_cache(user_id) -> list[str]:
@@ -724,6 +838,13 @@ def forget_personal_cache(user_id) -> list[str]:
         if isinstance(entries, dict) and str(user_id) in entries:
             entries.pop(str(user_id))
             removed.append(section)
+    index = cache.get(CALENDAR_TOKEN_INDEX)
+    if isinstance(index, dict):
+        stale = [digest for digest, uid in index.items() if str(uid) == str(user_id)]
+        for digest in stale:
+            index.pop(digest)
+        if stale:
+            removed.append(CALENDAR_TOKEN_INDEX)
     if removed:
         save_general_cache(cache)
     return removed
@@ -734,16 +855,14 @@ TRAVEL_MODES = ("bike", "bus")
 
 def get_travel_mode(user_id) -> str:
     """How the student gets between Haarentor and Wechloy: "bike" (default) or "bus"."""
-    mode = (load_general_cache().get("travel_modes") or {}).get(str(user_id))
+    mode = personal_record(user_id, "travel_modes")
     return mode if mode in TRAVEL_MODES else "bike"
 
 
 def set_travel_mode(user_id, mode: str) -> None:
     if mode not in TRAVEL_MODES:
         raise ValueError(mode)
-    cache = load_general_cache()
-    cache.setdefault("travel_modes", {})[str(user_id)] = mode
-    save_general_cache(cache)
+    save_personal_record(user_id, "travel_modes", mode)
 
 
 WARDROBE_OUTFIT_HISTORY_DAYS = 7  # how far back record_worn_items prunes to
@@ -758,30 +877,27 @@ def get_cached_outfit_today(user_id) -> Optional[dict]:
     day resends it instantly instead of burning another round of (quota-
     limited, free-tier) image-generation calls. None if nothing cached
     yet today."""
-    cache = load_general_cache().get("outfit_today_cache", {}).get(str(user_id))
+    cache = personal_record(user_id, "outfit_today_cache")
     if cache and cache.get("date") == datetime.now(TZ_BERLIN).date().isoformat():
         return cache
     return None
 
 
 def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[str], color_tip: str = "", item_labels: Optional[list] = None) -> None:
-    cache = load_general_cache()
-    all_cached = cache.setdefault("outfit_today_cache", {})
-    all_cached[str(user_id)] = {
+    save_personal_record(user_id, "outfit_today_cache", {
         "date": datetime.now(TZ_BERLIN).date().isoformat(),
         "description": description,
         "color_tip": color_tip,
         "photo_file_id": photo_file_id,
         "item_labels": item_labels or [],
-    }
-    save_general_cache(cache)
+    })
 
 
 def get_recently_worn_item_ids(user_id) -> set:
     """Item ids chosen in the last WARDROBE_RECENT_WORN_DAYS days, used to
     deprioritize (not hard-exclude - the wardrobe may simply have only one
     t-shirt) repeating the exact same outfit back-to-back."""
-    history = load_general_cache().get("outfit_history", {}).get(str(user_id), {})
+    history = personal_record(user_id, "outfit_history", {}) or {}
     cutoff = datetime.now(TZ_BERLIN).date() - timedelta(days=WARDROBE_RECENT_WORN_DAYS)
     recent_ids = set()
     for date_str, item_ids in history.items():
@@ -796,9 +912,7 @@ def get_recently_worn_item_ids(user_id) -> set:
 def record_worn_items(user_id, item_ids: list) -> None:
     """Record today's chosen item ids and prune entries older than
     WARDROBE_OUTFIT_HISTORY_DAYS so this cache doesn't grow forever."""
-    cache = load_general_cache()
-    history = cache.setdefault("outfit_history", {})
-    user_history = history.setdefault(str(user_id), {})
+    user_history = dict(personal_record(user_id, "outfit_history", {}) or {})
     today_str = datetime.now(TZ_BERLIN).date().isoformat()
     user_history[today_str] = item_ids
     cutoff = datetime.now(TZ_BERLIN).date() - timedelta(days=WARDROBE_OUTFIT_HISTORY_DAYS)
@@ -808,4 +922,4 @@ def record_worn_items(user_id, item_ids: list) -> None:
                 del user_history[date_str]
         except ValueError:
             del user_history[date_str]
-    save_general_cache(cache)
+    save_personal_record(user_id, "outfit_history", user_history)

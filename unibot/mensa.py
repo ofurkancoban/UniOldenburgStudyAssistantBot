@@ -3,6 +3,7 @@
 Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
+import hashlib
 import html
 import logging
 import random
@@ -1176,8 +1177,8 @@ def _food_preferences_management_view(category="main"):
     ]
 
     # If there are custom keywords, add remove buttons for them
-    for kw in avoid_keywords:
-        keyboard.append([InlineKeyboardButton(f"❌ Remove \"{kw}\"", callback_data=f"foodpref_remove|{kw}")])
+    for i, kw in enumerate(avoid_keywords):
+        keyboard.append([InlineKeyboardButton(f"❌ Remove \"{kw}\"", callback_data=foodpref_remove_data(i, kw))])
 
     if avoided_items:
         keyboard.append([InlineKeyboardButton("🗑 Clear All Preferences", callback_data="foodpref_clear_ask")])
@@ -1313,6 +1314,31 @@ async def handle_foodpref_toggle(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
+_FOODPREF_REMOVE_REF = re.compile(r"^k(\d+):([0-9a-f]{8})$")
+
+
+def _keyword_tag(keyword: str) -> str:
+    return hashlib.sha1(keyword.encode("utf-8")).hexdigest()[:8]
+
+
+def foodpref_remove_data(index: int, keyword: str) -> str:
+    """Callback data for removing one own keyword: its position plus a short
+    hash, so a long keyword never exceeds Telegram's 64 byte limit and a
+    stale button can't remove a different keyword."""
+    return f"foodpref_remove|k{index}:{_keyword_tag(keyword)}"
+
+
+def _resolve_foodpref_remove(value: str, keywords: list) -> Optional[str]:
+    """The keyword or code a remove button points at (None: stale button)."""
+    ref = _FOODPREF_REMOVE_REF.match(value)
+    if not ref:
+        return value  # buttons sent before the indexed form carried the value itself
+    index = int(ref.group(1))
+    if index < len(keywords) and _keyword_tag(keywords[index]) == ref.group(2):
+        return keywords[index]
+    return None
+
+
 async def handle_foodpref_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Tapped "Remove" - remove that one code/keyword and re-render
     the management view in place."""
@@ -1323,8 +1349,9 @@ async def handle_foodpref_remove(update: Update, context: ContextTypes.DEFAULT_T
     if not is_user_allowed(user_id):
         return
 
-    value = query.data.split("|", 1)[1]
     prefs = load_food_preferences()
+    value = _resolve_foodpref_remove(query.data.split("|", 1)[1], prefs["avoid_keywords"])
+    # value None (a stale button) removes nothing and just redraws the current list
     codes = [c for c in prefs["avoid_codes"] if c != value]
     keywords = [k for k in prefs["avoid_keywords"] if k != value]
     save_food_preferences(codes, keywords)

@@ -29,15 +29,14 @@ from unibot.config import (
 from unibot.preferences import get_pref, set_pref
 from unibot.storage import (
     cleanup_link_cache,
+    student_courses,
     get_travel_mode,
     get_user_name,
     set_travel_mode,
-    get_weekly_study_plan_enabled,
     link_cache,
     load_default_semester,
     user_tasks,
     save_user_name,
-    set_weekly_study_plan_enabled,
     shared_http,
 )
 from unibot.formatting import _short_id, clean_html_text
@@ -53,7 +52,7 @@ from unibot.telegram_ui import (
     get_main_keyboard,
     nav_names,
 )
-from unibot.auth import _perform_logout, _send_login_prompt, get_user_session, is_user_allowed, login_studip
+from unibot.auth import _perform_logout, _send_login_prompt, get_user_session, is_user_admin, is_user_allowed, login_studip
 from unibot.studip_api import (
     ZIP_RAW_LIMIT_BYTES,
     _api_message,
@@ -154,7 +153,8 @@ async def handle_status_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             set_pref(uid, "watch_previous_semester", not get_pref(uid, "watch_previous_semester"))
             state.courses_map = {}  # same as handle_toggle_watch_prev_sem: rebuild on the next watcher cycle
         elif feature == "study_plan":
-            set_weekly_study_plan_enabled(not get_weekly_study_plan_enabled())
+            uid = query.from_user.id
+            set_pref(uid, "weekly_study_plan", not get_pref(uid, "weekly_study_plan"))
         elif feature == "travel":
             set_travel_mode(query.from_user.id, "bus" if get_travel_mode(query.from_user.id) == "bike" else "bike")
         text, keyboard = _status_group_view(group, query.from_user.id)
@@ -722,11 +722,22 @@ _STATUS_BUTTON_HANDLERS = {
 }
 
 
+# Buttons that act on the whole bot (watchers, the shared WhatsApp gateway).
+_ADMIN_STATUS_BUTTONS = frozenset({
+    "wa_menu", "start_watchers", "stop_watchers", "request_wa_qr",
+    "force_wa_qr", "wa_test_message", "detect_wa_groups",
+})
+
+
 async def handle_status_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    data = query.data or ""
+    if data in _ADMIN_STATUS_BUTTONS and not is_user_admin(query.from_user.id):
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
+        return
     await query.answer()
 
-    handler = _STATUS_BUTTON_HANDLERS.get(query.data or "")
+    handler = _STATUS_BUTTON_HANDLERS.get(data)
     if handler is not None:
         await handler(update, context, query)
 
@@ -736,7 +747,7 @@ async def _selection_course(update, context, query, data, user_id):
     """Inline button callback: course."""
     cid = data[1]
     user_courses[user_id] = cid
-    course_name = state.courses_map.get(cid, f"Course {cid[:6]}")
+    course_name = student_courses(user_id).get(cid, f"Course {cid[:6]}")
     root_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
     nav_stack[user_id] = [root_url]
     nav_names[user_id] = [course_name]
@@ -882,13 +893,13 @@ async def _selection_nav(update, context, query, data, user_id):
 
         if nav_stack.get(user_id):
             back_url = nav_stack[user_id][-1]
-            files = await list_files(cid, back_url)
+            files = await list_files(cid, back_url, session=get_user_session(user_id), user_id=user_id)
             await send_folder(query, files, cid, user_id, current_url=back_url)
         else:
             # Fallback: course root'a git
             root_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
             nav_stack[user_id] = [root_url]
-            nav_names[user_id] = [state.courses_map.get(cid, f"Course {cid[:6]}")]
+            nav_names[user_id] = [student_courses(user_id).get(cid, f"Course {cid[:6]}")]
             user_sess = get_user_session(user_id)
             files = await list_files(cid, root_url, session=user_sess, user_id=user_id)
             await send_folder(query, files, cid, user_id, current_url=root_url)
@@ -896,7 +907,7 @@ async def _selection_nav(update, context, query, data, user_id):
     elif action == "home":
         root_url = f"https://elearning.uni-oldenburg.de/dispatch.php/course/files?cid={cid}"
         nav_stack[user_id] = [root_url]
-        nav_names[user_id] = [state.courses_map.get(cid, f"Course {cid[:6]}")]
+        nav_names[user_id] = [student_courses(user_id).get(cid, f"Course {cid[:6]}")]
         user_sess = get_user_session(user_id)
         files = await list_files(cid, root_url, session=user_sess, user_id=user_id)
         await send_folder(query, files, cid, user_id, current_url=root_url)

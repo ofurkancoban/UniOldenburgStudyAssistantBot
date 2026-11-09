@@ -30,7 +30,7 @@ from unibot.storage import (
     user_tasks,
 )
 from unibot.telegram_ui import user_data, get_main_keyboard
-from unibot.auth import get_user_session, is_user_allowed, login_studip
+from unibot.auth import acting_as, get_user_session, is_user_allowed, login_studip
 from unibot.studip_api import list_courses
 from unibot.ai import _call_openrouter, _extract_json_object
 from unibot.schedule import fastenroll_tasks
@@ -50,8 +50,11 @@ async def _run_fastenroll_task(chat_id: int, sem_id: str, target_time_str: str, 
             logging.warning("fastenroll progress notify failed", exc_info=True)
 
     try:
-        session = await login_studip()
-        success, message = await run_fast_enroll(session, sem_id, target_time_str, target_date_str, on_progress=on_progress)
+        # always the student who scheduled it: a job restored after a restart
+        # runs outside any update, where the acting user would be the bot's
+        with acting_as(chat_id):
+            session = await login_studip(user_id=chat_id)
+            success, message = await run_fast_enroll(session, sem_id, target_time_str, target_date_str, on_progress=on_progress)
         icon = "✅" if success else "❌"
         await context.bot.send_message(chat_id=chat_id, text=f"{icon} {message}")
     except asyncio.CancelledError:
