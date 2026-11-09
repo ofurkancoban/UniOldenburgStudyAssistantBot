@@ -71,3 +71,4 @@ watch_log.txt.*
 
 # migration leftovers (personal data, already in SQLite)
 *.imported
+.deploy_freeze_before.txt

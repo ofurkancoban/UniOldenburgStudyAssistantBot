@@ -26,7 +26,7 @@ from telegram.ext import ContextTypes
 import studip_oauth
 from studip_utils import TZ_BERLIN, berlin_now
 from unibot import course_registry, db, state
-from unibot.ai import transcribe_voice_message
+from unibot.ai import AI_BUDGET_MESSAGE, ai_budget_left, transcribe_voice_message
 from unibot.auth import (
     ACTIVE,
     act_as_bot,
@@ -1354,6 +1354,10 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if message is None or message.voice is None or chat is None or user_data is None:
         return
 
+    if not ai_budget_left(user_id):
+        # every voice note needs several AI calls (intent, answer, speech)
+        await message.reply_text(AI_BUDGET_MESSAGE)
+        return
     status_msg = await message.reply_text("🎙️ Transcribing...", disable_notification=True)
     await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
 

@@ -93,6 +93,23 @@ NOW="$(git rev-parse --short HEAD)"
 [ "$NOW" = "$EXPECTED" ] || { echo "server is at $NOW, expected $EXPECTED" >&2; exit 1; }
 echo "updated $PREVIOUS -> $NOW"
 
+# Python packages follow requirements.txt when it changed; the versions from
+# before are kept so a rollback can put them back.
+DEPS_CHANGED=0
+FREEZE=".deploy_freeze_before.txt"
+if ! git diff --quiet "$PREVIOUS" "$NOW" -- requirements.txt; then
+  DEPS_CHANGED=1
+  .venv/bin/pip freeze > "$FREEZE"
+  echo "requirements.txt changed: installing packages"
+  if ! { .venv/bin/pip install -q -U "setuptools>=84.1" "wheel>=0.46.2" \
+         && .venv/bin/pip install -q -r requirements.txt; }; then
+    echo "package install failed; back to $PREVIOUS" >&2
+    .venv/bin/pip install -q -r "$FREEZE" || echo "restoring the old packages failed too" >&2
+    git reset -q --hard "$PREVIOUS"
+    exit 1
+  fi
+fi
+
 if restart "$HEALTH_TIMEOUT"; then
   echo "healthy on $NOW"
   exit 0
@@ -100,6 +117,9 @@ fi
 
 echo "not healthy after ${HEALTH_TIMEOUT}s; rolling back to $PREVIOUS" >&2
 git reset -q --hard "$PREVIOUS"
+if [ "$DEPS_CHANGED" = 1 ]; then
+  .venv/bin/pip install -q -r "$FREEZE" || echo "restoring the old packages failed" >&2
+fi
 if restart "$ROLLBACK_TIMEOUT"; then
   echo "rolled back to $PREVIOUS and healthy" >&2
 else

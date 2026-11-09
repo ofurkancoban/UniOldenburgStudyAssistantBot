@@ -271,6 +271,18 @@ function _botCloseApp(tries) {
 """
 
 
+# Who may show these pages in a frame: Telegram's web clients (the Mini App
+# runs in their iframe; the mobile apps use a webview, which needs no frame
+# permission). Upstream's own X-Frame-Options/CSP are stripped for that
+# iframe, so without this any site could frame a signed-in proxy session
+# and trick the student into clicking (deregister an exam, leave a course).
+FRAME_ANCESTORS = "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
+
+
+async def _add_frame_policy(_request: web.Request, response: web.StreamResponse) -> None:
+    response.headers["Content-Security-Policy"] = FRAME_ANCESTORS
+
+
 class _RedactedAccessLogger(AbstractAccessLogger):
     """Access log line without the query string, Referer or User-Agent.
 
@@ -770,6 +782,7 @@ class LoginServer:
         if self._runner is not None:
             return
         app = web.Application(client_max_size=16 * 1024 * 1024)
+        app.on_response_prepare.append(_add_frame_policy)
         app.router.add_get("/app", self._app_gate)
         app.router.add_post("/_bot/auth", self._bot_auth)
         app.router.add_get("/_bot/entry", self._bot_entry)

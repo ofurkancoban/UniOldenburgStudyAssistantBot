@@ -31,7 +31,7 @@ from unibot.config import (
     OPENROUTER_TTS_VOICE,
 )
 from unibot import state
-from unibot.auth import current_user_id
+from unibot.auth import current_user_id, is_user_admin
 from unibot.storage import save_wardrobe_item_descriptions, shared_http, student_courses
 
 
@@ -69,8 +69,8 @@ async def transcribe_with_whisper(ogg_path: str) -> Optional[str]:
     dersinin..."), which Google's one-language-per-call endpoint dropped,
     and heard "Mensa" where Google heard "Manisa". The course names go in
     as a vocabulary hint. None if GWDG is unset or the call failed."""
-    if not GWDG_API_KEY or time.monotonic() < state._gwdg_blocked_until:
-        return None
+    if not GWDG_API_KEY or time.monotonic() < state._gwdg_blocked_until or not use_ai_budget():
+        return None  # the free Google recognizer takes over
     # the speaking student's own course names help the transcription
     hint = ", ".join(["Stud.IP", "StuMS", "Mensa"] + sorted(set(student_courses(current_user_id()).values())))[:800]
     form = aiohttp.FormData()
@@ -260,11 +260,61 @@ async def _call_gwdg_chat(messages: list, model: str, temperature: float = 0, ti
         return None
 
 
+# ── per-student AI budget ─────────────────────────────────────────────────────
+# The GWDG/OpenRouter quotas are shared by everyone: one student can't use
+# them up for all. Background work (no acting user) and admins don't count.
+AI_CALLS_PER_HOUR = 60
+AI_CALLS_PER_DAY = 300
+AI_BUDGET_MESSAGE = "⏳ You've used a lot of AI answers recently - please try again in a while."
+_ai_calls: dict[int, list[float]] = {}
+
+
+def _budget_user(user_id=None) -> Optional[int]:
+    uid = user_id if user_id is not None else current_user_id()
+    if uid is None or is_user_admin(uid):
+        return None
+    return int(uid)
+
+
+def _recent_ai_calls(uid: int, now: float) -> list[float]:
+    calls = [t for t in _ai_calls.get(uid, []) if now - t < 86400]
+    if calls:
+        _ai_calls[uid] = calls
+    else:
+        _ai_calls.pop(uid, None)
+    return calls
+
+
+def ai_budget_left(user_id=None) -> bool:
+    """Whether the student may start another AI call (without using one)."""
+    uid = _budget_user(user_id)
+    if uid is None:
+        return True
+    now = time.time()
+    calls = _recent_ai_calls(uid, now)
+    return len(calls) < AI_CALLS_PER_DAY and sum(1 for t in calls if now - t < 3600) < AI_CALLS_PER_HOUR
+
+
+def use_ai_budget(user_id=None) -> bool:
+    """Count one AI call for the student; False (and nothing counted) when
+    their hourly or daily budget is used up."""
+    uid = _budget_user(user_id)
+    if uid is None:
+        return True
+    if not ai_budget_left(uid):
+        logging.info("AI budget used up for user %s", uid)
+        return False
+    _ai_calls.setdefault(uid, []).append(time.time())
+    return True
+
+
 async def _call_openrouter(system_prompt: str, user_text: str, temperature: float = 0, timeout: Optional[float] = None, reasoning: bool = True, model: Optional[str] = None, gwdg_model: Optional[str] = None) -> Optional[str]:
     """One text completion: GWDG (GWDG_TEXT_MODEL) first, OpenRouter if that
     fails. Retried and with a longer timeout while _ai_patience is set. An
     explicit timeout always wins. `gwdg_model` overrides GWDG_TEXT_MODEL;
     `reasoning` and `model` only apply to the OpenRouter call."""
+    if not use_ai_budget():
+        return None
     patience = _ai_patience.get()
     timeout = timeout or (patience[0] if patience else 15)
     attempts = patience[1] if patience else 1
@@ -333,6 +383,8 @@ async def _call_openrouter_once(system_prompt: str, user_text: str, temperature:
 async def synthesize_speech(text: str) -> Optional[tuple]:
     """_synthesize_speech_once, retried and with a longer timeout while
     _ai_patience is set (see _call_openrouter)."""
+    if not use_ai_budget():
+        return None
     patience = _ai_patience.get()
     timeout = max(30, patience[0]) if patience else 30
     attempts = patience[1] if patience else 1

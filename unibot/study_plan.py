@@ -68,6 +68,7 @@ from unibot.studip_api import (
 )
 from unibot.ai import (
     GWDG_BURST_WAIT_SECONDS,
+    use_ai_budget,
     _gwdg_throttle,
     _record_gwdg_quota,
 )
@@ -430,7 +431,7 @@ def _chunk_text(text: str) -> list:
 
 async def embed_texts(texts: list) -> Optional[list]:
     """Embedding vectors for texts via GWDG (one request), or None."""
-    if not GWDG_API_KEY or not texts or time.monotonic() < state._gwdg_blocked_until:
+    if not GWDG_API_KEY or not texts or time.monotonic() < state._gwdg_blocked_until or not use_ai_budget():
         return None
     try:
         async with shared_http() as session:

@@ -313,5 +313,110 @@ class InviteGatePersistenceTests(unittest.TestCase):
             self.assertTrue(auth._gate_reply_due(32))
 
 
+class FramePolicyTests(unittest.TestCase):
+    def test_every_response_says_who_may_frame_it(self):
+        import socket
+
+        import aiohttp
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+
+        async def run():
+            server = studip_login_server.LoginServer(port=port, host="127.0.0.1", bot_token="1:x",
+                                                     is_allowed_callback=lambda uid: True)
+            await server.start()
+            try:
+                async with aiohttp.ClientSession() as http:
+                    seen = {}
+                    for path in ("/health", "/app", "/_bot/entry", "/dispatch.php/my_courses"):
+                        async with http.get(f"http://127.0.0.1:{port}{path}", allow_redirects=False) as resp:
+                            seen[path] = (resp.status, resp.headers.get("Content-Security-Policy"))
+                    return seen
+            finally:
+                await server.stop()
+
+        seen = asyncio.run(run())
+        for path, (status, policy) in seen.items():
+            self.assertEqual(policy, studip_login_server.FRAME_ANCESTORS, (path, status))
+        self.assertEqual(seen["/_bot/entry"][0], 302)  # redirects carry it too
+        self.assertNotIn("*", studip_login_server.FRAME_ANCESTORS.replace("https://*.telegram.org", ""))
+
+
+class StoppedStudentFeedTests(unittest.TestCase):
+    def test_a_stopped_students_feed_is_gone(self):
+        from unibot import study_week
+
+        request = mock.MagicMock()
+        request.match_info = {"token": "tok.ics"}
+        calendar = mock.AsyncMock(return_value="BEGIN:VCALENDAR")
+        with mock.patch.object(study_week, "user_for_calendar_token", return_value=9501), \
+                mock.patch.object(study_week, "is_user_allowed", return_value=True), \
+                mock.patch.object(study_week, "calendar_for", calendar):
+            with mock.patch.object(study_week, "lifecycle_state", return_value=study_week.INACTIVE):
+                self.assertEqual(asyncio.run(study_week.feed_handler(request)).status, 404)
+            calendar.assert_not_called()
+            with mock.patch.object(study_week, "lifecycle_state", return_value="active"):
+                self.assertEqual(asyncio.run(study_week.feed_handler(request)).status, 200)
+
+
+class AiBudgetTests(unittest.TestCase):
+    def setUp(self):
+        from unibot import ai
+        self.ai = ai
+        ai._ai_calls.clear()
+        self.addCleanup(ai._ai_calls.clear)
+
+    def test_a_student_cannot_use_up_the_shared_quota(self):
+        with mock.patch.object(self.ai, "is_user_admin", return_value=False):
+            for _ in range(self.ai.AI_CALLS_PER_HOUR):
+                self.assertTrue(self.ai.use_ai_budget(9601))
+            self.assertFalse(self.ai.use_ai_budget(9601))
+            self.assertFalse(self.ai.ai_budget_left(9601))
+            self.assertTrue(self.ai.use_ai_budget(9602))  # another student is unaffected
+            later = time.time() + 3601
+            with mock.patch.object(self.ai.time, "time", return_value=later):
+                self.assertTrue(self.ai.use_ai_budget(9601))  # the hour is over
+
+    def test_the_daily_cap_holds_across_hours(self):
+        now = time.time()
+        self.ai._ai_calls[9603] = [now - 7200 - i for i in range(self.ai.AI_CALLS_PER_DAY)]
+        with mock.patch.object(self.ai, "is_user_admin", return_value=False):
+            self.assertFalse(self.ai.use_ai_budget(9603))
+
+    def test_admins_and_background_work_are_not_counted(self):
+        with mock.patch.object(self.ai, "is_user_admin", return_value=True):
+            for _ in range(self.ai.AI_CALLS_PER_HOUR + 5):
+                self.assertTrue(self.ai.use_ai_budget(9604))
+        self.assertTrue(self.ai.use_ai_budget(None))
+        self.assertEqual(self.ai._ai_calls, {})
+
+    def test_an_exhausted_student_reaches_no_provider(self):
+        gwdg, openrouter = mock.AsyncMock(), mock.AsyncMock()
+        with mock.patch.object(self.ai, "is_user_admin", return_value=False), \
+                mock.patch.object(self.ai, "_call_gwdg_chat", gwdg), \
+                mock.patch.object(self.ai, "_call_openrouter_once", openrouter), \
+                mock.patch.object(self.ai, "ai_budget_left", return_value=False):
+            with auth.acting_as(9605):
+                self.assertIsNone(asyncio.run(self.ai._call_openrouter("s", "u")))
+                self.assertIsNone(asyncio.run(self.ai.synthesize_speech("hello")))
+        gwdg.assert_not_called()
+        openrouter.assert_not_called()
+
+    def test_voice_notes_stop_with_a_message(self):
+        update = mock.MagicMock()
+        update.effective_user.id = 9606
+        update.message.reply_text = mock.AsyncMock()
+        context = mock.MagicMock()
+        context.user_data = {}
+        context.bot.get_file = mock.AsyncMock()
+        with mock.patch.object(monitoring, "is_user_allowed", return_value=True), \
+                mock.patch.object(monitoring, "ai_budget_left", return_value=False):
+            asyncio.run(monitoring.handle_voice_message(update, context))
+        update.message.reply_text.assert_awaited_once_with(monitoring.AI_BUDGET_MESSAGE)
+        context.bot.get_file.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

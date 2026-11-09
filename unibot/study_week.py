@@ -138,7 +138,8 @@ async def feed_handler(request: web.Request) -> web.Response:
     """GET /cal/<token>.ics: the student's live calendar feed."""
     token = request.match_info.get("token", "").removesuffix(".ics")
     user_id = user_for_calendar_token(token)
-    if user_id is None or not is_user_allowed(user_id):
+    # a student who stopped the bot gets no background work, a feed included
+    if user_id is None or not is_user_allowed(user_id) or lifecycle_state(user_id) == INACTIVE:
         return web.Response(status=404, text="Not found")
     try:
         body = await calendar_for(user_id)
