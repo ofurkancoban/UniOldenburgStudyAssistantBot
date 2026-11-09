@@ -1705,6 +1705,7 @@ COURSE_SESSION_STATE_KEY = "course_session_state"  # {cid: {event id: entry}}, c
 COURSE_SESSION_DAYS_AHEAD = 14
 COURSE_SESSION_SCAN_SECONDS = 20 * 60        # every course at most this often
 PERSONAL_TIMETABLE_CHECK_SECONDS = 6 * 3600  # each student's own timetable
+SESSION_URGENT_HOURS = 48  # a change to a session this close skips the evening digest
 _last_course_session_scan = 0.0
 _timetable_checked_at: dict[int, float] = {}
 
@@ -1772,13 +1773,22 @@ async def check_course_session_changes(bot, now: Optional[datetime] = None, forc
         events = _course_session_events(cid, course_name, raw, now)
         first_scan = cid not in all_state
         course_state = dict(all_state.get(cid) or {})
-        alerts, _changed = _diff_course_events(events, course_state, now)
+        changes: list[tuple[datetime, str]] = []
+        for ev in events:  # one at a time, so each alert knows how close its session is
+            alerts, _changed = _diff_course_events([ev], course_state, now)
+            changes.extend((ev["start_dt"], text) for text in alerts)
         all_state[cid] = course_state
         if first_scan:
             continue  # baseline: sessions cancelled before we knew the course are not news
-        for text in alerts:
-            await course_registry.fan_out(bot, cid, "schedule", text, _alert_title(text),
-                                          reply_markup=_SCHEDULE_WA_MARKUP, members=course_members(cid), now=now)
+        for start_dt, text in changes:
+            # a session within SESSION_URGENT_HOURS: a missed change means a wasted
+            # trip, so a full card with sound that skips the evening digest (muted
+            # courses and quiet hours still apply); later ones follow the
+            # student's own course format and delivery
+            await course_registry.fan_out(
+                bot, cid, "schedule", text, _alert_title(text), reply_markup=_SCHEDULE_WA_MARKUP,
+                members=course_members(cid), now=now,
+                urgent=start_dt - now <= timedelta(hours=SESSION_URGENT_HOURS))
             stats["alerts"] += 1
     known = {cid for _, cid, _ in plan}
     all_state = {cid: entries for cid, entries in all_state.items() if cid in known}

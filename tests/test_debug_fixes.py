@@ -348,7 +348,10 @@ class PersonalRecordTests(SharedCacheMixin, unittest.TestCase):
 
         async def fan_out(bot, cid, kind, text, title_text, **kwargs):
             fan_outs.append((cid, kind, set(kwargs.get("members") or ()), title_text))
+            self.urgent.append(kwargs.get("urgent", False))
             return {}
+
+        self.urgent: list = []
 
         return [mock.patch.object(schedule, "load_general_cache", lambda: self.cache),
                 mock.patch.object(schedule, "save_general_cache", lambda d: self.cache.update(d)),
@@ -387,6 +390,11 @@ class PersonalRecordTests(SharedCacheMixin, unittest.TestCase):
         asyncio.run(schedule.check_course_session_changes(None, now=noon, force=True))
         self.assertEqual([(cid, kind, members) for cid, kind, members, _ in fan_outs], [("c1", "schedule", {801, 802})])
         self.assertIn("CANCELLED", fan_outs[0][3])
+        self.assertEqual(self.urgent, [True])  # two days ahead: comes right away, with sound
+        feeds["c2"] = [{"id": "e1", "attributes": {"start": "2026-11-20T10:00:00+01:00",
+                                                   "end": "2026-11-20T12:00:00+01:00", "is-cancelled": True}}]
+        asyncio.run(schedule.check_course_session_changes(None, now=noon, force=True))
+        self.assertEqual((fan_outs[-1][0], self.urgent[-1]), ("c2", False))  # ten days ahead: their own way
         self.assertIn("Course One", fan_outs[0][3])
         self.assertNotIn("801", json.dumps(self.cache))  # the shared state holds course facts only
 
@@ -419,6 +427,37 @@ class PersonalRecordTests(SharedCacheMixin, unittest.TestCase):
         self.assertEqual([(cid, members) for cid, _, members, _ in fan_outs], [(None, {811})])
         self.assertEqual(storage.personal_record(812, "user_schedule_slots")["s1"]["location"], "B2")
         self.assertNotIn("C3", json.dumps(self.cache))
+
+
+class UrgentDeliveryTests(unittest.TestCase):
+    def _deliver(self, fmt, reason, urgent):
+        from unibot import course_registry
+        bot = mock.MagicMock()
+        bot.send_message = mock.AsyncMock()
+        queued = []
+        with mock.patch.object(course_registry, "broadcast_targets", lambda cid, members: {830}), \
+                mock.patch.object(course_registry, "delivery_format", lambda uid, cid, kind: fmt), \
+                mock.patch.object(course_registry, "_hold_reason", lambda uid, now: reason), \
+                mock.patch.object(course_registry, "get_pref", lambda uid, key: "card"), \
+                mock.patch.object(course_registry, "queue_alert", lambda *a: queued.append(a)), \
+                mock.patch.object(course_registry.asyncio, "sleep", mock.AsyncMock()):
+            counts = asyncio.run(course_registry.fan_out(bot, "c1", "schedule", "text", "title", urgent=urgent))
+        return counts, bot.send_message.await_args_list
+
+    def test_urgent_comes_with_sound_and_skips_the_digest(self):
+        counts, sent = self._deliver("silent", "digest", urgent=True)
+        self.assertEqual(counts["full"], 1)
+        self.assertFalse(sent[0].kwargs["disable_notification"])
+        self.assertEqual(sent[0].kwargs["text"], "text")
+
+    def test_urgent_still_respects_quiet_hours_and_mute(self):
+        self.assertEqual(self._deliver("silent", "quiet", urgent=True)[0]["queued"], 1)
+        self.assertEqual(self._deliver(None, None, urgent=True)[0]["skipped"], 1)
+
+    def test_not_urgent_keeps_the_students_choice(self):
+        counts, sent = self._deliver("silent", None, urgent=False)
+        self.assertTrue(sent[0].kwargs["disable_notification"])
+        self.assertEqual(self._deliver("silent", "digest", urgent=False)[0]["queued"], 1)
 
 
 class RequirementsTests(unittest.TestCase):

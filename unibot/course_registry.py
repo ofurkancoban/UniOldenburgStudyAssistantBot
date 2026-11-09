@@ -294,7 +294,7 @@ def _prune_queue(queue: list, now: datetime) -> list:
 async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str, *,
                   reply_markup=None, members=None, parse_mode: str = "HTML",
                   send_full: Optional[Callable[..., Awaitable[bool]]] = None,
-                  now: Optional[datetime] = None) -> dict:
+                  now: Optional[datetime] = None, urgent: bool = False) -> dict:
     """Deliver one alert to the course's followers in their own way.
 
     Per course: muted, kind switched off, or the format (full card with
@@ -303,6 +303,9 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
     for new files, their file delivery picks the file itself (send_full,
     which returns False to fall back to the card), the card with its
     download button, or a Stud.IP link only.
+    An urgent alert (a session soon cancelled or moved) still respects a
+    muted course and quiet hours, but always comes as a full card with sound
+    and skips the evening digest.
     Returns {"full"|"title"|"silent"|"skipped"|"queued": count}."""
     counts = {"full": 0, "title": 0, "silent": 0, "skipped": 0, "queued": 0}
     now = now or datetime.now(TZ_BERLIN)
@@ -311,10 +314,14 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
         if fmt is None:
             counts["skipped"] += 1
             continue
+        if urgent:
+            fmt = "full"
         files_mode = get_pref(uid, "file_delivery") if kind == "files" else "card"
         markup = files_link_markup(cid) if files_mode == "link" else reply_markup
         try:
             reason = _hold_reason(uid, now)
+            if urgent and reason == "digest":
+                reason = None
             if reason is not None:
                 queue_alert(uid, kind, cid, title_text, markup, reason, now)
                 counts["queued"] += 1
