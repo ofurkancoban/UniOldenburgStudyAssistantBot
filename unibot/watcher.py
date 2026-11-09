@@ -41,7 +41,20 @@ from unibot.storage import (
     update_general_cache,
 )
 from unibot.telegram_ui import broadcast
-from unibot.auth import act_as_bot, acting_as, all_sessions, get_user_session, has_stored_login, login_studip, signed_in_accounts
+from unibot.auth import (
+    ACTIVE,
+    INACTIVE,
+    NEEDS_REAUTH,
+    act_as_bot,
+    acting_as,
+    all_sessions,
+    get_user_session,
+    has_stored_login,
+    lifecycle_state,
+    login_studip,
+    send_reauth_notice,
+    signed_in_accounts,
+)
 from unibot.schedule import (
     check_calendar_reminders,
     check_course_schedule_changes,
@@ -130,7 +143,8 @@ async def _scan_and_announce_file_exams(bot, session):
 
 def _get_active_user_ids() -> list[int]:
     try:
-        active = [u["telegram_id"] for u in db.get_all_users() if u.get("is_active", 1)]
+        active = [u["telegram_id"] for u in db.get_all_users()
+                  if u.get("is_active", 1) and lifecycle_state(u["telegram_id"]) != INACTIVE]
         if active:
             return active
     except Exception:
@@ -279,8 +293,33 @@ def _single_account_owner(session) -> Optional[int]:
     return getattr(session, "user_id", None) or next(iter(ALLOWED_USER_IDS), None)
 
 
+REAUTH_NOTIFIED_KEY = "reauth_notified"
+
+
+async def _notify_reauth_needed(bot) -> int:
+    """Each student who just moved to NEEDS_REAUTH gets one sign-in prompt
+    (again only after the next expiry). Returns how many were told."""
+    notified = dict(load_general_cache().get(REAUTH_NOTIFIED_KEY) or {})
+    told = 0
+    for uid in db.users_in_lifecycle(NEEDS_REAUTH):
+        changed_at = db.get_lifecycle(uid)["changed_at"]
+        if notified.get(str(uid)) == changed_at:
+            continue
+        try:
+            await send_reauth_notice(bot, uid)
+            told += 1
+        except Exception as e:
+            logging.warning("Sign-in prompt for %s failed: %s", uid, e)
+        notified[str(uid)] = changed_at
+        await asyncio.sleep(0.3)
+    if told:
+        update_general_cache({REAUTH_NOTIFIED_KEY: notified})
+    return told
+
+
 async def _run_reminder_checks(bot, session, now: datetime):
     """Calendar, schedule change, task, exam, grade and tuition reminders."""
+    await _guarded("Sign-in prompts", _notify_reauth_needed, bot)
     # course alerts held for quiet hours or the evening digest go out when due
     await _guarded("Course digest", course_registry.flush_alert_queues, bot, now)
     await _guarded("Calendar reminder check", _send_calendar_reminders, bot)
@@ -544,7 +583,9 @@ async def session_keepalive_loop():
     act_as_bot()  # this task acts for the bot itself, never for a user
     while True:
         await asyncio.sleep(SESSION_KEEPALIVE_SECONDS + random.uniform(0, 60))
-        for index, sess in enumerate(all_sessions()):
+        # an expired (NEEDS_REAUTH) or stopped (INACTIVE) student's session is left alone
+        sessions = [s for s in all_sessions() if lifecycle_state(getattr(s, "user_id", None)) == ACTIVE]
+        for index, sess in enumerate(sessions):
             if index:
                 await asyncio.sleep(random.uniform(2.0, 6.0))  # never all users at once
             try:

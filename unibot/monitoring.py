@@ -27,11 +27,13 @@ from studip_utils import berlin_now
 from unibot import course_registry, db, state
 from unibot.ai import transcribe_voice_message
 from unibot.auth import (
+    ACTIVE,
     act_as_bot,
     acting_as,
     current_user_id,
     get_user_session,
     has_stored_login,
+    lifecycle_state,
     is_user_allowed,
     login_studip,
     signed_in_accounts,
@@ -275,7 +277,7 @@ async def watched_courses() -> list:
     known_uids: set = set()
     watcher = state.global_session
     watcher_uid = getattr(watcher, "user_id", None) if watcher is not None else None
-    if watcher is not None and has_stored_login(watcher):
+    if watcher is not None and has_stored_login(watcher) and lifecycle_state(watcher_uid) == ACTIVE:
         await _ensure_watched_courses_map(watcher)
         for cid, name in state.courses_map.items():
             titles.setdefault(cid, name)
@@ -701,7 +703,8 @@ async def message_poll_loop(app) -> None:
         if state.global_watcher_paused:
             continue
         with acting_as(None):
-            if state.global_session is not None and admin_id is not None and has_stored_login(state.global_session):
+            if state.global_session is not None and admin_id is not None and has_stored_login(state.global_session) \
+                    and lifecycle_state(getattr(state.global_session, "user_id", None)) == ACTIVE:
                 try:
                     await check_new_messages(app.bot, admin_id, silent=True)
                 except Exception as e:

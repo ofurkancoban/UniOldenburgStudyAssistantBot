@@ -78,7 +78,7 @@ DEFAULTS: dict[str, Any] = {
     "morning_time": "07:00",
     "morning_sections": {key: True for key in MORNING_SECTIONS},
     "outfit": True,
-    "quiet_hours": None,
+    "quiet_hours": {"start": "23:00", "end": "08:00"},
     "delivery_mode": "instant",
     "file_delivery": "card",
 }

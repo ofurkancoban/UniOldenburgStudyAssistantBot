@@ -142,6 +142,9 @@ class FanOutTests(unittest.TestCase):
         db.get_user_scope(2).set_course_pref("c1", "format", "title")
         db.get_user_scope(4).set_course_pref("c1", "is_muted", True)
         db.get_user_scope(5).set_course_pref("c1", "notify_files", False)
+        from unibot import preferences
+        for uid in (1, 2, 3, 4, 5, 6):
+            preferences.set_pref(uid, "quiet_hours", None)  # these tests send at once, whatever the clock says
         self.sent = []
         self.docs = []
         outer = self
@@ -202,6 +205,8 @@ class QuietHoursAndDigestTests(unittest.TestCase):
             db.get_user_scope(uid).sync_courses({"c1"})
             db.get_user_scope(uid).delete_private("alert_queue")
         preferences.set_pref(21, "quiet_hours", {"start": "23:00", "end": "08:00"})
+        preferences.set_pref(22, "quiet_hours", None)
+        preferences.set_pref(23, "quiet_hours", None)
         preferences.set_pref(22, "delivery_mode", "digest")
         preferences.set_pref(23, "file_delivery", "link")
         self.sent = []

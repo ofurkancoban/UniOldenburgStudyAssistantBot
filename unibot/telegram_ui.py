@@ -18,8 +18,8 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import TelegramError
-from telegram.ext import ContextTypes
+from telegram.error import RetryAfter, TelegramError
+from telegram.ext import BaseRateLimiter, ContextTypes
 
 from studip_utils import md_escape as _md
 from studip_utils import safe_filename as _safe_filename
@@ -64,6 +64,49 @@ async def _send_file_bytes(message, content: bytes, fname: str, sid: str, captio
             caption=caption,
             reply_markup=doc_markup,
         )
+
+
+# ── Telegram API safety layer ─────────────────────────────────────────────────
+class TelegramSafetyLimiter(BaseRateLimiter):
+    """Every Bot API call of the bot goes through here (ApplicationBuilder
+    .rate_limiter): calls are spaced at least MIN_INTERVAL apart (Telegram
+    allows about 30 messages a second per bot), and a 429 Flood-Wait
+    (RetryAfter) is waited out and retried instead of failing the send."""
+
+    MIN_INTERVAL = 1 / 25
+    MAX_RETRIES = 2
+
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._next_at = 0.0
+
+    async def initialize(self) -> None:
+        return None
+
+    async def shutdown(self) -> None:
+        return None
+
+    async def _wait_turn(self) -> None:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            delay = self._next_at - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next_at = loop.time() + self.MIN_INTERVAL
+
+    async def process_request(self, callback, args, kwargs, endpoint, data, rate_limit_args):
+        for attempt in range(self.MAX_RETRIES + 1):
+            await self._wait_turn()
+            try:
+                return await callback(*args, **kwargs)
+            except RetryAfter as e:
+                if attempt == self.MAX_RETRIES:
+                    raise
+                wait = float(e.retry_after.total_seconds() if hasattr(e.retry_after, "total_seconds")
+                             else e.retry_after)
+                logging.warning("Telegram flood wait on %s: retrying in %.1f s", endpoint, wait)
+                await asyncio.sleep(wait + 0.5)
+        raise RuntimeError("unreachable")
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────

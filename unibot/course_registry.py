@@ -376,6 +376,7 @@ async def flush_alert_queues(bot, now: Optional[datetime] = None) -> int:
             continue
         scope.save_private(ALERT_QUEUE_KIND, [item for item in queue if item not in due])
         sent += 1
+        await asyncio.sleep(0.3)  # Telegram rate limit safety between students
     return sent
 
 

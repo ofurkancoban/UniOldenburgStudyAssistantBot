@@ -63,7 +63,9 @@ class SchemaTests(unittest.TestCase):
         self.assertTrue(preferences.in_quiet_hours(8004, _at(23, 30)))
         self.assertTrue(preferences.in_quiet_hours(8004, _at(7, 59)))
         self.assertFalse(preferences.in_quiet_hours(8004, _at(8, 0)))
-        self.assertFalse(preferences.in_quiet_hours(8005, _at(3, 0)))  # none set
+        self.assertTrue(preferences.in_quiet_hours(8005, _at(3, 0)))   # default 23:00 to 08:00
+        preferences.set_pref(8005, "quiet_hours", None)
+        self.assertFalse(preferences.in_quiet_hours(8005, _at(3, 0)))  # switched off
         preferences.set_pref(8004, "quiet_hours", {"start": "13:00", "end": "14:00"})
         self.assertTrue(preferences.in_quiet_hours(8004, _at(13, 30)))
 

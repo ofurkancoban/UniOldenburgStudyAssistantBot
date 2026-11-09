@@ -37,7 +37,7 @@ from unibot.config import (
     validate_settings,
 )
 from unibot.storage import close_shared_http, link_cache
-from unibot.telegram_ui import _show_typing
+from unibot.telegram_ui import TelegramSafetyLimiter, _show_typing
 from unibot.auth import (
     _authorization_gate,
     _get_login_server,
@@ -54,7 +54,7 @@ from unibot.studip_api import get_studip_user_profile, list_courses
 from unibot.documents import handle_file_audio_summary
 from unibot.weather import handle_set_weather_location
 from unibot.course_registry import handle_course_alerts
-from unibot.privacy import handle_privacy
+from unibot.privacy import handle_privacy, stop_command
 from unibot.settings_menu import handle_settings, settings_command
 from unibot.study_week import handle_calendar_sync, handle_study_buddy, register_calendar_feed
 from unibot.mensa import (
@@ -273,6 +273,7 @@ def register_handlers(app) -> None:
     app.add_handler(CommandHandler("watch", watch))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("healthcheck", healthcheck_command))
     app.add_handler(CommandHandler("menu", menu_command))
     app.add_handler(CommandHandler("timetable", timetable_command))
@@ -431,7 +432,8 @@ async def main():
         if not await state.global_session.login():
             logging.warning("⚠️ Not logged in to Stud.IP yet. Starting bot so you can sign in via /login.")
 
-        app = ApplicationBuilder().token(TELEGRAM_TOKEN or "").build()  # validate_settings() requires it
+        # validate_settings() requires the token; every API call is spaced and survives flood waits
+        app = ApplicationBuilder().token(TELEGRAM_TOKEN or "").rate_limiter(TelegramSafetyLimiter()).build()
         register_handlers(app)
 
         # Explicitly initialize and start the application

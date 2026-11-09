@@ -500,28 +500,97 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+INVITE_MAX_USES = 200
+INVITE_MAX_DAYS = 365
+INVITE_USAGE = (
+    "🔑 <b>Invites</b>\n"
+    "<code>/invite</code> or <code>/invite &lt;label&gt;</code>: one student, 7 days\n"
+    "<code>/invite create &lt;uses&gt; [days] [label]</code>: one code for several students\n"
+    "<code>/invite list</code>: codes still usable\n"
+    "<code>/invite revoke &lt;code&gt;</code>: stop a code at once"
+)
+
+
+def parse_invite_args(args: list) -> dict:
+    """{"action": "create"|"list"|"revoke"|"help", ...} from /invite arguments;
+    ValueError with a message for bad numbers."""
+    if not args:
+        return {"action": "create", "uses": 1, "days": 7.0, "label": None}
+    head = args[0].lower()
+    if head == "list":
+        return {"action": "list"}
+    if head == "revoke":
+        if len(args) < 2:
+            raise ValueError("Which code? /invite revoke UNI-ABC-123")
+        return {"action": "revoke", "code": args[1]}
+    if head in ("help", "?"):
+        return {"action": "help"}
+    if head == "create":
+        rest = list(args[1:])
+        uses, days = 1, 7.0
+        if rest and rest[0].isdigit():
+            uses = int(rest.pop(0))
+        if rest and rest[0].replace(".", "", 1).isdigit():
+            days = float(rest.pop(0))
+        if not 1 <= uses <= INVITE_MAX_USES:
+            raise ValueError(f"Uses must be 1 to {INVITE_MAX_USES}.")
+        if not 0 < days <= INVITE_MAX_DAYS:
+            raise ValueError(f"Days must be more than 0 and at most {INVITE_MAX_DAYS}.")
+        return {"action": "create", "uses": uses, "days": days, "label": " ".join(rest).strip() or None}
+    return {"action": "create", "uses": 1, "days": 7.0, "label": " ".join(args).strip()}
+
+
+def _invite_list_text(tokens: list) -> str:
+    if not tokens:
+        return "🔑 No usable invite codes. Make one with <code>/invite create 5 14</code>."
+    lines = ["🔑 <b>Usable invite codes</b>", ""]
+    for t in tokens:
+        left = max(0, (t.get("max_uses") or 1) - (t.get("use_count") or 0))
+        days = max(0.0, (t["expires_at"] - time.time()) / 86400)
+        label = f" · {html.escape(t['label'])}" if t.get("label") else ""
+        lines.append(f"<code>{t['code']}</code>: {left} left, {days:.0f} days{label}")
+    return "\n".join(lines)
+
+
 async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generate a new personalized invite code."""
+    """Admins: create (single-use or with a quota), list and revoke invite codes."""
     user = update.effective_user
     if not user or not is_user_admin(user.id):
         await update.message.reply_text("⛔ This command is restricted to administrators.")
         return
+    try:
+        req = parse_invite_args(list(context.args or []))
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {html.escape(str(e))}\n\n{INVITE_USAGE}", parse_mode="HTML")
+        return
+    if req["action"] == "help":
+        await update.message.reply_text(INVITE_USAGE, parse_mode="HTML")
+        return
+    if req["action"] == "list":
+        tokens = [t for t in db.list_invite_tokens(active_only=True)
+                  if (t.get("use_count") or 0) < (t.get("max_uses") or 1)]
+        await update.message.reply_text(_invite_list_text(tokens), parse_mode="HTML")
+        return
+    if req["action"] == "revoke":
+        ok = db.revoke_invite_token(req["code"])
+        await update.message.reply_text("🚫 Revoked: nobody can use it any more." if ok else "⚠️ No such code.")
+        return
 
-    label = " ".join(context.args).strip() if context.args else None
-    code = db.create_invite_token(created_by=user.id, label=label, expires_days=7.0)
+    label, uses, days = req["label"], req["uses"], req["days"]
+    code = db.create_invite_token(created_by=user.id, label=label, expires_days=days, max_uses=uses)
     bot_me = await context.bot.get_me()
     deep_link = f"https://t.me/{bot_me.username}?start=inv_{code.replace('-', '').lower()}"
-
+    usage = "single-use" if uses == 1 else f"for {uses} students"
     text = (
-        "🔑 <b>New Personalized Invite Code</b>\n"
+        "🔑 <b>New Invite Code</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"🎫 <b>Access Code:</b> <code>{code}</code>\n"
-        f"👤 <b>Label:</b> <code>{label or 'Unlabeled'}</code>\n"
-        "⏳ <b>Validity:</b> 7 days (Single-use)\n\n"
+        f"👤 <b>Label:</b> <code>{html.escape(label or 'Unlabeled')}</code>\n"
+        f"⏳ <b>Validity:</b> {days:g} days ({usage})\n\n"
         "🔗 <b>One-Tap Invite Link:</b>\n"
         f"{deep_link}\n"
         "━━━━━━━━━━━━━━━━━━\n"
-        "<i>Share this code or link with the student.</i>"
+        "<i>Share this code or link. /invite list shows what is left, /invite revoke stops it.</i>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 

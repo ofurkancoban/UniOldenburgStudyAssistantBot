@@ -9,6 +9,7 @@ import errno
 import html
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,6 +27,7 @@ from telegram.ext import ApplicationHandlerStop, ContextTypes
 import studip_oauth
 from studip_http import BACKGROUND, INTERACTIVE, set_request_priority
 from studip_login_server import LoginServer
+import studip_session
 from studip_session import StudIPSession, StumsState
 from studip_tunnel import NamedTunnel, QuickTunnel
 from unibot import db, state
@@ -95,12 +97,153 @@ def acting_as(user_id: Optional[int]):
         _current_user.reset(token)
 
 
+# ── per-user rate limit ───────────────────────────────────────────────────────
+# Sliding windows: at most RATE_PER_SECOND updates in one second and
+# RATE_PER_MINUTE in a minute; going over starts a cooldown during which the
+# user's updates are dropped (one warning when it starts).
+RATE_PER_SECOND = 2
+RATE_PER_MINUTE = 20
+RATE_COOLDOWN_SECONDS = 30
+RATE_WARNING = "⚠️ Please don't tap so fast. Try again in half a minute."
+_rate_hits: dict[int, list] = {}
+_rate_cooldown_until: dict[int, float] = {}
+
+
+def rate_limit(user_id: int, now: Optional[float] = None) -> str:
+    """"ok", "warn" (limit just exceeded: tell the user) or "drop"."""
+    now = now if now is not None else time.monotonic()
+    if now < _rate_cooldown_until.get(user_id, 0.0):
+        return "drop"
+    hits = [t for t in _rate_hits.get(user_id, []) if now - t < 60.0]
+    hits.append(now)
+    _rate_hits[user_id] = hits
+    if sum(1 for t in hits if now - t < 1.0) > RATE_PER_SECOND or len(hits) > RATE_PER_MINUTE:
+        _rate_cooldown_until[user_id] = now + RATE_COOLDOWN_SECONDS
+        _rate_hits[user_id] = []
+        return "warn"
+    return "ok"
+
+
+async def _rate_limited(update: Update, user_id: int) -> bool:
+    """Apply the rate limit; True when the update must be dropped."""
+    verdict = rate_limit(user_id)
+    if verdict == "ok":
+        return False
+    if verdict == "warn":
+        logging.info("Rate limit hit by user %s; cooling down", user_id)
+        try:
+            if update.callback_query:
+                await update.callback_query.answer(RATE_WARNING, show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text(RATE_WARNING)
+        except TelegramError:
+            pass
+    elif update.callback_query:
+        try:
+            await update.callback_query.answer()
+        except TelegramError:
+            pass
+    return True
+
+
+# ── user lifecycle (ACTIVE, NEEDS_REAUTH, INACTIVE) ──────────────────────────
+# ACTIVE: background checks run. NEEDS_REAUTH: the university session expired
+# and silent renewal failed twice in a row; background checks pause (no error
+# logs) and the student is asked once to sign in again; a confirmed login
+# makes them ACTIVE. INACTIVE: stopped with /stop or deleted their data; no
+# background work at all until /start.
+ACTIVE, NEEDS_REAUTH, INACTIVE = "active", "needs_reauth", "inactive"
+REAUTH_AFTER_FAILURES = 2
+REAUTH_PROMPT_INTERVAL_SECONDS = 6 * 3600
+_renewal_failures: dict[int, int] = {}
+_reauth_prompted_at: dict[int, float] = {}
+
+
+def lifecycle_state(user_id: Optional[int]) -> str:
+    if user_id is None:
+        return ACTIVE
+    try:
+        return db.get_lifecycle(user_id)["state"]
+    except Exception:
+        logging.debug("Lifecycle lookup failed", exc_info=True)
+        return ACTIVE
+
+
+def _on_login_state(user_id: int, ok: bool) -> None:
+    """studip_session listener: a confirmed login makes a NEEDS_REAUTH user
+    ACTIVE again; repeated failed renewals move an ACTIVE one to NEEDS_REAUTH.
+    Only registered users are tracked: session noise never creates a user."""
+    if db.get_user(user_id) is None:
+        return
+    if ok:
+        _renewal_failures.pop(user_id, None)
+        if lifecycle_state(user_id) == NEEDS_REAUTH and db.set_lifecycle(user_id, ACTIVE, "signed in again"):
+            logging.info("User %s signed in again: active", user_id)
+        return
+    _renewal_failures[user_id] = _renewal_failures.get(user_id, 0) + 1
+    if _renewal_failures[user_id] >= REAUTH_AFTER_FAILURES and lifecycle_state(user_id) == ACTIVE:
+        if db.set_lifecycle(user_id, NEEDS_REAUTH, "session expired, silent renewal failed"):
+            logging.info("User %s needs to sign in again; background checks paused", user_id)
+
+
+studip_session.LOGIN_STATE_LISTENERS.append(_on_login_state)
+
+
+def reauth_prompt_due(user_id: int, now: Optional[float] = None) -> bool:
+    now = now if now is not None else time.time()
+    if now - _reauth_prompted_at.get(user_id, 0.0) < REAUTH_PROMPT_INTERVAL_SECONDS:
+        return False
+    _reauth_prompted_at[user_id] = now
+    return True
+
+
+REAUTH_TEXT = ("🔐 <b>Your university session has expired</b> (password change, timeout or 2FA).\n"
+               "Background checks for you are paused until you sign in again. It takes one tap:")
+
+
+class _ChatTarget:
+    """reply_text() into a chat, for prompts sent outside an update."""
+
+    def __init__(self, bot, chat_id: int):
+        self.bot, self.chat_id = bot, chat_id
+
+    async def reply_text(self, text, **kwargs):
+        return await self.bot.send_message(chat_id=self.chat_id, text=text, **kwargs)
+
+
+async def send_reauth_notice(bot, user_id: int) -> None:
+    """Tell an expired student once, with the one-tap sign-in button."""
+    await bot.send_message(chat_id=user_id, text=REAUTH_TEXT, parse_mode="HTML")
+    await _send_login_prompt(_ChatTarget(bot, user_id), user_id)
+    _reauth_prompted_at[user_id] = time.time()
+
+
+async def _lifecycle_on_interaction(update: Update, user_id: int) -> None:
+    """Resume a stopped student on /start; remind an expired one to sign in."""
+    state_now = lifecycle_state(user_id)
+    message = update.effective_message
+    text = (message.text or "").strip() if message is not None else ""
+    if state_now == INACTIVE and text.startswith("/start"):
+        db.set_lifecycle(user_id, ACTIVE, "resumed with /start")
+        logging.info("User %s resumed with /start", user_id)
+    elif state_now == NEEDS_REAUTH and message is not None and reauth_prompt_due(user_id):
+        try:
+            await message.reply_text(REAUTH_TEXT, parse_mode="HTML")
+            await _send_login_prompt(message, user_id)
+        except TelegramError:
+            logging.debug("Re-auth prompt failed", exc_info=True)
+
+
 async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drop or onboard updates. Allowed users proceed; new users can redeem invite codes."""
+    """Drop or onboard updates. Allowed users proceed (rate limited, with the
+    lifecycle hooks); new users can redeem invite codes."""
     user = update.effective_user
     _current_user.set(None)
     set_request_priority(BACKGROUND)
     if user is not None and is_user_allowed(user.id):
+        if await _rate_limited(update, user.id):
+            raise ApplicationHandlerStop
+        await _lifecycle_on_interaction(update, user.id)
         _current_user.set(user.id)
         set_request_priority(INTERACTIVE)
         action = None
@@ -159,7 +302,7 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         gate_text = (
             "🔒 <b>UniOldenburg Student Assistant</b>\n"
             "━━━━━━━━━━━━━━━━━━\n"
-            "This bot is currently private and invite-only.\n\n"
+            "This bot works by private invitation only.\n\n"
             "To gain access, please send your <b>personalized invite code</b> "
             "(e.g., <code>UNI-ABC-123</code>) provided by your administrator.\n"
             "━━━━━━━━━━━━━━━━━━"
@@ -716,8 +859,10 @@ def accounts() -> list:
 
 
 def signed_in_accounts() -> list:
-    """The Accounts with a stored login: the ones background checks run for."""
-    return [account for account in accounts() if account.signed_in]
+    """The Accounts with a stored login whose lifecycle is ACTIVE: the ones
+    background checks run for (NEEDS_REAUTH and INACTIVE students cost
+    nothing until they sign in again or come back)."""
+    return [account for account in accounts() if account.signed_in and lifecycle_state(account.user_id) == ACTIVE]
 
 
 async def close_all_sessions() -> None:

@@ -30,6 +30,21 @@ from studip_http import (
 from studip_sso import SsoFlowMixin, _describe_page  # noqa: F401 - _describe_page re-exported
 from studip_utils import redact_url, route_proxy_url, unroute_proxy_url
 
+# Called with (user_id, ok) when a student's session is confirmed signed in
+# (ok=True) or a silent renewal failed (ok=False); the bot uses it for the
+# user lifecycle (active / needs_reauth). Listeners must not raise.
+LOGIN_STATE_LISTENERS: list = []
+
+
+def _report_login_state(user_id, ok: bool) -> None:
+    if not user_id:
+        return
+    for listener in list(LOGIN_STATE_LISTENERS):
+        try:
+            listener(user_id, ok)
+        except Exception:
+            logging.debug("Login state listener failed", exc_info=True)
+
 _REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 
@@ -583,6 +598,7 @@ class StudIPSession(SsoFlowMixin):
         if result:
             self._logged_in_until = now + LOGIN_CHECK_CACHE_SECONDS
             self._logged_out_until = 0.0
+            _report_login_state(getattr(self, "user_id", None), True)
         else:
             self._logged_in_until = 0.0
             self._logged_out_until = now + 15.0  # 15s negative cache
@@ -652,9 +668,11 @@ class StudIPSession(SsoFlowMixin):
                 return True
             else:
                 self.logger.warning("⚠️ [Self-Healing] Silent SSO flow finished but login markers missing.")
+                _report_login_state(getattr(self, "user_id", None), False)
                 return False
         except Exception as exc:
             self.logger.warning("⚠️ [Self-Healing] Silent SSO flow failed: %s", exc)
+            _report_login_state(getattr(self, "user_id", None), False)
             return False
 
     async def is_logged_in(self, allow_oauth: bool = True) -> bool:

@@ -103,6 +103,7 @@ async def delete_personal_data(user_id: int) -> dict:
         exam_action_cache.pop(sid, None)
     for members in (getattr(state, "course_members", None) or {}).values():
         members.discard(user_id)
+    db.set_lifecycle(user_id, "inactive", "deleted their data")  # no background work until /start
     logging.info("Personal data deleted for user %s", user_id)
     return removed
 
@@ -123,6 +124,19 @@ async def run_manual_check(bot, user_id: int) -> str:
         await _run_stums_checks(bot, session, _user_sender(user_id))
     mark_personal_check(user_id)
     return "✅ Checked. Anything new was sent to you above; no message means nothing changed."
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/stop - pause everything the bot does in the background for this
+    student (INACTIVE); their data stays, /start resumes."""
+    user, message = update.effective_user, update.message
+    if user is None or message is None or not is_user_allowed(user.id):
+        return
+    db.set_lifecycle(user.id, "inactive", "stopped with /stop")
+    await message.reply_text(
+        "⏸️ <b>Paused.</b> No more background checks, alerts, reminders or morning summaries.\n"
+        "Your data and settings stay. Send /start to resume, or use 🔒 Privacy to delete everything.",
+        parse_mode="HTML")
 
 
 async def handle_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):

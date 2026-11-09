@@ -134,8 +134,26 @@ def _connection() -> sqlite3.Connection:
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=FULL")
         _conn.executescript(_SCHEMA)
+        _migrate_columns(_conn)
         _conn_path = path
     return _conn
+
+
+# Columns added after a table first shipped: (table, column, definition).
+_ADDED_COLUMNS = (
+    ("users", "lifecycle", "TEXT NOT NULL DEFAULT 'active'"),
+    ("users", "lifecycle_reason", "TEXT"),
+    ("users", "lifecycle_changed_at", "REAL"),
+    ("invite_tokens", "max_uses", "INTEGER NOT NULL DEFAULT 1"),
+    ("invite_tokens", "use_count", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _migrate_columns(conn: sqlite3.Connection) -> None:
+    for table, column, definition in _ADDED_COLUMNS:
+        have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
 def _key(path: str) -> str:
@@ -409,37 +427,52 @@ def is_user_allowed_db(telegram_id: int) -> bool:
 
 # ── Invite Code helpers ───────────────────────────────────────────────────────
 
-def create_invite_token(created_by: int, label: Optional[str] = None, expires_days: float = 7.0) -> str:
+def normalize_invite_code(code: str) -> str:
+    """"uniabc123", "UNI-ABC-123", " uni abc 123 " all mean UNI-ABC-123
+    (the deep link carries the code without dashes)."""
+    raw = "".join(ch for ch in (code or "").upper() if ch.isalnum())
+    if raw.startswith("UNI") and len(raw) == 9:
+        return f"UNI-{raw[3:6]}-{raw[6:]}"
+    return (code or "").strip().upper()
+
+
+def create_invite_token(created_by: int, label: Optional[str] = None, expires_days: float = 7.0,
+                        max_uses: int = 1) -> str:
+    """A new invite code, valid for `max_uses` students until it expires."""
     import secrets
+    if max_uses < 1:
+        raise ValueError("an invite needs at least one use")
     raw_code = secrets.token_hex(3).upper()
     code = f"UNI-{raw_code[:3]}-{raw_code[3:]}"
     expires_at = time.time() + (expires_days * 86400)
     with _lock:
         _connection().execute(
-            "INSERT INTO invite_tokens (code, created_by, label, expires_at, is_used) VALUES (?, ?, ?, ?, 0)",
-            (code, created_by, label, expires_at),
+            "INSERT INTO invite_tokens (code, created_by, label, expires_at, is_used, max_uses, use_count) "
+            "VALUES (?, ?, ?, ?, 0, ?, 0)",
+            (code, created_by, label, expires_at, int(max_uses)),
         )
     return code
 
 
 def redeem_invite_token(code: str, telegram_id: int, full_name: Optional[str] = None, username: Optional[str] = None) -> tuple[bool, str]:
-    clean_code = code.strip().upper()
+    clean_code = normalize_invite_code(code)
     now = time.time()
     with _lock:
         row = _connection().execute(
-            "SELECT code, created_by, label, expires_at, is_used FROM invite_tokens WHERE code = ?",
+            "SELECT code, created_by, label, expires_at, is_used, max_uses, use_count FROM invite_tokens WHERE code = ?",
             (clean_code,),
         ).fetchone()
         if not row:
             return False, "Invalid invite code."
-        if row[4]:  # is_used
+        if row[4] or row[6] >= row[5]:  # used up or revoked
             return False, "This invite code has already been used."
         if now > row[3]:  # expires_at
             return False, "This invite code has expired."
 
+        uses = row[6] + 1
         _connection().execute(
-            "UPDATE invite_tokens SET is_used = 1, used_by = ?, used_at = ? WHERE code = ?",
-            (telegram_id, now, clean_code),
+            "UPDATE invite_tokens SET use_count = ?, is_used = ?, used_by = ?, used_at = ? WHERE code = ?",
+            (uses, 1 if uses >= row[5] else 0, telegram_id, now, clean_code),
         )
         upsert_user(
             telegram_id=telegram_id,
@@ -448,12 +481,24 @@ def redeem_invite_token(code: str, telegram_id: int, full_name: Optional[str] = 
             full_name=full_name,
             is_active=1,
         )
+        set_lifecycle(telegram_id, "active", "invite redeemed")
         return True, "Invite code verified successfully. Welcome!"
+
+
+def revoke_invite_token(code: str) -> bool:
+    """Make a code unusable at once; False when there is no such code."""
+    with _lock:
+        cur = _connection().execute(
+            "UPDATE invite_tokens SET is_used = 1, expires_at = MIN(expires_at, ?) WHERE code = ?",
+            (time.time(), normalize_invite_code(code)),
+        )
+    return cur.rowcount > 0
 
 
 def list_invite_tokens(active_only: bool = False) -> list[dict]:
     with _lock:
-        query = "SELECT code, created_by, label, expires_at, is_used, used_by, used_at FROM invite_tokens"
+        query = ("SELECT code, created_by, label, expires_at, is_used, used_by, used_at, max_uses, use_count "
+                 "FROM invite_tokens")
         if active_only:
             query += " WHERE is_used = 0 AND expires_at > ?"
             cursor = _connection().execute(query, (time.time(),))
@@ -470,6 +515,8 @@ def list_invite_tokens(active_only: bool = False) -> list[dict]:
                 "is_used": bool(r[4]),
                 "used_by": r[5],
                 "used_at": r[6],
+                "max_uses": r[7],
+                "use_count": r[8],
             })
         return res
 
@@ -895,3 +942,50 @@ def _migrate_shared_tasks() -> None:
             _save_private(owner, TASKS_KIND, have + [t for t in tasks if t.get("id") not in known])
         _connection().execute("DELETE FROM documents WHERE key = ?", (_key(LEGACY_TASKS_DOC),))
         logging.info("Moved the shared task list into %s private task records", len(by_owner))
+
+
+# ── user lifecycle: active, needs_reauth, inactive ───────────────────────────
+
+LIFECYCLE_STATES = ("active", "needs_reauth", "inactive")
+
+
+def get_lifecycle(telegram_id: int) -> dict:
+    """{"state", "reason", "changed_at"}; "active" for unknown users."""
+    with _lock:
+        row = _connection().execute(
+            "SELECT lifecycle, lifecycle_reason, lifecycle_changed_at FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+    if not row:
+        return {"state": "active", "reason": None, "changed_at": None}
+    return {"state": row[0] or "active", "reason": row[1], "changed_at": row[2]}
+
+
+def set_lifecycle(telegram_id: int, lifecycle: str, reason: Optional[str] = None) -> bool:
+    """Move a user to a lifecycle state; True when the state changed."""
+    if lifecycle not in LIFECYCLE_STATES:
+        raise ValueError(f"unknown lifecycle state {lifecycle!r}")
+    with _lock:
+        conn = _connection()
+        row = conn.execute("SELECT lifecycle FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+        if row is None:
+            now = time.time()
+            conn.execute(
+                "INSERT INTO users (telegram_id, role, is_active, created_at, last_active_at, lifecycle, "
+                "lifecycle_reason, lifecycle_changed_at) VALUES (?, 'user', 1, ?, ?, ?, ?, ?)",
+                (telegram_id, now, now, lifecycle, reason, now),
+            )
+            return lifecycle != "active"
+        if row[0] == lifecycle:
+            return False
+        conn.execute(
+            "UPDATE users SET lifecycle = ?, lifecycle_reason = ?, lifecycle_changed_at = ? WHERE telegram_id = ?",
+            (lifecycle, reason, time.time(), telegram_id),
+        )
+        return True
+
+
+def users_in_lifecycle(lifecycle: str) -> list[int]:
+    with _lock:
+        return [r[0] for r in _connection().execute(
+            "SELECT telegram_id FROM users WHERE lifecycle = ? ORDER BY telegram_id", (lifecycle,))]
