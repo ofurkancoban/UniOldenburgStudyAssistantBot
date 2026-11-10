@@ -287,9 +287,8 @@ async def _send_courses_menu(query_or_message, courses, extra_buttons=None):
 
     keyboard = []
     for name, cid in courses:
-        # Avoid extremely long names just in case
-        clean_name = html.escape(name[:64])
-        keyboard.append([InlineKeyboardButton(f"📘 {clean_name}", callback_data=f"course|{cid}")])
+        # a button label is plain text: no HTML escaping, or "&" shows as "&amp;"
+        keyboard.append([InlineKeyboardButton(f"📘 {name[:64]}", callback_data=f"course|{cid}")])
 
     keyboard.extend(extra_buttons or [])
 
@@ -863,7 +862,9 @@ async def _selection_file(update, context, query, data, user_id):
         except Exception as e:
             logging.warning("⚠️ Cached URL failed, getting fresh URL: %s", e)
 
-    # If cached URL doesn't work, get fresh URL
+    # If cached URL doesn't work, get fresh URL. The file card is reused as
+    # the status message and put back afterwards, so its buttons stay.
+    card_text, card_markup = getattr(query.message, "text_html", None), query.message.reply_markup
     status_msg = await query.edit_message_text(f"🔍 Getting fresh download link for:\n📄 {fname}")
     await _show_typing(query, action=ChatAction.UPLOAD_DOCUMENT)
     stop_evt, anim_task = _start_loading_animation(status_msg, f"Getting fresh download link for:\n📄 {fname}")
@@ -904,6 +905,11 @@ async def _selection_file(update, context, query, data, user_id):
             await query.message.reply_text(f"⚠️ Download failed:\n{str(e)[:200]}")
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+        if card_text:
+            try:
+                await query.edit_message_text(card_text, parse_mode="HTML", reply_markup=card_markup)
+            except TelegramError as e:
+                logging.debug("File card not restored: %s", e)
 
 
 # ── navigation (back, home, courses, zip) ────────────────────────────
@@ -917,7 +923,8 @@ async def _selection_nav(update, context, query, data, user_id):
     if action == "back":
         if len(nav_stack.get(user_id, [])) > 1:
             nav_stack[user_id].pop()
-            nav_names[user_id].pop()
+            if nav_names.get(user_id):
+                nav_names[user_id].pop()
 
         if nav_stack.get(user_id):
             back_url = nav_stack[user_id][-1]

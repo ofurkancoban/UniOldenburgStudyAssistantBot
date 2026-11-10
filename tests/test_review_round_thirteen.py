@@ -21,7 +21,7 @@ from tests.testenv import use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
-from unibot import onboarding, schedule, settings_menu, study_plan  # noqa: E402
+from unibot import menus, onboarding, schedule, settings_menu, study_plan  # noqa: E402
 from unibot import preferences as prefs  # noqa: E402
 
 UID = 9801
@@ -159,6 +159,32 @@ class OutfitIsForAdminsTests(unittest.TestCase):
         with mock.patch.object(onboarding, "is_user_admin", return_value=False), self.assertRaises(ValueError):
             onboarding.apply_answer(uid, "outfit", "off", [])
         self.assertTrue(prefs.get_pref(uid, "outfit"))
+
+
+
+class FilesBrowserTests(unittest.TestCase):
+    def test_course_button_shows_an_ampersand_as_it_is(self):
+        query = mock.AsyncMock()
+        asyncio.run(menus._send_courses_menu(query, [("Research & Methods", "c1")]))
+        markup = query.edit_message_text.call_args.kwargs["reply_markup"]
+        self.assertEqual(markup.inline_keyboard[0][0].text, "📘 Research & Methods")
+
+    def test_file_card_comes_back_after_a_failed_fresh_link(self):
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        card_markup = InlineKeyboardMarkup([[InlineKeyboardButton("📥 Download", callback_data="file|s1")]])
+        query = mock.AsyncMock()
+        query.message.text_html = "<b>📁 File</b>"
+        query.message.reply_markup = card_markup
+        with mock.patch.dict(menus.link_cache, {"s1": {"cid": "c1", "name": "slides.pdf"}}), \
+                mock.patch.object(menus, "get_user_session", lambda uid=None: object()), \
+                mock.patch.object(menus, "get_fresh_file_url", mock.AsyncMock(return_value=None)), \
+                mock.patch.object(menus, "_show_typing", mock.AsyncMock()), \
+                mock.patch.object(menus, "_start_loading_animation", lambda *a: (None, None)), \
+                mock.patch.object(menus, "_stop_loading_animation", mock.AsyncMock()):
+            asyncio.run(menus._selection_file(None, None, query, ["file", "s1"], UID))
+        last = query.edit_message_text.call_args
+        self.assertEqual(last.args[0], "<b>📁 File</b>")
+        self.assertIs(last.kwargs["reply_markup"], card_markup)
 
 
 if __name__ == "__main__":
