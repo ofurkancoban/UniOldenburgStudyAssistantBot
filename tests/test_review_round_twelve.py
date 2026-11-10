@@ -22,7 +22,7 @@ use_temp_db()
 
 import exam_reminder  # noqa: E402
 from studip_utils import TZ_BERLIN  # noqa: E402
-from unibot import auth, course_registry, db, enrollment, monitoring, morning, storage, tasks, voice  # noqa: E402
+from unibot import auth, course_registry, db, enrollment, monitoring, morning, storage, tasks, voice, weather  # noqa: E402
 
 UID = 9701
 
@@ -336,6 +336,42 @@ class SignInResumesTests(unittest.TestCase):
                 mock.patch("unibot.studip_api.get_studip_user_profile", mock.AsyncMock(return_value={})):
             asyncio.run(auth._on_proxy_session_authenticated(uid))
         self.assertEqual(auth.lifecycle_state(uid), auth.ACTIVE)
+
+
+
+class WeatherNullTemperatureTests(unittest.TestCase):
+    def test_missing_temperature_gives_no_snapshot(self):
+        day = datetime.now(TZ_BERLIN).date()
+        iso = day.isoformat()
+        data = {"hourly": {"time": [f"{iso}T09:00"], "weathercode": [3], "precipitation_probability": [10]},
+                "daily": {"time": [iso], "temperature_2m_min": [None], "temperature_2m_max": [8.0]}}
+
+        class Resp:
+            status = 200
+
+            async def json(self):
+                return data
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        class Http:
+            def get(self, *a, **k):
+                return Resp()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *a):
+                return False
+
+        weather._SNAPSHOTS.clear()
+        with mock.patch.object(weather, "shared_http", lambda: Http()), \
+                mock.patch.object(weather, "load_weather_location", lambda uid=None: None):
+            self.assertIsNone(asyncio.run(weather.get_weather_snapshot(day, user_id=UID)))
 
 
 if __name__ == "__main__":

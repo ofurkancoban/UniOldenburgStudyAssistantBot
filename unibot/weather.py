@@ -248,13 +248,20 @@ async def get_weather_snapshot(target_date=None, user_id=None) -> Optional[dict]
         code = max(morning_codes)  # worst-case in the window
         desc, emoji = WEATHER_CODE_DESCRIPTIONS.get(code, ("unknown conditions", "🌡️"))
         day_index = data["daily"]["time"].index(target_iso)
+        temp_min = data["daily"]["temperature_2m_min"][day_index]
+        temp_max = data["daily"]["temperature_2m_max"][day_index]
+        if not all(isinstance(t, (int, float)) for t in (temp_min, temp_max)):
+            # a null temperature would break every line that prints it
+            # (the morning summary of everyone at this place)
+            logging.warning("get_weather_snapshot: no temperature for %s", target_iso)
+            return None
         snapshot = {
             "description": desc,
             "emoji": emoji,
             "is_wet": code >= WEATHER_WET_CODE_THRESHOLD,
             "precip_chance": max(morning_precip) if morning_precip else 0,
-            "temp_min": data["daily"]["temperature_2m_min"][day_index],
-            "temp_max": data["daily"]["temperature_2m_max"][day_index],
+            "temp_min": temp_min,
+            "temp_max": temp_max,
             "location_name": location["name"] if location else "Oldenburg",
         }
         _SNAPSHOTS[key] = snapshot
