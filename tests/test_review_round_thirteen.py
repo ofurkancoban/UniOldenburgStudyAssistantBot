@@ -21,7 +21,7 @@ from tests.testenv import use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
-from unibot import menus, onboarding, schedule, settings_menu, study_plan  # noqa: E402
+from unibot import mensa, menus, onboarding, schedule, settings_menu, study_plan  # noqa: E402
 from unibot import preferences as prefs  # noqa: E402
 
 UID = 9801
@@ -185,6 +185,39 @@ class FilesBrowserTests(unittest.TestCase):
         last = query.edit_message_text.call_args
         self.assertEqual(last.args[0], "<b>📁 File</b>")
         self.assertIs(last.kwargs["reply_markup"], card_markup)
+
+
+
+class _Page:
+    def __init__(self, html_text):
+        self._html = html_text
+
+    async def text(self):
+        return self._html
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _Session:
+    def __init__(self, html_text):
+        self._html = html_text
+
+    async def get(self, url):
+        return _Page(self._html)
+
+
+class MenuWithoutHeadingTests(unittest.TestCase):
+    def test_a_table_without_a_heading_row_does_not_break_the_menu(self):
+        page = ("<table class='default'><tr><td>Pizza Margherita<span class='attributes'>Gl</span></td>"
+                "<td>3,50 &euro;</td></tr></table>"
+                "<table class='default'><tr><th>Main Dishes</th></tr><tr><td>Lentil stew</td><td>2,90 &euro;</td></tr></table>")
+        text, _p, _n, _d, items, _h = asyncio.run(mensa.get_todays_menu_enhanced(_Session(page)))
+        self.assertEqual(sorted(i["name"] for i in items), ["Lentil stew", "Pizza Margherita"])
+        self.assertIn("PIZZA", text)
 
 
 if __name__ == "__main__":

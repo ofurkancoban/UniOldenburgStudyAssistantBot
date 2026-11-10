@@ -261,7 +261,7 @@ async def fetch_todays_menu_items(session, sub_path="2/") -> list:
             th = category_table.find('th')
             category_name = th.get_text(strip=True) if th else ""
 
-            for row in category_table.find_all('tr')[1:]:
+            for row in _menu_dish_rows(category_table):
                 cols = row.find_all('td')
                 if len(cols) < 2:
                     continue
@@ -672,13 +672,21 @@ def _menu_date_text(soup, effective_ts: int) -> str:
 
 def _menu_category_name(category_table) -> str:
     """Category heading; an unnamed table of pizzas becomes "PIZZA"."""
-    category_name = category_table.find("th").get_text(strip=True)
+    heading = category_table.find("th")
+    category_name = heading.get_text(strip=True) if heading else ""  # a table without a heading row
     if not category_name.strip():
-        for row in category_table.find_all("tr")[1:]:
+        for row in _menu_dish_rows(category_table):
             cols = row.find_all("td")
             if len(cols) >= 2 and "pizza" in cols[0].get_text(strip=True).lower():
                 return "PIZZA"
     return category_name
+
+
+def _menu_dish_rows(category_table) -> list:
+    """The dish rows of a menu table: everything after the heading row, or
+    every row when the table has no heading row."""
+    rows = category_table.find_all("tr")
+    return rows[1:] if category_table.find("th") else rows
 
 
 def _clean_menu_price(price: str) -> str:
@@ -826,7 +834,7 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
             priority = _MENU_CATEGORY_PRIORITY.get(category_name, 100)
             cat_chunk = _MENU_SEPARATOR + f"{display_name}\n" + _MENU_SEPARATOR
             items_found = False
-            for row in category_table.find_all("tr")[1:]:
+            for row in _menu_dish_rows(category_table):
                 codes, dish = _parse_menu_row(row)
                 codes_used |= codes
                 if dish is None:
