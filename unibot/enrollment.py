@@ -20,6 +20,7 @@ from unibot.preferences import get_pref, set_pref
 from unibot.storage import (
     clear_default_semester,
     load_default_semester,
+    rebuild_watched_courses,
     save_default_semester,
 )
 from unibot.telegram_ui import (
@@ -462,6 +463,7 @@ async def handle_default_semester_pick(update: Update, context: ContextTypes.DEF
 
     label = next((lbl for sid, lbl in semesters if sid == semester_id), semester_id)
     save_default_semester(semester_id, label, user_id=user_id)
+    rebuild_watched_courses(user_id)
     await query.edit_message_text(f"✅ Default semester set to: {semester_display(label)}\nFiles, Browse Courses, and Sign Out will now use it directly.")
 
 
@@ -476,6 +478,7 @@ async def handle_default_semester_clear(update: Update, context: ContextTypes.DE
         return
 
     clear_default_semester(user_id)
+    rebuild_watched_courses(user_id)
     await query.edit_message_text("✅ Default semester cleared. Files, Browse Courses, and Sign Out will ask each time again.")
 
 
@@ -495,7 +498,7 @@ async def handle_toggle_watch_prev_sem(update: Update, context: ContextTypes.DEF
 
     new_state = not get_pref(user_id, "watch_previous_semester")
     set_pref(user_id, "watch_previous_semester", new_state)
-    state.courses_map = {}  # force _ensure_watched_courses_map to rebuild on the next watcher cycle
+    rebuild_watched_courses(user_id)
 
     if new_state:
         await query.edit_message_text("✅ Now also watching the previous semester's courses for new announcements, files, and forum posts - takes effect on the next check cycle.")

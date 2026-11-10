@@ -13,7 +13,7 @@ from telegram.ext import ContextTypes
 
 from unibot import preferences as prefs
 from unibot.auth import is_user_allowed
-from unibot.storage import get_travel_mode, set_travel_mode
+from unibot.storage import get_travel_mode, rebuild_watched_courses, set_travel_mode
 
 QUIET_PRESETS = {
     "off": None,
@@ -181,8 +181,7 @@ def apply_action(user_id: int, parts: list) -> str:
     if action == "flip" and arg in FLIP_KEYS:
         prefs.set_pref(user_id, arg, not prefs.get_pref(user_id, arg))
         if arg == "watch_previous_semester":
-            from unibot import state
-            state.courses_map = {}  # the watcher map is rebuilt on the next cycle
+            rebuild_watched_courses(user_id)
         return PAGE_OF[arg]
     if action == "travel":
         set_travel_mode(user_id, "bus" if get_travel_mode(user_id) == "bike" else "bike")

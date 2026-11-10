@@ -8,6 +8,7 @@ Part of the unibot package.
 
 import html
 import logging
+import time
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -18,10 +19,12 @@ from fast_enroll import current_semester_id, get_semester_options, semester_disp
 from unibot import state
 from unibot.auth import get_user_session, is_user_allowed, login_studip
 from unibot.settings_menu import main_view
-from unibot.storage import mark_setup_done, save_default_semester, setup_done
+from unibot.storage import mark_setup_done, rebuild_watched_courses, save_default_semester, setup_done
 
 SETUP_SEMESTER_CHOICES = 4  # the current term and the ones around it
 SETUP_ASK_EACH_TIME = "ask"
+SETUP_REOFFER_SECONDS = 600  # a question still on screen isn't sent again (sign-in and /start close together)
+_setup_offered: dict[int, float] = {}
 
 
 def semester_choices(options: list, current: Optional[str]) -> list:
@@ -74,15 +77,20 @@ async def offer_setup(bot, user_id: int, session=None) -> bool:
     Returns whether it was asked."""
     if setup_done(user_id):
         return False
+    if time.time() - _setup_offered.get(user_id, 0.0) < SETUP_REOFFER_SECONDS:
+        return False
+    _setup_offered[user_id] = time.time()  # before any await: a concurrent offer sees it
     try:
         options = await _semester_options(user_id, session)
+        if not options:
+            _setup_offered.pop(user_id, None)
+            return False
+        text, markup = semester_step_view(options, current_semester_id(options))
+        await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=markup)
     except Exception:
-        logging.warning("Setup: semesters unavailable for %s", user_id, exc_info=True)
+        _setup_offered.pop(user_id, None)  # not shown: the next sign-in or /start tries again
+        logging.warning("Setup: could not ask %s", user_id, exc_info=True)
         return False
-    if not options:
-        return False
-    text, markup = semester_step_view(options, current_semester_id(options))
-    await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=markup)
     return True
 
 
@@ -110,10 +118,10 @@ async def handle_setup_semester(update: Update, context: ContextTypes.DEFAULT_TY
             return
         await query.answer("Saved")
         save_default_semester(choice, label, user_id=user_id)
-        if state.global_session is not None and getattr(state.global_session, "user_id", None) == user_id:
-            state._courses_map_built_with_prev = None  # the watcher's own student: rebuild its course list
+        rebuild_watched_courses(user_id)
         semester_line = f"✅ Semester: <b>{html.escape(semester_display(label))}</b>"
     mark_setup_done(user_id)
+    _setup_offered.pop(user_id, None)
     text, markup = preferences_step_view(user_id, semester_line)
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
 

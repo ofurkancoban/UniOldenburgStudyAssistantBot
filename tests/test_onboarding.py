@@ -97,6 +97,7 @@ class SetupFlowTests(unittest.TestCase):
     def setUp(self):
         storage.clear_default_semester(self.UID)
         storage.save_personal_record(self.UID, storage.SETUP_RECORD, None)
+        onboarding._setup_offered.pop(self.UID, None)
         self.allowed = mock.patch.object(onboarding, "is_user_allowed", return_value=True)
         self.allowed.start()
         self.addCleanup(self.allowed.stop)

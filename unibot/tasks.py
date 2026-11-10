@@ -14,7 +14,7 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
-from telegram.error import NetworkError, TelegramError
+from telegram.error import NetworkError, RetryAfter, TelegramError
 
 from fast_enroll import clear_pending_job, run_fast_enroll
 from studip_utils import TZ_BERLIN
@@ -435,8 +435,8 @@ async def check_task_reminders(bot):
             ])
             try:
                 await bot.send_message(chat_id=uid, text=f"⏰ <b>Reminder:</b> {html.escape(str(task['text']))}", parse_mode="HTML", reply_markup=keyboard)
-            except NetworkError as e:
-                # Telegram unreachable for now: the task stays and fires next minute
+            except (NetworkError, RetryAfter) as e:
+                # Telegram unreachable or rate limiting for now: the task stays and fires next minute
                 logging.warning("Task reminder %s not sent yet: %s", task['id'], e)
                 continue
             except Exception as e:

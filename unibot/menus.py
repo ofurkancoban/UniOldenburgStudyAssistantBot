@@ -35,6 +35,7 @@ from unibot.storage import (
     set_travel_mode,
     link_cache,
     load_default_semester,
+    rebuild_watched_courses,
     user_tasks,
     save_studip_user_name,
     save_user_name,
@@ -178,8 +179,7 @@ async def handle_status_group(update: Update, context: ContextTypes.DEFAULT_TYPE
         if feature == "watch_prev":
             uid = query.from_user.id
             set_pref(uid, "watch_previous_semester", not get_pref(uid, "watch_previous_semester"))
-            if uid == getattr(state.global_session, "user_id", None):
-                state.courses_map = {}  # the watcher's own map: rebuild it on the next cycle
+            rebuild_watched_courses(uid)
         elif feature == "study_plan":
             uid = query.from_user.id
             set_pref(uid, "weekly_study_plan", not get_pref(uid, "weekly_study_plan"))

@@ -425,6 +425,17 @@ def save_default_semester(semester_id: str, label: str, user_id=None) -> None:
         logging.error("Could not save default semester: %s", e)
 
 
+def rebuild_watched_courses(user_id) -> None:
+    """After a student changes what the watcher should follow (default
+    semester, previous semester too): when they are the watcher session's
+    own student, its course list is rebuilt on the next cycle. The map is
+    kept until then rather than emptied, and another student's change
+    leaves it alone."""
+    watcher = state.global_session
+    if watcher is not None and user_id is not None and getattr(watcher, "user_id", None) == int(user_id):
+        state._courses_map_built_with_prev = None
+
+
 SETUP_RECORD = "setup"
 
 

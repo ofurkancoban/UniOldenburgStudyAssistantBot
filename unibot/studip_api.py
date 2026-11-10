@@ -68,13 +68,30 @@ def _normalize_url(u: str | None) -> str | None:
     return u
 
 
-def _record_course(cid: str, name: str, user_id: Optional[int] = None) -> None:
+def _course_list_owner(session: Any = None, user_id: Optional[int] = None) -> Optional[int]:
+    """The student a course listing belongs to: the given one, else the
+    session's, else the one the update acts for (None only for background
+    work on the watcher session)."""
+    if user_id is not None:
+        return user_id
+    if session is not None and getattr(session, "user_id", None) is not None:
+        return session.user_id
+    return current_user_id()
+
+
+def _record_course(cid: str, name: str, user_id: Optional[int] = None, semester_id: Optional[str] = None) -> None:
+    """Remember a course from a current-semester listing in its student's
+    own map. Listings of a picked semester (Files, enrolment) are only shown,
+    never recorded, so browsing an old term doesn't make its courses the
+    student's. The shared watcher map is the watcher session's own current
+    course list: only that student's (or a background) listing adds to it,
+    so a course they enrol in mid-semester is followed without a rebuild."""
+    if semester_id is not None:
+        return
     if user_id is not None:
         if user_id not in state.user_courses_map:
             state.user_courses_map[user_id] = {}
         state.user_courses_map[user_id][cid] = name
-    # the shared map is the watcher session's own course list; another
-    # admin's (or a student's) courses stay in their own map
     if user_id is None or user_id == getattr(state.global_session, "user_id", None):
         state.courses_map[cid] = name
 
@@ -88,11 +105,12 @@ async def list_courses(
     """[(name, cid), ...] of the user's courses in semester_id (the current
     semester when None), via the JSON:API with the my_courses page as
     fallback. Also records courses in user_courses_map and courses_map."""
+    user_id = _course_list_owner(session, user_id)
     try:
         courses = await _list_courses_api(semester_id, session=session, user_id=user_id)
         if courses:
             for name, cid in courses:
-                _record_course(cid, name, user_id=user_id)
+                _record_course(cid, name, user_id=user_id, semester_id=semester_id)
             logging.info("✅ %s courses from the Stud.IP API.", len(courses))
             return courses
     except Exception as e:
@@ -183,7 +201,7 @@ async def _list_courses_html(
                                 name = info.get("name", "").strip()
                                 if name:
                                     all_courses_dict[cid] = name
-                                    _record_course(cid, name, user_id=user_id)
+                                    _record_course(cid, name, user_id=user_id, semester_id=semester_id)
                                     
                     # Fallback: Recursive search in this specific JSON block
                     if not courses_payload:
@@ -214,7 +232,7 @@ async def _list_courses_html(
             name = tag_attr(row, "title") or row.get_text(" ", strip=True)
             if cid and name and len(name) > 3:
                 all_courses_dict[cid] = name
-                _record_course(cid, name, user_id=user_id)
+                _record_course(cid, name, user_id=user_id, semester_id=semester_id)
 
         # Pattern 2: Any link containing a course ID pattern
         course_links = soup.find_all("a", href=re.compile(r"(?:course_id=|to=|details\.php\?id=)([a-f0-9]{32})"))
@@ -227,7 +245,7 @@ async def _list_courses_html(
                 if name and len(name) > 3:
                     if cid not in all_courses_dict:
                         all_courses_dict[cid] = name
-                        _record_course(cid, name, user_id=user_id)
+                        _record_course(cid, name, user_id=user_id, semester_id=semester_id)
         
         # If we found courses on the first URL, we might still want to try the second 
         # to ensure we get "all" if the first was restricted to one semester.
@@ -236,7 +254,7 @@ async def _list_courses_html(
         logging.info("✅ Extracted %s unique courses.", len(all_courses_dict))
         # Ensure the map is updated for other functions
         for cid, name in all_courses_dict.items():
-            _record_course(cid, name, user_id=user_id)
+            _record_course(cid, name, user_id=user_id, semester_id=semester_id)
         # The bot expects (name, cid) tuples
         return [(name, cid) for cid, name in all_courses_dict.items()]
 
