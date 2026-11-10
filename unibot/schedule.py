@@ -150,7 +150,8 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
         # heads-up -- that's the actual leaving-home commute; later classes
         # are typically just a walk across campus, where weather matters
         # far less than a wet trip from home.
-        today_starts = [e["start_dt"] for e in events if e.get("start_dt") and e["start_dt"].date() == now.date()]
+        today_starts = [e["start_dt"] for e in events
+                        if e.get("start_dt") and e["start_dt"].date() == now.date() and not e.get("is_cancelled")]
         first_start_today = min(today_starts) if today_starts else None
         first_class_weather = None
         if first_start_today:
@@ -167,6 +168,8 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
         for event in events:
             if not event.get("start_dt") or not event.get("title") or event["title"] == "Untitled":
                 continue
+            if event.get("is_cancelled"):
+                continue  # nobody should set off for a class that isn't held
 
             title = event["title"]
             start_dt = event["start_dt"]
