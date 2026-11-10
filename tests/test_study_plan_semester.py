@@ -41,6 +41,16 @@ class CurrentSemesterTests(unittest.TestCase):
         self.assertEqual(fast_enroll.semester_start("SoSe 26"), date(2026, 4, 1))
         self.assertIsNone(fast_enroll.semester_start("Business 2026"))
 
+    def test_english_labels(self):
+        self.assertEqual(fast_enroll.semester_start("Summer semester 2026"), date(2026, 4, 1))
+        self.assertEqual(fast_enroll.semester_start("Winter semester 2026/27"), date(2026, 10, 1))
+        options = [("s27", "Summer semester 2027"), ("w26", "Winter semester 2026/27"),
+                   ("s26", "Summer semester 2026"), ("w25", "Winter semester 2025/26")]
+        self.assertEqual(fast_enroll.current_semester_id(options, date(2026, 11, 10)), "w26")
+        self.assertEqual(fast_enroll.current_semester_id(options, date(2026, 7, 1)), "s26")
+        self.assertEqual(fast_enroll.semester_display("Summer semester 2026"), "☀️ Summer semester 2026")
+        self.assertEqual(fast_enroll.semester_display("Winter semester 2026/27"), "❄️ Winter semester 2026/27")
+
     def test_watched_map_uses_the_running_term(self):
         session = mock.MagicMock(user_id=77)
         listed = []

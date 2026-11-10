@@ -307,7 +307,8 @@ async def get_semester_options(session) -> list:
     return [(sid, label) for sid, label in options if not starts_before_2022(label)]
 
 
-_SEMESTER_LABEL_RE = re.compile(r"\b(sommer|winter|sose|wise|ss|ws)\w*\.?\s*(\d{2,4})", re.IGNORECASE)
+# German and English Stud.IP labels: "Sommersemester 2026", "Winter semester 2026/27", "SoSe 26", "WS 2026/27"
+_SEMESTER_LABEL_RE = re.compile(r"\b(sommer|summer|winter|sose|wise|ss|ws)\w*\.?\s*(?:semester\s*)?(\d{2,4})", re.IGNORECASE)
 
 
 def semester_start(label: str):
@@ -319,7 +320,7 @@ def semester_start(label: str):
     year = int(m.group(2))
     if year < 100:
         year += 2000
-    summer = m.group(1).lower().startswith(("sommer", "sose", "ss"))
+    summer = m.group(1).lower().startswith(("sommer", "summer", "sose", "ss"))
     return datetime(year, 4 if summer else 10, 1).date()
 
 
