@@ -34,6 +34,7 @@ from unibot.storage import (
     load_general_cache,
     load_reminders_cache,
     user_tasks,
+    tasks_due_between,
     save_reminders_cache,
     single_flight,
 )
@@ -848,16 +849,10 @@ def _week_tasks_for_range(week_start, week_end, user_id: Optional[int] = None) -
     acts for; other students' tasks are never included."""
     user_id = user_id if user_id is not None else current_user_id()
     try:
-        tasks = [
-            t for t in user_tasks(user_id)
-            if t.get("due_time")
-            and week_start <= datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() <= week_end
-        ]
+        return tasks_due_between(user_tasks(user_id), week_start, week_end) if user_id is not None else []
     except Exception as e:
         logging.warning("_week_tasks_for_range: tasks fetch failed: %s", e)
         return []
-    tasks.sort(key=lambda t: t["due_time"])
-    return tasks
 # "Good Times to Study" hints (daily view, weekly view, morning summary, narration)
 STUDY_WINDOW_DAY_START = dtime(9, 0)
 STUDY_WINDOW_DAY_END = dtime(19, 0)

@@ -30,6 +30,8 @@ from unibot.storage import (
     personal_record,
     save_personal_record,
     load_general_cache,
+    tasks_due_between,
+    task_due,
     user_tasks,
     record_worn_items,
     save_cached_outfit_today,
@@ -76,6 +78,9 @@ def _format_schedule_section(today_events: list) -> str:
         course_icon = _get_course_icon(ev.get("title", ""))
         display_title = clean_course_title(ev.get("title", ""))
         loc_icon = _get_location_emoji(ev.get("location", ""))
+        if ev.get("is_cancelled"):
+            course_blocks.append(f"🚫 <s>{_h(display_title)}</s> <b>(cancelled)</b>\n   🕒 <code>{ev['time']}</code>")
+            continue
         course_blocks.append(
             f"{course_icon} <b>{_h(display_title)}</b>\n"
             f"   🕒 <code>{ev['time']}</code>\n"
@@ -116,15 +121,8 @@ def _load_today_tasks(today_date, user_id: Optional[int] = None) -> list:
     """The user's own tasks due today (`user_id` defaults to the user the
     current update acts for; without one there are none)."""
     owner = user_id if user_id is not None else current_user_id()
-    if owner is None:
-        return []
     try:
-        tasks = [
-            t for t in user_tasks(owner)
-            if t.get("due_time")
-            and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == today_date
-        ]
-        return sorted(tasks, key=lambda t: t["due_time"])
+        return tasks_due_between(user_tasks(owner), today_date, today_date) if owner is not None else []
     except Exception as e:
         logging.error("Summary tasks fetch error: %s", e)
         return []
@@ -134,8 +132,10 @@ def _format_tasks_section(today_tasks: list) -> str:
     if not today_tasks:
         return ""
     task_lines = ["✅ <b>Today's Tasks:</b>"]
-    for t in sorted(today_tasks, key=lambda t: t["due_time"]):
-        due = datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN)
+    for t in today_tasks:
+        due = task_due(t)
+        if due is None:
+            continue
         course_line = f" [{_h(t['course'])}]" if t.get("course") else ""
         task_lines.append(f"⏰ <code>{due.strftime('%H:%M')}</code> - {_h(t['text'])}{course_line}")
     return "\n\n" + "\n".join(task_lines)
@@ -577,9 +577,11 @@ def build_daily_plan_speech_text(events: list, target_date) -> str:
     """Build a plain-English (no Markdown/HTML) description of one day's
     schedule, suitable as TTS input - reuses the same event dicts
     send_daily_calendar renders (title, time, location, status)."""
-    today_events = [ev for ev in events if ev["date_key"] == target_date]
+    day_events = [ev for ev in events if ev["date_key"] == target_date]
+    today_events = [ev for ev in day_events if not ev.get("is_cancelled")]
+    cancelled = _cancelled_sentence(day_events)
     if not today_events:
-        return f"You have no events scheduled on {target_date:%A, %B %d}. Enjoy your free day!"
+        return f"You have no events scheduled on {target_date:%A, %B %d}. Enjoy your free day!{cancelled}"
 
     parts = [f"Here is your schedule for {target_date:%A, %B %d}. You have {len(today_events)} event{'s' if len(today_events) != 1 else ''} today."]
     for ev in today_events:
@@ -590,7 +592,14 @@ def build_daily_plan_speech_text(events: list, target_date) -> str:
         if location and location not in ("-", "TBA", "N/A"):
             sentence += f", in {location}"
         parts.append(sentence + ".")
-    return " ".join(parts)
+    return " ".join(parts) + cancelled
+
+
+def _cancelled_sentence(events: list) -> str:
+    """" Cancelled: X at 10:00." for the cancelled classes, or ""."""
+    gone = [f"{clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')}"
+            for ev in events if ev.get("is_cancelled")]
+    return f" Cancelled: {', '.join(gone)}." if gone else ""
 
 
 DAILY_PLAN_NARRATION_SYSTEM_PROMPT = """You are recording a short, warm, upbeat spoken morning briefing for a university student - it will be converted to speech and sent as a voice message, so write it exactly as you'd say it out loud, not as a written list.
@@ -618,13 +627,16 @@ async def build_ai_daily_plan_narration(today_events: list, target_date, name: O
     build_food_recommendation() result. Returns None on any failure;
     callers should fall back to build_daily_plan_speech_text so the voice
     message always has content."""
-    if today_events:
+    held = [ev for ev in today_events if not ev.get("is_cancelled")]
+    if held:
         schedule_summary = "\n".join(
             f"- {clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')} in {_safe_loc(ev.get('location', ''))}"
-            for ev in today_events
+            for ev in held
         )
     else:
         schedule_summary = "No events scheduled - a free day."
+    if len(held) < len(today_events):
+        schedule_summary += f"\nCancelled today (mention briefly, they don't take place):{_cancelled_sentence(today_events)}"
 
     user_prompt = f"Today is {target_date:%A, %B %d}.\nSchedule:\n{schedule_summary}"
 
@@ -638,7 +650,7 @@ async def build_ai_daily_plan_narration(today_events: list, target_date, name: O
 
     if today_tasks:
         tasks_summary = "\n".join(
-            f"- {t['text']}" + (f" (due {datetime.fromisoformat(t['due_time']).astimezone(TZ_BERLIN).strftime('%H:%M')})" if t.get("due_time") else "")
+            f"- {t['text']}" + (f" (due {due:%H:%M})" if (due := task_due(t)) else "")
             for t in today_tasks
         )
         user_prompt += f"\n\nTasks due today:\n{tasks_summary}\nMention these naturally too, not as a separate rigid list."
@@ -660,8 +672,11 @@ def build_weekly_plan_speech_text(events: list, week_start, week_end) -> str:
     schedule, suitable as TTS input - the deterministic fallback for
     build_ai_weekly_plan_narration, same role as build_daily_plan_speech_text
     for the daily version."""
+    cancelled = _cancelled_sentence(events)
+    events = [ev for ev in events if not ev.get("is_cancelled")]
     if not events:
-        return f"You have no events scheduled for the week of {week_start:%B %d} to {week_end:%B %d}. Enjoy the free week!"
+        return (f"You have no events scheduled for the week of {week_start:%B %d} to {week_end:%B %d}. "
+                f"Enjoy the free week!{cancelled}")
 
     events_by_day: dict = {}
     for ev in events:
@@ -672,7 +687,7 @@ def build_weekly_plan_speech_text(events: list, week_start, week_end) -> str:
         day_name = dk.strftime("%A")
         titles = ", ".join(clean_course_title(ev.get("title", "")) or "an event" for ev in events_by_day[dk])
         parts.append(f"On {day_name}, you have {titles}.")
-    return " ".join(parts)
+    return " ".join(parts) + cancelled
 
 
 WEEKLY_PLAN_NARRATION_SYSTEM_PROMPT = """You are recording a short, warm, upbeat spoken weekly briefing for a university student - it will be converted to speech and sent as a voice message, so write it exactly as you'd say it out loud, not as a written list.
@@ -693,6 +708,8 @@ async def build_ai_weekly_plan_narration(events: list, week_start, week_end, nam
     the weekly counterpart of build_ai_daily_plan_narration. Returns None
     on any failure; callers should fall back to build_weekly_plan_speech_text
     so the voice message always has content."""
+    cancelled = _cancelled_sentence(events)
+    events = [ev for ev in events if not ev.get("is_cancelled")]
     if events:
         events_by_day: dict = {}
         for ev in events:
@@ -709,10 +726,12 @@ async def build_ai_weekly_plan_narration(events: list, week_start, week_end, nam
         schedule_summary = "No events scheduled - a free week."
 
     user_prompt = f"Week of {week_start:%B %d} to {week_end:%B %d}.\nSchedule:\n{schedule_summary}"
+    if cancelled:
+        user_prompt += f"\nCancelled this week (mention briefly, they don't take place):{cancelled}"
 
     if week_tasks:
         tasks_summary = "\n".join(
-            f"- {t['text']}" + (f" (due {datetime.fromisoformat(t['due_time']).astimezone(TZ_BERLIN).strftime('%A %H:%M')})" if t.get("due_time") else "")
+            f"- {t['text']}" + (f" (due {due:%A %H:%M})" if (due := task_due(t)) else "")
             for t in week_tasks
         )
         user_prompt += f"\n\nTasks due this week:\n{tasks_summary}\nMention these naturally too, not as a separate rigid list."
@@ -808,11 +827,7 @@ async def send_daily_plan_voice(sender, events: list, target_date, user_id=None)
         return
     name = get_user_name(owner)
     try:
-        today_tasks = [
-            t for t in user_tasks(owner)
-            if t.get("due_time")
-            and datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN).date() == target_date
-        ]
+        today_tasks = tasks_due_between(user_tasks(owner), target_date, target_date) if owner is not None else []
     except Exception as e:
         logging.warning("send_daily_plan_voice: tasks fetch failed: %s", e)
         today_tasks = []

@@ -350,6 +350,29 @@ TASKS_CACHE_PATH = "tasks_cache.json"
 # Tasks are personal: each student's list is a private record reached only
 # through their own db.UserScope; there is no "all tasks" list any more.
 
+def task_due(task: dict) -> Optional[datetime]:
+    """A task's due time as an aware Berlin datetime, or None when it has
+    none or it can't be read. A time stored without a zone counts as Berlin
+    time (not the server's own zone)."""
+    raw = task.get("due_time") if isinstance(task, dict) else None
+    if not raw:
+        return None
+    try:
+        due = datetime.fromisoformat(str(raw))
+    except ValueError:
+        logging.warning("Task %s has an unreadable due time; skipped", task.get("id"))
+        return None
+    return due.astimezone(TZ_BERLIN) if due.tzinfo else due.replace(tzinfo=TZ_BERLIN)
+
+
+def tasks_due_between(tasks: list, first_day, last_day) -> list:
+    """The tasks (one student's own) due from first_day to last_day (dates,
+    inclusive), soonest first. One unreadable task is left out, not all."""
+    due = [(task_due(t), t) for t in tasks]
+    picked = [(d, t) for d, t in due if d is not None and first_day <= d.date() <= last_day]
+    return [t for _d, t in sorted(picked, key=lambda pair: pair[0])]
+
+
 def user_tasks(user_id) -> list:
     """The student's own tasks ([] without a student)."""
     if user_id is None:

@@ -1,7 +1,9 @@
-"""Fixes from the twelfth review (tasks): a reminder time already gone is
+"""Fixes from the twelfth review. Tasks: a reminder time already gone is
 refused instead of firing at once, an AI-read deadline already gone leaves
 a plain to-do, a malformed snooze button doesn't lose the reminder, and an
-unreadable stored time doesn't break the task list."""
+unreadable stored time doesn't break the task list. Morning: a cancelled
+class is shown as cancelled and not spoken as if it took place, and one
+unreadable task doesn't hide the day's other tasks."""
 
 import asyncio
 import os
@@ -19,7 +21,7 @@ from tests.testenv import use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
-from unibot import storage, tasks  # noqa: E402
+from unibot import morning, storage, tasks  # noqa: E402
 
 UID = 9701
 
@@ -75,6 +77,59 @@ class TaskListTests(unittest.TestCase):
         texts = [c.args[0] for c in message.reply_text.call_args_list]
         self.assertEqual(len(texts), 1)
         self.assertIn("Fine", texts[0])
+
+
+def _class(title, hour, cancelled=False):
+    start = datetime(2026, 11, 11, hour, tzinfo=TZ_BERLIN)
+    return {"title": f"Vorlesung: {title}", "time": f"{hour}:00 - {hour + 2}:00", "location": "A1",
+            "date_key": start.date(), "start_dt": start, "end_dt": start + timedelta(hours=2),
+            "is_cancelled": cancelled}
+
+
+class CancelledClassTests(unittest.TestCase):
+    EVENTS = [_class("Statistics", 10), _class("Econometrics", 14, cancelled=True)]
+
+    def test_summary_marks_it(self):
+        text = morning._format_schedule_section(self.EVENTS)
+        self.assertIn("<s>Econometrics</s> <b>(cancelled)</b>", text)
+        self.assertIn("<b>Statistics</b>", text)
+
+    def test_plain_speech_says_cancelled(self):
+        day = self.EVENTS[0]["date_key"]
+        text = morning.build_daily_plan_speech_text(self.EVENTS, day)
+        self.assertIn("You have 1 event", text)
+        self.assertIn("Cancelled: Econometrics", text)
+        week = morning.build_weekly_plan_speech_text(self.EVENTS, day, day)
+        self.assertNotIn("Statistics, Econometrics", week)
+        self.assertIn("Cancelled: Econometrics", week)
+
+    def test_ai_is_told_it_is_cancelled(self):
+        prompts = []
+
+        async def call(system, user, temperature=None):
+            prompts.append(user)
+            return "ok"
+
+        day = self.EVENTS[0]["date_key"]
+        with mock.patch.object(morning, "_call_openrouter", call), \
+                mock.patch.object(morning, "find_weekly_study_gaps", lambda e: []):
+            asyncio.run(morning.build_ai_daily_plan_narration(self.EVENTS, day))
+            asyncio.run(morning.build_ai_weekly_plan_narration(self.EVENTS, day, day))
+        for prompt in prompts:
+            schedule = prompt.split("Cancelled")[0]
+            self.assertNotIn("Econometrics", schedule)
+            self.assertIn("Cancelled", prompt)
+
+
+class MorningTasksTests(unittest.TestCase):
+    def test_one_unreadable_task_leaves_the_others(self):
+        self.addCleanup(storage.save_user_tasks, UID, [])
+        day = datetime(2026, 11, 11).date()
+        storage.save_user_tasks(UID, [{"id": "a", "text": "Broken", "due_time": "nope"},
+                                      {"id": "b", "text": "Hand in", "due_time": "2026-11-11T15:00:00"}])
+        found = morning._load_today_tasks(day, user_id=UID)
+        self.assertEqual([t["id"] for t in found], ["b"])
+        self.assertIn("15:00", morning._format_tasks_section(found))
 
 
 if __name__ == "__main__":

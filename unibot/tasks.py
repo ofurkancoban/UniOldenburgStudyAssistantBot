@@ -27,6 +27,7 @@ from unibot.storage import (
     remove_user_tasks,
     save_user_tasks,
     students_with_tasks,
+    task_due,
     user_tasks,
 )
 from unibot.telegram_ui import get_main_keyboard, markup_for, user_data
@@ -461,19 +462,7 @@ async def check_task_reminders(bot):
             remove_user_tasks(uid, fired_ids)
 
 
-def _task_due(task: dict) -> Optional[datetime]:
-    """A task's due time as an aware Berlin datetime, or None when it has
-    none or it can't be read. A time stored without a zone counts as Berlin
-    time, so it can still be compared with the clock."""
-    raw = task.get("due_time")
-    if not raw:
-        return None
-    try:
-        due = datetime.fromisoformat(str(raw))
-    except ValueError:
-        logging.warning("Task %s has an unreadable due time; skipped", task.get("id"))
-        return None
-    return due if due.tzinfo else due.replace(tzinfo=TZ_BERLIN)
+_task_due = task_due  # kept under its old name for callers and tests
 
 
 def _snooze_offset(code: str) -> timedelta:
