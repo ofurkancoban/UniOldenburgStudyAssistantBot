@@ -52,6 +52,7 @@ from unibot.telegram_ui import (
     _stop_loading_animation,
     broadcast,
     get_main_keyboard,
+    MAIN_KEYBOARD_LABELS,
     nav_names,
 )
 from unibot.auth import (
@@ -1170,6 +1171,9 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # custom keyboard (get_main_keyboard()) even after it's resent later, so instead
 # each step is tracked in context.user_data["pending_step"] and plain text answers
 # (no forced reply) are matched against it here.
+PENDING_STEP_STATE = ("pending_step", "task_wizard", "fastenroll_wizard", "studip_reply_target")
+
+
 async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text_override: Optional[str] = None) -> bool:
     """If the user has an active multi-step wizard pending, consume this message
     as that step's answer and return True. Otherwise return False so the caller
@@ -1183,6 +1187,12 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         return False
 
     text = text_override if text_override is not None else (update.message.text or "").strip()
+    if text_override is None and text in MAIN_KEYBOARD_LABELS:
+        # a menu button tapped mid-wizard leaves the wizard: its label is
+        # never a task time, a place or (worst) a reply sent to a lecturer
+        for key in PENDING_STEP_STATE:
+            context.user_data.pop(key, None)
+        return False
 
     if step in ("wardrobe_add_item", "wardrobe_set_reference"):
         # These two steps only consume a photo (handle_photo_message) - a

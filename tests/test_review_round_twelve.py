@@ -22,7 +22,7 @@ use_temp_db()
 
 import exam_reminder  # noqa: E402
 from studip_utils import TZ_BERLIN  # noqa: E402
-from unibot import auth, course_registry, db, enrollment, monitoring, morning, storage, tasks, voice, weather  # noqa: E402
+from unibot import auth, course_registry, db, enrollment, menus, monitoring, morning, storage, tasks, voice, weather  # noqa: E402
 
 UID = 9701
 
@@ -372,6 +372,36 @@ class WeatherNullTemperatureTests(unittest.TestCase):
         with mock.patch.object(weather, "shared_http", lambda: Http()), \
                 mock.patch.object(weather, "load_weather_location", lambda uid=None: None):
             self.assertIsNone(asyncio.run(weather.get_weather_snapshot(day, user_id=UID)))
+
+
+
+class MenuButtonLeavesWizardTests(unittest.TestCase):
+    def _send(self, text, user_data):
+        update = types.SimpleNamespace(message=types.SimpleNamespace(text=text), effective_message=mock.AsyncMock(),
+                                       effective_user=types.SimpleNamespace(id=UID))
+        context = types.SimpleNamespace(user_data=user_data)
+        return asyncio.run(menus.handle_pending_step(update, context))
+
+    def test_menu_button_is_never_sent_as_a_reply(self):
+        user_data = {"pending_step": "studip_msg_reply", "studip_reply_target": {"recipient_id": "r1"}}
+        sent = mock.AsyncMock()
+        with mock.patch.object(menus, "send_studip_message", sent):
+            consumed = self._send("📁 Files", user_data)
+        self.assertFalse(consumed)  # the button does what it says
+        sent.assert_not_awaited()
+        self.assertEqual(user_data, {})
+
+    def test_menu_button_leaves_the_task_wizard(self):
+        user_data = {"pending_step": "task_time", "task_wizard": {"text": "Read"}}
+        self.assertFalse(self._send("📅 Schedule", user_data))
+        self.assertEqual(user_data, {})
+
+    def test_typed_answers_still_go_to_the_wizard(self):
+        user_data = {"pending_step": "studip_msg_reply", "studip_reply_target": {"recipient_id": "r1"}}
+        sent = mock.AsyncMock()
+        with mock.patch.object(menus, "send_studip_message", sent):
+            self.assertTrue(self._send("Thank you, see you on Monday", user_data))
+        sent.assert_awaited_once()
 
 
 if __name__ == "__main__":

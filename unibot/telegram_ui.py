@@ -363,14 +363,18 @@ async def delete_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+MAIN_KEYBOARD_ROWS = (
+    ("📁 Files", "📅 Schedule", "✅ Tasks"),
+    ("🍽️ Mensa", "📘 Study Plan", "📊 Progress"),
+    ("📝 Exams", "🔄 Check", "⚙️ Status"),
+)
+MAIN_KEYBOARD_LABELS = frozenset(label for row in MAIN_KEYBOARD_ROWS for label in row)
+
+
 def get_main_keyboard():
     """Main persistent reply keyboard with 3 rows of 3 buttons (9 buttons)"""
     return ReplyKeyboardMarkup(
-        [
-            ["📁 Files", "📅 Schedule", "✅ Tasks"],
-            ["🍽️ Mensa", "📘 Study Plan", "📊 Progress"],
-            ["📝 Exams", "🔄 Check", "⚙️ Status"]
-        ],
+        [list(row) for row in MAIN_KEYBOARD_ROWS],
         resize_keyboard=True,
         one_time_keyboard=False,
         is_persistent=True
