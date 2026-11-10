@@ -1,6 +1,7 @@
-"""First-run setup: the semester question comes first (current term on top),
-is asked once, its answer becomes the default Files opens, and the
-preferences step follows."""
+"""First-run setup: every choice that is the student's own (semester, the
+two AI permissions, the preferences) is asked in one message, the
+permissions stay off until answered, Done needs the questions without a
+default, and the semester becomes the default Files opens."""
 
 import asyncio
 import os
@@ -19,6 +20,7 @@ use_temp_db()
 
 import fast_enroll  # noqa: E402
 from unibot import menus, onboarding, state, storage  # noqa: E402
+from unibot import preferences as prefs  # noqa: E402
 
 OPTIONS = [("s29", "Sommersemester 2029"), ("w28", "Wintersemester 2028/2029"), ("s28", "Sommersemester 2028"),
            ("w27", "Wintersemester 2027/2028"), ("s27", "Sommersemester 2027"),
@@ -48,13 +50,14 @@ def _datas(markup):
     return [b.callback_data for row in markup.inline_keyboard for b in row]
 
 
-class SemesterStepTests(unittest.TestCase):
+class SemesterChoiceTests(unittest.TestCase):
     def test_current_first_then_next_and_previous(self):
         current = fast_enroll.current_semester_id(OPTIONS, date(2026, 11, 10))
-        _text, markup = onboarding.semester_step_view(OPTIONS, current)
-        self.assertEqual(_labels(markup), ["❄️ Wintersemester 2026/2027 ⭐ current", "☀️ Sommersemester 2027",
-                                           "☀️ Sommersemester 2026", "❄️ Wintersemester 2025/2026", "🗓️ Ask me each time"])
-        self.assertEqual(_datas(markup)[0], "setup_sem|w26")
+        _text, markup = onboarding.setup_view(9310, OPTIONS, current)
+        sem = [b for row in markup.inline_keyboard for b in row if b.callback_data.startswith("setup|sem|")]
+        self.assertEqual([b.text for b in sem], ["❄️ Winter 26/27 ⭐", "☀️ Summer 2027", "☀️ Summer 2026",
+                                                 "❄️ Winter 25/26", "🗓️ Ask me each time"])
+        self.assertEqual(sem[0].callback_data, "setup|sem|w26")
 
     def test_unknown_current_lists_the_first_ones(self):
         choices = onboarding.semester_choices(OPTIONS[:2], None)
@@ -97,52 +100,110 @@ class SetupFlowTests(unittest.TestCase):
     def setUp(self):
         storage.clear_default_semester(self.UID)
         storage.save_personal_record(self.UID, storage.SETUP_RECORD, None)
+        storage.save_personal_record(self.UID, onboarding.SETUP_ANSWERS_RECORD, None)
+        storage.set_ai_personal_enabled(self.UID, False)
+        storage.set_ai_grades_enabled(self.UID, False)
         onboarding._setup_offered.pop(self.UID, None)
-        self.allowed = mock.patch.object(onboarding, "is_user_allowed", return_value=True)
-        self.allowed.start()
-        self.addCleanup(self.allowed.stop)
-        self.options = mock.patch.object(onboarding, "_semester_options", mock.AsyncMock(return_value=OPTIONS))
-        self.options.start()
-        self.addCleanup(self.options.stop)
+        onboarding._setup_semesters.pop(self.UID, None)
+        for p in (mock.patch.object(onboarding, "is_user_allowed", return_value=True),
+                  mock.patch.object(onboarding, "is_user_admin", return_value=False),
+                  mock.patch.object(onboarding, "current_semester_id", lambda o: "w26"),
+                  mock.patch.object(onboarding, "_semester_options", mock.AsyncMock(return_value=OPTIONS))):
+            p.start()
+            self.addCleanup(p.stop)
 
     def _offer(self):
         bot = mock.AsyncMock()
-        with mock.patch.object(onboarding, "current_semester_id", lambda o: "w26"):
-            asked = asyncio.run(onboarding.offer_setup(bot, self.UID))
+        asked = asyncio.run(onboarding.offer_setup(bot, self.UID))
         return asked, bot
 
-    def test_offered_once_and_saved_as_default(self):
+    def _tap(self, data, handler=None):
+        query = Query(data, self.UID)
+        asyncio.run((handler or onboarding.handle_setup)(types.SimpleNamespace(callback_query=query), None))
+        return query
+
+    def test_every_question_in_one_message(self):
         asked, bot = self._offer()
         self.assertTrue(asked)
-        self.assertIn("Which semester", bot.send_message.call_args.kwargs["text"])
+        bot.send_message.assert_awaited_once()
+        datas = _datas(bot.send_message.call_args.kwargs["reply_markup"])
+        for key, _title, _info, _required in onboarding.QUESTIONS:
+            if key not in onboarding.ADMIN_ONLY:
+                self.assertIn(f"setup|info|{key}", datas)
+        self.assertNotIn("setup|info|outfit", datas)  # an administrator's feature
+        self.assertIn("setup|ai_personal|yes", datas)
+        self.assertIn("setup|ai_grades|yes", datas)
+        self.assertIn("setup|diet|vegan", datas)
+        self.assertIn("setup|done", datas)
+        self.assertIn("Still to answer: <b>1, 2, 3</b>", bot.send_message.call_args.kwargs["text"])
 
-        query = Query("setup_sem|w26", self.UID)
-        asyncio.run(onboarding.handle_setup_semester(types.SimpleNamespace(callback_query=query), None))
-        self.assertEqual(storage.load_default_semester(self.UID), {"id": "w26", "label": "Wintersemester 2026/2027"})  # stored as Stud.IP names it
-        text, markup = query.edited
-        self.assertIn("(2/2)", text)
-        self.assertIn("setup_done", _datas(markup))
-        self.assertIn("settings|acad", _datas(markup))
+    def test_permissions_stay_off_and_unticked_until_answered(self):
+        _text, markup = onboarding.setup_view(self.UID, OPTIONS, "w26")
+        ticked = [b.callback_data for row in markup.inline_keyboard for b in row if b.text.startswith("✅ ")
+                  and b.callback_data.startswith(("setup|ai_", "setup|sem|"))]
+        self.assertEqual(ticked, [])
+        self.assertFalse(storage.get_ai_personal_enabled(self.UID))
 
-        asked, bot = self._offer()
-        self.assertFalse(asked)
-        bot.send_message.assert_not_called()
+    def test_done_needs_the_open_questions(self):
+        query = self._tap("setup|done")
+        self.assertTrue(query.answers[0][1])
+        self.assertIsNone(query.edited)
+        self.assertFalse(storage.personal_record(self.UID, storage.SETUP_RECORD))
 
-    def test_ask_each_time_keeps_no_default_but_is_not_asked_again(self):
-        query = Query("setup_sem|ask", self.UID)
-        asyncio.run(onboarding.handle_setup_semester(types.SimpleNamespace(callback_query=query), None))
-        self.assertEqual(storage.load_default_semester(self.UID), {})
+    def test_answers_are_saved_on_the_same_message_and_done_closes_it(self):
+        self._offer()
+        query = self._tap("setup|sem|w26")
+        self.assertEqual(storage.load_default_semester(self.UID), {"id": "w26", "label": "Wintersemester 2026/2027"})
+        self.assertIn("✅ ❄️ Winter 26/27 ⭐", [b.text for row in query.edited[1].inline_keyboard for b in row])
+        self._tap("setup|ai_personal|yes")
+        self._tap("setup|ai_grades|no")
+        self._tap("setup|diet|vegan")
+        self._tap("setup|quiet_hours|off")
+        self._tap("setup|morning_time|08:00")
+        self._tap("setup|travel|bus")
+        self.assertTrue(storage.get_ai_personal_enabled(self.UID))
+        self.assertFalse(storage.get_ai_grades_enabled(self.UID))
+        self.assertEqual(prefs.get_pref(self.UID, "diet"), "vegan")
+        self.assertIsNone(prefs.get_pref(self.UID, "quiet_hours"))
+        self.assertEqual(prefs.get_pref(self.UID, "morning_time"), "08:00")
+        self.assertEqual(storage.get_travel_mode(self.UID), "bus")
+        self.assertEqual(onboarding.missing_answers(self.UID), [])
+
+        query = self._tap("setup|done")
+        self.assertIn("Setup complete", query.edited[0])
+        self.assertIn("Vegan", query.edited[0])
+        self.assertTrue(storage.personal_record(self.UID, storage.SETUP_RECORD))
         self.assertFalse(self._offer()[0])
+
+    def test_saying_no_counts_as_an_answer(self):
+        for data in ("setup|sem|ask", "setup|ai_personal|no", "setup|ai_grades|no"):
+            self._tap(data)
+        self.assertEqual(storage.load_default_semester(self.UID), {})
+        self.assertEqual(onboarding.missing_answers(self.UID), [])
+        self.assertIn("Setup complete", self._tap("setup|done").edited[0])
+
+    def test_unknown_answers_are_refused(self):
+        for data in ("setup|sem|gone", "setup|diet|raw", "setup|nothing|x"):
+            query = self._tap(data)
+            self.assertTrue(query.answers[0][1])
+            self.assertIsNone(query.edited)
+        self.assertEqual(storage.load_default_semester(self.UID), {})
+
+    def test_title_tap_explains(self):
+        query = self._tap("setup|info|ai_personal")
+        self.assertIn("OpenRouter", query.answers[0][0])
+        self.assertIsNone(query.edited)
+
+    def test_older_buttons_still_work(self):
+        query = self._tap("setup_sem|w26")
+        self.assertEqual(storage.load_default_semester(self.UID).get("id"), "w26")
+        self.assertIn("Quick setup", query.edited[0])
+        query = self._tap("setup_done", onboarding.handle_setup_done)
+        self.assertTrue(query.answers[0][1])  # the permissions are still open
 
     def test_an_existing_default_counts_as_done(self):
         storage.save_default_semester("s26", "Sommersemester 2026", user_id=self.UID)
         self.assertFalse(self._offer()[0])
-
-    def test_unknown_semester_is_refused(self):
-        query = Query("setup_sem|gone", self.UID)
-        asyncio.run(onboarding.handle_setup_semester(types.SimpleNamespace(callback_query=query), None))
-        self.assertTrue(query.answers[0][1])
-        self.assertEqual(storage.load_default_semester(self.UID), {})
 
     def test_files_open_the_picked_semester(self):
         storage.save_default_semester("w26", "Wintersemester 2026/2027", user_id=self.UID)

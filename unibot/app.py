@@ -261,7 +261,7 @@ def register_handlers(app) -> None:
 
     # Command & Callback handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(onboarding.handle_setup_semester, pattern=r"^setup_sem\|.+$"))
+    app.add_handler(CallbackQueryHandler(onboarding.handle_setup, pattern=r"^setup(_sem)?\|.+$"))
     app.add_handler(CallbackQueryHandler(onboarding.handle_setup_done, pattern="^setup_done$"))
     onboarding.register(app)
     app.add_handler(CommandHandler("check", check_command))
