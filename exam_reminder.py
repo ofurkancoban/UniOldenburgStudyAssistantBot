@@ -260,10 +260,7 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
         return
 
     cache = load_exam_cache()
-    # the sittings this student is registered for: reminders built from course
-    # files skip these dates for them (this check already covers those)
-    cache["registered_dates"] = sorted({str(e["date"])[:10] for e in exams if e.get("date")})
-    save_exam_cache(cache)
+    cache.pop("registered_dates", None)  # was read only by the retired course-file exam scan
     notified_days = cache.get("notified_exam_date", {})
     notified_hours = cache.get("notified_exam_hours", {})
 
@@ -519,6 +516,13 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
 FINAL_GRADE_STATUSES = {"passed", "not passed"}
 
 
+def _grade_fingerprint(entry: dict) -> dict:
+    """What a module's result is compared by; the baseline and every later
+    check write the same shape, so an unchanged result is never announced."""
+    grade = (entry.get("grade") or "").strip()
+    return {"status_title": (entry.get("status_title") or "").lower(), "grade": grade or None}
+
+
 @_background_job
 async def check_grade_reminders(session, bot, broadcast_fn) -> None:
     """Notify when a module reaches a final grade (passed/failed) for the first
@@ -532,13 +536,16 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
     cache = load_exam_cache()
     known_grades = cache.get("known_grades", {})
 
-    # Initial baseline seeding: record existing grades without blast-alerting historical exams
-    if not known_grades:
+    # Initial baseline seeding: record existing grades without blast-alerting
+    # historical exams. Done once: a student with no final grade yet must
+    # still hear about their first one, so an empty baseline counts as seeded.
+    if not known_grades and not cache.get("grades_seeded"):
         for entry in grades:
             st = (entry.get("status_title") or "").lower()
             if st in FINAL_GRADE_STATUSES:
-                known_grades[entry["number"]] = {"status_title": st, "grade": entry.get("grade")}
+                known_grades[entry["number"]] = _grade_fingerprint(entry)
         cache["known_grades"] = known_grades
+        cache["grades_seeded"] = True
         save_exam_cache(cache)
         logging.info("🎓 Grade baseline seeded")
         return
@@ -550,7 +557,7 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> None:
 
         number = entry["number"]
         grade_val = (entry.get("grade") or "").strip()
-        fingerprint = {"status_title": status_title, "grade": grade_val or None}
+        fingerprint = _grade_fingerprint(entry)
         if known_grades.get(number) == fingerprint:
             continue  # already notified about this exact result
 

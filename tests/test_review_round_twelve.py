@@ -20,6 +20,7 @@ os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tes
 from tests.testenv import use_temp_db  # noqa: E402
 use_temp_db()
 
+import exam_reminder  # noqa: E402
 from studip_utils import TZ_BERLIN  # noqa: E402
 from unibot import morning, storage, tasks, voice  # noqa: E402
 
@@ -149,6 +150,39 @@ class VoiceExamReminderTests(unittest.TestCase):
                 None, [], message))
         self.assertEqual(added, [])
         self.assertIn("already passed", message.reply_text.call_args.args[0])
+
+
+
+class GradeNoticeTests(unittest.TestCase):
+    def _check(self, grades, cache):
+        sent = []
+
+        async def broadcast(bot, text, parse_mode=None, reply_markup=None):
+            sent.append(text)
+
+        def save(data, user_id=None):
+            cache.clear()
+            cache.update(data)
+
+        with mock.patch.object(exam_reminder, "get_grades", mock.AsyncMock(return_value=grades)), \
+                mock.patch.object(exam_reminder, "load_exam_cache", lambda *a, **k: dict(cache)), \
+                mock.patch.object(exam_reminder, "save_exam_cache", save):
+            asyncio.run(exam_reminder.check_grade_reminders(types.SimpleNamespace(user_id=UID), None, broadcast))
+        return sent
+
+    def test_first_grade_of_a_new_student_is_announced(self):
+        cache: dict = {}
+        self.assertEqual(self._check([], cache), [])  # nothing final yet: the baseline is empty
+        first = [{"number": "M1", "title": "Statistics", "status_title": "passed", "grade": "1,7"}]
+        sent = self._check(first, cache)
+        self.assertTrue(any("Statistics" in t and "1,7" in t for t in sent))
+
+    def test_a_result_without_a_grade_is_not_announced_again(self):
+        cache: dict = {}
+        grades = [{"number": "M2", "title": "Seminar", "status_title": "passed", "grade": ""},
+                  {"number": "M3", "title": "Lab", "status_title": "passed", "grade": " 2,0 "}]
+        self._check(grades, cache)  # baseline
+        self.assertEqual(self._check(grades, cache), [])
 
 
 if __name__ == "__main__":
