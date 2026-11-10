@@ -1,12 +1,15 @@
 """Fixes from the thirteenth review (schedule): a cancelled class gets no
 "starting in 30 minutes" reminder, the weather heads-up goes with the first
 class that is actually held, two students may fast-enroll in the same
-course, and one unreadable task time doesn't break the Upcoming view."""
+course, one unreadable task time doesn't break the Upcoming view, a course
+whose file listing failed keeps its search index, and the progress buttons
+say when the student's session expired."""
 
 import asyncio
 import os
 import sys
 import tempfile
+import types
 import unittest
 from datetime import date, datetime, timedelta
 from unittest import mock
@@ -18,8 +21,8 @@ from tests.testenv import use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
-
-from unibot import schedule  # noqa: E402
+from unibot import onboarding, schedule, settings_menu, study_plan  # noqa: E402
+from unibot import preferences as prefs  # noqa: E402
 
 UID = 9801
 DAY = date(2026, 11, 4)
@@ -109,6 +112,53 @@ class UpcomingDashboardTests(unittest.TestCase):
         self.assertIn("• Broken", text)  # kept as an undated to-do
         self.assertIn("• Buy pens", text)
         self.assertLess(text.index("Hand in"), text.index("Statistics"))
+
+
+
+class CourseIndexKeptOnFailureTests(unittest.TestCase):
+    def test_failed_listing_keeps_the_courses_index(self):
+        index = {"files": {"c1|old.pdf": {"course": "A", "file": "old.pdf", "size": "1", "modified_ts": 1, "chunks": []},
+                           "c2|gone.pdf": {"course": "B", "file": "gone.pdf", "size": "1", "modified_ts": 1, "chunks": []}}}
+        saved = {}
+
+        async def listing(cid, session=None):
+            if cid == "c1":
+                raise RuntimeError("Stud.IP timeout")
+            return []
+
+        with mock.patch.object(study_plan, "GWDG_API_KEY", "k"), \
+                mock.patch.object(study_plan, "watched_courses", mock.AsyncMock(return_value=[("A", "c1", object()), ("B", "c2", object())])), \
+                mock.patch.object(study_plan, "_list_course_files", listing), \
+                mock.patch.object(study_plan, "_load_course_index_async", mock.AsyncMock(return_value=index)), \
+                mock.patch.object(study_plan, "save_course_index", lambda data: saved.update(data)):
+            stats = asyncio.run(study_plan.index_course_files(None))
+        self.assertIn("c1|old.pdf", saved["files"])  # not read this run: kept, not re-embedded tomorrow
+        self.assertNotIn("c2|gone.pdf", saved["files"])  # read and really gone
+        self.assertEqual(stats["removed"], 1)
+
+
+class ExpiredSessionButtonTests(unittest.TestCase):
+    def test_progress_and_track_buttons_say_so(self):
+        for handler, loader in ((study_plan.handle_study_progress_menu, "_load_progress_rows"),
+                                (study_plan.handle_study_track_menu, "_load_track_menu_progress")):
+            query = mock.AsyncMock()
+            query.data = "sp_progress"
+            update = types.SimpleNamespace(callback_query=query, effective_user=types.SimpleNamespace(id=UID))
+            with mock.patch.object(study_plan, loader, mock.AsyncMock(side_effect=RuntimeError("Sign in again"))):
+                asyncio.run(handler(update, None))
+            self.assertIn("Sign in again", query.message.reply_text.call_args.args[0])
+
+
+
+class OutfitIsForAdminsTests(unittest.TestCase):
+    def test_a_student_cannot_flip_the_outfit_switch(self):
+        uid = 9802
+        prefs.set_pref(uid, "outfit", True)
+        with mock.patch.object(settings_menu, "is_user_admin", return_value=False):
+            settings_menu.apply_action(uid, ["settings", "flip", "outfit"])
+        with mock.patch.object(onboarding, "is_user_admin", return_value=False), self.assertRaises(ValueError):
+            onboarding.apply_answer(uid, "outfit", "off", [])
+        self.assertTrue(prefs.get_pref(uid, "outfit"))
 
 
 if __name__ == "__main__":

@@ -478,11 +478,13 @@ async def index_course_files(session) -> dict:
     index = await _load_course_index_async()
     files_index = index.setdefault("files", {})
     seen, calls, unsaved = set(), 0, 0
+    unread: set = set()  # courses whose listing failed: their index is kept as it is
     for course_name, cid, http in plan:
         try:
             files = await _list_course_files(cid, session=http)
         except Exception as e:
             logging.warning("index_course_files: list_files failed for %s: %s", cid, e)
+            unread.add(cid)
             continue
         for folder, f in files:
             name, url = f.get("name"), f.get("url")
@@ -533,7 +535,7 @@ async def index_course_files(session) -> dict:
                 await asyncio.to_thread(save_course_index, index)
                 unsaved = 0
     enrolled = {cid for _, cid, _ in plan}
-    for key in [k for k in files_index if k not in seen and k.split("|", 1)[0] in enrolled]:
+    for key in [k for k in files_index if k not in seen and k.split("|", 1)[0] in enrolled - unread]:
         del files_index[key]
         stats["removed"] += 1
     for key in [k for k in files_index if k.split("|", 1)[0] not in enrolled]:
@@ -1598,7 +1600,11 @@ async def handle_study_track_menu(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id if update.effective_user else None
-    progress = await _load_track_menu_progress(user_id=user_id)
+    try:
+        progress = await _load_track_menu_progress(user_id=user_id)
+    except RuntimeError as e:  # their session expired: say so instead of a silent button
+        await query.message.reply_text(f"❌ {e}")
+        return
     data = query.data
     if data == "sp_track_auto":
         progress.pop("tracked", None)
@@ -1674,7 +1680,11 @@ async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAU
     await query.answer()
     user_id = update.effective_user.id if update.effective_user else None
     data = query.data
-    rows, progress = await _load_progress_rows(refresh=(data == "sp_progress_refresh"), user_id=user_id)
+    try:
+        rows, progress = await _load_progress_rows(refresh=(data == "sp_progress_refresh"), user_id=user_id)
+    except RuntimeError as e:  # their session expired: say so instead of a silent button
+        await query.message.reply_text(f"❌ {e}")
+        return
 
     if data in ("sp_progress", "sp_progress_refresh"):
         text, markup = render_progress_overview(rows)
