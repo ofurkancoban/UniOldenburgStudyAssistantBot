@@ -191,6 +191,7 @@ from unibot.menus import (
     handle_status_buttons,
     handle_status_group,
     menu_button_handler,
+    start,
 )
 from unibot.watcher import start_unified_watcher
 
@@ -260,7 +261,7 @@ def register_handlers(app) -> None:
     app.add_handler(TypeHandler(Update, _authorization_gate), group=-1)
 
     # Command & Callback handlers
-    app.add_handler(CommandHandler("start", onboarding.start_with_setup))
+    app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(onboarding.handle_setup_semester, pattern=r"^setup_sem\|.+$"))
     app.add_handler(CallbackQueryHandler(onboarding.handle_setup_done, pattern="^setup_done$"))
     onboarding.register(app)

@@ -1,5 +1,5 @@
 """First-run setup: right after a student's first sign-in (or their next
-/start while signed in) the bot asks for their preferences, starting with
+/start while signed in, see menus.start) the bot asks for their preferences, starting with
 the semester. The picked semester becomes the default that Files, Browse
 Courses and Sign Out open directly; the rest are the /settings pages.
 
@@ -16,8 +16,7 @@ from telegram.ext import ContextTypes
 from fast_enroll import current_semester_id, get_semester_options
 
 from unibot import state
-from unibot.auth import get_user_session, has_stored_login, is_user_allowed, login_studip
-from unibot.menus import start
+from unibot.auth import get_user_session, is_user_allowed, login_studip
 from unibot.settings_menu import main_view
 from unibot.storage import mark_setup_done, save_default_semester, setup_done
 
@@ -85,21 +84,6 @@ async def offer_setup(bot, user_id: int, session=None) -> bool:
     text, markup = semester_step_view(options, current_semester_id(options))
     await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=markup)
     return True
-
-
-async def start_with_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/start: the dashboard, then the setup for a signed-in student who
-    hasn't done it yet (a student who isn't signed in gets it after /login)."""
-    await start(update, context)
-    user = update.effective_user
-    if user is None or not is_user_allowed(user.id) or setup_done(user.id):
-        return
-    session = get_user_session(user.id)
-    if session is not None and has_stored_login(session):
-        try:
-            await offer_setup(context.bot, user.id, session)
-        except Exception:
-            logging.warning("Setup offer after /start failed for %s", user.id, exc_info=True)
 
 
 async def handle_setup_semester(update: Update, context: ContextTypes.DEFAULT_TYPE):

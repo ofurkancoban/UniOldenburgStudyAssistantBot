@@ -1414,6 +1414,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=get_main_keyboard()
     )
+    await _offer_setup_if_signed_in(context.bot, user_id)
+
+
+async def _offer_setup_if_signed_in(bot, user_id: int) -> None:
+    """A signed-in student who never did the first-run setup gets it here
+    (one who isn't signed in gets it right after /login)."""
+    if state.on_signed_in is None:
+        return
+    session = get_user_session(user_id)
+    if session is None or not has_stored_login(session):
+        return
+    try:
+        await state.on_signed_in(bot, user_id, session)
+    except Exception:
+        logging.warning("Setup offer after /start failed for %s", user_id, exc_info=True)
 
 
 async def send_course_picker(message, context: ContextTypes.DEFAULT_TYPE):

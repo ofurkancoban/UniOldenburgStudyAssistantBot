@@ -134,21 +134,19 @@ class SignInHookTests(unittest.TestCase):
         self.assertIs(state.on_signed_in, onboarding.offer_setup)
 
     def test_start_offers_setup_only_when_signed_in(self):
-        update = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=9302))
+        update = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=9302), message=mock.AsyncMock())
         context = types.SimpleNamespace(bot=mock.AsyncMock())
-        offer = mock.AsyncMock()
-        with mock.patch.object(onboarding, "start", mock.AsyncMock()), \
-                mock.patch.object(onboarding, "is_user_allowed", return_value=True), \
-                mock.patch.object(onboarding, "setup_done", return_value=False), \
-                mock.patch.object(onboarding, "get_user_session", return_value=object()), \
-                mock.patch.object(onboarding, "offer_setup", offer):
-            with mock.patch.object(onboarding, "has_stored_login", return_value=False):
-                asyncio.run(onboarding.start_with_setup(update, context))
-            offer.assert_not_awaited()
-            with mock.patch.object(onboarding, "has_stored_login", return_value=True):
-                asyncio.run(onboarding.start_with_setup(update, context))
-            offer.assert_awaited_once()
-
+        hook = mock.AsyncMock()
+        with mock.patch.object(state, "on_signed_in", hook), \
+                mock.patch.object(menus, "is_user_allowed", return_value=True), \
+                mock.patch.object(menus, "get_user_session", return_value=object()):
+            with mock.patch.object(menus, "has_stored_login", return_value=False):
+                asyncio.run(menus.start(update, context))
+            hook.assert_not_awaited()
+            with mock.patch.object(menus, "has_stored_login", return_value=True):
+                asyncio.run(menus.start(update, context))
+            hook.assert_awaited_once()
+            self.assertEqual(hook.call_args.args[1], 9302)
 
 if __name__ == "__main__":
     unittest.main()
