@@ -21,7 +21,7 @@ from tests.testenv import use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
-from unibot import morning, storage, tasks  # noqa: E402
+from unibot import morning, storage, tasks, voice  # noqa: E402
 
 UID = 9701
 
@@ -130,6 +130,25 @@ class MorningTasksTests(unittest.TestCase):
         found = morning._load_today_tasks(day, user_id=UID)
         self.assertEqual([t["id"] for t in found], ["b"])
         self.assertIn("15:00", morning._format_tasks_section(found))
+
+
+
+class VoiceExamReminderTests(unittest.TestCase):
+    def test_exam_already_over_gets_no_reminder(self):
+        exam_dt = (datetime.now(TZ_BERLIN) - timedelta(days=5)).replace(tzinfo=None)
+        message = mock.AsyncMock()
+        update = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=UID))
+        added = []
+        with mock.patch.object(voice, "extract_exam_reminder_task", mock.AsyncMock(return_value={
+                    "course_query": "Algorithms", "offset_value": 1, "offset_unit": "days"})), \
+                mock.patch.object(voice, "login_studip", mock.AsyncMock()), \
+                mock.patch.object(voice, "_find_exam_datetime", mock.AsyncMock(return_value=("Algorithms", exam_dt, True))), \
+                mock.patch.object(voice, "add_user_task", lambda uid, task: added.append(task)):
+            asyncio.run(voice._voice_intent_create_exam_reminder_task(
+                update, types.SimpleNamespace(bot=mock.AsyncMock()), {}, "remind me", "create_exam_reminder_task",
+                None, [], message))
+        self.assertEqual(added, [])
+        self.assertIn("already passed", message.reply_text.call_args.args[0])
 
 
 if __name__ == "__main__":

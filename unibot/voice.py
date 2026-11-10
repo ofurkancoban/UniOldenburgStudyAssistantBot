@@ -212,7 +212,7 @@ async def build_qa_context(user_id=None) -> str:
         if not get_ai_grades_enabled(user_id):
             # grades only leave the server for the AI provider when the student allows it
             parts.append("Transcript: not shared with the assistant. The student can allow it under "
-                         "/status > Official Documents > Privacy.")
+                         "/settings > Privacy.")
         else:
             try:
                 grades = await get_grades(session)
@@ -618,9 +618,15 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
 
     delta = timedelta(hours=offset_value) if extracted["offset_unit"] == "hours" else timedelta(days=offset_value)
     due_dt = (exam_dt - delta).replace(tzinfo=TZ_BERLIN)
-    if due_dt <= datetime.now(TZ_BERLIN) and exam_dt.replace(tzinfo=TZ_BERLIN) > datetime.now(TZ_BERLIN):
-        # a reminder in the past would fire at once: ask for a shorter lead time instead
+    if due_dt <= datetime.now(TZ_BERLIN):
+        # a reminder in the past would fire at once
         exam_when = exam_dt.strftime("%d.%m.%Y %H:%M") if has_time else exam_dt.strftime("%d.%m.%Y")
+        if exam_dt.replace(tzinfo=TZ_BERLIN) <= datetime.now(TZ_BERLIN):
+            await message.reply_text(
+                f"⚠️ The {exam_title} exam I found was on {exam_when}, which has already passed, so no reminder "
+                "was set. If there is a later sitting, register for it first or add the reminder via ➕ Add Task."
+            )
+            return True
         await message.reply_text(
             f"⚠️ {exam_title} is on {exam_when}, so a reminder that far ahead is already in the past. "
             "Try a shorter time, e.g. \"remind me 1 day before\"."
@@ -638,9 +644,8 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
     add_user_task(update.effective_user.id, task)
 
     exam_when = exam_dt.strftime("%d.%m.%Y %H:%M") if has_time else exam_dt.strftime("%d.%m.%Y (time unknown)")
-    past_warning = "\n⚠️ That exam date has already passed - double-check this is the sitting you meant." if exam_dt.date() < berlin_now().date() else ""
     await message.reply_text(
-        f"✅ Reminder set for {due_dt.strftime('%d.%m.%Y %H:%M')} - {exam_title} exam ({exam_when}){past_warning}"
+        f"✅ Reminder set for {due_dt.strftime('%d.%m.%Y %H:%M')} - {exam_title} exam ({exam_when})"
     )
     return True
 
