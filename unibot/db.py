@@ -648,13 +648,21 @@ def _save_private(user_id: int, kind: str, data: Any) -> None:
 
 
 def _load_private(user_id: int, kind: str) -> Optional[Any]:
+    """The student's decrypted record; one still under the old shared key is
+    re-encrypted with the student's own key on this read, like a credential."""
     from studip_vault import decrypt_user_payload
     uid = _require_uid(user_id)
     with _lock:
         row = _connection().execute(
             "SELECT encrypted_blob FROM user_private_data WHERE user_id = ? AND kind = ?", (uid, kind),
         ).fetchone()
-    return decrypt_user_payload(uid, row[0]) if row else None
+        if not row:
+            return None
+        legacy: list = []
+        data = decrypt_user_payload(uid, row[0], legacy)
+        if legacy and data is not None:
+            _save_private(uid, kind, data)
+        return data
 
 
 def _has_private(user_id: int, kind: str) -> bool:

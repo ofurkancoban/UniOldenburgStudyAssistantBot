@@ -21,6 +21,8 @@ from tests.testenv import use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
+import studip_vault  # noqa: E402
+from unibot import db  # noqa: E402
 from unibot import mensa, menus, onboarding, schedule, settings_menu, study_plan  # noqa: E402
 from unibot import preferences as prefs  # noqa: E402
 
@@ -218,6 +220,22 @@ class MenuWithoutHeadingTests(unittest.TestCase):
         text, _p, _n, _d, items, _h = asyncio.run(mensa.get_todays_menu_enhanced(_Session(page)))
         self.assertEqual(sorted(i["name"] for i in items), ["Lentil stew", "Pizza Margherita"])
         self.assertIn("PIZZA", text)
+
+
+
+class LegacyPrivateRecordTests(unittest.TestCase):
+    def test_a_shared_key_record_is_rekeyed_on_read(self):
+        uid = 9803
+        with db._lock:
+            db._connection().execute(
+                "INSERT OR REPLACE INTO user_private_data (user_id, kind, encrypted_blob, updated_at) VALUES (?, ?, ?, ?)",
+                (uid, "exam_cache", studip_vault.encrypt_payload({"known_grades": {"M1": "1.0"}}), 0))
+        self.assertEqual(db.get_user_scope(uid).private("exam_cache"), {"known_grades": {"M1": "1.0"}})
+        with db._lock:
+            blob = db._connection().execute(
+                "SELECT encrypted_blob FROM user_private_data WHERE user_id = ? AND kind = ?", (uid, "exam_cache")).fetchone()[0]
+        self.assertTrue(blob.startswith(studip_vault.USER_MAGIC))  # now under the student's own key
+        self.assertEqual(db.get_user_scope(uid).private("exam_cache"), {"known_grades": {"M1": "1.0"}})
 
 
 if __name__ == "__main__":
