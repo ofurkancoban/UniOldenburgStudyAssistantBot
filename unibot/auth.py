@@ -981,6 +981,10 @@ async def _perform_logout(user_id: Optional[int] = None) -> None:
             state._studip_api_user_id = None
             state._studip_user_profile = None
             state._last_notified_studip_cookie = None
+            # the shared course list was the signed-out admin's own: the next
+            # watcher builds its own instead of following theirs
+            state.courses_map = {}
+            state._courses_map_built_with_prev = None
         if sess is not None and sess is not state.global_session:
             await sess.close()  # its HTTP connections would otherwise leak
         return

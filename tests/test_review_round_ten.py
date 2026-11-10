@@ -128,6 +128,40 @@ class WatchedListRebuildTests(_StateGuard):
         self.assertIsNone(state._courses_map_built_with_prev)
 
 
+class WatcherSwitchTests(_StateGuard):
+    def test_signed_out_admins_course_list_is_dropped(self):
+        old = mock.MagicMock(user_id=WATCHER)
+        old.logout = mock.AsyncMock()
+        old.close = mock.AsyncMock()
+        new = mock.MagicMock(user_id=9405)
+        state.global_session = old
+        saved_sessions = dict(state.user_sessions)
+        self.addCleanup(lambda: (state.user_sessions.clear(), state.user_sessions.update(saved_sessions)))
+        state.user_sessions[WATCHER] = old
+        state.user_courses_map[WATCHER] = {"w1": "Watched"}
+        with mock.patch.object(auth, "pick_watcher_session", return_value=new), \
+                mock.patch.object(auth.db, "get_user_scope"), mock.patch.object(auth.db, "update_user_studip"), \
+                mock.patch("unibot.studip_api.forget_user_profile"):
+            asyncio.run(auth._perform_logout(user_id=WATCHER))
+        self.assertIs(state.global_session, new)
+        self.assertEqual(state.courses_map, {})
+        self.assertIsNone(state._courses_map_built_with_prev)
+        self.assertNotIn(WATCHER, state.user_courses_map)
+
+    def test_other_users_logout_keeps_the_watcher_list(self):
+        other = mock.MagicMock(user_id=STUDENT)
+        other.logout = mock.AsyncMock()
+        other.close = mock.AsyncMock()
+        saved_sessions = dict(state.user_sessions)
+        self.addCleanup(lambda: (state.user_sessions.clear(), state.user_sessions.update(saved_sessions)))
+        state.user_sessions[STUDENT] = other
+        with mock.patch.object(auth.db, "get_user_scope"), mock.patch.object(auth.db, "update_user_studip"), \
+                mock.patch("unibot.studip_api.forget_user_profile"):
+            asyncio.run(auth._perform_logout(user_id=STUDENT))
+        self.assertEqual(state.courses_map, {"w1": "Watched"})
+        self.assertIs(state._courses_map_built_with_prev, False)
+
+
 class RateLimitedReminderTests(unittest.TestCase):
     def test_retry_after_keeps_the_task(self):
         uid = 9403
