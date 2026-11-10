@@ -82,7 +82,7 @@ from unibot.monitoring_fetch import (  # noqa: F401 - the fetch layer, re-export
     _post_author_id,
     fetch_message_body,
 )
-from fast_enroll import get_semester_options
+from fast_enroll import current_semester_id, get_semester_options
 from unibot.preferences import get_pref
 from unibot.storage import (
     link_cache,
@@ -287,7 +287,7 @@ async def _previous_semester_courses(uid: int, sess) -> dict:
             time.time() - _prev_semester_fetched.get(uid, 0.0) < COURSE_LIST_REFRESH_SECONDS:
         return _prev_semester_courses[uid]
     options = await get_semester_options(sess)
-    anchor = load_default_semester().get("id") or (options[0][0] if options else None)
+    anchor = load_default_semester(uid).get("id") or current_semester_id(options)
     index = next((i for i, (sid, _label) in enumerate(options) if sid == anchor), None)
     courses: dict = {}
     if index is not None and index + 1 < len(options):

@@ -17,7 +17,7 @@ from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 
 import studip_oauth
-from fast_enroll import get_semester_options
+from fast_enroll import current_semester_id, get_semester_options
 from studip_utils import (
     TZ_BERLIN,
     berlin_now,
@@ -273,7 +273,7 @@ async def _ensure_watched_courses_map(session) -> None:
     state has changed since the last build, not on every watcher cycle.
 
     Deliberately resolves "current semester" explicitly (default_semester,
-    falling back to the newest entry in get_semester_options) rather than
+    falling back to the semester running today, see current_semester_id) rather than
     relying on a no-arg list_courses() call reflecting "current" - that
     depends on whatever semester some unrelated browsing interaction
     (Files/Enroll/Sign Out's own semester pickers) last left the shared
@@ -288,7 +288,7 @@ async def _ensure_watched_courses_map(session) -> None:
     try:
         default = load_default_semester(owner)  # the watcher account's own setting
         semester_options = await get_semester_options(session)
-        anchor_id = default.get("id") or (semester_options[0][0] if semester_options else None)
+        anchor_id = default.get("id") or current_semester_id(semester_options)
     except Exception as e:
         logging.warning("_ensure_watched_courses_map: failed to resolve current semester: %s", e)
 

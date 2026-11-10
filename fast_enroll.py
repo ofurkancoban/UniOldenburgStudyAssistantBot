@@ -307,6 +307,36 @@ async def get_semester_options(session) -> list:
     return [(sid, label) for sid, label in options if not starts_before_2022(label)]
 
 
+_SEMESTER_LABEL_RE = re.compile(r"\b(sommer|winter|sose|wise|ss|ws)\w*\.?\s*(\d{2,4})", re.IGNORECASE)
+
+
+def semester_start(label: str):
+    """The date a semester label's term starts (summer: 1 April, winter:
+    1 October of its first year), or None when the label isn't one."""
+    m = _SEMESTER_LABEL_RE.search(label or "")
+    if not m:
+        return None
+    year = int(m.group(2))
+    if year < 100:
+        year += 2000
+    summer = m.group(1).lower().startswith(("sommer", "sose", "ss"))
+    return datetime(year, 4 if summer else 10, 1).date()
+
+
+def current_semester_id(options: list, today=None) -> Optional[str]:
+    """The id of the semester running today among get_semester_options()'s
+    [(id, label)]: the latest one that has already started. The list is
+    newest first and Stud.IP offers semesters years ahead, so its first entry
+    is a future term, not the current one. Falls back to the first entry
+    when no label can be read."""
+    today = today or datetime.now(ZoneInfo("Europe/Berlin")).date()
+    started = [(start, sid) for sid, label in options
+               if (start := semester_start(label)) is not None and start <= today]
+    if started:
+        return max(started)[1]
+    return options[0][0] if options else None
+
+
 def _parse_module_links(html: str) -> list:
     """Extract (module_label, verzeichnis_url) pairs from the student module
     overview page: each module with an offering in the selected semester links

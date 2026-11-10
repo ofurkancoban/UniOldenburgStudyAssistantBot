@@ -1081,6 +1081,13 @@ def save_study_progress(data: dict, user_id: Optional[int] = None) -> None:
         logging.error("Failed to save study progress: %s", e)
 
 
+def _is_cancelled(ev: dict) -> bool:
+    """A calendar event that won't take place: Stud.IP's own flag, or a
+    title that says so (older feeds only had the title)."""
+    lower = ev.get("title", "").lower()
+    return bool(ev.get("is_cancelled")) or "fällt aus" in lower or "cancelled" in lower or "canceled" in lower
+
+
 def _semester_lecture_start(today):
     """First day of the current semester's lecture period (approximate:
     WS from 1 Oct, SS from 1 Apr) - only used as the lower bound for
@@ -1095,14 +1102,17 @@ def _semester_lecture_start(today):
 async def count_lectures_held(session, course_candidates: list) -> dict:
     """{cid: number of lecture sessions already held this semester}, from
     the Stud.IP calendar. Only "Vorlesung"/"Lecture"/"Seminar" entries count
-    (exercises repeat the lecture's material), and cancelled ones
-    ("fällt aus") are skipped. This is what "covered in class" means for
-    the behind-schedule check: the first N lecture units of a course."""
+    (exercises repeat the lecture's material), and cancelled ones are
+    skipped. Each event is counted for the course it belongs to; a title
+    match is only the fallback for an event without a known course. This
+    is what "covered in class" means for the behind-schedule check: the
+    first N lecture units of a course."""
     from unibot.voice import _best_title_match
     today = datetime.now(TZ_BERLIN).date()
     start = _semester_lecture_start(today)
     events = await get_calendar_events(session, start, days=(today - start).days + 1)
     now = datetime.now(TZ_BERLIN)
+    known = {cid for _name, cid in course_candidates}
     held: dict = {}
     for ev in events:
         title = ev.get("title", "")
@@ -1111,9 +1121,10 @@ async def count_lectures_held(session, course_candidates: list) -> dict:
             continue
         if not lower.startswith(("vorlesung", "lecture", "seminar")):
             continue
-        if "fällt aus" in lower or "cancelled" in lower or "canceled" in lower:
+        if _is_cancelled(ev):
             continue
-        cid = _best_title_match(clean_course_title(title), course_candidates, min_score=0.6)
+        cid = ev.get("course_id") if ev.get("course_id") in known else None
+        cid = cid or _best_title_match(clean_course_title(title), course_candidates, min_score=0.6)
         if cid:
             held[cid] = held.get(cid, 0) + 1
     return held
@@ -1216,8 +1227,8 @@ def find_free_study_windows(events: list, week_start) -> list:
     shape as find_weekly_study_gaps. Unlike that function (which is shared
     with the voice narration and only looks between two classes), this
     also counts the morning before the first class, the afternoon after
-    the last one and fully free days. Cancelled classes ("fällt aus") are
-    treated as free time. Weekends are deliberately excluded."""
+    the last one and fully free days. Cancelled classes are treated as
+    free time. Weekends are deliberately excluded."""
     windows: list[dict] = []
     for i in range(5):
         day = week_start + timedelta(days=i)
@@ -1225,7 +1236,7 @@ def find_free_study_windows(events: list, week_start) -> list:
         day_start = datetime.combine(day, _dtime(STUDY_DAY_START_HOUR, 0), tzinfo=TZ_BERLIN)
         day_end = datetime.combine(day, _dtime(STUDY_DAY_END_HOUR, 0), tzinfo=TZ_BERLIN)
         busy = sorted(
-            (ev for ev in events if ev["date_key"] == day and "fällt aus" not in ev.get("title", "").lower()),
+            (ev for ev in events if ev["date_key"] == day and not _is_cancelled(ev)),
             key=lambda ev: ev["start_dt"],
         )
         cursor, after = day_start, ("no classes that day" if not busy else "start of day")

@@ -265,7 +265,7 @@ class PreviousSemesterTests(unittest.TestCase):
         with mock.patch.object(monitoring, "signed_in_accounts", lambda: accounts), \
                 mock.patch.object(monitoring, "get_semester_options", options), \
                 mock.patch.object(monitoring, "_list_courses_api", api), \
-                mock.patch.object(monitoring, "load_default_semester", lambda: {}), \
+                mock.patch.object(monitoring, "load_default_semester", lambda uid=None: {}), \
                 mock.patch.object(monitoring, "list_courses", mock.AsyncMock()), \
                 mock.patch.object(monitoring.course_registry, "has_stored_login", lambda s: True):
             plan = asyncio.run(monitoring.watched_courses())
