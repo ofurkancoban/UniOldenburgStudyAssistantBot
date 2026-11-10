@@ -1,6 +1,7 @@
 """Fixes from the thirteenth review (schedule): a cancelled class gets no
-"starting in 30 minutes" reminder, and the weather heads-up goes with the
-first class that is actually held."""
+"starting in 30 minutes" reminder, the weather heads-up goes with the first
+class that is actually held, two students may fast-enroll in the same
+course, and one unreadable task time doesn't break the Upcoming view."""
 
 import asyncio
 import os
@@ -17,6 +18,7 @@ from tests.testenv import use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
+
 from unibot import schedule  # noqa: E402
 
 UID = 9801
@@ -72,6 +74,41 @@ class CancelledClassReminderTests(unittest.TestCase):
         (reminder,) = self._run(events, "09:15")
         self.assertIn("Econometrics", reminder)
         self.assertIn("umbrella", reminder)
+
+
+
+class FastEnrollPerStudentTests(unittest.TestCase):
+    def test_two_students_may_schedule_the_same_course(self):
+        sem = "a" * 32
+        saved = []
+
+        async def run(*args):
+            return None
+
+        with mock.patch("fast_enroll.load_pending", return_value={"1": {sem: {}}}), \
+                mock.patch.object(schedule, "save_pending_job", lambda *a: saved.append(a[0])), \
+                mock.patch("unibot.tasks._run_fastenroll_task", run), \
+                mock.patch.dict(schedule.fastenroll_tasks, {}, clear=True):
+            reply = asyncio.run(schedule.schedule_fastenroll_job(2, sem, "08:00:00", None, None))
+        self.assertIn("scheduled", reply)
+        self.assertEqual(saved, [2])
+
+
+class UpcomingDashboardTests(unittest.TestCase):
+    def test_unreadable_and_naive_task_times(self):
+        tasks = [{"id": "a", "text": "Broken", "due_time": "nope"},
+                 {"id": "b", "text": "Hand in", "due_time": "2030-01-05T15:00:00"},
+                 {"id": "c", "text": "Buy pens"}]
+        with mock.patch.object(schedule, "user_tasks", lambda uid: tasks), \
+                mock.patch.object(schedule, "get_open_exam_registrations", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(schedule, "get_registered_exam_schedule", mock.AsyncMock(return_value=[
+                    {"title": "Statistics", "date": "2030-01-10", "start_datetime": None}])):
+            text = asyncio.run(schedule.build_upcoming_dashboard(object(), UID))
+        self.assertIn("Hand in", text)
+        self.assertIn("Statistics", text)
+        self.assertIn("• Broken", text)  # kept as an undated to-do
+        self.assertIn("• Buy pens", text)
+        self.assertLess(text.index("Hand in"), text.index("Statistics"))
 
 
 if __name__ == "__main__":

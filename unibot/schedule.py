@@ -17,7 +17,7 @@ from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
 from exam_reminder import get_open_exam_registrations, get_registered_exam_schedule
-from fast_enroll import load_pending, save_pending_job
+from fast_enroll import save_pending_job
 from studip_utils import TZ_BERLIN, berlin_now, format_hours as _format_hours, md_escape as _md
 
 from unibot import state
@@ -34,6 +34,7 @@ from unibot.storage import (
     load_general_cache,
     load_reminders_cache,
     user_tasks,
+    task_due,
     tasks_due_between,
     save_reminders_cache,
     single_flight,
@@ -1911,13 +1912,13 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
     except Exception as e:
         logging.warning("Upcoming dashboard: exam date fetch failed: %s", e)
 
-    todos = []
+    todos: list[str] = []
     for t in user_tasks(user_id):
         # task text can come from an announcement or a forum post
         course_suffix = f" [{html.escape(t['course'])}]" if t.get("course") else ""
-        if t.get("due_time"):
-            dt = datetime.fromisoformat(t["due_time"])
-            items.append((dt, f"✅ <b>Task:</b> {html.escape(t['text'])}{course_suffix} – {_format_relative(dt, now)}"))
+        due = task_due(t)  # Berlin time, so it sorts with the exam dates; unreadable counts as undated
+        if due is not None:
+            items.append((due, f"✅ <b>Task:</b> {html.escape(t['text'])}{course_suffix} – {_format_relative(due, now)}"))
         else:
             todos.append(f"{html.escape(t['text'])}{course_suffix}")
 
@@ -1975,18 +1976,6 @@ async def schedule_fastenroll_job(chat_id: int, sem_id: Optional[str], target_ti
     existing = fastenroll_tasks.get(chat_id, {}).get(sem_id)
     if existing and not existing.done():
         return f"A fast-enroll job is already scheduled for course {sem_id}. Cancel it first with /fastenroll_cancel {sem_id}."
-
-    # The bot logs into a single shared Stud.IP account regardless of which
-    # Telegram chat is talking to it, so the same course must not be scheduled
-    # twice from two different chats -- that would fire two redundant enrollment
-    # attempts at the same instant.
-    all_pending = load_pending()
-    for other_chat_id_str, other_jobs in all_pending.items():
-        if int(other_chat_id_str) != chat_id and sem_id in other_jobs:
-            return (
-                f"⚠️ Course {sem_id} is already scheduled from another Telegram chat connected to this bot. "
-                "Cancel it there first if you want to reschedule it here."
-            )
 
     when = f"{target_date_str} {target_time_str}" if target_date_str else f"{target_time_str} (next occurrence)"
     save_pending_job(chat_id, sem_id, target_time_str, target_date_str)
