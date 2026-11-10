@@ -20,7 +20,6 @@ from telegram.error import TelegramError
 
 from studip_utils import TZ_BERLIN, berlin_now, tag_attr
 
-from unibot import state
 from unibot.storage import shared_http
 from unibot.telegram_ui import (
     _show_typing,
@@ -740,6 +739,12 @@ def _format_allergen_guide(codes_used: set, hidden_count: int) -> str:
     return text
 
 
+def _is_login_page(html_content: str) -> bool:
+    """Whether Stud.IP answered with its sign-in page (signed-out session)."""
+    text = html_content or ""
+    return 'name="loginname"' in text or "dispatch.php/login" in text
+
+
 async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avoid_keywords=None):
     """Enhanced menu fetching with dynamic allergen guide and navigation links.
 
@@ -778,6 +783,10 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
 
         categories = soup.find_all("table", class_="default")
         if not categories:
+            if _is_login_page(html_content):
+                # not a closed Mensa: Stud.IP sent its sign-in page instead
+                return ("🍽️ <b>Mensa Uni Oldenburg</b>\n\n⚠️ The menu couldn't be loaded because the "
+                        "Stud.IP session has expired. Sign in again with /login."), prev_link, next_link, None, [], None
             return "🍽️ <b>Mensa Uni Oldenburg</b>\n\n❌ No dishes found for this date. The Mensa might be closed.", prev_link, next_link, None, [], None
 
         dish_items = []
@@ -983,13 +992,15 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        # Session check
-        await login_studip()
+        # the student's own signed-in session, like the Today/Next buttons
+        # (the watcher's may not be signed in, and its login page read as
+        # "no dishes")
+        session = await login_studip()
 
         # Fetch menu, filtered per any saved food preferences
         prefs = load_food_preferences()
         menu_text, prev, next_, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
-            state.global_session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
+            session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
         )
 
         # Dish photos are opt-in via the "📸 Show Dish Photos" button below,

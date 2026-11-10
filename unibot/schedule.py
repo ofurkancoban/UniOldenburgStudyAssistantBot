@@ -1272,7 +1272,8 @@ async def build_timetable_text(session=None, user_id: Optional[int] = None) -> s
     try:
         today = datetime.now(TZ_BERLIN).date()
         week_start = today - timedelta(days=today.weekday())
-        week_evs = await get_calendar_events(session=session or state.global_session, week_start=week_start, days=14, user_id=user_id)
+        week_evs = await get_calendar_events(session=session or get_user_session(user_id), week_start=week_start,
+                                           days=14, user_id=user_id)
         for ev in week_evs:
             loc = (ev.get("location") or "").strip()
             if not loc:
