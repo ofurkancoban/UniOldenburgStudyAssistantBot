@@ -387,6 +387,8 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
 
         all_found = []
         semaphore = asyncio.Semaphore(3)
+        read_ok: set = set()  # courses whose announcements were actually read
+        seeded = _seeded_courses(cache.get("seeded"), (key.split(":", 1)[0] for key in seen))
 
         async def check_single_course_announcements(course_name, cid, session):
             async with semaphore:
@@ -394,6 +396,7 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                     found, used = await course_registry.scan_with_failover(
                         cid, session, lambda s: _course_announcements_api(cid, course_name, session=s))
                     course_registry.record_scan(cid, used)
+                    read_ok.add(cid)
                     return course_name, cid, found
                 except Exception as e:
                     logging.warning("Announcements API failed for %s (%s), falling back to the overview page", course_name, e)
@@ -425,6 +428,7 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                                 break
 
                     if not ann_container:
+                        read_ok.add(cid)  # the page loaded: the course has no announcements
                         return course_name, cid, []
 
                     course_announcements = []
@@ -449,6 +453,7 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                             "sender": sender, "date": date_s, "dt": dt.isoformat() if dt else None, "body": body,
                         }
                         course_announcements.append(announcement)
+                    read_ok.add(cid)
                     return course_name, cid, course_announcements
                 except Exception as e:
                     logging.warning("Announcement parse error in %s: %s", course_name, e)
@@ -463,7 +468,11 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
 
         if all_found:
             all_found.sort(key=lambda x: (x["dt"] or "", x["date"]))
-        new_items = [a for a in all_found if a["key"] not in seen]
+        # a newly followed course's existing announcements are its starting
+        # point; only later ones are announced
+        new_items = [a for a in all_found if a["key"] not in seen and a["cid"] in seeded]
+        seeded |= read_ok
+        cache["seeded"] = sorted(seeded)
 
         if new_items:
             for ann in new_items:
@@ -649,6 +658,7 @@ async def _scan_course_files(course_name: str, cid: str, cache: dict, session=No
     later comparisons use the latest timestamps.
     """
     try:
+        api_ok = True
         try:
             files, used = await course_registry.scan_with_failover(
                 cid, session, lambda s: _list_files_api(cid, None, session=s))
@@ -656,10 +666,20 @@ async def _scan_course_files(course_name: str, cid: str, cache: dict, session=No
             logging.warning("File API failed for %s with every member (%s), falling back to the HTML page",
                             course_name, e)
             files, used = await _list_files_html(cid, None, session=session), session
+            api_ok = False
         if not files:
+            if api_ok and cid not in cache:
+                cache[cid] = {}  # read and empty: its first file is news
+                return [], True
             return [], False
         current = _snapshot_course_files(files)
         course_registry.record_scan(cid, used, file_hash=course_registry.content_hash(current))
+        if cid not in cache:
+            # first scan of a newly followed course: what is already there
+            # is its starting point, not a batch of "new file" alerts
+            cache[cid] = {name: {**info, "course": course_name, "modified_ts": info.get("modified_ts")}
+                          for name, info in current.items()}
+            return [], True
         old = cache.get(cid, {})
         events = _file_events(course_name, cid, *_diff_course_files(current, old))
         if current == old:
@@ -870,6 +890,16 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
 
 
 FORUM_CACHE_PATH = "forum_cache.json"
+FORUM_SEEDED_PATH = "forum_seeded_courses.json"
+
+
+def _seeded_courses(stored, known_cids) -> set:
+    """Courses whose existing posts or announcements were already taken as
+    their starting point. Before this was stored, every course with a cached
+    item counted."""
+    if isinstance(stored, list):
+        return {str(c) for c in stored}
+    return {str(c) for c in known_cids if c}
 
 
 def _load_forum_cache() -> dict:
@@ -905,23 +935,28 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, cou
                         cid, sess, lambda s: _fetch_course_forum_strict(s, course_name, cid))
                 except Exception as e:
                     logging.warning("Forum of %s unavailable with every member: %s", course_name, e)
-                    return []
+                    return None
                 course_registry.record_scan(cid, used, forum_hash=course_registry.content_hash(
                     sorted((p.get("key"), p.get("date")) for p in entries)))
-                return entries
+                return cid, entries
 
         results = await asyncio.gather(*(fetch(name, cid, sess) for name, cid, sess in courses),
                                        return_exceptions=True)
+        stored_seeded = db.load(FORUM_SEEDED_PATH) if db.exists(FORUM_SEEDED_PATH) else None
+        seeded = _seeded_courses(stored_seeded, (p.get("cid") for p in cache.values() if isinstance(p, dict)))
         new_posts_found = []
         for res in results:
-            if not isinstance(res, list):
+            if not isinstance(res, tuple):
                 continue
-            for p in res:
-                # Notify for threads not seen before that have unread postings
-                if p["key"] not in cache and p.get("is_new"):
+            cid, entries = res
+            for p in entries:
+                # Notify for threads not seen before that have unread postings;
+                # a newly followed course's existing threads are its starting point
+                if p["key"] not in cache and p.get("is_new") and cid in seeded:
                     new_posts_found.append(p)
                 # Always cache, so "Show Last 5" works immediately
                 cache[p["key"]] = p
+            seeded.add(cid)
 
         for p in new_posts_found:
             markup = await _forum_alert_markup(p)
@@ -931,6 +966,7 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, cou
 
         # Always save cache to bootstrap the "Last 5" feature
         db.save(FORUM_CACHE_PATH, cache)
+        db.save(FORUM_SEEDED_PATH, sorted(seeded))
 
         if not new_posts_found and not silent:
             await bot.send_message(chat_id=chat_id, text="☑️ No new forum posts found (cache updated).", disable_notification=True)

@@ -22,7 +22,7 @@ use_temp_db()
 
 import exam_reminder  # noqa: E402
 from studip_utils import TZ_BERLIN  # noqa: E402
-from unibot import course_registry, enrollment, morning, storage, tasks, voice  # noqa: E402
+from unibot import course_registry, db, enrollment, monitoring, morning, storage, tasks, voice  # noqa: E402
 
 UID = 9701
 
@@ -229,6 +229,95 @@ class CourseAlertRedrawTests(unittest.TestCase):
         with mock.patch.object(course_registry, "is_user_allowed", return_value=True):
             asyncio.run(course_registry.handle_course_alerts(types.SimpleNamespace(callback_query=query), None))
         query.answer.assert_awaited_once()
+
+
+
+async def _scan(fetch, cid, primary):
+    return await fetch(primary), primary
+
+
+class FirstScanBaselineTests(unittest.TestCase):
+    """A newly followed course's existing files, announcements and forum
+    threads are its starting point, not a batch of alerts."""
+
+    def setUp(self):
+        for p in (mock.patch.object(monitoring.course_registry, "scan_with_failover",
+                                    lambda cid, primary, fetch: _scan(fetch, cid, primary)),
+                  mock.patch.object(monitoring.course_registry, "record_scan", lambda *a, **k: None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_files(self):
+        listing = [{"type": "file", "name": "slides.pdf", "size": "1 MB", "modified": "01.11.2026 10:00",
+                    "modified_iso": "2026-11-01T10:00:00+01:00", "url": "u"}]
+        cache: dict = {}
+        with mock.patch.object(monitoring, "_list_files_api", mock.AsyncMock(return_value=listing)):
+            events, changed = asyncio.run(monitoring._scan_course_files("Stats", "c1", cache, session=object()))
+        self.assertEqual(events, [])
+        self.assertTrue(changed)
+        self.assertIn("slides.pdf", cache["c1"])
+        listing.append({**listing[0], "name": "sheet1.pdf"})
+        with mock.patch.object(monitoring, "_list_files_api", mock.AsyncMock(return_value=listing)):
+            events, _ = asyncio.run(monitoring._scan_course_files("Stats", "c1", cache, session=object()))
+        self.assertEqual([e["name"] for e in events], ["sheet1.pdf"])
+
+    def test_an_empty_course_announces_its_first_file(self):
+        cache: dict = {}
+        with mock.patch.object(monitoring, "_list_files_api", mock.AsyncMock(return_value=[])):
+            asyncio.run(monitoring._scan_course_files("Stats", "c2", cache, session=object()))
+        self.assertEqual(cache["c2"], {})
+
+    def _announcements(self, found_by_cid):
+        sent = []
+
+        async def fan_out(bot, cid, kind, text, title, **kw):
+            sent.append(cid)
+
+        async def api(cid, name, session=None):
+            return found_by_cid[cid]
+
+        with mock.patch.object(monitoring, "_course_announcements_api", api), \
+                mock.patch.object(monitoring.course_registry, "fan_out", fan_out):
+            asyncio.run(monitoring.check_new_announcements_parallel(
+                mock.AsyncMock(), UID, silent=True, courses=[("A", cid, object()) for cid in found_by_cid]))
+        return sent
+
+    def test_announcements(self):
+        db.save("announcement_cache.json", {"seen": ["old:1"], "history": []})
+        ann = {"key": "new:1", "cid": "new", "course": "A", "subject": "Hi", "sender": "x", "date": "", "dt": None,
+               "body": "b"}
+        self.assertEqual(self._announcements({"new": [ann], "old": []}), [])
+        later = {**ann, "key": "new:2"}
+        old_course = {**ann, "key": "old:2", "cid": "old"}
+        self.assertEqual(sorted(self._announcements({"new": [ann, later], "old": [old_course]})), ["new", "old"])
+
+    def test_forum(self):
+        db.save(monitoring.FORUM_CACHE_PATH, {"k0": {"key": "k0", "cid": "known"}})
+        if db.exists(monitoring.FORUM_SEEDED_PATH):
+            db.delete(monitoring.FORUM_SEEDED_PATH)
+        sent = []
+
+        async def fan_out(bot, cid, kind, text, title, **kw):
+            sent.append(cid)
+
+        posts = {"known": [{"key": "k1", "cid": "known", "is_new": True}],
+                 "fresh": [{"key": "f1", "cid": "fresh", "is_new": True}]}
+
+        async def fetch(sess, name, cid):
+            return posts[cid]
+
+        with mock.patch.object(monitoring, "_fetch_course_forum_strict", fetch), \
+                mock.patch.object(monitoring.course_registry, "fan_out", fan_out), \
+                mock.patch.object(monitoring, "_forum_alert_markup", mock.AsyncMock(return_value=None)), \
+                mock.patch.object(monitoring, "_forum_alert_text", lambda p: "t"), \
+                mock.patch.object(monitoring, "forum_title_text", lambda p: "t"):
+            asyncio.run(monitoring.check_new_forum_posts_parallel(
+                mock.AsyncMock(), UID, silent=True, courses=[("A", "known", object()), ("B", "fresh", object())]))
+            self.assertEqual(sent, ["known"])
+            posts["fresh"].append({"key": "f2", "cid": "fresh", "is_new": True})
+            asyncio.run(monitoring.check_new_forum_posts_parallel(
+                mock.AsyncMock(), UID, silent=True, courses=[("B", "fresh", object())]))
+        self.assertEqual(sent, ["known", "fresh"])
 
 
 if __name__ == "__main__":
