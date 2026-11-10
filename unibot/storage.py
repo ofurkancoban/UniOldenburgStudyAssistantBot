@@ -437,13 +437,17 @@ def rebuild_watched_courses(user_id) -> None:
 
 
 SETUP_RECORD = "setup"
+SETUP_ANSWERS_RECORD = "setup_answers"  # questions without a default answered in an unfinished setup
 
 
 def setup_done(user_id) -> bool:
     """Whether the student went through the first-run setup (or already
-    picked a semester before it existed), so it is offered only once."""
+    picked a semester before it existed), so it is offered only once. A
+    semester picked inside a setup left unfinished doesn't count."""
     try:
-        return bool(personal_record(user_id, SETUP_RECORD)) or bool(load_default_semester(user_id).get("id"))
+        if personal_record(user_id, SETUP_RECORD):
+            return True
+        return bool(load_default_semester(user_id).get("id")) and personal_record(user_id, SETUP_ANSWERS_RECORD) is None
     except Exception:
         logging.debug("Setup state unavailable", exc_info=True)
         return True  # unsure: don't nag

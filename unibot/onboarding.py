@@ -37,6 +37,7 @@ from unibot.storage import (
     rebuild_watched_courses,
     save_default_semester,
     save_personal_record,
+    SETUP_ANSWERS_RECORD,
     set_ai_grades_enabled,
     set_ai_personal_enabled,
     set_travel_mode,
@@ -46,7 +47,6 @@ from unibot.storage import (
 SETUP_SEMESTER_CHOICES = 4  # the current term and the ones around it
 SETUP_ASK_EACH_TIME = "ask"
 SETUP_REOFFER_SECONDS = 600  # a question still on screen isn't sent again (sign-in and /start close together)
-SETUP_ANSWERS_RECORD = "setup_answers"  # which questions without a default the student answered
 _setup_offered: dict[int, float] = {}
 _setup_semesters: dict[int, tuple] = {}  # user id -> (options, current id) shown in their setup message
 

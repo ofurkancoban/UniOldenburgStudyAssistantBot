@@ -100,7 +100,7 @@ class SetupFlowTests(unittest.TestCase):
     def setUp(self):
         storage.clear_default_semester(self.UID)
         storage.save_personal_record(self.UID, storage.SETUP_RECORD, None)
-        storage.save_personal_record(self.UID, onboarding.SETUP_ANSWERS_RECORD, None)
+        storage.save_personal_record(self.UID, storage.SETUP_ANSWERS_RECORD, None)
         storage.set_ai_personal_enabled(self.UID, False)
         storage.set_ai_grades_enabled(self.UID, False)
         onboarding._setup_offered.pop(self.UID, None)
@@ -200,6 +200,12 @@ class SetupFlowTests(unittest.TestCase):
         self.assertIn("Quick setup", query.edited[0])
         query = self._tap("setup_done", onboarding.handle_setup_done)
         self.assertTrue(query.answers[0][1])  # the permissions are still open
+
+    def test_a_setup_left_after_the_semester_is_offered_again(self):
+        self._offer()
+        self._tap("setup|sem|w26")
+        onboarding._setup_offered.pop(self.UID, None)
+        self.assertTrue(self._offer()[0])  # the permissions are still unanswered
 
     def test_an_existing_default_counts_as_done(self):
         storage.save_default_semester("s26", "Sommersemester 2026", user_id=self.UID)
