@@ -129,9 +129,12 @@ class DocumentStoreTests(unittest.TestCase):
     def test_storage_uses_database(self):
         storage = _import("storage")
         with mock.patch.object(storage, "DEFAULT_SEMESTER_CACHE_PATH", self.path):
-            storage.save_default_semester("sem1", "WS 26/27")
-            self.assertEqual(storage.load_default_semester()["id"], "sem1")
-            storage.clear_default_semester()
+            # an explicit student: without one the owner is PRIMARY_ADMIN_ID,
+            # which is unset where there is no .env (CI)
+            storage.save_default_semester("sem1", "WS 26/27", user_id=4242)
+            self.assertEqual(storage.load_default_semester(4242)["id"], "sem1")
+            storage.clear_default_semester(4242)
+            self.assertEqual(storage.load_default_semester(4242), {})
             self.assertFalse(self.db.exists(self.path))
 
 
