@@ -347,7 +347,7 @@ async def _run_reminder_checks(bot, session, now: datetime):
             await _for_each_stums_user(job, [account for account, _slot in due])
     else:
         # single-account setup without per-user logins: still that one student's data only
-        owner = _single_account_owner(session)
+        owner = _single_account_owner(session) if session else None
         if owner is None:
             return
         adopt_legacy_exam_cache(owner)
@@ -374,7 +374,7 @@ async def _run_exam_date_checks(bot, session, now: datetime):
             lambda uid, sess: check_exam_date_reminders(sess, bot, _user_sender(uid))
         )
     else:
-        owner = _single_account_owner(session)
+        owner = _single_account_owner(session) if session else None
         if owner is not None:
             adopt_legacy_exam_cache(owner)
             with acting_as(owner), exam_cache_user(owner):
@@ -519,13 +519,37 @@ async def _run_content_watchers(bot, admin_id, cycle_count: int, now: datetime):
 
 
 def _should_skip_cycle() -> bool:
-    """Skip while paused, explicitly logged out, or while the user is actively
-    using the bot (so background requests don't compete with theirs)."""
+    """Wait while the admin is actively using the bot, so background requests
+    don't compete with theirs. A signed-out admin no longer stops the cycle:
+    the students' checks run on their own sessions (_admin_watcher_session)."""
     session = state.global_session
-    return session is not None and (
-        session.explicitly_logged_out
-        or time.time() - getattr(session, "last_interactive_activity", 0.0) < 180
+    return session is not None and not session.explicitly_logged_out and (
+        time.time() - getattr(session, "last_interactive_activity", 0.0) < 180
     )
+
+
+_admin_session_missing = False
+
+
+async def _admin_watcher_session():
+    """The admin's own Stud.IP session, or None. Only the single-account
+    fallback needs it: courses are read with their members' sessions and
+    every student's checks use their own, so a signed-out admin must not
+    stop the cycle for everyone. Logged once per outage, not every cycle."""
+    global _admin_session_missing
+    session = None
+    current = state.global_session
+    if current is None or not current.explicitly_logged_out:
+        try:
+            session = await login_studip()
+        except Exception as e:
+            logging.debug("Admin Stud.IP login failed: %s", e)
+    if session and _admin_session_missing:
+        logging.info("🔑 The admin's Stud.IP session is back")
+    elif not session and not _admin_session_missing:
+        logging.warning("🔑 No admin Stud.IP session; the watcher runs on the students' own sessions")
+    _admin_session_missing = not session
+    return session or None
 
 
 async def unified_watcher_controller(app):
@@ -556,17 +580,7 @@ async def unified_watcher_controller(app):
                 await asyncio.sleep(30)
                 continue
 
-            try:
-                session = await login_studip()
-            except Exception as e:
-                logging.error("❌ Login error in watcher: %s", e)
-                session = None
-            else:
-                if not session:
-                    logging.warning("🔑 Failed to acquire logged-in session, retrying...")
-            if not session:
-                await asyncio.sleep(60)
-                continue
+            session = await _admin_watcher_session()
 
             cycle_count += 1
             logging.info("🔄 Watcher cycle #%s started", cycle_count)

@@ -183,5 +183,70 @@ class AuthHookTests(unittest.TestCase):
         self.assertEqual(calls, [(77,)])
 
 
+class _Stop(BaseException):
+    pass
+
+
+class WatcherWithoutAdminTests(unittest.TestCase):
+    def _cycles(self, login, cycles=2, admin_session=None):
+        from unibot import state, watcher
+        seen = []
+        steps = ["_run_scheduled_jobs", "_run_reminder_checks", "_run_exam_date_checks", "_run_health_check",
+                 "_run_daily_backup", "_run_daily_digest", "_run_weekly_report", "_run_content_watchers"]
+
+        def step(name):
+            async def run(*args, **kwargs):
+                seen.append((name, args[1] if name in steps[:3] else None))
+            return run
+
+        ends = []
+
+        async def fake_sleep(seconds):
+            if seconds == 180:
+                ends.append(1)
+                if len(ends) >= cycles:
+                    raise _Stop
+
+        patches = {name: step(name) for name in steps}
+        patches.update(login_studip=login, PRIMARY_ADMIN_ID=1)
+        watcher._admin_session_missing = False
+        with mock.patch.multiple(watcher, **patches), \
+                mock.patch.object(watcher.asyncio, "sleep", fake_sleep), \
+                mock.patch.object(state, "global_session", admin_session), \
+                mock.patch.object(state, "global_watcher_paused", False), \
+                self.assertLogs(level="INFO") as logs:
+            with self.assertRaises(_Stop):
+                asyncio.run(watcher.unified_watcher_controller(mock.MagicMock()))
+        return seen, [r.getMessage() for r in logs.records]
+
+    def test_students_are_served_when_the_admin_login_fails(self):
+        seen, logs = self._cycles(mock.AsyncMock(side_effect=RuntimeError("Failed to log in to Stud.IP.")))
+        names = [name for name, _session in seen]
+        self.assertEqual(names.count("_run_content_watchers"), 2)
+        self.assertIn("_run_scheduled_jobs", names)
+        self.assertTrue(all(session is None for _name, session in seen))
+        self.assertEqual(sum("No admin Stud.IP session" in m for m in logs), 1)  # once, not per cycle
+        self.assertFalse(any("Login error" in m for m in logs))
+
+    def test_a_signed_out_admin_no_longer_pauses_everyone(self):
+        admin = mock.MagicMock(explicitly_logged_out=True, last_interactive_activity=0.0)
+        login = mock.AsyncMock()
+        seen, _logs = self._cycles(login, cycles=1, admin_session=admin)
+        login.assert_not_awaited()  # their logout is respected: no sign-in attempt
+        self.assertIn("_run_content_watchers", [name for name, _session in seen])
+
+    def test_the_single_account_fallback_needs_a_session(self):
+        from unibot import watcher
+        run = mock.AsyncMock()
+        with mock.patch.multiple(watcher, _stums_users=lambda: [], _notify_reauth_needed=mock.AsyncMock(),
+                                 _send_calendar_reminders=mock.AsyncMock(),
+                                 check_course_session_changes=mock.AsyncMock(),
+                                 check_personal_timetable_changes=mock.AsyncMock(),
+                                 check_task_reminders=mock.AsyncMock(), _run_stums_checks=run), \
+                mock.patch.object(watcher.course_registry, "flush_alert_queues", mock.AsyncMock()):
+            asyncio.run(watcher._run_reminder_checks(mock.MagicMock(), None, datetime.now(TZ_BERLIN)))
+        run.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()
