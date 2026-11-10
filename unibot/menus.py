@@ -36,6 +36,7 @@ from unibot.storage import (
     link_cache,
     load_default_semester,
     user_tasks,
+    save_studip_user_name,
     save_user_name,
     shared_http,
 )
@@ -52,7 +53,15 @@ from unibot.telegram_ui import (
     get_main_keyboard,
     nav_names,
 )
-from unibot.auth import _perform_logout, _send_login_prompt, get_user_session, is_user_admin, is_user_allowed, login_studip
+from unibot.auth import (
+    _perform_logout,
+    _send_login_prompt,
+    get_user_session,
+    has_stored_login,
+    is_user_admin,
+    is_user_allowed,
+    login_studip,
+)
 from unibot.studip_api import (
     ZIP_RAW_LIMIT_BYTES,
     _api_message,
@@ -97,8 +106,14 @@ def _status_group_view(group: str, user_id: Optional[int] = None) -> tuple:
     the on/off toggles, which go through status_group_toggle so the
     submenu redraws in place instead of being replaced by a confirmation."""
     if group == "profile":
-        studip_name = (get_user_name(user_id) if user_id is not None else None) or "Connected"
-        title = f"👤 <b>Profile</b>\n\nName: <b>{_h(studip_name)}</b>\n<i>(Automatically synced from Stud.IP)</i>"
+        studip_name = get_user_name(user_id) if user_id is not None else None
+        if studip_name:
+            name_line = f"Name: <b>{_h(studip_name)}</b>\n<i>(Automatically synced from Stud.IP)</i>"
+        elif user_id is not None and has_stored_login(get_user_session(user_id)):
+            name_line = "Name: <i>not synced from Stud.IP yet, try again in a minute</i>"
+        else:
+            name_line = "Name: <i>not signed in, use /login</i>"
+        title = f"👤 <b>Profile</b>\n\n{name_line}"
         rows = [
             [InlineKeyboardButton("📍 Set Location", callback_data="set_weather_location")],
         ]
@@ -131,6 +146,20 @@ def _status_group_view(group: str, user_id: Optional[int] = None) -> tuple:
     return title, InlineKeyboardMarkup(rows)
 
 
+async def _sync_profile_name(user_id: int) -> None:
+    """Fetch this student's own Stud.IP profile and keep its name. The
+    profile is theirs: their own session's, or the watcher's when the
+    watcher runs on their session (studip_api._uses_global_profile)."""
+    try:
+        profile = await asyncio.wait_for(get_studip_user_profile(user_id=user_id), 15)
+    except Exception:
+        logging.debug("Stud.IP profile lookup failed", exc_info=True)
+        return
+    name = (profile or {}).get("display_name")
+    if name and not get_user_name(user_id):
+        save_studip_user_name(name, user_id=user_id)
+
+
 async def handle_status_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """status_group|<group> opens a /status submenu as a new message
     (keeping /status itself intact); status_group_toggle|<group>|<feature>
@@ -141,11 +170,9 @@ async def handle_status_group(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     parts = query.data.split("|")
     group = parts[1] if len(parts) > 1 else "profile"
-    if group == "profile":
-        try:
-            await get_studip_user_profile()
-        except Exception:
-            logging.debug("Stud.IP profile lookup failed", exc_info=True)
+    uid = query.from_user.id
+    if group == "profile" and not get_user_name(uid) and has_stored_login(get_user_session(uid)):
+        await _sync_profile_name(uid)
     if parts[0] == "status_group_toggle":
         feature = parts[2] if len(parts) > 2 else ""
         if feature == "watch_prev":
@@ -158,10 +185,10 @@ async def handle_status_group(update: Update, context: ContextTypes.DEFAULT_TYPE
             set_pref(uid, "weekly_study_plan", not get_pref(uid, "weekly_study_plan"))
         elif feature == "travel":
             set_travel_mode(query.from_user.id, "bus" if get_travel_mode(query.from_user.id) == "bike" else "bike")
-        text, keyboard = _status_group_view(group, query.from_user.id)
+        text, keyboard = _status_group_view(group, uid)
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
         return
-    text, keyboard = _status_group_view(group, query.from_user.id)
+    text, keyboard = _status_group_view(group, uid)
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 

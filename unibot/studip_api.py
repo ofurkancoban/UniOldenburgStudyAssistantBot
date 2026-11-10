@@ -431,7 +431,10 @@ async def get_studip_user_profile(user_id: Optional[int] = None, session: Any = 
             state._studip_api_user_id = studip_id
             state._studip_user_profile = profile
             if display_name:
-                save_studip_user_name(display_name)
+                # the watcher session's own student, never simply the primary admin
+                owner = user_id if user_id is not None else getattr(session or state.global_session, "user_id", None)
+                if owner is not None:
+                    save_studip_user_name(display_name, user_id=owner)
         elif studip_id and user_id is not None:
             _user_profiles[user_id] = profile
             if display_name:

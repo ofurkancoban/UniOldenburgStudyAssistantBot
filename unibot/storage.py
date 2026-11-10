@@ -514,15 +514,18 @@ def _own_name(uid: int) -> Optional[str]:
 
 def save_studip_user_name(name: str, user_id: Optional[int] = None) -> None:
     """Save the name Stud.IP reports for a student, unless they told the bot
-    what to call them. Without a student it is the watcher account's name
-    (the primary admin's)."""
+    what to call them. Without a student it is the name of whoever the
+    watcher session belongs to (any admin who signed in, not necessarily
+    the primary one), and nobody's while that session has no owner."""
     if not name:
         return
-    owner = user_id if user_id is not None else PRIMARY_ADMIN_ID
+    owner = user_id if user_id is not None else getattr(state.global_session, "user_id", None)
+    if owner is None:
+        return
     try:
-        if owner is not None and not _own_name(int(owner)):
+        if not _own_name(int(owner)):
             save_personal_record(int(owner), USER_NAME_RECORD, name)
-        if user_id is None and PRIMARY_ADMIN_ID is not None:
+        if int(owner) == PRIMARY_ADMIN_ID:
             save_personal_record(PRIMARY_ADMIN_ID, WATCHER_NAME_RECORD, name)
     except Exception as e:
         logging.error("Could not save Stud.IP user name: %s", e)
