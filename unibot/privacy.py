@@ -22,9 +22,11 @@ from unibot.weather import forget_weather_place, load_weather_location
 from unibot.storage import (
     forget_personal_cache,
     get_ai_grades_enabled,
+    get_ai_personal_enabled,
     personal_record,
     save_personal_record,
     set_ai_grades_enabled,
+    set_ai_personal_enabled,
 )
 from unibot.watcher import PERSONAL_LAST_KEY, _run_stums_checks, _user_sender, mark_personal_check
 
@@ -62,19 +64,26 @@ def privacy_view(user_id: int, now: Optional[datetime] = None, note: str = "") -
     times = stagger.describe_slots(user_id, now.date(), season)
     last = personal_record(user_id, PERSONAL_LAST_KEY)
     ai_on = get_ai_grades_enabled(user_id)
+    personal_on = get_ai_personal_enabled(user_id)
     mode = "exam season, 4 a day" if season else "2 a day"
     text = (
         "🔒 <b>Privacy</b>\n\n"
         f"🕒 Your grade, exam and fee checks today: <b>{times}</b> ({mode}, none 00:00 to 07:00)\n"
         f"✅ Last check: {_fmt_ts(last)}\n"
+        f"🤖 Assistant may use your timetable, tasks and exams: {'✅ Yes' if personal_on else '🔲 No'}\n"
         f"🤖 Assistant may use your grades: {'✅ Yes' if ai_on else '🔲 No'}\n\n"
         "<i>Grades, exam registrations and fee status are stored encrypted with a key of your own and "
-        "fetched only with your own login. Alerts about them go only to this chat.</i>"
+        "fetched only with your own login. Alerts about them go only to this chat.</i>\n\n"
+        "<i>The spoken morning summary, 🔊 Listen and spoken questions are made by an outside AI service "
+        "(OpenRouter). They use your timetable, tasks, exams, first name and weather place only when you "
+        "allow it; grades need their own permission.</i>"
     )
     if note:
         text += f"\n\n{note}"
     rows = [
         [InlineKeyboardButton("🔄 Check now", callback_data="privacy|check")],
+        [InlineKeyboardButton("🤖 Don't let the assistant use my timetable" if personal_on
+                              else "🤖 Let the assistant use my timetable", callback_data="privacy|ai_personal")],
         [InlineKeyboardButton("🤖 Don't let the assistant use my grades" if ai_on
                               else "🤖 Let the assistant use my grades", callback_data="privacy|ai")],
         [InlineKeyboardButton("🗑️ Delete my data", callback_data="privacy|delete")],
@@ -166,7 +175,7 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """privacy, privacy|check, privacy|ai, privacy|delete, privacy|delete_yes."""
+    """privacy, privacy|check, privacy|ai, privacy|ai_personal, privacy|delete, privacy|delete_yes."""
     query = update.callback_query
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
@@ -196,6 +205,9 @@ async def handle_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             note = "⚠️ The check failed. Try again later."
     elif action == "ai":
         set_ai_grades_enabled(user_id, not get_ai_grades_enabled(user_id))
+        await query.answer("Saved")
+    elif action == "ai_personal":
+        set_ai_personal_enabled(user_id, not get_ai_personal_enabled(user_id))
         await query.answer("Saved")
     else:
         await query.answer()

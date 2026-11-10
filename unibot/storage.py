@@ -960,6 +960,24 @@ def set_ai_grades_enabled(user_id, enabled: bool) -> None:
     save_personal_record(user_id, "ai_grades", bool(enabled))
 
 
+AI_PERSONAL_OFF_NOTE = ("🔒 Your timetable, tasks and exams aren't shared with the AI service, so there is no "
+                        "spoken version. You can allow it under /settings > 🔒 Privacy.")
+
+
+def get_ai_personal_enabled(user_id) -> bool:
+    """Opt in: only then do the student's timetable, tasks, registered exams,
+    name and weather place go to the AI provider (OpenRouter), for the
+    spoken morning summary, 🔊 Listen and spoken questions. Grades have
+    their own switch (get_ai_grades_enabled)."""
+    if user_id is None:
+        return False
+    return bool(personal_record(user_id, "ai_personal", False))
+
+
+def set_ai_personal_enabled(user_id, enabled: bool) -> None:
+    save_personal_record(user_id, "ai_personal", bool(enabled))
+
+
 # former general cache sections keyed by the student's id (now personal
 # records); "Delete my data" clears any entry still left in the shared cache
 PERSONAL_CACHE_SECTIONS = ("study_blocks", "task_outcomes", "calendar_tokens", "study_buddy", "travel_modes",

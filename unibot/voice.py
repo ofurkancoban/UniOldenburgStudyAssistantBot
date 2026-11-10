@@ -28,6 +28,7 @@ from studip_utils import TZ_BERLIN, berlin_now
 
 from unibot.storage import (
     get_ai_grades_enabled,
+    get_ai_personal_enabled,
     add_wardrobe_item,
     cleanup_link_cache,
     get_user_name,
@@ -157,11 +158,17 @@ async def build_qa_context(user_id=None) -> str:
     page) just leaves that section out of the context rather than blocking
     the others or the whole answer."""
     parts = []
+    # timetable, exams, tasks and weather place go to the AI provider only
+    # with the student's permission (grades have their own)
+    personal = get_ai_personal_enabled(user_id)
+    if not personal:
+        parts.append("The student's timetable, exams, tasks and location aren't shared with the assistant. "
+                      "If the question needs them, say they can allow it under /settings > Privacy.")
 
     session = None
     try:
         # personal sections only ever come from the asking student's own session
-        if user_id is not None:
+        if user_id is not None and (personal or get_ai_grades_enabled(user_id)):
             session = await login_studip(user_id=user_id)
     except Exception as e:
         logging.warning("build_qa_context: login failed: %s", e)
@@ -171,7 +178,7 @@ async def build_qa_context(user_id=None) -> str:
         week_start = today - timedelta(days=today.weekday())
         # the asking student's own timetable; none without their login
         events = await get_calendar_events(session=session, week_start=week_start, user_id=user_id) \
-            if session is not None else []
+            if session is not None and personal else []
         if events:
             lines = [
                 f"- {ev.get('date_key')}: {clean_course_title(ev.get('title', '')) or 'event'} at {ev.get('time', '')}"
@@ -182,7 +189,7 @@ async def build_qa_context(user_id=None) -> str:
         logging.warning("build_qa_context: calendar failed: %s", e)
 
     try:
-        weather = await get_weather_snapshot(today, user_id=user_id)
+        weather = await get_weather_snapshot(today, user_id=user_id) if personal else None
         if weather:
             wet_note = "wet (rain/drizzle/snow expected)" if weather["is_wet"] else "dry"
             parts.append(
@@ -195,7 +202,7 @@ async def build_qa_context(user_id=None) -> str:
 
     if session:
         try:
-            exams = await get_registered_exam_schedule(session)
+            exams = await get_registered_exam_schedule(session) if personal else []
             if exams:
                 lines = [f"- {e['title']}: {e.get('date_line') or e.get('date')}" for e in exams]
                 parts.append("Registered upcoming exams:\n" + "\n".join(lines))
@@ -219,7 +226,7 @@ async def build_qa_context(user_id=None) -> str:
                 logging.warning("build_qa_context: transcript failed: %s", e)
 
     try:
-        tasks = user_tasks(user_id)  # [] without a student: never someone else's
+        tasks = user_tasks(user_id) if personal else []  # [] without a student: never someone else's
         if tasks:
             lines = [f"- {t['text']}" + (f" (due {t['due_time']})" if t.get("due_time") else "") for t in tasks]
             parts.append("Personal tasks:\n" + "\n".join(lines))
@@ -930,7 +937,7 @@ async def _voice_intent_ask_question(update, context, result, transcript, intent
             context_data += "\n\nCourse material excerpts (from the student's Stud.IP course files, closest to the question first):\n" + "\n\n".join(
                 f"[{p['course']} | {p['file']}]\n{p['text']}" for p in passages
             )
-        name = get_user_name(qa_user_id)
+        name = get_user_name(qa_user_id) if get_ai_personal_enabled(qa_user_id) else None
         answer = await answer_question_with_context(transcript, context_data, name=name)
     except Exception as e:
         logging.error("_route_voice_intent: ask_question failed: %s", e)

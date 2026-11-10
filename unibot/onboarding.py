@@ -60,7 +60,9 @@ def preferences_step_view(user_id: int, semester_line: str) -> tuple:
     text = (
         f"🧭 <b>Quick setup</b> (2/2)\n{semester_line}\n\n"
         "These are your other preferences. Tap a section to change it, or <b>Done</b> to keep the defaults. "
-        "They stay in /settings.\n\n" + settings_text
+        "They stay in /settings.\n"
+        "🔒 In <b>Privacy</b> you decide whether the AI assistant may use your timetable, tasks and exams "
+        "(needed for the spoken morning summary and 🔊 Listen). It is off until you turn it on.\n\n" + settings_text
     )
     return text, InlineKeyboardMarkup(rows)
 

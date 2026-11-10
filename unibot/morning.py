@@ -20,6 +20,8 @@ from studip_utils import TZ_BERLIN, aread_bytes, berlin_now, format_hours as _fo
 from unibot import course_registry, state
 from unibot.preferences import campus_anchor, food_filter, get_pref
 from unibot.storage import (
+    AI_PERSONAL_OFF_NOTE,
+    get_ai_personal_enabled,
     get_cached_outfit_today,
     get_recently_worn_item_ids,
     get_user_name,
@@ -369,8 +371,10 @@ async def _prepare_user_summary(uid: int, today_date, weather, lunch_at) -> tupl
         _format_lunch_section(food) if show["mensa"] else "",
         await _fetch_exam_countdown(session, today_date) if session and show["exams"] else "",
     ])
+    # the spoken version is written and voiced by the AI service: only with the student's permission
     voice = await _prepare_morning_voice(today_events if show["classes"] else [], today_date, today_tasks,
-                                         weather_shown, food, name=get_user_name(uid))
+                                         weather_shown, food, name=get_user_name(uid)) \
+        if get_ai_personal_enabled(uid) else None
     return text, voice, menu_button, (photo_url, photo_caption)
 
 
@@ -797,9 +801,13 @@ async def send_daily_plan_voice(sender, events: list, target_date, user_id=None)
     `user_id` personalizes the narration with that user's name (see
     get_user_name); without a known name the narration uses none."""
     today_events = [ev for ev in events if ev["date_key"] == target_date]
-    name = get_user_name(user_id)
+    owner = user_id if user_id is not None else current_user_id()
+    if not get_ai_personal_enabled(owner):
+        # nothing leaves the server: the plain schedule, built here, as text
+        await sender.reply_text(f"{build_daily_plan_speech_text(events, target_date)}\n\n{AI_PERSONAL_OFF_NOTE}")
+        return
+    name = get_user_name(owner)
     try:
-        owner = user_id if user_id is not None else current_user_id()
         today_tasks = [
             t for t in user_tasks(owner)
             if t.get("due_time")
@@ -823,8 +831,12 @@ async def send_weekly_plan_voice(sender, events: list, week_start, user_id=None)
     plain deterministic description, and further to plain text, on any
     failure."""
     week_end = week_start + timedelta(days=6)
-    name = get_user_name(user_id)
-    week_tasks = _week_tasks_for_range(week_start, week_end, user_id=user_id)
+    owner = user_id if user_id is not None else current_user_id()
+    if not get_ai_personal_enabled(owner):
+        await sender.reply_text(f"{build_weekly_plan_speech_text(events, week_start, week_end)}\n\n{AI_PERSONAL_OFF_NOTE}")
+        return
+    name = get_user_name(owner)
+    week_tasks = _week_tasks_for_range(week_start, week_end, user_id=owner)
     text = await build_ai_weekly_plan_narration(events, week_start, week_end, name=name, week_tasks=week_tasks) or build_weekly_plan_speech_text(events, week_start, week_end)
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
 

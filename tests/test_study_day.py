@@ -443,7 +443,8 @@ class PerUserMorningSummaryTests(unittest.TestCase):
                     mock.patch.object(morning, "_prepare_outfits", mock.AsyncMock(return_value={})), \
                     mock.patch.object(morning, "_fetch_exam_countdown", mock.AsyncMock(return_value="")), \
                     mock.patch.object(morning, "_lunch_menu_highlight", mock.AsyncMock(return_value=None)), \
-                    mock.patch.object(morning, "_prepare_morning_voice", voice):
+                    mock.patch.object(morning, "_prepare_morning_voice", voice), \
+                    mock.patch.object(morning, "get_ai_personal_enabled", lambda uid: uid != 1):
                 prepared = asyncio.run(morning._prepare_morning_summary(None, [1, 2, 3]))
         finally:
             state.global_session = saved
@@ -456,6 +457,7 @@ class PerUserMorningSummaryTests(unittest.TestCase):
         self.assertNotIn("Lab report", texts[1])
         self.assertIn("No classes today", texts[3])
         self.assertEqual(prepared["voice_paths"][2], "/tmp/voice-['Lab report']")
+        self.assertNotIn(1, prepared["voice_paths"])  # no permission for the AI service: no spoken version
         self.assertIn("Lunch at", texts[1])  # the study day plan is part of it
 
 

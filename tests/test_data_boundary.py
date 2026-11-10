@@ -176,7 +176,7 @@ class PrivacyScreenTests(unittest.TestCase):
         self.assertIn(stagger.describe_slots(501, now.date(), False), text)
         self.assertIn("2 a day", text)
         data = [b.callback_data for row in markup.inline_keyboard for b in row]
-        self.assertEqual(data, ["privacy|check", "privacy|ai", "privacy|delete"])
+        self.assertEqual(data, ["privacy|check", "privacy|ai_personal", "privacy|ai", "privacy|delete"])
 
     def test_check_now_is_rate_limited_and_needs_a_login(self):
         runs = []
@@ -221,12 +221,13 @@ class PrivacyScreenTests(unittest.TestCase):
                 mock.patch.object(voice, "get_grades", grades), \
                 mock.patch.object(voice, "get_registered_exam_schedule", empty), \
                 mock.patch.object(voice, "get_ai_grades_enabled", lambda uid: False), \
+                mock.patch.object(voice, "get_ai_personal_enabled", lambda uid: True), \
                 mock.patch.object(voice, "get_calendar_events", empty), \
                 mock.patch.object(voice, "get_weather_snapshot", mock.AsyncMock(return_value=None)), \
                 mock.patch.object(voice, "user_tasks", lambda uid: []):
             context = asyncio.run(voice.build_qa_context(user_id=505))
         self.assertEqual(fetched, [])
-        self.assertIn("not shared with the assistant", context)
+        self.assertIn("Transcript: not shared with the assistant", context)
 
     def test_delete_my_data(self):
         import exam_reminder as er
