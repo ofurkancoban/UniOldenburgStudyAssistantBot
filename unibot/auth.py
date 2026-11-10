@@ -705,6 +705,13 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
     session.reset_login_backoff()
     state._login_failure_notified = False
     await session.save_cookies()
+    if user_id is not None:
+        # a completed interactive sign-in ends a paused (expired) state even
+        # when the Stud.IP check below can't confirm it yet: paused students
+        # are never checked in the background, so nothing else would
+        _renewal_failures.pop(user_id, None)
+        if lifecycle_state(user_id) == NEEDS_REAUTH and db.set_lifecycle(user_id, ACTIVE, "signed in again"):
+            logging.info("User %s signed in again: active", user_id)
 
     # Signed in through StuMS: sign the same session in to Stud.IP as well.
     try:

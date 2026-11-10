@@ -22,7 +22,7 @@ use_temp_db()
 
 import exam_reminder  # noqa: E402
 from studip_utils import TZ_BERLIN  # noqa: E402
-from unibot import course_registry, db, enrollment, monitoring, morning, storage, tasks, voice  # noqa: E402
+from unibot import auth, course_registry, db, enrollment, monitoring, morning, storage, tasks, voice  # noqa: E402
 
 UID = 9701
 
@@ -318,6 +318,24 @@ class FirstScanBaselineTests(unittest.TestCase):
             asyncio.run(monitoring.check_new_forum_posts_parallel(
                 mock.AsyncMock(), UID, silent=True, courses=[("B", "fresh", object())]))
         self.assertEqual(sent, ["known", "fresh"])
+
+
+
+class SignInResumesTests(unittest.TestCase):
+    def test_interactive_sign_in_ends_the_paused_state(self):
+        uid = 9721
+        db.upsert_user(uid, role="student", username="s", full_name="S", is_active=1)
+        db.set_lifecycle(uid, auth.NEEDS_REAUTH, "test")
+        session = mock.MagicMock(session=None, user_id=uid)
+        session.save_cookies = mock.AsyncMock()
+        session.is_html_logged_in = mock.AsyncMock(return_value=False)
+        session.heal_session = mock.AsyncMock(return_value=False)
+        with mock.patch.object(auth, "get_user_session", return_value=session), \
+                mock.patch.object(auth.state, "_menu_app", None), \
+                mock.patch("stums_client._establish_stums_session", mock.AsyncMock()), \
+                mock.patch("unibot.studip_api.get_studip_user_profile", mock.AsyncMock(return_value={})):
+            asyncio.run(auth._on_proxy_session_authenticated(uid))
+        self.assertEqual(auth.lifecycle_state(uid), auth.ACTIVE)
 
 
 if __name__ == "__main__":
