@@ -313,7 +313,8 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
                     "• <b>Timetable & Deadlines:</b> Check your upcoming schedule and room locations.\n"
                     "• <b>Mensa Menu & Tasks:</b> View daily meals and manage assignment deadlines.\n\n"
                     "━━━━━━━━━━━━━━━━━━\n"
-                    "👉 <i>Please sign in to Stud.IP to link your student profile:</i>"
+                    "👉 <i>Please sign in to Stud.IP to link your student profile. "
+                    "Right after, I'll ask for your semester and a few preferences.</i>"
                 )
                 await update.effective_message.reply_text(welcome_text, parse_mode="HTML")
                 await _send_login_prompt(update.effective_message, user.id)
@@ -770,6 +771,11 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
                 )
             except Exception as exc:
                 logging.warning("⚠️ Could not send login confirmation to %s: %s", uid, exc)
+        if user_id is not None and state.on_signed_in is not None:
+            try:
+                await state.on_signed_in(state._menu_app.bot, user_id, session)
+            except Exception:
+                logging.warning("Post sign-in step failed for %s", user_id, exc_info=True)
 
 
 def _get_login_server() -> LoginServer:

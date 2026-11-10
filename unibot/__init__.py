@@ -52,6 +52,7 @@ MODULE_ORDER = (
     "watcher",      # background watcher loop
     "privacy",      # privacy screen: check times, check now, delete my data
     "settings_menu",  # /settings: every per-student preference on buttons
+    "onboarding",   # first-run setup after sign-in: semester, then preferences
     "app",          # startup and handler registration
 )
 

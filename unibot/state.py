@@ -61,6 +61,7 @@ _login_failure_notified = False
 login_server: Optional[LoginServer] = None
 quick_tunnel: Optional[QuickTunnel] = None
 _menu_app: Any = None  # telegram.ext.Application, set at startup
+on_signed_in: Any = None  # async (bot, user_id, session) run after a student signs in; set by the app (first-run setup)
 _last_notified_studip_cookie: Optional[str] = None
 
 

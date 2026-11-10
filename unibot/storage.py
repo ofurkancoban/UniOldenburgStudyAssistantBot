@@ -425,6 +425,26 @@ def save_default_semester(semester_id: str, label: str, user_id=None) -> None:
         logging.error("Could not save default semester: %s", e)
 
 
+SETUP_RECORD = "setup"
+
+
+def setup_done(user_id) -> bool:
+    """Whether the student went through the first-run setup (or already
+    picked a semester before it existed), so it is offered only once."""
+    try:
+        return bool(personal_record(user_id, SETUP_RECORD)) or bool(load_default_semester(user_id).get("id"))
+    except Exception:
+        logging.debug("Setup state unavailable", exc_info=True)
+        return True  # unsure: don't nag
+
+
+def mark_setup_done(user_id) -> None:
+    try:
+        save_personal_record(user_id, SETUP_RECORD, {"done": int(time.time())})
+    except Exception as e:
+        logging.error("Could not save the setup state: %s", e)
+
+
 def clear_default_semester(user_id=None) -> None:
     uid = _setting_owner(user_id)
     if uid is None:

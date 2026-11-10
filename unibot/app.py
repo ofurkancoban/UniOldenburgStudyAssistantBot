@@ -56,6 +56,7 @@ from unibot.weather import handle_set_weather_location
 from unibot.course_registry import handle_course_alerts
 from unibot.privacy import handle_privacy, stop_command
 from unibot.settings_menu import handle_settings, settings_command
+from unibot import onboarding
 from unibot.study_week import handle_calendar_sync, handle_study_buddy, register_calendar_feed
 from unibot.mensa import (
     handle_foodpref_category,
@@ -190,7 +191,6 @@ from unibot.menus import (
     handle_status_buttons,
     handle_status_group,
     menu_button_handler,
-    start,
 )
 from unibot.watcher import start_unified_watcher
 
@@ -260,7 +260,10 @@ def register_handlers(app) -> None:
     app.add_handler(TypeHandler(Update, _authorization_gate), group=-1)
 
     # Command & Callback handlers
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", onboarding.start_with_setup))
+    app.add_handler(CallbackQueryHandler(onboarding.handle_setup_semester, pattern=r"^setup_sem\|.+$"))
+    app.add_handler(CallbackQueryHandler(onboarding.handle_setup_done, pattern="^setup_done$"))
+    onboarding.register(app)
     app.add_handler(CommandHandler("check", check_command))
     app.add_handler(CommandHandler("exams", exams_command))
     app.add_handler(CommandHandler("exam", exams_command))
