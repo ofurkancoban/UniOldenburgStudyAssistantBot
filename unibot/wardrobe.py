@@ -356,44 +356,44 @@ def _wardrobe_list_view(user_id) -> tuple:
 
 async def handle_wardrobe_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
     if not is_user_admin(user_id):
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
+    await query.answer()
     text, keyboard = _wardrobe_list_view(user_id)
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
 async def handle_wardrobe_add_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
     if not is_user_admin(user_id):
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
+    await query.answer()
     user_data(context)["pending_step"] = "wardrobe_add_item"
     await query.message.reply_text("📸 Send a photo of one clothing item.")
 
 
 async def handle_wardrobe_set_reference(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
     if not is_user_admin(user_id):
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
+    await query.answer()
     user_data(context)["pending_step"] = "wardrobe_set_reference"
     await query.message.reply_text("🖼️ Send one clear full-body photo of yourself - I'll reuse it every morning.")
 
 
 async def handle_wardrobe_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     user_id = query.from_user.id
     if not is_user_admin(user_id):
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
+    await query.answer()
     item_id = query.data.split("|", 1)[1]
     remove_wardrobe_item(user_id, item_id)
     text, keyboard = _wardrobe_list_view(user_id)
@@ -435,12 +435,12 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
     skips silently when the wardrobe/reference photo aren't set up yet,
     this is an explicit request - tell the user why nothing happened."""
     query = update.callback_query
-    await query.answer()
 
     user_id = query.from_user.id
     if not is_user_admin(user_id):
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
+    await query.answer()
 
     entry = get_wardrobe_entry(user_id)
     items = entry.get("items", [])

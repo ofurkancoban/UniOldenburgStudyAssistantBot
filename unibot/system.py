@@ -630,16 +630,107 @@ def _is_protected_admin(user_id: int) -> bool:
             or user_id == PRIMARY_ADMIN_ID)
 
 
+def _build_user_detail_view(target_id: int, viewer_id: int):
+    """The admin dashboard's view of one user, or None when the user is gone."""
+    target = db.get_user(target_id)
+    if not target:
+        return None
+    name = target["username"] or target["full_name"] or str(target_id)
+    role = target.get("role", "user")
+    is_active = target.get("is_active", True)
+    studip_user = target.get("studip_username") or "Not linked"
+    reg_time = datetime.fromtimestamp(target.get("created_at", time.time()), TZ_BERLIN).strftime("%d.%m.%Y %H:%M")
+    last_active = _format_time_ago(target.get("last_active_at", time.time()))
+
+    has_active_session = target_id in state.user_sessions
+    session_badge = "🟢 In-memory Session Active" if has_active_session else "⚪ No active memory session"
+
+    text = (
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>Student Profile: @{html.escape(str(name))}</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>Telegram ID:</b> <code>{target_id}</code>\n"
+        f"📛 <b>Full Name:</b> {html.escape(target.get('full_name') or 'N/A')}\n"
+        f"🎓 <b>Stud.IP Account:</b> <code>{html.escape(str(studip_user))}</code>\n"
+        f"👑 <b>Role:</b> {'👑 Administrator' if role == 'admin' else '🎓 Student'}\n"
+        f"📶 <b>Account Status:</b> {'🟢 Active' if is_active else '🔴 Blocked'}\n"
+        f"⚡ <b>Session State:</b> {session_badge}\n"
+        f"📊 <b>Interactions:</b> {target.get('interaction_count', 0)} commands\n"
+        f"🕓 <b>Last Active:</b> {last_active}\n"
+        f"📅 <b>Registered:</b> {reg_time}\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
+
+    keyboard = []
+    protected = _is_protected_admin(target_id)
+    if not protected and target_id != viewer_id:
+        block_label = "🚫 Block Account" if is_active else "✅ Activate Account"
+        keyboard.append([InlineKeyboardButton(block_label, callback_data=f"admin_toggle_user|{target_id}")])
+
+        role_label = "🎓 Demote to Student" if role == "admin" else "👑 Promote to Admin"
+        keyboard.append([InlineKeyboardButton(role_label, callback_data=f"admin_role_user|{target_id}")])
+
+    if not protected or target_id == viewer_id:
+        keyboard.append([InlineKeyboardButton("🚪 Revoke Stud.IP Session", callback_data=f"admin_revoke_user|{target_id}")])
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Users", callback_data="admin_users")])
+    return text, InlineKeyboardMarkup(keyboard)
+
+
 async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Callback router for Admin Dashboard."""
+    """Callback router for Admin Dashboard. The callback is answered exactly
+    once: Telegram rejects a second answer, so an alert must be the only one."""
     query = update.callback_query
-    await query.answer()
     user = query.from_user
     if not user or not is_user_admin(user.id):
         await query.answer("⛔ Access denied. Admin-only feature.", show_alert=True)
         return
 
-    data = query.data
+    data = query.data or ""
+    notice = None
+
+    # actions on one user redraw that user's detail view afterwards
+    action, _, raw_target = data.partition("|")
+    if action in ("admin_toggle_user", "admin_role_user", "admin_revoke_user"):
+        try:
+            target_id = int(raw_target)
+        except ValueError:
+            await query.answer("Unknown user.", show_alert=True)
+            return
+        if action == "admin_revoke_user":
+            if _is_protected_admin(target_id) and target_id != user.id:
+                await query.answer("Cannot revoke this administrator's session.", show_alert=True)
+                return
+            await _perform_logout(user_id=target_id)
+            notice = "Stud.IP session revoked and credentials cleared."
+        else:
+            if _is_protected_admin(target_id) or target_id == user.id:
+                await query.answer("Cannot modify this administrator." if action == "admin_toggle_user"
+                                   else "Cannot change this administrator's role.", show_alert=True)
+                return
+            target = db.get_user(target_id)
+            if target and action == "admin_toggle_user":
+                new_state = not target["is_active"]
+                db.set_user_active(target_id, new_state)
+                notice = f"User {'activated' if new_state else 'blocked'}."
+            elif target:
+                new_role = "student" if target["role"] == "admin" else "admin"
+                db.set_user_role(target_id, new_role)
+                notice = f"Role updated to {new_role}."
+        data = f"admin_user_detail|{target_id}"
+
+    if data.startswith("admin_user_detail|"):
+        try:
+            view = _build_user_detail_view(int(data.split("|")[1]), user.id)
+        except ValueError:
+            view = None
+        if view is None:
+            await query.answer("User not found.", show_alert=True)
+            return
+        await query.answer(notice, show_alert=bool(notice))
+        await query.edit_message_text(view[0], parse_mode="HTML", reply_markup=view[1])
+        return
+
+    await query.answer()
 
     if data == "admin_menu":
         text, reply_markup = _build_admin_overview_view()
@@ -673,94 +764,6 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 
         keyboard.append([InlineKeyboardButton("⬅️ Back to Admin Menu", callback_data="admin_menu")])
         await query.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if data.startswith("admin_user_detail|"):
-        target_id = int(data.split("|")[1])
-        target = db.get_user(target_id)
-        if not target:
-            await query.answer("User not found.", show_alert=True)
-            return
-
-        name = target["username"] or target["full_name"] or str(target_id)
-        role = target.get("role", "user")
-        is_active = target.get("is_active", True)
-        studip_user = target.get("studip_username") or "Not linked"
-        reg_time = datetime.fromtimestamp(target.get("created_at", time.time()), TZ_BERLIN).strftime("%d.%m.%Y %H:%M")
-        last_active = _format_time_ago(target.get("last_active_at", time.time()))
-
-        has_active_session = target_id in state.user_sessions
-        session_badge = "🟢 In-memory Session Active" if has_active_session else "⚪ No active memory session"
-
-        text = (
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Student Profile: @{html.escape(str(name))}</b>\n"
-            "━━━━━━━━━━━━━━━━━━\n"
-            f"🆔 <b>Telegram ID:</b> <code>{target_id}</code>\n"
-            f"📛 <b>Full Name:</b> {html.escape(target.get('full_name') or 'N/A')}\n"
-            f"🎓 <b>Stud.IP Account:</b> <code>{html.escape(str(studip_user))}</code>\n"
-            f"👑 <b>Role:</b> {'👑 Administrator' if role == 'admin' else '🎓 Student'}\n"
-            f"📶 <b>Account Status:</b> {'🟢 Active' if is_active else '🔴 Blocked'}\n"
-            f"⚡ <b>Session State:</b> {session_badge}\n"
-            f"📊 <b>Interactions:</b> {target.get('interaction_count', 0)} commands\n"
-            f"🕓 <b>Last Active:</b> {last_active}\n"
-            f"📅 <b>Registered:</b> {reg_time}\n"
-            "━━━━━━━━━━━━━━━━━━"
-        )
-
-        keyboard = []
-        protected = _is_protected_admin(target_id)
-        if not protected and target_id != user.id:
-            block_label = "🚫 Block Account" if is_active else "✅ Activate Account"
-            keyboard.append([InlineKeyboardButton(block_label, callback_data=f"admin_toggle_user|{target_id}")])
-
-            role_label = "🎓 Demote to Student" if role == "admin" else "👑 Promote to Admin"
-            keyboard.append([InlineKeyboardButton(role_label, callback_data=f"admin_role_user|{target_id}")])
-
-        if not protected or target_id == user.id:
-            keyboard.append([InlineKeyboardButton("🚪 Revoke Stud.IP Session", callback_data=f"admin_revoke_user|{target_id}")])
-        keyboard.append([InlineKeyboardButton("⬅️ Back to Users", callback_data="admin_users")])
-
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
-
-    if data.startswith("admin_toggle_user|"):
-        target_id = int(data.split("|")[1])
-        if _is_protected_admin(target_id) or target_id == user.id:
-            await query.answer("Cannot modify this administrator.", show_alert=True)
-            return
-        target = db.get_user(target_id)
-        if target:
-            new_state = not target["is_active"]
-            db.set_user_active(target_id, new_state)
-            await query.answer(f"User {'activated' if new_state else 'blocked'}.", show_alert=True)
-        query.data = f"admin_user_detail|{target_id}"
-        await handle_admin_callbacks(update, context)
-        return
-
-    if data.startswith("admin_role_user|"):
-        target_id = int(data.split("|")[1])
-        if _is_protected_admin(target_id) or target_id == user.id:
-            await query.answer("Cannot change this administrator's role.", show_alert=True)
-            return
-        target = db.get_user(target_id)
-        if target:
-            new_role = "student" if target["role"] == "admin" else "admin"
-            db.set_user_role(target_id, new_role)
-            await query.answer(f"Role updated to {new_role}.", show_alert=True)
-        query.data = f"admin_user_detail|{target_id}"
-        await handle_admin_callbacks(update, context)
-        return
-
-    if data.startswith("admin_revoke_user|"):
-        target_id = int(data.split("|")[1])
-        if _is_protected_admin(target_id) and target_id != user.id:
-            await query.answer("Cannot revoke this administrator's session.", show_alert=True)
-            return
-        await _perform_logout(user_id=target_id)
-        await query.answer("Stud.IP session revoked and credentials cleared.", show_alert=True)
-        query.data = f"admin_user_detail|{target_id}"
-        await handle_admin_callbacks(update, context)
         return
 
     if data == "admin_invites":

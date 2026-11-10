@@ -14,7 +14,7 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
-from telegram.error import TelegramError
+from telegram.error import NetworkError, TelegramError
 
 from fast_enroll import clear_pending_job, run_fast_enroll
 from studip_utils import TZ_BERLIN
@@ -82,8 +82,21 @@ def parse_task_due_time(text: str):
     t = text.strip()
     if t.lower() in TASK_SKIP_WORDS:
         return None
+    try:
+        return _parse_task_due_time(t, datetime.now(TZ_BERLIN))
+    except ValueError as exc:
+        if str(exc).startswith((TASK_TIME_UNKNOWN, TASK_TIME_INVALID)):
+            raise
+        # datetime's own message ("day is out of range for month") means
+        # nothing to a student; the date itself does not exist
+        raise ValueError(f"{TASK_TIME_INVALID} {text}") from exc
 
-    now = datetime.now(TZ_BERLIN)
+
+TASK_TIME_UNKNOWN = "Could not understand the date/time:"
+TASK_TIME_INVALID = "That date or time doesn't exist:"
+
+
+def _parse_task_due_time(t: str, now: datetime) -> datetime:
 
     m = re.match(r"^(\d+)\s*(?:saat|hours?)\s*sonra$", t, re.IGNORECASE) or re.match(r"^in\s+(\d+)\s*hours?$", t, re.IGNORECASE)
     if m:
@@ -111,12 +124,18 @@ def parse_task_due_time(text: str):
     m = re.match(r"^(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})$", t)
     if m:
         day, month, hour, minute = map(int, m.groups())
-        candidate = datetime(now.year, month, day, hour, minute, tzinfo=TZ_BERLIN)
-        if candidate < now:
-            candidate = candidate.replace(year=now.year + 1)
-        return candidate
+        datetime(2000, month, day, hour, minute)  # a leap year: raises only for a date that never exists
+        # the next time this day comes round; 29.02 waits for a leap year
+        for year in range(now.year, now.year + 9):
+            try:
+                candidate = datetime(year, month, day, hour, minute, tzinfo=TZ_BERLIN)
+            except ValueError:
+                continue
+            if candidate >= now:
+                return candidate
+        raise ValueError(f"{TASK_TIME_INVALID} {t}")
 
-    raise ValueError(f"Could not understand the date/time: {text}")
+    raise ValueError(f"{TASK_TIME_UNKNOWN} {t}")
 
 
 async def send_tasks_menu(sender):
@@ -334,10 +353,9 @@ async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAU
     post, so this saves directly with no course-picker step, unlike the
     ➕ Add Task wizard."""
     query = update.callback_query
-    await query.answer()
-
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
+        await query.answer()
         return
 
     sid = query.data.split("|", 1)[1]
@@ -345,6 +363,7 @@ async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAU
     if not info:
         await query.answer("This suggestion has expired.", show_alert=True)
         return
+    await query.answer()
 
     confirmation = _save_task_and_confirmation_text(user_id, info["text"], info.get("due_time"), info.get("course"))
     try:
@@ -362,10 +381,9 @@ async def handle_announcement_to_task(update: Update, context: ContextTypes.DEFA
     runs on tap, since it's only worth the call when the student actually
     wants it."""
     query = update.callback_query
-    await query.answer("Converting to task...")
-
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
+        await query.answer()
         return
 
     sid = query.data.split("|", 1)[1]
@@ -373,6 +391,7 @@ async def handle_announcement_to_task(update: Update, context: ContextTypes.DEFA
     if not info:
         await query.answer("This announcement has expired.", show_alert=True)
         return
+    await query.answer("Converting to task...")
 
     try:
         result = await convert_announcement_to_task(info["course"], info.get("subject"), info["body"])
@@ -407,23 +426,44 @@ async def check_task_reminders(bot):
     for uid in students_with_tasks():
         fired_ids: set = set()
         for task in user_tasks(uid):
-            due = task.get("due_time")
-            if not due or datetime.fromisoformat(due) > now:
+            due = _task_due(task)
+            if due is None or due > now:
                 continue
-            remember_user_callback(uid, f"task:{task['id']}", task)
-            record_task_outcome(uid, task)  # due now; done or not comes later
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✔️ Done", callback_data=f"task_reminder_done|{task['id']}")],
                 [InlineKeyboardButton(label, callback_data=f"task_reminder_snooze|{task['id']}|{code}") for code, label in TASK_SNOOZE_OPTIONS],
             ])
             try:
                 await bot.send_message(chat_id=uid, text=f"⏰ <b>Reminder:</b> {html.escape(str(task['text']))}", parse_mode="HTML", reply_markup=keyboard)
+            except NetworkError as e:
+                # Telegram unreachable for now: the task stays and fires next minute
+                logging.warning("Task reminder %s not sent yet: %s", task['id'], e)
+                continue
             except Exception as e:
+                # the chat is gone or the student blocked the bot: retrying won't help
                 logging.error("Failed to send task reminder %s: %s", task['id'], e)
+            else:
+                remember_user_callback(uid, f"task:{task['id']}", task)
+                record_task_outcome(uid, task)  # due now; done or not comes later
             fired_ids.add(task["id"])
         if fired_ids:
             # removed by id on a fresh read: tasks added while sending survive
             remove_user_tasks(uid, fired_ids)
+
+
+def _task_due(task: dict) -> Optional[datetime]:
+    """A task's due time as an aware Berlin datetime, or None when it has
+    none or it can't be read. A time stored without a zone counts as Berlin
+    time, so it can still be compared with the clock."""
+    raw = task.get("due_time")
+    if not raw:
+        return None
+    try:
+        due = datetime.fromisoformat(str(raw))
+    except ValueError:
+        logging.warning("Task %s has an unreadable due time; skipped", task.get("id"))
+        return None
+    return due if due.tzinfo else due.replace(tzinfo=TZ_BERLIN)
 
 
 def _snooze_offset(code: str) -> timedelta:
@@ -436,10 +476,9 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
     stored reminder). Snoozing re-saves the task with a new due_time;
     "Done" just acknowledges, since the task is already gone from the list."""
     query = update.callback_query
-    await query.answer()
-
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
+        await query.answer()
         return
 
     parts = query.data.split("|")
@@ -452,6 +491,7 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
     if not task:
         await query.answer("This reminder has expired.", show_alert=True)
         return
+    await query.answer()
 
     try:
         await query.edit_message_reply_markup(reply_markup=None)

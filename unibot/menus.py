@@ -241,11 +241,7 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         error_str = str(e)
         if "Message is not modified" in error_str:
-            # Not a real error, just the same menu content
-            try:
-                await query.answer("All current information is already displayed.")
-            except TelegramError:
-                pass
+            # the same menu again; the tap was already answered with "Loading"
             return
 
         error_msg = f"❌ Error loading menu:\n{error_str}"
