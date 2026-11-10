@@ -39,7 +39,7 @@ from unibot.storage import (
 )
 from unibot.formatting import _short_id, clean_course_title
 from unibot.telegram_ui import user_data, _download_telegram_file, get_main_keyboard, nav_names
-from unibot.auth import get_user_session, is_user_allowed, login_studip
+from unibot.auth import get_user_session, is_user_allowed, login_studip, personal_session
 from unibot.studip_api import BASE_URL, _normalize_url, list_courses, list_files
 from unibot.ai import _call_openrouter, _extract_json_object
 from unibot.weather import get_weather_snapshot
@@ -611,6 +611,14 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
 
     delta = timedelta(hours=offset_value) if extracted["offset_unit"] == "hours" else timedelta(days=offset_value)
     due_dt = (exam_dt - delta).replace(tzinfo=TZ_BERLIN)
+    if due_dt <= datetime.now(TZ_BERLIN) and exam_dt.replace(tzinfo=TZ_BERLIN) > datetime.now(TZ_BERLIN):
+        # a reminder in the past would fire at once: ask for a shorter lead time instead
+        exam_when = exam_dt.strftime("%d.%m.%Y %H:%M") if has_time else exam_dt.strftime("%d.%m.%Y")
+        await message.reply_text(
+            f"⚠️ {exam_title} is on {exam_when}, so a reminder that far ahead is already in the past. "
+            "Try a shorter time, e.g. \"remind me 1 day before\"."
+        )
+        return True
     task = {
         "id": str(uuid.uuid4())[:8],
         "user_id": update.effective_user.id,
@@ -826,7 +834,7 @@ async def _voice_intent_exam_register(update, context, result, transcript, inten
     """Voice intent: exam_register / exam_deregister."""
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     try:
-        session = get_user_session(update.effective_user.id)
+        session = personal_session(update.effective_user.id)  # the speaker's own, like the exam menu
         if intent == "exam_register":
             exams = await get_open_exam_registrations(session)
             action_type = "anmelden"

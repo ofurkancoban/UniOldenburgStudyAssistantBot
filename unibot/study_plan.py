@@ -82,7 +82,7 @@ from unibot.schedule import (
     user_travel,
 )
 from unibot.monitoring import render_weekly_study_plan_message, watched_courses
-from unibot.exams import STUDY_PLAN_MAX_FILE_MB, STUDY_PLAN_SUPPORTED_EXTENSIONS, get_file_exam_events
+from unibot.exams import STUDY_PLAN_MAX_FILE_MB, STUDY_PLAN_SUPPORTED_EXTENSIONS
 
 
 async def handle_toggle_weekly_study_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1308,16 +1308,6 @@ async def gather_weekly_study_inputs(session, user_id: Optional[int] = None) -> 
             continue
         matched_cid = _best_title_match(exam["title"], course_candidates, min_score=0.6)
         exams.append({**exam, "days_until": days_until, "matched_cid": matched_cid})
-    # Exams announced only in course files count too (already tied to their
-    # course, no fuzzy matching needed). Retakes are left out: before the
-    # main exam they aren't what the student is preparing for.
-    known = {(e["matched_cid"], e.get("date")) for e in exams}
-    for fe in get_file_exam_events(user_id):
-        if fe["kind"] not in ("exam", "midterm") or not fe["date"]:
-            continue
-        days_until = (datetime.fromisoformat(fe["date"]).date() - today).days
-        if 0 <= days_until <= STUDY_PLAN_EXAM_WINDOW_DAYS and (fe["cid"], fe["date"]) not in known:
-            exams.append({"title": f"{fe['course']} ({fe['kind']})", "date": fe["date"], "days_until": days_until, "matched_cid": fe["cid"]})
     exams.sort(key=lambda e: e["days_until"])
 
     progress = load_study_progress(user_id=user_id)

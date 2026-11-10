@@ -393,8 +393,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
         room_line = f"📍 <b>Room:</b> {_h(exam['room'])}\n" if exam.get("room") else ""
         exam_date_line = f"📅 <b>Exam Date:</b> {_h(exam['exam_date_display'])}\n" if exam.get("exam_date_display") else ""
 
-        sid = str(uuid.uuid4())[:8]
-        exam_action_cache[sid] = {
+        action = {
             "unit_id": exam["unit_id"],
             "action_type": "anmelden",
             "title": exam["title"],
@@ -408,11 +407,17 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
             "group_label": exam.get("group_label"),
             "room": exam.get("room"),
         }
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Register", callback_data=f"exam_ask|{sid}")],
-            [InlineKeyboardButton("📲 Forward to WA", callback_data=f"examopen_wa_ask|{sid}")],
-            [InlineKeyboardButton("🔕 Don't remind me again", callback_data=f"examopen_mute_ask|{sid}")],
-        ])
+
+        def keyboard_for(action=action):
+            # Registered only for a notice that is actually sent: every check
+            # would otherwise store a new button action in the student's record.
+            sid = str(uuid.uuid4())[:8]
+            exam_action_cache[sid] = action
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Register", callback_data=f"exam_ask|{sid}")],
+                [InlineKeyboardButton("📲 Forward to WA", callback_data=f"examopen_wa_ask|{sid}")],
+                [InlineKeyboardButton("🔕 Don't remind me again", callback_data=f"examopen_mute_ask|{sid}")],
+            ])
 
         if occurrence_key not in notified_open:
             text = (
@@ -426,7 +431,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
                 "━━━━━━━━━━━━━━━━━"
             )
             try:
-                await broadcast_fn(bot, text, reply_markup=keyboard)
+                await broadcast_fn(bot, text, reply_markup=keyboard_for())
                 logging.info("🎓 Exam registration opening sent")
             except Exception as e:
                 logging.error("exam_reminder: failed to send open-notification for %s: %s", occurrence_key, e)
@@ -452,7 +457,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
                         "━━━━━━━━━━━━━━━━━"
                     )
                     try:
-                        await broadcast_fn(bot, text, reply_markup=keyboard)
+                        await broadcast_fn(bot, text, reply_markup=keyboard_for())
                         logging.info("🎓 Exam registration deadline reminder sent")
                     except Exception as e:
                         logging.error("exam_reminder: failed to send deadline-notification for %s: %s", occurrence_key, e)

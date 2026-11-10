@@ -10,7 +10,6 @@ import sys
 import tempfile
 import time
 import unittest
-from datetime import datetime
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -21,7 +20,6 @@ use_temp_db()
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup  # noqa: E402
 
-from studip_utils import TZ_BERLIN  # noqa: E402
 from unibot import auth, db, state, storage, telegram_ui  # noqa: E402
 
 WA_ROW = [InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]
@@ -32,63 +30,6 @@ def _raw_private(user_id: int, kind: str) -> str:
         "SELECT encrypted_blob FROM user_private_data WHERE user_id = ? AND kind = ?", (user_id, kind),
     ).fetchone()
     return row[0] if row else ""
-
-
-class ExamDatePerCourseTests(unittest.TestCase):
-    def setUp(self):
-        from unibot import exams
-        self.exams = exams
-        self.cache = {"files": {
-            "c1": {"syllabus.pdf": {"events": [{"kind": "exam", "date": "2026-12-01", "start": None, "source": "syllabus.pdf"}]}},
-            "c2": {"info.pdf": {"events": [{"kind": "exam", "date": "2026-12-05", "start": None, "source": "info.pdf"}]}},
-        }}
-        for name, value in (("load_exam_file_cache", lambda: self.cache),
-                            ("save_exam_file_cache", lambda d: self.cache.update(d))):
-            patcher = mock.patch.object(exams, name, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-
-    def test_new_dates_go_to_each_courses_students_only(self):
-        calls = []
-
-        async def fan_out(bot, cid, kind, text, title_text, **kwargs):
-            calls.append((cid, kind, set(kwargs.get("members") or ())))
-
-        events = [{**e, "cid": cid, "course": cid, "source": "syllabus.pdf"}
-                  for cid in ("c1", "c2") for e in self.cache["files"][cid]["syllabus.pdf" if cid == "c1" else "info.pdf"]["events"]]
-        with mock.patch.object(self.exams.course_registry, "fan_out", fan_out), \
-                mock.patch.object(self.exams, "course_members", lambda cid: {"c1": {901}, "c2": {902}}[cid]):
-            asyncio.run(self.exams.notify_new_file_exam_events(mock.MagicMock(), events))
-        self.assertEqual(calls, [("c1", "exams", {901}), ("c2", "exams", {902})])
-
-    def test_reminders_skip_students_registered_for_that_date(self):
-        sent = []
-
-        async def fan_out(bot, cid, kind, text, title_text, **kwargs):
-            sent.append((cid, set(kwargs["recipients"])))
-
-        today = datetime(2026, 11, 28, tzinfo=TZ_BERLIN)
-        registered = {903: {"2026-12-01"}, 904: set()}
-        with mock.patch.object(self.exams.course_registry, "fan_out", fan_out), \
-                mock.patch.object(self.exams.course_registry, "broadcast_targets", lambda cid, members: {903, 904}),\
-                mock.patch.object(self.exams, "course_members", lambda cid: {903, 904}), \
-                mock.patch.object(self.exams, "_registered_dates", lambda uid: registered[uid]), \
-                mock.patch.object(self.exams, "datetime", wraps=datetime) as fake_dt:
-            fake_dt.now.return_value = today
-            asyncio.run(self.exams.check_file_exam_reminders(mock.MagicMock()))
-        self.assertIn(("c1", {904}), sent)
-
-    def test_a_student_sees_only_their_courses_and_their_own_stums_dates(self):
-        db.get_user_scope(906).delete_private()
-        storage.save_personal_record(905, self.exams.STUMS_SITTINGS_RECORD, {"c1": [{"date": "2026-12-03"}]})
-        with mock.patch.object(self.exams, "student_courses", lambda uid: {"c1": "One"}), \
-                mock.patch.object(self.exams, "_student_tracked", lambda uid: None):
-            mine = self.exams.get_file_exam_events(905)
-        self.assertEqual([(e["cid"], e["date"], e["source"]) for e in mine], [("c1", "2026-12-03", "StuMS")])
-        with mock.patch.object(self.exams, "student_courses", lambda uid: {"c1": "One"}), \
-                mock.patch.object(self.exams, "_student_tracked", lambda uid: None):
-            other = self.exams.get_file_exam_events(906)  # same course, no StuMS sittings of their own
-        self.assertEqual([e["date"] for e in other], ["2026-12-01"])
 
 
 class AdminOnlyTests(unittest.TestCase):

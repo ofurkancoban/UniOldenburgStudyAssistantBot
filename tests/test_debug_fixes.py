@@ -183,7 +183,6 @@ class PerStudentSwitchTests(unittest.TestCase):
                 mock.patch.object(watcher, "_guarded", mock.AsyncMock()), \
                 mock.patch.object(watcher, "_run_once_per_period", once), \
                 mock.patch.object(watcher, "get_pref", lambda uid, key: uid == 715), \
-                mock.patch.object(watcher, "EXAM_FILE_SCAN_HOUR", 25), \
                 mock.patch.object(watcher, "GWDG_API_KEY", ""):
             asyncio.run(watcher._run_scheduled_jobs(mock.MagicMock(), None, sunday))
         self.assertEqual(ran[0], [715])

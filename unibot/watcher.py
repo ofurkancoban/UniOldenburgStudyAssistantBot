@@ -68,12 +68,7 @@ from unibot.monitoring import (
     message_poll_loop,
     watched_courses,
 )
-from unibot.exams import (
-    check_file_exam_reminders,
-    exam_action_cache,
-    notify_new_file_exam_events,
-    scan_course_files_for_exams,
-)
+from unibot.exams import exam_action_cache
 from unibot.study_plan import index_course_files, run_weekly_study_plan_job
 from unibot.tasks import check_task_reminders
 from unibot.study_week import weekly_report, weekly_report_due
@@ -137,11 +132,6 @@ def _is_due(cache_key: str, now: datetime, interval_seconds: int) -> bool:
         return True
 
 
-async def _scan_and_announce_file_exams(bot, session):
-    new_events = await scan_course_files_for_exams(session)
-    await notify_new_file_exam_events(bot, new_events)
-
-
 def _get_active_user_ids() -> list[int]:
     """Students the per-user background jobs (morning summary, calendar
     reminders, weekly plan) run for: ACTIVE only. An expired (NEEDS_REAUTH)
@@ -181,13 +171,6 @@ async def _run_scheduled_jobs(bot, session, now: datetime):
         await _run_once_per_period(
             "last_weekly_study_plan", now.strftime("%G-W%V"), "Weekly study plan",
             "📘 Generating weekly study plan...", _run_weekly_study_plan_all_users, bot, plan_uids, session,
-        )
-
-    # Exam dates from course files (syllabus, info sheets, slides): once a day.
-    if now.hour >= EXAM_FILE_SCAN_HOUR:
-        await _run_once_per_period(
-            "last_exam_file_scan", now.date().isoformat(), "Exam file scan",
-            "📄 Scanning course files for exam dates...", _scan_and_announce_file_exams, bot, session,
         )
 
     # Course material search index: once a day, only new/changed files.
@@ -359,14 +342,8 @@ async def _run_reminder_checks(bot, session, now: datetime):
             _mark_personal_slot(owner, slot)
 
 
-async def _check_file_exam_reminders(bot, session):
-    # per course, to its students; each student's own StuMS check records
-    # the sittings they are registered for, which are skipped for them
-    await check_file_exam_reminders(bot)
-
-
 async def _run_exam_date_checks(bot, session, now: datetime):
-    """Upcoming exam dates (StuMS and course files), throttled to every 3 hours."""
+    """Upcoming exam dates from StuMS, throttled to every 3 hours."""
     if stagger.is_night(now) or not _is_due("last_exam_date_check", now, EXAM_DATE_CHECK_INTERVAL_SECONDS):
         return
     if _stums_users():
@@ -380,7 +357,6 @@ async def _run_exam_date_checks(bot, session, now: datetime):
             with acting_as(owner), exam_cache_user(owner):
                 await _guarded("Exam date reminder check", check_exam_date_reminders, session, bot,
                                _user_sender(owner), start_message="🎓 Checking upcoming exam dates...")
-    await _guarded("File exam reminder check", _check_file_exam_reminders, bot, session)
     update_general_cache({"last_exam_date_check": now.isoformat()})
 
 
@@ -663,4 +639,3 @@ async def stop_unified_watcher():
     state.watcher_controller_running = False
     logging.info("🛑 Unified watcher controller stopped")
 COURSE_INDEX_HOUR = 8  # daily, on the first watcher cycle from this hour on
-EXAM_FILE_SCAN_HOUR = 7  # daily scan runs on the first watcher cycle from this hour on

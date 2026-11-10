@@ -146,7 +146,9 @@ class TelegramSafetyLimiter(BaseRateLimiter):
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
-WA_FORWARD_CALLBACK_PREFIX = "forward_wa"
+# Buttons that post into the administrator's WhatsApp group: the plain
+# "Forward to WA" and the one on exam registration notices
+WA_FORWARD_CALLBACK_PREFIX = ("forward_wa", "examopen_wa")
 
 
 def is_admin_chat(uid: Optional[int]) -> bool:

@@ -313,7 +313,7 @@ def single_flight(fn):
 
     These jobs read a cache file, await network work for a long time and
     write the file back. Started twice at once (the watcher cycle plus a
-    button such as "📄 Scan Course Files Now"), the second run would also
+    button such as "📊 Progress"), the second run would also
     redo all the downloads and its save would overwrite the first one's.
     A later call waits for the running one instead."""
     @functools.wraps(fn)

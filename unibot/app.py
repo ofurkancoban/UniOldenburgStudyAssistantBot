@@ -116,7 +116,6 @@ from unibot.exams import (
     handle_all_exam_dates,
     handle_exam_buttons,
     handle_exam_dates_list,
-    handle_exam_files_scan,
     handle_examopen_cancel,
     handle_examopen_mute_ask,
     handle_examopen_mute_confirm,
@@ -320,7 +319,6 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_calendar_timetable, pattern="^calendar_timetable$"))
     app.add_handler(CallbackQueryHandler(handle_activity_stream, pattern=r"^activity_stream(\|.*)?$"))
     app.add_handler(CallbackQueryHandler(handle_exam_dates_list, pattern="^exam_dates_list$"))
-    app.add_handler(CallbackQueryHandler(handle_exam_files_scan, pattern="^exam_files_scan$"))
     app.add_handler(CallbackQueryHandler(handle_all_exam_dates, pattern="^exam_dates_all$"))
     app.add_handler(CallbackQueryHandler(handle_transcript_summary, pattern="^transcript_summary$"))
     app.add_handler(CallbackQueryHandler(handle_upcoming_dashboard, pattern="^upcoming_dashboard$"))
@@ -441,6 +439,13 @@ async def main():
         record_start()  # the daily digest tells deploys from crashes by this
     except Exception as exc:
         logging.warning("Could not log this start: %s", exc)
+
+    try:
+        from unibot import db as _db
+        from unibot.exams import drop_retired_exam_file_data
+        drop_retired_exam_file_data([u["telegram_id"] for u in _db.get_all_users()])
+    except Exception as exc:
+        logging.warning("Could not drop retired exam file data: %s", exc)
 
     app = None
     try:

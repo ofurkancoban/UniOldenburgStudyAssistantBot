@@ -460,9 +460,6 @@ class WatcherCycleTests(unittest.TestCase):
             "check_grade_reminders": job("grades"),
             "check_tuition_reminders": job("tuition"),
             "check_exam_date_reminders": job("exam_dates"),
-            "check_file_exam_reminders": job("file_exams"),
-            "scan_course_files_for_exams": job("scan", result=[]),
-            "notify_new_file_exam_events": job("notify"),
             "index_course_files": job("index"),
             "run_health_checks": job("health", result={"studip": (False, "down <now>")}),
             "check_new_announcements_parallel": job("announcements"),
@@ -486,7 +483,7 @@ class WatcherCycleTests(unittest.TestCase):
                 asyncio.run(watcher.unified_watcher_controller(app))
 
         for expected in ("morning", "calendar", "schedule_changes", "timetable", "tasks", "exam_registrations", "grades",
-                         "tuition", "exam_dates", "file_exams", "health", "announcements", "forum"):
+                         "tuition", "exam_dates", "health", "announcements", "forum"):
             self.assertIn(expected, calls)
         self.assertIn("files", calls)  # throttled to every 30 min, so due on the first cycle
         self.assertEqual(cache["health_state"], {"studip": False})
@@ -625,8 +622,8 @@ class DispatchTableTests(unittest.TestCase):
             self.assertIn("handle_selection", self.routes(f"{key}|x"), key)
 
     def test_background_jobs_stay_single_flight(self):
-        exams, mon, schedule, study_plan = (_import(m) for m in ("exams", "monitoring", "schedule", "study_plan"))
-        for fn in (exams.scan_course_files_for_exams, mon.check_new_files_parallel, schedule.check_calendar_reminders,
+        mon, schedule, study_plan = (_import(m) for m in ("monitoring", "schedule", "study_plan"))
+        for fn in (mon.check_new_files_parallel, schedule.check_calendar_reminders,
                    study_plan.index_course_files, study_plan.collect_course_topics, study_plan.collect_course_workload):
             self.assertTrue(hasattr(fn, "__wrapped__"), fn.__name__)
 

@@ -307,10 +307,17 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     menu_buttons: dict[int, str] = {}
     photos: dict[int, tuple] = {}
     for uid in user_ids:
-        with acting_as(uid):
-            weather_of[uid] = await get_weather_snapshot(today_date, user_id=uid)
-            texts[uid], voice, menu_buttons[uid], photos[uid] = await _prepare_user_summary(
-                uid, today_date, weather_of[uid], lunch_at)
+        # one student's failure leaves only their own summary out, never the slot's
+        try:
+            with acting_as(uid):
+                weather_of[uid] = await get_weather_snapshot(today_date, user_id=uid)
+                texts[uid], voice, menu_buttons[uid], photos[uid] = await _prepare_user_summary(
+                    uid, today_date, weather_of[uid], lunch_at)
+        except Exception:
+            logging.error("Morning summary for %s could not be prepared", uid, exc_info=True)
+            for part in (texts, menu_buttons, photos):
+                part.pop(uid, None)
+            continue
         if voice:
             voice_paths[uid] = voice
 

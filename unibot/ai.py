@@ -348,7 +348,7 @@ async def _call_openrouter_once(system_prompt: str, user_text: str, temperature:
     to produce the same greedy completion.
 
     `timeout` (seconds) can be raised for slower structured-extraction
-    calls (see extract_exam_events). `reasoning=False` turns off the
+    calls. `reasoning=False` turns off the
     model's thinking phase for prompts where it adds minutes but little
     quality (see pick_outfit_from_wardrobe). `model` overrides
     OPENROUTER_MODEL for one call."""

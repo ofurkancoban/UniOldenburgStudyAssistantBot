@@ -209,44 +209,11 @@ class HealthCheckTests(unittest.TestCase):
         self.assertNotIn("Disk", text)
 
 
-class ExamScanTests(unittest.TestCase):
-    def _tap(self, user_id: int, admin: bool, last_scan: float):
-        from unibot import exams
-        update, _query = _query_update(user_id, "exam_files_scan")
-        scan = mock.AsyncMock(return_value=[])
-        with mock.patch.object(exams, "is_user_allowed", lambda uid: True), \
-                mock.patch.object(exams, "is_user_admin", lambda uid: admin), \
-                mock.patch.object(exams, "scan_course_files_for_exams", scan), \
-                mock.patch.object(exams, "notify_new_file_exam_events", mock.AsyncMock()), \
-                mock.patch.object(exams, "get_file_exam_events", lambda uid: []), \
-                mock.patch.object(exams, "_last_exam_file_scan", last_scan):
-            asyncio.run(exams.handle_exam_files_scan(update, mock.MagicMock()))
-        return scan
-
-    def test_students_see_a_recent_scan_instead_of_starting_one(self):
-        self.assertFalse(self._tap(1008, admin=False, last_scan=time.time()).called)
-        self.assertTrue(self._tap(1008, admin=False, last_scan=0.0).called)
-        self.assertTrue(self._tap(1, admin=True, last_scan=time.time()).called)
-
-
 if __name__ == "__main__":
     unittest.main()
 
 
 class RescanFixTests(unittest.TestCase):
-    def test_unknown_course_students_get_nothing_until_known(self):
-        from unibot import exams
-        calls = []
-
-        async def fan_out(*args, **kwargs):
-            calls.append(args)
-
-        event = {"cid": "c1", "course": "One", "kind": "exam", "date": "2026-12-01", "source": "f.pdf"}
-        with mock.patch.object(exams.course_registry, "fan_out", fan_out), \
-                mock.patch.object(exams, "course_members", lambda cid: None):
-            asyncio.run(exams.notify_new_file_exam_events(mock.MagicMock(), [event]))
-        self.assertEqual(calls, [])
-
     def test_a_failed_round_keeps_the_course_session_state(self):
         from unibot import course_registry, monitoring, schedule
         cache = {schedule.COURSE_SESSION_STATE_KEY: {"c1": {"e1": {"ts": int(time.time())}}}}
