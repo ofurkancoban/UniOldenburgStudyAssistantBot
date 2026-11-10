@@ -62,27 +62,20 @@ def _fastenroll_job_line(sem_id: str, job: dict) -> str:
 
 
 def _build_fastenroll_list_content(chat_id: int):
-    """Return (text, InlineKeyboardMarkup | None) for the jobs across every Telegram
-    chat connected to this bot, not just `chat_id` - the bot logs into a single
-    shared Stud.IP account regardless of which chat scheduled a job, so a job set
-    up from one chat/device should be visible (and cancellable) from any other."""
-    all_pending = load_pending()
-    entries = [
-        (other_chat_id_str, sem_id, job)
-        for other_chat_id_str, jobs in all_pending.items()
-        for sem_id, job in jobs.items()
-    ]
-    if not entries:
+    """Return (text, InlineKeyboardMarkup | None) for this student's own jobs.
+    Each job enrolls with its owner's own login, so another student's jobs
+    (their courses and chat) are neither shown nor cancellable here."""
+    jobs = load_pending().get(str(chat_id)) or {}
+    if not jobs:
         return "No fast-enroll jobs scheduled.", None
 
-    lines = ["📋 Scheduled fast-enroll jobs (all chats):"]
+    lines = ["📋 Your scheduled fast-enroll jobs:"]
     keyboard = []
-    for owner_chat_id_str, sem_id, job in entries:
-        owner_tag = " (this chat)" if owner_chat_id_str == str(chat_id) else f" (chat {owner_chat_id_str})"
-        lines.append(_fastenroll_job_line(sem_id, job) + owner_tag)
+    for sem_id, job in jobs.items():
+        lines.append(_fastenroll_job_line(sem_id, job))
         keyboard.append([InlineKeyboardButton(
-            f"🛑 Cancel {sem_id[:8]}…{owner_tag}",
-            callback_data=f"fastenroll_cancel|{owner_chat_id_str}|{sem_id}",
+            f"🛑 Cancel {sem_id[:8]}…",
+            callback_data=f"fastenroll_cancel|{chat_id}|{sem_id}",
         )])
     return "\n".join(lines), InlineKeyboardMarkup(keyboard)
 
@@ -112,15 +105,6 @@ async def cancel_fastenroll_job(chat_id: int, sem_id: str) -> str:
     return f"No running job found for {sem_id}, removed from pending list if present."
 
 
-def _find_job_owner_chat_id(sem_id: str) -> Optional[int]:
-    """Search every chat's pending jobs for `sem_id`, return the owning chat_id or None."""
-    all_pending = load_pending()
-    for chat_id_str, jobs in all_pending.items():
-        if sem_id in jobs:
-            return int(chat_id_str)
-    return None
-
-
 async def fastenroll_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id if update.effective_user else None
     if user_id is None or not is_user_allowed(user_id):
@@ -129,15 +113,14 @@ async def fastenroll_cancel_command(update: Update, context: ContextTypes.DEFAUL
     chat_id = update.effective_chat.id
     args = context.args or []
     if len(args) != 1:
-        if not load_pending():
+        if not load_pending().get(str(chat_id)):
             await update.message.reply_text("No fast-enroll jobs scheduled to cancel.")
             return
         await send_fastenroll_list(update.message, chat_id)
         return
 
     sem_id = extract_sem_id(args[0]) or args[0]
-    owner_chat_id = _find_job_owner_chat_id(sem_id) or chat_id
-    result = await cancel_fastenroll_job(owner_chat_id, sem_id)
+    result = await cancel_fastenroll_job(chat_id, sem_id)  # only the student's own job
     await update.message.reply_text(result)
 
 
@@ -149,8 +132,12 @@ async def fastenroll_cancel_callback(update: Update, context: ContextTypes.DEFAU
         await query.message.reply_text("Not authorized to use this bot.")
         return
     _, owner_chat_id_str, sem_id = query.data.split("|", 2)
-    owner_chat_id = int(owner_chat_id_str)
-    result = await cancel_fastenroll_job(owner_chat_id, sem_id)
+    if owner_chat_id_str != str(query.message.chat_id):
+        # a button from another student's list (forwarded, or from before
+        # the lists were per student) never cancels their job
+        await query.message.reply_text("⚠️ That job isn't yours to cancel.")
+        return
+    result = await cancel_fastenroll_job(query.message.chat_id, sem_id)
 
     text, markup = _build_fastenroll_list_content(query.message.chat_id)
     try:

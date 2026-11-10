@@ -540,7 +540,7 @@ def course_alerts_course_view(user_id: int, cid: str) -> tuple:
     }[prefs["format"]]
     row = db.get_global_course(cid) or {}
     scanned = row.get("last_scanned_at")
-    scanned_line = (f"\n🕒 Last checked {time.strftime('%d.%m %H:%M', time.localtime(scanned))}"
+    scanned_line = (f"\n🕒 Last checked {datetime.fromtimestamp(scanned, TZ_BERLIN):%d.%m %H:%M}"
                     if scanned else "")
     followers = len(db.course_followers(cid))
     text = (f"🔔 <b>{html.escape(course_title(cid))}</b>\n\n"
@@ -571,6 +571,10 @@ async def handle_course_alerts(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     text, markup = course_alerts_course_view(user_id, cid) if cid else course_alerts_list_view(user_id)
     if action:
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        try:
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except BadRequest as e:  # the same course opened again: nothing changed
+            if "not modified" not in str(e).lower():
+                raise
     else:
         await query.message.reply_text(text, parse_mode="HTML", reply_markup=markup)

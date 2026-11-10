@@ -22,7 +22,7 @@ use_temp_db()
 
 import exam_reminder  # noqa: E402
 from studip_utils import TZ_BERLIN  # noqa: E402
-from unibot import morning, storage, tasks, voice  # noqa: E402
+from unibot import course_registry, enrollment, morning, storage, tasks, voice  # noqa: E402
 
 UID = 9701
 
@@ -183,6 +183,52 @@ class GradeNoticeTests(unittest.TestCase):
                   {"number": "M3", "title": "Lab", "status_title": "passed", "grade": " 2,0 "}]
         self._check(grades, cache)  # baseline
         self.assertEqual(self._check(grades, cache), [])
+
+
+
+class FastEnrollOwnerTests(unittest.TestCase):
+    MINE, THEIRS = 9711, 9712
+    PENDING = {str(MINE): {"a" * 32: {"target_time_str": "08:00:00"}},
+               str(THEIRS): {"b" * 32: {"target_time_str": "09:00:00"}}}
+
+    def test_list_shows_only_own_jobs(self):
+        with mock.patch.object(enrollment, "load_pending", return_value=self.PENDING):
+            text, markup = enrollment._build_fastenroll_list_content(self.MINE)
+        self.assertIn("a" * 32, text)
+        self.assertNotIn("b" * 32, text)
+        self.assertNotIn(str(self.THEIRS), str(markup.to_dict()))
+
+    def test_another_students_job_cannot_be_cancelled(self):
+        cancel = mock.AsyncMock(return_value="cancelled")
+        query = mock.AsyncMock()
+        query.data = f"fastenroll_cancel|{self.THEIRS}|{'b' * 32}"
+        query.message.chat_id = self.MINE
+        update = types.SimpleNamespace(callback_query=query, effective_user=types.SimpleNamespace(id=self.MINE))
+        with mock.patch.object(enrollment, "is_user_allowed", return_value=True), \
+                mock.patch.object(enrollment, "cancel_fastenroll_job", cancel):
+            asyncio.run(enrollment.fastenroll_cancel_callback(update, None))
+        cancel.assert_not_awaited()
+
+        message = mock.AsyncMock()
+        update = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=self.MINE),
+                                       effective_chat=types.SimpleNamespace(id=self.MINE), message=message)
+        with mock.patch.object(enrollment, "is_user_allowed", return_value=True), \
+                mock.patch.object(enrollment, "load_pending", return_value=self.PENDING), \
+                mock.patch.object(enrollment, "cancel_fastenroll_job", cancel):
+            asyncio.run(enrollment.fastenroll_cancel_command(update, types.SimpleNamespace(args=["b" * 32])))
+        self.assertEqual(cancel.call_args.args[0], self.MINE)
+
+
+class CourseAlertRedrawTests(unittest.TestCase):
+    def test_opening_the_same_course_again_is_quiet(self):
+        from telegram.error import BadRequest
+        query = mock.AsyncMock()
+        query.data = "calert|c|c1"
+        query.from_user = types.SimpleNamespace(id=UID)
+        query.edit_message_text.side_effect = BadRequest("Message is not modified")
+        with mock.patch.object(course_registry, "is_user_allowed", return_value=True):
+            asyncio.run(course_registry.handle_course_alerts(types.SimpleNamespace(callback_query=query), None))
+        query.answer.assert_awaited_once()
 
 
 if __name__ == "__main__":
