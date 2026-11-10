@@ -17,7 +17,7 @@ from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
 from exam_reminder import filter_exams_by_module_codes, get_all_exam_dates
-from fast_enroll import get_semester_options
+from fast_enroll import get_semester_options, semester_display
 from studip_utils import berlin_now, html_escape as _h, redact_url
 
 from unibot import state
@@ -346,7 +346,8 @@ async def _show_semester_picker(sender, callback_prefix: str, prompt: str):
         await _reply_or_edit(sender, "❌ Could not find any semesters.", reply_markup=InlineKeyboardMarkup([]))
         return
 
-    keyboard = [[InlineKeyboardButton(label, callback_data=f"{callback_prefix}|{sid}")] for sid, label in semesters]
+    keyboard = [[InlineKeyboardButton(semester_display(label), callback_data=f"{callback_prefix}|{sid}")]
+                for sid, label in semesters]
     await _reply_or_edit(sender, prompt, reply_markup=InlineKeyboardMarkup(keyboard))
 
 

@@ -13,7 +13,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
-from fast_enroll import clear_pending_job, decline_course, enroll_now, get_semester_options, load_pending
+from fast_enroll import clear_pending_job, decline_course, enroll_now, get_semester_options, load_pending, semester_display
 
 from unibot import state
 from unibot.preferences import get_pref, set_pref
@@ -431,7 +431,7 @@ async def handle_set_default_semester(update: Update, context: ContextTypes.DEFA
         await query.message.reply_text("❌ Could not find any semesters.")
         return
 
-    keyboard = [[InlineKeyboardButton(label, callback_data=f"default_sem|{sid}")] for sid, label in semesters]
+    keyboard = [[InlineKeyboardButton(semester_display(label), callback_data=f"default_sem|{sid}")] for sid, label in semesters]
     current = load_default_semester(query.from_user.id)
     if current.get("id"):
         keyboard.append([InlineKeyboardButton("🗑️ Clear default (always ask)", callback_data="default_sem_clear")])
@@ -462,7 +462,7 @@ async def handle_default_semester_pick(update: Update, context: ContextTypes.DEF
 
     label = next((lbl for sid, lbl in semesters if sid == semester_id), semester_id)
     save_default_semester(semester_id, label, user_id=user_id)
-    await query.edit_message_text(f"✅ Default semester set to: {label}\nFiles, Browse Courses, and Sign Out will now use it directly.")
+    await query.edit_message_text(f"✅ Default semester set to: {semester_display(label)}\nFiles, Browse Courses, and Sign Out will now use it directly.")
 
 
 async def handle_default_semester_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):

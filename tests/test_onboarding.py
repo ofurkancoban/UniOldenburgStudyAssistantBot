@@ -52,13 +52,43 @@ class SemesterStepTests(unittest.TestCase):
     def test_current_first_then_next_and_previous(self):
         current = fast_enroll.current_semester_id(OPTIONS, date(2026, 11, 10))
         _text, markup = onboarding.semester_step_view(OPTIONS, current)
-        self.assertEqual(_labels(markup), ["⭐ Wintersemester 2026/2027 (current)", "Sommersemester 2027",
-                                           "Sommersemester 2026", "Wintersemester 2025/2026", "🗓️ Ask me each time"])
+        self.assertEqual(_labels(markup), ["❄️ Wintersemester 2026/2027 ⭐ current", "☀️ Sommersemester 2027",
+                                           "☀️ Sommersemester 2026", "❄️ Wintersemester 2025/2026", "🗓️ Ask me each time"])
         self.assertEqual(_datas(markup)[0], "setup_sem|w26")
 
     def test_unknown_current_lists_the_first_ones(self):
         choices = onboarding.semester_choices(OPTIONS[:2], None)
         self.assertEqual([c[0] for c in choices], ["s29", "w28"])
+
+
+class SemesterIconTests(unittest.TestCase):
+    def test_sun_for_summer_snow_for_winter(self):
+        self.assertEqual(fast_enroll.semester_display("Sommersemester 2026"), "☀️ Sommersemester 2026")
+        self.assertEqual(fast_enroll.semester_display("Wintersemester 2026/2027"), "❄️ Wintersemester 2026/2027")
+        self.assertEqual(fast_enroll.semester_display("SoSe 26"), "☀️ SoSe 26")
+        self.assertEqual(fast_enroll.semester_display("WiSe 2026/27"), "❄️ WiSe 2026/27")
+
+    def test_other_labels_unchanged(self):
+        self.assertEqual(fast_enroll.semester_display("Not set"), "Not set")
+        self.assertEqual(fast_enroll.semester_display(""), "")
+
+    def test_semester_pickers_show_icons(self):
+        from telegram import InlineKeyboardMarkup
+        sent = {}
+
+        async def reply(sender, text, reply_markup=None):
+            sent["markup"] = reply_markup
+
+        sender = mock.MagicMock(from_user=types.SimpleNamespace(id=9303))
+        session = mock.MagicMock()
+        session.is_logged_in = mock.AsyncMock(return_value=True)
+        with mock.patch.object(menus, "get_user_session", return_value=session), \
+                mock.patch.object(menus, "get_semester_options", mock.AsyncMock(return_value=OPTIONS[5:7])), \
+                mock.patch.object(menus, "_reply_or_edit", reply):
+            asyncio.run(menus._show_semester_picker(sender, "files_sem", "Pick"))
+        self.assertIsInstance(sent["markup"], InlineKeyboardMarkup)
+        self.assertEqual(_labels(sent["markup"]), ["❄️ Wintersemester 2026/2027", "☀️ Sommersemester 2026"])
+        self.assertEqual(_datas(sent["markup"]), ["files_sem|w26", "files_sem|s26"])
 
 
 class SetupFlowTests(unittest.TestCase):
@@ -87,7 +117,7 @@ class SetupFlowTests(unittest.TestCase):
 
         query = Query("setup_sem|w26", self.UID)
         asyncio.run(onboarding.handle_setup_semester(types.SimpleNamespace(callback_query=query), None))
-        self.assertEqual(storage.load_default_semester(self.UID), {"id": "w26", "label": "Wintersemester 2026/2027"})
+        self.assertEqual(storage.load_default_semester(self.UID), {"id": "w26", "label": "Wintersemester 2026/2027"})  # stored as Stud.IP names it
         text, markup = query.edited
         self.assertIn("(2/2)", text)
         self.assertIn("setup_done", _datas(markup))

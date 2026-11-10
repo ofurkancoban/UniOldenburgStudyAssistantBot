@@ -17,6 +17,7 @@ from telegram.ext import ContextTypes
 
 from datetime import datetime
 import studip_oauth
+from fast_enroll import semester_display
 from studip_utils import TZ_BERLIN, berlin_now
 
 from unibot import db, state
@@ -257,7 +258,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logging.debug("Ignored a non-critical error", exc_info=True)
 
         default_semester = load_default_semester(user_id)
-        default_semester_label = default_semester.get("label") or "Not set"
+        default_semester_label = html.escape(semester_display(default_semester.get("label") or "Not set"))
         weather_location = load_weather_location(user_id)
         weather_location_label = (html.escape(f"{weather_location['name']}, {weather_location['country']}")
                                   if weather_location else "Uni Oldenburg (default)")
@@ -381,7 +382,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n\n{sys_info}"
 
     default_semester = load_default_semester(user_id)
-    default_semester_label = default_semester.get("label") or "Not set (always asks)"
+    default_semester_label = html.escape(semester_display(default_semester.get("label") or "Not set (always asks)"))
     text += f"\n\n📆 Default Semester: {default_semester_label}"
 
     watch_prev = get_pref(user_id, "watch_previous_semester")

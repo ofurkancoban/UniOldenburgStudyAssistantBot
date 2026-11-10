@@ -13,7 +13,7 @@ from typing import Optional
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
-from fast_enroll import current_semester_id, get_semester_options
+from fast_enroll import current_semester_id, get_semester_options, semester_display
 
 from unibot import state
 from unibot.auth import get_user_session, is_user_allowed, login_studip
@@ -39,7 +39,7 @@ def semester_choices(options: list, current: Optional[str]) -> list:
 def semester_step_view(options: list, current: Optional[str]) -> tuple:
     rows = []
     for sid, label, is_current in semester_choices(options, current):
-        text = f"⭐ {label} (current)" if is_current else label
+        text = f"{semester_display(label)} ⭐ current" if is_current else semester_display(label)
         rows.append([InlineKeyboardButton(text[:64], callback_data=f"setup_sem|{sid}")])
     rows.append([InlineKeyboardButton("🗓️ Ask me each time", callback_data=f"setup_sem|{SETUP_ASK_EACH_TIME}")])
     text = (
@@ -112,7 +112,7 @@ async def handle_setup_semester(update: Update, context: ContextTypes.DEFAULT_TY
         save_default_semester(choice, label, user_id=user_id)
         if state.global_session is not None and getattr(state.global_session, "user_id", None) == user_id:
             state._courses_map_built_with_prev = None  # the watcher's own student: rebuild its course list
-        semester_line = f"✅ Semester: <b>{html.escape(label)}</b>"
+        semester_line = f"✅ Semester: <b>{html.escape(semester_display(label))}</b>"
     mark_setup_done(user_id)
     text, markup = preferences_step_view(user_id, semester_line)
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)

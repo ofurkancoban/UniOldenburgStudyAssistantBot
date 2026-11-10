@@ -323,6 +323,20 @@ def semester_start(label: str):
     return datetime(year, 4 if summer else 10, 1).date()
 
 
+SUMMER_ICON = "☀️"
+WINTER_ICON = "❄️"
+
+
+def semester_display(label: str) -> str:
+    """A semester label for buttons and messages, with a sun for a summer
+    and a snowflake for a winter term. The stored label stays as Stud.IP
+    gives it."""
+    start = semester_start(label)
+    if start is None or not label:
+        return label
+    return f"{SUMMER_ICON if start.month == 4 else WINTER_ICON} {label}"
+
+
 def current_semester_id(options: list, today=None) -> Optional[str]:
     """The id of the semester running today among get_semester_options()'s
     [(id, label)]: the latest one that has already started. The list is
