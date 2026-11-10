@@ -82,18 +82,25 @@ def parse_task_due_time(text: str):
     t = text.strip()
     if t.lower() in TASK_SKIP_WORDS:
         return None
+    now = datetime.now(TZ_BERLIN)
     try:
-        return _parse_task_due_time(t, datetime.now(TZ_BERLIN))
+        due = _parse_task_due_time(t, now)
     except ValueError as exc:
         if str(exc).startswith((TASK_TIME_UNKNOWN, TASK_TIME_INVALID)):
             raise
         # datetime's own message ("day is out of range for month") means
         # nothing to a student; the date itself does not exist
         raise ValueError(f"{TASK_TIME_INVALID} {text}") from exc
+    if due < now - TASK_PAST_GRACE:
+        # it would fire at once: "today 08:00" in the afternoon, a date gone by
+        raise ValueError(f"{TASK_TIME_PAST} {text}")
+    return due
 
 
 TASK_TIME_UNKNOWN = "Could not understand the date/time:"
 TASK_TIME_INVALID = "That date or time doesn't exist:"
+TASK_TIME_PAST = "That time has already passed:"
+TASK_PAST_GRACE = timedelta(minutes=1)
 
 
 def _parse_task_due_time(t: str, now: datetime) -> datetime:
@@ -156,7 +163,9 @@ async def send_task_list(message, user_id: int):
     plain = [t for t in tasks if not t.get("due_time")]
 
     for t in reminders:
-        due = datetime.fromisoformat(t["due_time"])
+        due = _task_due(t)
+        if due is None:
+            continue
         course_line = f" [{t['course']}]" if t.get("course") else ""
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"task_delete|{t['id']}")]])
         await message.reply_text(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} - {t['text']}{course_line}", reply_markup=keyboard)
@@ -299,7 +308,8 @@ async def handle_task_course_pick(update: Update, context: ContextTypes.DEFAULT_
 
     course_name = None
     if query.data != "task_course_skip":
-        idx = int(query.data.split("|", 1)[1])
+        raw_idx = query.data.split("|", 1)[1]
+        idx = int(raw_idx) if raw_idx.isdigit() else -1
         options = state.get("course_options", [])
         if 0 <= idx < len(options):
             course_name = options[idx][0]
@@ -483,6 +493,9 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
 
     parts = query.data.split("|")
     action, task_id = parts[0], parts[1]
+    if action == "task_reminder_snooze" and (len(parts) < 3 or parts[2] not in dict(TASK_SNOOZE_OPTIONS)):
+        await query.answer()  # checked before the reminder is taken out of the record
+        return
     # looked up in the tapping student's own record: another student's
     # reminder button (forwarded, in a group) finds nothing
     task = recall_user_callback(user_id, f"task:{task_id}", forget=True)
@@ -527,9 +540,13 @@ def _resolve_task_due_time(due_date: Optional[str], due_time_str: Optional[str])
     try:
         time_part = due_time_str or "09:00"
         due_dt = datetime.strptime(f"{due_date} {time_part}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ_BERLIN)
-        return due_dt.isoformat()
     except ValueError:
         return None
+    if due_dt < datetime.now(TZ_BERLIN):
+        # a deadline already gone would remind at once; it stays a plain to-do
+        # (or, typed by the student, they are asked for the time)
+        return None
+    return due_dt.isoformat()
 
 
 async def extract_task_suggestion(course_name: str, thread_title: Optional[str], body_text: str) -> Optional[dict]:
