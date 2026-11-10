@@ -604,10 +604,9 @@ class LoginServer:
     async def _run_auth_hook(self, user_id: Optional[int] = None) -> None:
         try:
             if self.on_session_authenticated:
-                try:
-                    await self.on_session_authenticated(user_id)
-                except TypeError:
-                    await self.on_session_authenticated()
+                # never retried without user_id: a TypeError raised inside
+                # the hook would otherwise rerun it on the admin's session
+                await self.on_session_authenticated(user_id)
         except Exception as exc:
             logger.warning("on_session_authenticated hook failed: %s", exc)
 

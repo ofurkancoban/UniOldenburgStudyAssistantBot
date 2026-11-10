@@ -169,5 +169,19 @@ class ErrorHandlerTests(unittest.TestCase):
         answer.assert_not_awaited()
 
 
+class AuthHookTests(unittest.TestCase):
+    def test_a_failing_hook_is_not_rerun_without_the_student(self):
+        from studip_login_server import LoginServer
+        calls = []
+
+        async def hook(*args):
+            calls.append(args)
+            raise TypeError("bug inside the hook")
+
+        server = LoginServer(port=1, on_session_authenticated=hook)
+        asyncio.run(server._run_auth_hook(77))
+        self.assertEqual(calls, [(77,)])
+
+
 if __name__ == "__main__":
     unittest.main()
