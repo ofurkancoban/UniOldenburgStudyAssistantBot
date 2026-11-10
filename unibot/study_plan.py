@@ -49,6 +49,7 @@ from unibot.storage import (
     shared_http,
     single_flight,
     student_courses,
+    task_due,
 )
 from unibot.formatting import _course_abbrev, _hours, _progress_bar, _short_id, clean_course_title
 from unibot.telegram_ui import (
@@ -1839,9 +1840,8 @@ def _due_tasks(user_id: int, now: datetime, course: Optional[str] = None) -> lis
     for t in user_tasks(user_id):
         if not t.get("due_time"):  # a done task is deleted
             continue
-        try:
-            when = datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN)
-        except ValueError:
+        when = task_due(t)
+        if when is None:
             continue
         if now <= when <= horizon and (course is None or t.get("course") == course):
             due.append({**t, "due_dt": when})

@@ -293,7 +293,8 @@ class SettingsMenuTests(unittest.TestCase):
         self.assertIn("Settings", q.message.reply_text.call_args.args[0])
         self._tap(uid, "settings|cycle|diet")
         self.assertEqual(preferences.get_pref(uid, "diet"), "vegetarian")
-        self._tap(uid, "settings|flip|outfit")
+        with mock.patch("unibot.settings_menu.is_user_admin", return_value=True):  # an administrator's switch
+            self._tap(uid, "settings|flip|outfit")
         self.assertFalse(preferences.get_pref(uid, "outfit"))
         self._tap(uid, "settings|mt|later")
         self._tap(uid, "settings|mt|later")

@@ -39,6 +39,7 @@ from unibot.config import (
     OPENROUTER_MODEL,
     OUTFIT_OPENROUTER_MODEL,
 )
+from unibot.preferences import get_pref, set_pref
 from unibot.storage import (
     clear_wardrobe_items,
     get_cached_outfit_today,
@@ -496,21 +497,24 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
 async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stateless flip toggle, same template as handle_toggle_watch_prev_sem."""
     query = update.callback_query
-    if not is_user_admin(query.from_user.id):
+    user_id = query.from_user.id
+    if not is_user_admin(user_id):
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     await query.answer()
     new_state = not get_wardrobe_feature_enabled()
     set_wardrobe_feature_enabled(new_state)
+    if isinstance(user_id, int):
+        set_pref(user_id, "outfit", new_state)
     await query.edit_message_text(
         f"👔 Daily Outfit Suggestion is now {'✅ On' if new_state else '🔲 Off'}.\nRun /status to see the full menu again."
     )
 
 
-def _outfit_menu_view() -> tuple:
+def _outfit_menu_view(user_id: Optional[int] = None) -> tuple:
     """/status's grouped outfit submenu: the daily suggestion toggle,
     the wardrobe list and the reference photo setup in one place."""
-    enabled = get_wardrobe_feature_enabled()
+    enabled = bool(get_wardrobe_feature_enabled() and (get_pref(user_id, "outfit") if isinstance(user_id, int) else True))
     text = f"👔 <b>Outfit &amp; Wardrobe</b>\n\nDaily Outfit Suggestion: {'✅ On' if enabled else '🔲 Off'}"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{'✅' if enabled else '🔲'} Daily Outfit Suggestion", callback_data="outfit_menu_toggle")],
@@ -531,11 +535,15 @@ async def handle_outfit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await query.answer()
     if query.data == "outfit_menu_toggle":
-        set_wardrobe_feature_enabled(not get_wardrobe_feature_enabled())
-        text, keyboard = _outfit_menu_view()
+        current = bool(get_wardrobe_feature_enabled() and (get_pref(user_id, "outfit") if isinstance(user_id, int) else True))
+        new_state = not current
+        set_wardrobe_feature_enabled(new_state)
+        if isinstance(user_id, int):
+            set_pref(user_id, "outfit", new_state)
+        text, keyboard = _outfit_menu_view(user_id)
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
         return
-    text, keyboard = _outfit_menu_view()
+    text, keyboard = _outfit_menu_view(user_id)
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 

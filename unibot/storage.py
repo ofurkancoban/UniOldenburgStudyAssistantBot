@@ -1008,7 +1008,7 @@ def set_ai_personal_enabled(user_id, enabled: bool) -> None:
 # former general cache sections keyed by the student's id (now personal
 # records); "Delete my data" clears any entry still left in the shared cache
 PERSONAL_CACHE_SECTIONS = ("study_blocks", "task_outcomes", "calendar_tokens", "study_buddy", "travel_modes",
-                           "ai_grades", "personal_check_slots", "personal_check_last", "personal_check_manual",
+                           "ai_grades", "ai_personal", "personal_check_slots", "personal_check_last", "personal_check_manual",
                            "outfit_history", "outfit_today_cache", "pinned_morning_summary", "user_schedule_slots")
 
 

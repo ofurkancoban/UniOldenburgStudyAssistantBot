@@ -40,7 +40,7 @@ from unibot.storage import (
     remember_user_callback,
     save_personal_record,
 )
-from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation, markup_for
+from unibot.telegram_ui import _delete_status_message, _show_typing, _start_loading_animation, _stop_loading_animation, markup_for
 from unibot.auth import get_user_session, is_user_admin, is_user_allowed, personal_session
 from unibot.studip_api import BASE_URL, list_courses
 from unibot.whatsapp import WA_ADMIN_ONLY, _send_text_to_whatsapp
@@ -167,6 +167,7 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             await send_exam_registration_menu(query.message, user_id=query.from_user.id)
         finally:
             await _stop_loading_animation(stop_evt, anim_task)
+            await _delete_status_message(status_msg)
         return
 
     if query.data == "exam_noop":
@@ -210,6 +211,7 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
         finally:
             await _stop_loading_animation(stop_evt, anim_task)
+            await _delete_status_message(status_msg)
         exam_action_cache.pop(sid, None)
         title = result.get("title") or info["title"]
         if result["success"]:
@@ -645,6 +647,7 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
         return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+        await _delete_status_message(status_msg)
 
     matched = filter_exams_by_module_codes(exams, module_codes)
 
@@ -686,6 +689,7 @@ async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TY
         return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+        await _delete_status_message(status_msg)
 
     today = berlin_now().date()
     upcoming = [e for e in exams if datetime.fromisoformat(e["exam_date"]).date() >= today]
@@ -727,6 +731,7 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
         return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+        await _delete_status_message(status_msg)
 
     summary = compute_transcript_summary(grades)
 

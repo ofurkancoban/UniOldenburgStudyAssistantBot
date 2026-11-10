@@ -539,7 +539,6 @@ async def _list_courses_api(
         if name:
             result.append((name if end_id else f"{name} (unrestricted)", c["id"]))
     return result
-    return result
 
 
 async def _list_files_api(cid, folder_url=None, session=None, user_id=None) -> list:

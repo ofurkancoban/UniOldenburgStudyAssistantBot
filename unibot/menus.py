@@ -40,11 +40,13 @@ from unibot.storage import (
     save_studip_user_name,
     save_user_name,
     shared_http,
+    task_due,
 )
 from unibot.formatting import _short_id, clean_html_text
 from unibot.telegram_ui import (
     user_data,
     _breadcrumb,
+    _delete_status_message,
     _reply_or_edit,
     _send_file_bytes,
     _show_typing,
@@ -78,9 +80,9 @@ from unibot.studip_api import (
 )
 from unibot.weather import geocode_location, save_weather_location
 from unibot.mensa import (
+    effective_food_filter,
     get_menu_navigation_keyboard,
     get_todays_menu_enhanced,
-    load_food_preferences,
     menu_command,
 )
 from unibot.schedule import get_calendar_events, send_daily_calendar
@@ -221,9 +223,9 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         # Session check
         session = await login_studip()
 
-        prefs = load_food_preferences()
+        food = effective_food_filter(user_id)
         menu_text, prev, next_, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
-            session, sub_path=sub_path, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
+            session, sub_path=sub_path, avoid_codes=food["avoid_codes"], avoid_keywords=food["avoid_keywords"], max_price=food["max_price"]
         )
 
         if should_reply:
@@ -1491,21 +1493,21 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     lines = [f"📘 <b>{_h(course_name)}</b>", "━━━━━━━━━━━━━━━━━"]
 
-    course_tasks = [t for t in user_tasks(user_id) if t.get("course") == course_name]
-    if course_tasks:
-        lines.append("📝 <b>Tasks</b>")
-        for t in sorted(course_tasks, key=lambda t: t.get("due_time") or ""):
-            if t.get("due_time"):
-                due = datetime.fromisoformat(t["due_time"])
-                lines.append(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} - {_h(t['text'])}")
-            else:
-                lines.append(f"• {_h(t['text'])}")
-        lines.append("━━━━━━━━━━━━━━━━━")
-    else:
-        lines.append("📝 <b>Tasks:</b> none")
-        lines.append("━━━━━━━━━━━━━━━━━")
-
     try:
+        course_tasks = [t for t in user_tasks(user_id) if t.get("course") == course_name]
+        if course_tasks:
+            lines.append("📝 <b>Tasks</b>")
+            for t in sorted(course_tasks, key=lambda t: t.get("due_time") or ""):
+                due = task_due(t) if t.get("due_time") else None
+                if due is not None:
+                    lines.append(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} - {_h(t['text'])}")
+                else:
+                    lines.append(f"• {_h(t['text'])}")
+            lines.append("━━━━━━━━━━━━━━━━━")
+        else:
+            lines.append("📝 <b>Tasks:</b> none")
+            lines.append("━━━━━━━━━━━━━━━━━")
+
         session = await login_studip()  # the acting user's own session
         module_codes = await get_my_module_codes(session, [(course_name, course_cid)])
         exams = await get_all_exam_dates(session)
@@ -1518,6 +1520,7 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
         upcoming = None
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+        await _delete_status_message(status_msg)
 
     if upcoming is None:
         lines.append("📅 <b>Exams:</b> could not load right now")

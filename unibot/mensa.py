@@ -22,13 +22,14 @@ from studip_utils import TZ_BERLIN, berlin_now, tag_attr
 
 from unibot.storage import shared_http
 from unibot.telegram_ui import (
+    _delete_status_message,
     _show_typing,
     _start_loading_animation,
     _stop_loading_animation,
     get_main_keyboard,
 )
 from unibot.auth import current_user_id, is_user_allowed, login_studip
-from unibot.preferences import DIETS, food_filter, get_prefs, set_pref
+from unibot.preferences import DIETS, diet_filter, food_filter, get_pref, get_prefs, set_pref
 from unibot.studip_api import BASE_URL
 from unibot.ai import _call_openrouter, _extract_json_object
 
@@ -45,6 +46,26 @@ def load_food_preferences(user_id: Optional[int] = None) -> dict:
         return {"avoid_codes": [], "avoid_keywords": []}
     prefs = get_prefs(uid)
     return {"avoid_codes": list(prefs["food_avoid_codes"]), "avoid_keywords": list(prefs["food_avoid_keywords"])}
+
+
+def effective_food_filter(user_id: Optional[int] = None) -> dict:
+    """Active food filter for menu display: the student's custom avoided
+    codes/keywords from load_food_preferences() combined with their diet
+    preset (vegetarian, vegan, halal, fish, budget)."""
+    try:
+        prefs = load_food_preferences(user_id) if isinstance(user_id, int) else load_food_preferences()
+    except TypeError:
+        prefs = load_food_preferences()
+    uid = user_id if isinstance(user_id, int) else current_user_id()
+    diet = get_pref(uid, "diet") if isinstance(uid, int) else "all"
+    base = diet_filter(diet)
+    return {
+        "diet": diet,
+        "avoid_codes": set(base["avoid_codes"]) | set(prefs.get("avoid_codes") or []),
+        "avoid_keywords": [*(k.lower() for k in base["avoid_keywords"]),
+                           *(k.lower() for k in (prefs.get("avoid_keywords") or []))],
+        "max_price": base["max_price"],
+    }
 
 
 def save_food_preferences(avoid_codes: list, avoid_keywords: list, user_id: Optional[int] = None) -> None:
@@ -707,10 +728,16 @@ def _parse_menu_row(row) -> tuple[set, Optional[dict]]:
     }
 
 
-def _is_dish_hidden(dish: dict, avoid_codes: set, avoid_keywords: list) -> bool:
+def _is_dish_hidden(dish: dict, avoid_codes: set, avoid_keywords: list, max_price: Optional[float] = None) -> bool:
     item_codes = {a.strip() for a in dish["allergens_text"].split(",")} if dish["allergens_text"] else set()
     haystack = f"{dish['name']} {dish['description']}".lower()
-    return bool(item_codes & avoid_codes) or any(kw in haystack for kw in avoid_keywords)
+    if bool(item_codes & avoid_codes) or any(kw in haystack for kw in avoid_keywords):
+        return True
+    if max_price is not None:
+        price = _speiseplan_price(str(dish.get("price") or ""))
+        if price is not None and price > max_price:
+            return True
+    return False
 
 
 def _format_menu_dish(name: str, description: str, allergens_text: str, price: str, is_limited: bool) -> str:
@@ -745,7 +772,7 @@ def _is_login_page(html_content: str) -> bool:
     return 'name="loginname"' in text or "dispatch.php/login" in text
 
 
-async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avoid_keywords=None):
+async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avoid_keywords=None, max_price=None):
     """Enhanced menu fetching with dynamic allergen guide and navigation links.
 
     avoid_codes/avoid_keywords (from food_preferences.json, see
@@ -804,7 +831,7 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
                 codes_used |= codes
                 if dish is None:
                     continue
-                if _is_dish_hidden(dish, avoid_codes, avoid_keywords):
+                if _is_dish_hidden(dish, avoid_codes, avoid_keywords, max_price=max_price):
                     hidden_count += 1
                     continue
                 if not dish["name"]:
@@ -826,7 +853,10 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
                 categories_data.append((priority, cat_chunk))
 
         categories_data.sort(key=lambda x: x[0])
-        menu_text = header_text + "\n\n" + "".join(chunk for _, chunk in categories_data)
+        body = "".join(chunk for _, chunk in categories_data)
+        if not body and hidden_count:
+            body = _MENU_SEPARATOR + f"ℹ️ No dishes match your food preferences today ({hidden_count} hidden).\n\n"
+        menu_text = header_text + "\n\n" + body
         menu_text += _format_allergen_guide(codes_used, hidden_count)
 
         dish_items.sort(key=lambda d: d["priority"])
@@ -884,7 +914,7 @@ def speiseplan_menu_keyboard(loc_id: str, day: date) -> InlineKeyboardMarkup:
     ])
 
 
-async def build_speiseplan_menu(loc_id: str, day: date, avoid_codes=None, avoid_keywords=None) -> str:
+async def build_speiseplan_menu(loc_id: str, day: date, avoid_codes=None, avoid_keywords=None, max_price=None) -> str:
     """HTML menu of a Speiseplan canteen for one day, with the user's food
     preferences applied like on the Stud.IP menu."""
     name = SPEISEPLAN_LOCATIONS.get(loc_id, "Mensa")
@@ -900,11 +930,13 @@ async def build_speiseplan_menu(loc_id: str, day: date, avoid_codes=None, avoid_
     shown, codes_used, hidden = [], set(), 0
     for meal in meals:
         codes_used |= {c.strip() for c in meal["allergens_text"].split(",") if c.strip()}
-        if _is_dish_hidden(meal, avoid, keywords):
+        if _is_dish_hidden(meal, avoid, keywords, max_price=max_price):
             hidden += 1
             continue
         shown.append(meal)
     text = header + "\n\n" + _MENU_SEPARATOR
+    if not shown:
+        text += f"ℹ️ No dishes match your food preferences today ({hidden} hidden).\n\n"
     for meal in shown:
         labels = f"🏷️ {', '.join(meal['labels'])}" if meal["labels"] else ""
         text += _format_menu_dish(meal["name"], labels, meal["allergens_text"], meal["price"], meal["is_limited"])
@@ -914,7 +946,8 @@ async def build_speiseplan_menu(loc_id: str, day: date, avoid_codes=None, avoid_
 async def handle_mensa_location_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """mensa_loc|<locationId>|<YYYY-MM-DD or today>[|new]: a Speiseplan canteen's menu."""
     query = update.callback_query
-    if not is_user_allowed(query.from_user.id):
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
         await query.answer("Not authorized.")
         return
     parts = query.data.split("|")
@@ -923,12 +956,12 @@ async def handle_mensa_location_button(update: Update, context: ContextTypes.DEF
         day = date.fromisoformat(parts[2]) if len(parts) > 2 and parts[2] != "today" else berlin_now().date()
     except ValueError:
         day = berlin_now().date()
-    prefs = load_food_preferences()
+    food = effective_food_filter(user_id)
     if len(parts) > 3 and parts[3] == "photos":
         await query.answer("Loading photos...")
         page = await _fetch_speiseplan_html(loc_id, day)
         meals = [m for m in parse_speiseplan_meals(page or "")
-                 if not _is_dish_hidden(m, set(prefs["avoid_codes"]), [k.lower() for k in prefs["avoid_keywords"]])]
+                 if not _is_dish_hidden(m, set(food["avoid_codes"]), [k.lower() for k in food["avoid_keywords"]], max_price=food["max_price"])]
         dish_items = [{**m, "category": SPEISEPLAN_LOCATIONS[loc_id], "description": ", ".join(m["labels"])} for m in meals]
         if not dish_items:
             await query.message.reply_text("❌ No dishes to show photos for.")
@@ -936,7 +969,7 @@ async def handle_mensa_location_button(update: Update, context: ContextTypes.DEF
         await _send_menu_items_individually(query.message, dish_items, day, skip_unmatched=True, loc_id=loc_id)
         return
     await query.answer("Loading...")
-    text = await build_speiseplan_menu(loc_id, day, prefs["avoid_codes"], prefs["avoid_keywords"])
+    text = await build_speiseplan_menu(loc_id, day, food["avoid_codes"], food["avoid_keywords"], max_price=food["max_price"])
     markup = speiseplan_menu_keyboard(loc_id, day)
     if len(parts) > 3 and parts[3] == "new":
         await query.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
@@ -997,10 +1030,10 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # "no dishes")
         session = await login_studip()
 
-        # Fetch menu, filtered per any saved food preferences
-        prefs = load_food_preferences()
+        # Fetch menu, filtered per any saved food preferences and diet preset
+        food = effective_food_filter(user_id)
         menu_text, prev, next_, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
-            session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
+            session, avoid_codes=food["avoid_codes"], avoid_keywords=food["avoid_keywords"], max_price=food["max_price"]
         )
 
         # Dish photos are opt-in via the "📸 Show Dish Photos" button below,
@@ -1161,6 +1194,10 @@ def _food_preferences_management_view(category="main"):
         avoided_items.append(f"🚫 \"{kw}\"")
 
     text = "🚫 <b>Mensa Food Preferences</b>\n\n"
+    uid = current_user_id()
+    diet = get_pref(uid, "diet") if isinstance(uid, int) else "all"
+    if diet != "all":
+        text += f"<b>Active diet preset:</b> {html.escape(DIETS.get(diet, diet))} <i>(change in /settings)</i>\n\n"
     if avoided_items:
         text += f"<b>Currently avoiding ({len(avoided_items)} items):</b>\n"
         text += "\n".join(f"• {it}" for it in avoided_items)
@@ -1231,9 +1268,9 @@ async def handle_menu_photos_button(update: Update, context: ContextTypes.DEFAUL
 
     try:
         session = await login_studip()
-        prefs = load_food_preferences()
+        food = effective_food_filter(user_id)
         _, _, _, menu_date, dish_items, _ = await get_todays_menu_enhanced(
-            session, sub_path=sub_path, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
+            session, sub_path=sub_path, avoid_codes=food["avoid_codes"], avoid_keywords=food["avoid_keywords"], max_price=food["max_price"]
         )
         if not dish_items:
             await query.message.reply_text("❌ No dishes to show photos for.")
@@ -1264,6 +1301,7 @@ async def handle_menu_recommend_button(update: Update, context: ContextTypes.DEF
         result = await build_food_recommendation(loc_id)
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+        await _delete_status_message(status_msg)
 
     if not result:
         await query.message.reply_text("❌ Couldn't reach the Mensa menu right now - try again in a bit.")

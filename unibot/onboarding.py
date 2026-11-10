@@ -194,6 +194,8 @@ def apply_answer(user_id: int, key: str, value: str, semesters: list) -> None:
         rebuild_watched_courses(user_id)
     elif key not in CHOICES or value not in dict(CHOICES[key]):
         raise ValueError(f"unknown answer {key}={value}")
+    elif key in ADMIN_ONLY and not is_user_admin(user_id):
+        raise ValueError(f"{key} is not offered to students")
     elif key == "ai_personal":
         set_ai_personal_enabled(user_id, value == "yes")
     elif key == "ai_grades":

@@ -49,8 +49,8 @@ from unibot.mensa import (
     build_food_recommendation,
     get_menu_navigation_keyboard,
     get_todays_menu_enhanced,
-    load_food_preferences,
 )
+from unibot.preferences import food_filter
 from unibot.wardrobe import describe_wardrobe_item, tag_wardrobe_item
 from unibot.schedule import get_calendar_events
 from unibot.monitoring import _run_check_now
@@ -692,6 +692,7 @@ async def _voice_intent_show_last_file(update, context, result, transcript, inte
         "cid": cid,
         "name": file_item["name"],
         "url": file_item.get("url"),
+        "user_id": update.effective_user.id,
         "ts": time.time(),
     }
     text = (
@@ -765,9 +766,9 @@ async def _voice_intent_show_menu(update, context, result, transcript, intent, q
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     try:
         session = await login_studip()
-        prefs = load_food_preferences()
+        food = food_filter(update.effective_user.id if update.effective_user else None)
         menu_text, prev, next_, menu_date, dish_items, header_text = await get_todays_menu_enhanced(
-            session, avoid_codes=prefs["avoid_codes"], avoid_keywords=prefs["avoid_keywords"]
+            session, avoid_codes=food["avoid_codes"], avoid_keywords=food["avoid_keywords"], max_price=food["max_price"]
         )
         await message.reply_text(menu_text, parse_mode="HTML", reply_markup=get_menu_navigation_keyboard(prev, next_))
     except Exception as e:

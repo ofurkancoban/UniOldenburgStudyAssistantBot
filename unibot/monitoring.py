@@ -223,6 +223,7 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "cid": cid,
                 "course": course,
                 "name": name,
+                "url": info.get("url"),
                 "size": info.get("size", "-"),
                 "modified": info.get("modified", "-"),
                 "dt": dt
@@ -239,7 +240,14 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for f in last5:
         sid = _short_id()
-        link_cache[sid] = {"cid": f["cid"], "name": f["name"], "course": f["course"], "ts": time.time()}
+        link_cache[sid] = {
+            "cid": f["cid"],
+            "name": f["name"],
+            "course": f["course"],
+            "url": f.get("url"),
+            "user_id": query.from_user.id,
+            "ts": time.time(),
+        }
 
         text = (
             "━━━━━━━━━━━━━━━━━\n"

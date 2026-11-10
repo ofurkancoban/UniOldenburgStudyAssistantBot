@@ -48,7 +48,7 @@ from unibot.formatting import (
     _status_emoji,
     clean_course_title,
 )
-from unibot.telegram_ui import _show_typing, _start_loading_animation, _stop_loading_animation
+from unibot.telegram_ui import _delete_status_message, _show_typing, _start_loading_animation, _stop_loading_animation
 from unibot.auth import acting_as, current_user_id, get_user_session, is_user_allowed, login_studip, signed_in_accounts
 from unibot.studip_api import (
     BASE_URL,
@@ -1109,10 +1109,13 @@ async def send_weekly_calendar(sender, events: list, week_start):
     if week_tasks:
         task_lines = ["\n✅ *Tasks This Week*", "━━━━━━━━━━━━━━━━━━"]
         for t in week_tasks:
-            due = datetime.fromisoformat(t["due_time"]).astimezone(TZ_BERLIN)
+            due = task_due(t)
+            if due is None:
+                continue
             course_line = f" ({_md(t['course'])})" if t.get("course") else ""
             task_lines.append(f"⏰ `{due.strftime('%a %d.%m %H:%M')}` - {_md(t['text'])}{course_line}")
-        text += "\n" + "\n".join(task_lines)
+        if len(task_lines) > 2:
+            text += "\n" + "\n".join(task_lines)
 
     all_study_windows = find_weekly_study_gaps(events, week_start)
 
@@ -1961,6 +1964,7 @@ async def handle_upcoming_dashboard(update: Update, context: ContextTypes.DEFAUL
         return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+        await _delete_status_message(status_msg)
 
     await query.message.reply_text(text, parse_mode="HTML")
 

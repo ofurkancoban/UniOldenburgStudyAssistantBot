@@ -4,6 +4,7 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import asyncio
+import inspect
 import io
 import logging
 import os
@@ -319,6 +320,19 @@ async def _stop_loading_animation(stop_event: asyncio.Event, task: "asyncio.Task
         await task
     except Exception:
         logging.debug("Loading animation task ended with an error", exc_info=True)
+
+
+async def _delete_status_message(status_message) -> None:
+    """Best-effort cleanup of a temporary 'Loading...' message."""
+    delete = getattr(status_message, "delete", None)
+    if not callable(delete):
+        return
+    try:
+        res = delete()
+        if inspect.isawaitable(res):
+            await res
+    except Exception:
+        logging.debug("Status message not deleted", exc_info=True)
 
 
 async def _reply_or_edit(sender, text, reply_markup=None, parse_mode=None):

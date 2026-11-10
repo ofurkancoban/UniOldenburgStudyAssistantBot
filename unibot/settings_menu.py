@@ -12,7 +12,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from unibot import preferences as prefs
-from unibot.auth import is_user_allowed
+from unibot.auth import is_user_admin, is_user_allowed
 from unibot.storage import get_travel_mode, rebuild_watched_courses, set_travel_mode
 
 QUIET_PRESETS = {
@@ -88,23 +88,25 @@ def academic_view(user_id: int) -> tuple:
 def life_view(user_id: int) -> tuple:
     p = prefs.get_prefs(user_id)
     travel = get_travel_mode(user_id)
+    admin = is_user_admin(user_id)
     text = (
         "🏫 <b>Daily life</b>\n\n"
         f"🏫 Home campus: {prefs.CAMPUS_ANCHORS[p['campus_anchor']]}\n"
         "<i>Used for study spots and the mensa when your classes don't say where you are.</i>\n"
         f"🍽️ Diet: {prefs.DIETS[p['diet']]}\n"
         "<i>The lunch pick in the morning summary and \"What should I eat?\" only show what fits.</i>\n"
-        f"🚲 Between campuses: {'Bike (bus when it rains)' if travel == 'bike' else 'Bus'}\n"
-        f"👔 Outfit suggestion: {_onoff(p['outfit'])}"
+        f"🚲 Between campuses: {'Bike (bus when it rains)' if travel == 'bike' else 'Bus'}"
+        + (f"\n👔 Outfit suggestion: {_onoff(p['outfit'])}" if admin else "")
     )
     rows = [
         [InlineKeyboardButton("🏫 Change campus", callback_data="settings|cycle|campus_anchor")],
         [InlineKeyboardButton("🍽️ Change diet", callback_data="settings|cycle|diet")],
         [InlineKeyboardButton("🚌 Switch to bus" if travel == "bike" else "🚲 Switch to bike",
                               callback_data="settings|travel")],
-        [InlineKeyboardButton(f"👔 Outfit suggestion: {_onoff(p['outfit'])}", callback_data="settings|flip|outfit")],
-        _back(),
     ]
+    if admin:
+        rows.append([InlineKeyboardButton(f"👔 Outfit suggestion: {_onoff(p['outfit'])}", callback_data="settings|flip|outfit")])
+    rows.append(_back())
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -179,6 +181,8 @@ def apply_action(user_id: int, parts: list) -> str:
         prefs.cycle_choice(user_id, arg, CYCLE_KEYS[arg])
         return PAGE_OF[arg]
     if action == "flip" and arg in FLIP_KEYS:
+        if arg == "outfit" and not is_user_admin(user_id):
+            return "life"  # the outfit tip is an administrator's feature; the row isn't shown to students
         prefs.set_pref(user_id, arg, not prefs.get_pref(user_id, arg))
         if arg == "watch_previous_semester":
             rebuild_watched_courses(user_id)

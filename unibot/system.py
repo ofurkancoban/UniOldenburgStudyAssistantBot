@@ -403,7 +403,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               if weather_location else "Uni Oldenburg (default)")
     text += f"\n📍 Weather Location: {weather_location_label}"
 
-    wardrobe_enabled = get_wardrobe_feature_enabled()
+    wardrobe_enabled = bool(get_wardrobe_feature_enabled() and get_pref(user_id, "outfit"))
     text += f"\n👔 Daily Outfit Suggestion: {'✅ On' if wardrobe_enabled else '🔲 Off'}"
 
     study_plan_enabled = get_pref(user_id, "weekly_study_plan")
@@ -714,7 +714,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
                 db.set_user_active(target_id, new_state)
                 notice = f"User {'activated' if new_state else 'blocked'}."
             elif target:
-                new_role = "student" if target["role"] == "admin" else "admin"
+                new_role = "user" if target["role"] == "admin" else "admin"
                 db.set_user_role(target_id, new_role)
                 notice = f"Role updated to {new_role}."
         data = f"admin_user_detail|{target_id}"

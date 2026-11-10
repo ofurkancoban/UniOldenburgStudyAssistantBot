@@ -25,6 +25,7 @@ from unibot.storage import (
 )
 from unibot.telegram_ui import (
     user_data,
+    _delete_status_message,
     _show_typing,
     _start_loading_animation,
     _stop_loading_animation,
@@ -268,6 +269,7 @@ async def handle_course_enroll_confirm(update: Update, context: ContextTypes.DEF
         return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+        await _delete_status_message(status_msg)
 
     if success:
         await query.message.reply_text("✅ Enrolled successfully!")
@@ -359,6 +361,7 @@ async def handle_course_deenroll_confirm(update: Update, context: ContextTypes.D
         return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+        await _delete_status_message(status_msg)
 
     if success:
         await query.message.reply_text("✅ Signed out of the course successfully!")
