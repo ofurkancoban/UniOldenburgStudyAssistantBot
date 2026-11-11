@@ -381,5 +381,27 @@ class FastEnrollShutdownTests(unittest.TestCase):
         self.assertEqual(cleared, [(UID, "s1")])
 
 
+class GwdgQuotaTests(unittest.TestCase):
+    def test_a_duration_reset_header_still_pauses_gwdg(self):
+        from unibot import ai, state
+        self.assertEqual(ai._reset_seconds("3600"), 3600)
+        self.assertEqual(ai._reset_seconds("1h30m"), 5400)
+        self.assertEqual(ai._reset_seconds("45s"), 45)
+        self.assertEqual(ai._reset_seconds("soon"), 3600)
+        headers = {"x-ratelimit-remaining-requests-day": "0", "x-ratelimit-reset-requests-day": "2h"}
+        posted = mock.AsyncMock(return_value=(429, None, headers))
+        http = mock.MagicMock()
+        http.return_value.__aenter__ = mock.AsyncMock(return_value=object())
+        http.return_value.__aexit__ = mock.AsyncMock(return_value=False)
+        with mock.patch.object(ai, "GWDG_API_KEY", "k"), mock.patch.object(ai, "_post_gwdg_chat", posted), \
+                mock.patch.object(ai, "shared_http", http), \
+                mock.patch.object(state, "_gwdg_blocked_until", 0.0):
+            import time as _time
+            before = _time.monotonic()
+            self.assertIsNone(asyncio.run(ai._call_gwdg_chat([{"role": "user", "content": "hi"}], "m")))
+            self.assertGreaterEqual(state._gwdg_blocked_until, before + 7000)
+        posted.assert_awaited_once()  # no second try with a used-up quota
+
+
 if __name__ == "__main__":
     unittest.main()

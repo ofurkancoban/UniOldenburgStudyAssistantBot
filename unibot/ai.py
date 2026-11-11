@@ -214,7 +214,24 @@ def _record_gwdg_quota(headers) -> None:
         remaining = headers.get(f"x-ratelimit-remaining-requests-{window}")
         limit = headers.get(f"x-ratelimit-limit-requests-{window}")
         if remaining is not None and limit is not None:
-            _gwdg_quota[window] = (int(remaining), int(limit))
+            try:
+                _gwdg_quota[window] = (int(remaining), int(limit))
+            except ValueError:
+                logging.debug("Unreadable GWDG quota header: %r / %r", remaining, limit)
+
+
+def _reset_seconds(value, default: int = 3600) -> int:
+    """Seconds until a quota window resets, from a reset header written as
+    plain seconds ("3600"), a duration ("1h30m", "45s", "2m") or anything
+    else (the default), so an unexpected format can't drop the pause."""
+    text = str(value or "").strip().lower()
+    if text.isdigit():
+        return int(text)
+    parts = re.findall(r"(\d+(?:\.\d+)?)\s*(h|m|s|ms)", text)
+    if not parts:
+        return default
+    factor = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
+    return max(1, int(sum(float(n) * factor[u] for n, u in parts)))
 
 
 async def _post_gwdg_chat(session, body: dict, timeout: float) -> tuple:
@@ -244,7 +261,7 @@ async def _call_gwdg_chat(messages: list, model: str, temperature: float = 0, ti
             if status == 429:
                 exhausted = next((w for w in ("month", "day", "hour") if headers.get(f"x-ratelimit-remaining-requests-{w}") == "0"), None)
                 if exhausted:
-                    wait = int(headers.get(f"x-ratelimit-reset-requests-{exhausted}", 3600))
+                    wait = _reset_seconds(headers.get(f"x-ratelimit-reset-requests-{exhausted}"))
                     state._gwdg_blocked_until = time.monotonic() + wait
                     logging.warning("GWDG %s quota used up, using fallbacks for %ss", exhausted, wait)
                     return None
