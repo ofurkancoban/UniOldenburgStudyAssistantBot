@@ -1016,36 +1016,6 @@ async def _selection_message(update, context, query, data, user_id):
     if not msg_id:
         await query.message.reply_text("⚠️ Message ID not found.")
         return
-    # ── Step 1: fetch planner page to get CSRF token & API URL ───────
-    # This block seems misplaced here, as it's about planner/calendar, not messages.
-    # Assuming it's intended for debugging or a future feature related to calendar.
-    # It requires 'session' and 'index_url' to be defined in this scope.
-    # For now, I'm placing it as requested, but it might cause NameError if not defined.
-    # async with await session.get(index_url) as r: # Commented out as session/index_url are not defined here.
-    #     page_html = await r.text()
-
-    # csrf_token = ""
-    # # Log all discovered event/calendar URLs from the HTML
-    # found_urls = _re.findall(r"['\"]([^'\"]*calendar[^'\"]*)['\"]", page_html)
-    # found_urls += _re.findall(r"['\"]([^'\"]*events[^'\"]*)['\"]", page_html)
-    # logging.info("📅 Discovered URLs in planner HTML:")
-    # for u in set(found_urls):
-    #     logging.info(f"   - {u}")
-
-    # # Also grab any JS lines defining FullCalendar source
-    # lines = [line for line in page_html.split('\n') if 'url' in line.lower() or 'events' in line.lower() or 'source' in line.lower()]
-    # logging.info("📅 Discovered Source JS lines:")
-    # for i, line in enumerate(lines[:15]):
-    #     logging.info(f"   L{i}: {line.strip()[:100]}")
-
-    # # STUDIP.CSRF_TOKEN = { name: '...', value: 'TOKEN' }
-    # m = _re.search(r"security_token['\"]?\s*[,:]\s*['\"]([A-Za-z0-9+/=_.\-]{10,})['\"]", page_html)
-    # if m:
-    #     csrf_token = m.group(1)
-    #     logging.info(f"📅 CSRF token: {csrf_token[:12]}...")
-    # The above block is commented out as it seems to be for a different context (calendar/planner)
-    # and would require `session`, `index_url`, and `_re` to be imported/defined.
-
     try:
         logging.info("📨 Opening message ID %s via direct URL...", msg_id)
 

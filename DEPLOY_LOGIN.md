@@ -22,7 +22,6 @@ full access to the Stud.IP account, so it is locked down:
 
    ```ini
    CLOUDFLARE_TUNNEL=quick
-   # SET_MENU_BUTTON=true   # optional: Mini App as the chat menu button
    ```
 
 3. Restart the bot. It starts `cloudflared tunnel --url http://127.0.0.1:8899`

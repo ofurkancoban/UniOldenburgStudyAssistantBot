@@ -14,7 +14,7 @@ The ultimate Telegram companion for students at the **University of Oldenburg**.
 
 ## 🔌 How It Talks to Stud.IP
 
-Courses, files and folders, announcements, messages and forum posts are read from Stud.IP's own JSON:API (`/jsonapi.php/v1`), using the same logged-in session as the web pages, so no API registration is needed. Each of them falls back to reading the HTML page if the API ever fails. Logging in (SSO with TOTP), enrolment and everything from StuMS (exam dates, registration, grades) still go through the web pages, since there is no API for them.
+Courses, files and folders, announcements, messages and forum posts are read from Stud.IP's own JSON:API (`/jsonapi.php/v1`), using the same logged-in session as the web pages, so no API registration is needed. Each of them falls back to reading the HTML page if the API ever fails. Signing in (the university SSO, done by the student in the /login Mini App), enrolment and everything from StuMS (exam dates, registration, grades) still go through the web pages, since there is no API for them.
 
 All outgoing requests to Stud.IP, StuMS, and NetIQ SSO can optionally be routed through a **Cloudflare Worker reverse proxy** (`CLOUDFLARE_WORKER_URL`). This routes bot requests through Cloudflare's rotating edge IPs to preserve privacy and mask the VPS host IP, while preserving session cookies and redirects. If unset, the bot falls back directly to transparent native requests.
 
@@ -164,14 +164,12 @@ chmod +x setup.sh
 ## ⚙️ Configuration (`.env`)
 
 ```ini
-# --- Credentials ---
-USERNAME=your_studip_id
-PASSWORD=your_password
+# --- Telegram ---
+# No Stud.IP password is kept here: each student signs in through the /login Mini App
 TELEGRAM_TOKEN=your_bot_token
 
 # --- Authentication ---
-ALLOWED_USER_IDS=123456,789012  # Required. Comma separated; left empty, everyone is rejected
-TOTP_SECRET=YOUR_KEY            # Optional: If 2FA/App Authenticator is enabled
+ALLOWED_USER_IDS=123456,789012  # Administrators from the environment (comma separated); students join with an invite code
 USE_STUDIP_OAUTH=false          # true: JSON:API calls also carry an OAuth2 bearer token
 # SESSION_ENCRYPTION_KEY=...    # Optional: else a random key is created in .vault_key
 

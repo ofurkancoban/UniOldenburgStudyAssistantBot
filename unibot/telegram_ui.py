@@ -17,11 +17,10 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
-    Update,
 )
 from telegram.constants import ChatAction
 from telegram.error import Forbidden, RetryAfter, TelegramError
-from telegram.ext import BaseRateLimiter, ContextTypes
+from telegram.ext import BaseRateLimiter
 
 from studip_utils import aread_bytes
 from studip_utils import md_escape as _md
@@ -363,24 +362,6 @@ async def _reply_or_edit(sender, text, reply_markup=None, parse_mode=None):
         except Exception as e:
             logging.debug("_reply_or_edit: edit failed, falling back to reply: %s", e)
     return await sender.reply_text(text, **kwargs)
-
-
-def _normalize_button_text(s: str) -> str:
-    # Clean leading/trailing spaces and repeated whitespace
-    return " ".join((s or "").strip().split())
-
-
-async def delete_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Delete any free text that isn't a valid keyboard command."""
-    try:
-        if not update.message or not update.message.text:
-            return
-        text = _normalize_button_text(update.message.text)
-        if text.startswith(("📁", "⬇️", "📚", "📅", "✅", "🍽️", "📘", "📊", "📝", "🔄", "⚙️", "🔁", "ℹ️", "🎯")):
-            return
-        await update.message.delete()
-    except TelegramError:
-        pass
 
 
 MAIN_KEYBOARD_ROWS = (

@@ -11,9 +11,9 @@ Why this works without ever needing to log in again:
      on the bot, so all cookies (`Studip_Session`, `JSESSIONID`, `_PA_SDK_SSO_`,
      `x-oidp-session*`) land directly in the bot's cookie jar.
   2. The moment the SSO redirect finishes and reaches Stud.IP, the bot saves
-     the cookies to `studip_cookies.json` and runs the OAuth2 PKCE consent flow
-     in the background to mint `studip_oauth_tokens.json` (access_token +
-     refresh_token).
+     the cookies encrypted in that student's own record of the database and,
+     when OAuth is enabled, runs the OAuth2 PKCE consent flow in the
+     background to store their access and refresh token the same way.
   3. Access to the proxy is strictly gated by Telegram Mini App `initData` HMAC
      verification (checked against `ALLOWED_USER_IDS`) or a single-use `/login`
      token.

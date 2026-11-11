@@ -445,5 +445,39 @@ class TaskTimePhraseTests(unittest.TestCase):
                 self._p(text)
 
 
+class EnvDocumentationTests(unittest.TestCase):
+    """Every setting .env.example documents is read by the code; nothing
+    documents a password, 2FA key or switch that does nothing."""
+
+    def test_every_documented_setting_is_used(self):
+        import re
+        import subprocess
+        files = subprocess.run(["git", "ls-files", "*.py", "*.js"], cwd=ROOT, capture_output=True, text=True).stdout.split()
+        code = ""
+        for name in files:
+            if name.startswith(("tests/", "whatsapp_service/package")):
+                continue
+            with open(os.path.join(ROOT, name), encoding="utf-8") as fh:
+                code += fh.read()
+        with open(os.path.join(ROOT, ".env.example"), encoding="utf-8") as fh:
+            keys = re.findall(r"^#?\s*([A-Z][A-Z0-9_]{3,})=", fh.read(), re.MULTILINE)
+        self.assertTrue(keys)
+        unused = [k for k in keys if k not in code]
+        self.assertEqual(unused, [], f"documented but never read: {unused}")
+
+    def test_no_password_settings_are_documented(self):
+        for name in (".env.example", "README.md"):
+            with open(os.path.join(ROOT, name), encoding="utf-8") as fh:
+                text = fh.read()
+            for key in ("PASSWORD=", "TOTP_SECRET=", "HEADLESS=", "SET_MENU_BUTTON="):
+                self.assertNotIn(key, text, f"{name} documents {key}")
+
+
+class DeadCodeTests(unittest.TestCase):
+    def test_the_unused_text_deleter_is_gone(self):
+        from unibot import telegram_ui
+        self.assertFalse(hasattr(telegram_ui, "delete_text"))
+
+
 if __name__ == "__main__":
     unittest.main()
