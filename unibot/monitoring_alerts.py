@@ -22,6 +22,7 @@ from unibot.formatting import (
 )
 from unibot.monitoring_fetch import FORUM_OMITTED
 from unibot.storage import link_cache, persistent_callback_cache
+from unibot.studip_api import file_date_sort_key
 from unibot.telegram_ui import (  # noqa: F401 - broadcast is re-exported for callers
     broadcast,
     markup_for,
@@ -130,7 +131,7 @@ def _full_file_sender(it: dict, text: str, keyboard, downloader_uid: Optional[in
 async def _send_file_alerts(bot, events: list) -> None:
     """Send file notifications in chronological order, each with download
     buttons, to every follower in their own format."""
-    for it in sorted(events, key=lambda x: (x["dt"], x["course"], x["name"])):
+    for it in sorted(events, key=lambda x: (file_date_sort_key(x["dt"]), x["course"], x["name"])):
         try:
             sid = _short_id()
             downloader = next(iter(sorted(course_members(it.get("cid")) or ())), None) \

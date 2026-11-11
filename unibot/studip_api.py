@@ -917,20 +917,18 @@ def _parse_file_date_v2(modified_text: str | None, modified_iso: str | None):
 
     # Simple regex for "x unit ago" pattern
     # Matches: "vor 10 Min", "10 min ago", "vor 1 Std", "1 hour ago"
-    m_rel = re.search(r'(?:vor|ago)?\s*(\d+)\s*(?:Min|min|Std|hour|Stunde|M|h)', s, re.IGNORECASE)
+    # Only a "vor ..." or "... ago" phrase counts: a date like "12 Mai 2025"
+    # must not be read as "12 minutes ago".
+    m_rel = (re.search(r'\bvor\s+(\d+)\s*(min|std|stunde|h)', s, re.IGNORECASE)
+             or re.search(r'\b(\d+)\s*(min|hour|hr|h)\w*\.?\s+ago\b', s, re.IGNORECASE))
     if m_rel:
-        try:
-            val = int(m_rel.group(1))
-            unit = m_rel.group(0).lower()
-            if 'h' in unit or 'std' in unit or 'stunde' in unit:
-                return now - timedelta(hours=val)
-            else:
-                return now - timedelta(minutes=val)
-        except ValueError:
-            pass
+        val = int(m_rel.group(1))
+        if m_rel.group(2).lower() == "min":
+            return now - timedelta(minutes=val)
+        return now - timedelta(hours=val)
 
     # "Just now" / "Gerade eben"
-    if any(k in s.lower() for k in ["gerade", "just now", "now", "soeben"]):
+    if any(k in s.lower() for k in ["gerade", "just now", "soeben"]) or s.lower() == "now":
         return now
 
     # B) Time only (HH:MM) -> Assume today
@@ -958,6 +956,12 @@ def _parse_file_date_v2(modified_text: str | None, modified_iso: str | None):
             pass
 
     return datetime.min
+
+
+def file_date_sort_key(dt: datetime) -> float:
+    """A sortable number for a _parse_file_date_v2 result: listings mix naive
+    dates and ISO stamps with an offset, which can't be compared directly."""
+    return float("-inf") if dt == datetime.min else dt.timestamp()
 
 
 def _api_message(m: dict, names: dict) -> dict:

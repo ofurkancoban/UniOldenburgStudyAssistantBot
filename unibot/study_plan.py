@@ -63,6 +63,7 @@ from unibot.auth import current_user_id, get_user_session, has_stored_login, is_
 from unibot.studip_api import (
     _ensure_watched_courses_map,
     _parse_file_date_v2,
+    file_date_sort_key,
     _switch_semester_filter,
     list_courses,
     list_files,
@@ -1768,14 +1769,15 @@ STUDY_PACK_KINDS = ("problem_set", "slides")  # newest file of each kind is offe
 def pick_study_pack_files(files: list, kinds: tuple[str, ...] = STUDY_PACK_KINDS) -> list[dict]:
     """The newest file of each of `kinds` among a course's (folder, item)
     files, in the order of `kinds` (default: problem set, then slides)."""
-    newest: dict[str, tuple[datetime, dict]] = {}
+    newest: dict[str, tuple[float, dict]] = {}
     for folder, item in files:
         kind = classify_workload_file(item.get("name") or "", folder)
         if kind not in kinds or not item.get("url"):
             continue
         dt = _parse_file_date_v2(item.get("modified"), item.get("modified_iso"))
-        if kind not in newest or dt > newest[kind][0]:
-            newest[kind] = (dt, {**item, "kind": kind})
+        ts = file_date_sort_key(dt)
+        if kind not in newest or ts > newest[kind][0]:
+            newest[kind] = (ts, {**item, "kind": kind})
     return [newest[k][1] for k in kinds if k in newest]
 
 

@@ -238,5 +238,32 @@ class LegacyPrivateRecordTests(unittest.TestCase):
         self.assertEqual(db.get_user_scope(uid).private("exam_cache"), {"known_grades": {"M1": "1.0"}})
 
 
+class FileDateTests(unittest.TestCase):
+    def test_a_written_out_date_is_not_minutes_ago(self):
+        from unibot.studip_api import _parse_file_date_v2
+        self.assertEqual(_parse_file_date_v2("12 May 2025", None), datetime(2025, 5, 12))
+        self.assertEqual(_parse_file_date_v2("3 Nov 2025", None), datetime(2025, 11, 3))
+        from studip_utils import berlin_now
+        now = berlin_now()
+        for text, minutes in (("vor 10 Minuten", 10), ("vor 2 Std.", 120), ("5 minutes ago", 5), ("1 hour ago", 60)):
+            dt = _parse_file_date_v2(text, None)
+            self.assertAlmostEqual((now - dt).total_seconds() / 60, minutes, delta=1, msg=text)
+
+    def test_newest_pack_file_with_mixed_stamps(self):
+        files = [("Uebungen", {"name": "Blatt 1.pdf", "url": "u1", "modified": "01.10.2025 10:00"}),
+                 ("Uebungen", {"name": "Blatt 2.pdf", "url": "u2", "modified": "02.10.2025",
+                               "modified_iso": "2025-10-02T09:00:00+02:00"})]
+        (picked,) = study_plan.pick_study_pack_files(files, ("problem_set",))
+        self.assertEqual(picked["name"], "Blatt 2.pdf")
+
+    def test_file_alerts_with_mixed_stamps_are_sent(self):
+        from unibot import monitoring_alerts
+        from unibot.monitoring_diff import _file_events
+        events = _file_events("Stats", "c1", [{"name": "a.pdf", "modified": "01.10.2025 10:00"},
+                                              {"name": "b.pdf", "modified_iso": "2025-10-02T09:00:00+02:00"}], [])
+        with mock.patch.object(monitoring_alerts, "course_members", lambda cid: set()):
+            asyncio.run(monitoring_alerts._send_file_alerts(mock.AsyncMock(), events))
+
+
 if __name__ == "__main__":
     unittest.main()
