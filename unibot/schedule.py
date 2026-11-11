@@ -775,7 +775,7 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
     """Send a specific day's schedule with a 'Week Plan' button. Matches backup UI."""
     today_events = [ev for ev in events if ev["date_key"] == target_date]
     weather = await get_weather_snapshot(target_date)
-    weather_block = f"\n\n{build_weather_text_line(weather)}" if weather else ""
+    weather_block = f"\n\n{build_weather_text_line(weather, escape=_md)}" if weather else ""
 
     if not today_events:
         text = (

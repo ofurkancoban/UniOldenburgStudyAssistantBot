@@ -38,6 +38,80 @@ def truncate_html(text: str, limit: int = TELEGRAM_HTML_LIMIT, marker: str = "â€
     return cut + marker + "".join(f"</{name}>" for name in reversed(open_tags))
 
 
+def escaped_chunks(text: str, limit: int) -> list[str]:
+    """`text` HTML-escaped and cut into parts that are each at most `limit`
+    characters once escaped (escaping makes '&' five characters and '<' four,
+    so cutting the plain text first can overshoot Telegram's limit)."""
+    parts: list[str] = []
+    current: list[str] = []
+    size = 0
+    for ch in text:
+        piece = html.escape(ch, quote=False)
+        if size + len(piece) > limit:
+            parts.append("".join(current))
+            current, size = [], 0
+        current.append(piece)
+        size += len(piece)
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+def split_html(text: str, limit: int = 3800) -> list[str]:
+    """Telegram HTML cut into messages of at most `limit` characters. A cut
+    falls between tags, preferably at a line break; a tag still open there is
+    closed and opened again at the start of the next part, so every part is
+    valid on its own. Text longer than the limit is cut inside the text,
+    never inside a tag or an entity."""
+    tokens: list[str] = []
+    for part in re.split(r"(<[^>]*>)", text):
+        if not part:
+            continue
+        if part.startswith("<") and part.endswith(">"):
+            tokens.append(part)
+            continue
+        for line in part.splitlines(keepends=True):
+            while len(line) > limit // 2:
+                cut = limit // 2
+                head = re.sub(r"&#?[a-zA-Z0-9]*$", "", line[:cut]) or line[:cut]
+                tokens.append(head)
+                line = line[len(head):]
+            tokens.append(line)
+
+    parts: list[str] = []
+    open_tags: list[tuple[str, str]] = []  # (name, opening tag)
+    current = ""
+
+    def closing() -> str:
+        return "".join(f"</{name}>" for name, _ in reversed(open_tags))
+
+    def flush() -> None:
+        nonlocal current
+        if current.strip():
+            parts.append(current.rstrip("\n") + closing())
+        current = "".join(tag for _, tag in open_tags)
+
+    for token in tokens:
+        if len(current) + len(token) + len(closing()) + 20 > limit:
+            flush()
+        current += token
+        m = re.fullmatch(r"<(/?)([a-zA-Z-]+)[^>]*>", token)
+        if m:
+            name = m.group(2).lower()
+            if m.group(1):
+                for i in range(len(open_tags) - 1, -1, -1):
+                    if open_tags[i][0] == name:
+                        del open_tags[i]
+                        break
+            else:
+                open_tags.append((name, token))
+        elif token.endswith("\n") and len(current) > limit * 0.8:
+            flush()  # prefer a cut at a line break
+    if current.strip():
+        parts.append(current.rstrip("\n"))
+    return parts
+
+
 def clean_for_html(text: str) -> str:
     """Clean text for HTML parse mode."""
     if not text:

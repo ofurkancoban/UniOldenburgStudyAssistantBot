@@ -25,6 +25,7 @@ from telegram.ext import BaseRateLimiter, ContextTypes
 
 from studip_utils import aread_bytes
 from studip_utils import md_escape as _md
+from unibot.formatting import split_html
 from studip_utils import safe_filename as _safe_filename
 from unibot import db, state
 from unibot.config import ADMIN_USER_IDS, ALLOWED_USER_IDS
@@ -416,13 +417,6 @@ async def _download_telegram_file(bot, file_id: str) -> Optional[bytes]:
 
 
 def _split_message(text: str, limit: int = 3800) -> list:
-    """Telegram caps messages at 4096 chars; split on line boundaries."""
-    chunks, chunk = [], ""
-    for line in text.split("\n"):
-        if len(chunk) + len(line) + 1 > limit and chunk:
-            chunks.append(chunk.rstrip("\n"))
-            chunk = ""
-        chunk += line + "\n"
-    if chunk.strip():
-        chunks.append(chunk.rstrip("\n"))
-    return chunks
+    """Telegram caps messages at 4096 chars; cut HTML text into parts that are
+    each valid HTML (see formatting.split_html)."""
+    return split_html(text, limit)

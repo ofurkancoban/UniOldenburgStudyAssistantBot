@@ -59,10 +59,10 @@ QUESTIONS = (
     ("sem", "🗓️ Your semester",
      "📁 Files, Browse Courses and Sign Out open this semester directly. Change it later in /status.", True),
     ("ai_personal", "🤖 AI may use timetable, tasks, exams",
-     "Needed for the spoken morning summary, 🔊 Listen and spoken questions. They are made by an outside AI "
-     "service (OpenRouter) and then see your timetable, tasks, exams, first name and weather place.", True),
+     "Needed for the spoken morning summary, 🔊 Listen and spoken questions. They are made by outside AI "
+     "services (GWDG, OpenRouter), which then see your timetable, tasks, exams, first name and weather place.", True),
     ("ai_grades", "🤖 AI may use your grades",
-     "Lets you ask the assistant about your grades. They are sent to the outside AI service (OpenRouter) "
+     "Lets you ask the assistant about your grades. They are sent to the outside AI services (GWDG, OpenRouter) "
      "only for that question.", True),
     ("campus_anchor", "🏫 Home campus",
      "Used for study spots and the mensa when your classes don't say where you are.", False),
@@ -264,8 +264,8 @@ def setup_view(user_id: int, options: list, current: Optional[str]) -> tuple:
         "All your choices are below in one place. Tap an option to pick it (✅ is the current one), "
         "or a question's title to see what it does.\n\n"
         "<b>1 to 3 need your answer.</b> The others already have a usual setting.\n"
-        "🤖 <i>2 and 3: the spoken morning summary, 🔊 Listen and spoken questions are made by an outside "
-        "AI service (OpenRouter). Nothing personal goes there unless you say yes.</i>\n\n"
+        "🤖 <i>2 and 3: the spoken morning summary, 🔊 Listen and spoken questions are made by outside "
+        "AI services (GWDG, OpenRouter; speech recognition may use Google). Nothing personal goes there unless you say yes.</i>\n\n"
         "Everything stays changeable in /settings (the semester in /status).\n\n" + status
     )
     return text, InlineKeyboardMarkup(rows)

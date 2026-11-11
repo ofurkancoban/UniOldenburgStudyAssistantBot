@@ -12,7 +12,7 @@ import aiohttp
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from studip_utils import TZ_BERLIN
+from studip_utils import TZ_BERLIN, html_escape
 
 from unibot import db
 from unibot.telegram_ui import user_data
@@ -272,11 +272,16 @@ async def get_weather_snapshot(target_date=None, user_id=None) -> Optional[dict]
         return None
 
 
-def build_weather_text_line(weather: dict) -> str:
+def build_weather_text_line(weather: dict, escape=None) -> str:
     """Short, deterministic weather + clothing line for the text message -
     LLM-independent, so it's always available even when OpenRouter isn't.
     The voice narration gets the raw snapshot instead and phrases its own
-    advice (see build_ai_daily_plan_narration)."""
+    advice (see build_ai_daily_plan_narration).
+
+    The place and description are free text (the student typed the place):
+    `escape` makes them safe for the markup of the message the line goes into
+    (HTML by default, studip_utils.md_escape for the Markdown schedule)."""
+    escape = escape or html_escape
     tips = []
     if weather["is_wet"]:
         tips.append("bring an umbrella/waterproof jacket")
@@ -286,7 +291,7 @@ def build_weather_text_line(weather: dict) -> str:
         tips.append("light clothing should do")
     tip_text = ", ".join(tips) if tips else "no special prep needed"
     return (
-        f"{weather['emoji']} Weather in {weather['location_name']}: {weather['description']}, {weather['temp_min']:.0f}–{weather['temp_max']:.0f}°C, "
+        f"{weather['emoji']} Weather in {escape(weather['location_name'])}: {escape(weather['description'])}, {weather['temp_min']:.0f}–{weather['temp_max']:.0f}°C, "
         f"{weather['precip_chance']}% chance of rain - {tip_text}"
     )
 

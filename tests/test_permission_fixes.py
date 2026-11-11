@@ -59,9 +59,9 @@ class WatchCommandTests(unittest.TestCase):
                 mock.patch.object(monitoring, "is_user_admin", lambda uid: True), \
                 mock.patch.object(watcher, "start_unified_watcher", start), \
                 mock.patch.object(state, "watcher_controller_running", True), \
-                mock.patch.object(state, "file_watcher_paused", True):
+                mock.patch.object(state, "global_watcher_paused", True):
             asyncio.run(monitoring.watch(_message_update(1), mock.MagicMock()))
-            self.assertFalse(state.file_watcher_paused)
+            self.assertFalse(state.global_watcher_paused)
         start.assert_not_called()
         with mock.patch.object(monitoring, "is_user_allowed", lambda uid: True), \
                 mock.patch.object(monitoring, "is_user_admin", lambda uid: True), \

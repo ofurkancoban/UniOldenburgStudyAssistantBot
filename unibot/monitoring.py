@@ -1469,7 +1469,6 @@ async def watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # never a second watcher loop: start the one watcher if it isn't running, else resume it
     from unibot.watcher import start_unified_watcher
     state.global_watcher_paused = False
-    state.message_watcher_paused = state.announcement_watcher_paused = state.file_watcher_paused = False
     if state.watcher_controller_running:
         await message.reply_text("👀 The watcher is running (paused checks resumed).", disable_notification=True)
         return

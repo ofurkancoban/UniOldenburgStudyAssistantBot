@@ -82,9 +82,6 @@ _morning_delivery_tasks: dict = {}  # "YYYY-MM-DD#HH:MM" -> task sending that sl
 #  CALLBACK ROUTER + REPLY KEYBOARD + MAIN BOT LOOP
 # ──────────────────────────────────────────────────────────────────────────────
 # Separate pause control for each watcher:
-message_watcher_paused = False
-announcement_watcher_paused = False
-file_watcher_paused = False
 _gwdg_blocked_until = 0.0
 
 # cid -> set of telegram ids taking that course (built by monitoring.watched_courses)

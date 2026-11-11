@@ -42,7 +42,7 @@ from unibot.storage import (
     shared_http,
     task_due,
 )
-from unibot.formatting import _short_id, clean_html_text
+from unibot.formatting import _short_id, clean_html_text, escaped_chunks
 from unibot.telegram_ui import (
     user_data,
     _breadcrumb,
@@ -614,17 +614,13 @@ async def _status_button_fastenroll_list_inline(update, context, query):
 
 async def _status_button_start_watchers(update, context, query):
     """Status button handlers: start_watchers."""
-    state.message_watcher_paused = False
-    state.announcement_watcher_paused = False
-    state.file_watcher_paused = False
+    state.global_watcher_paused = False  # the one flag the watcher controller and the message poll read
     await query.edit_message_text("▶️ All watchers resumed.")
 
 
 async def _status_button_stop_watchers(update, context, query):
     """Status button handlers: stop_watchers."""
-    state.message_watcher_paused = True
-    state.announcement_watcher_paused = True
-    state.file_watcher_paused = True
+    state.global_watcher_paused = True
     await query.edit_message_text("⏸️ All watchers paused.")
 
 
@@ -1103,8 +1099,8 @@ async def _selection_message(update, context, query, data, user_id):
             "━━━━━━━━━━━━━━━━━━\n"
         )
 
-        # split the plain text first, then escape each part, so no entity is cut
-        chunks = [_h(content[i:i + 3500]) for i in range(0, len(content), 3500)]
+        # escaped parts that each fit the limit (escaping grows '&' and '<'), no entity is cut
+        chunks = escaped_chunks(content, 3500)
         if chunks:
             await query.message.reply_text(f"{header}{chunks[0]}", parse_mode="HTML")
             for part in chunks[1:]:

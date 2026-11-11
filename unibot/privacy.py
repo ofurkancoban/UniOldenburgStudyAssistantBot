@@ -74,8 +74,8 @@ def privacy_view(user_id: int, now: Optional[datetime] = None, note: str = "") -
         f"🤖 Assistant may use your grades: {'✅ Yes' if ai_on else '🔲 No'}\n\n"
         "<i>Grades, exam registrations and fee status are stored encrypted with a key of your own and "
         "fetched only with your own login. Alerts about them go only to this chat.</i>\n\n"
-        "<i>The spoken morning summary, 🔊 Listen and spoken questions are made by an outside AI service "
-        "(OpenRouter). They use your timetable, tasks, exams, first name and weather place only when you "
+        "<i>The spoken morning summary, 🔊 Listen and spoken questions are made by outside AI services "
+        "(GWDG and OpenRouter; speech recognition may use Google). They use your timetable, tasks, exams, first name and weather place only when you "
         "allow it; grades need their own permission.</i>"
     )
     if note:
