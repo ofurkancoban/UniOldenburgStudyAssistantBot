@@ -638,5 +638,80 @@ class PersonalCalendarWindowTests(unittest.TestCase):
         self.assertIn("Personal calendar events unavailable", " ".join(logs.output))
 
 
+class CourseDatesOutsideTheTimetableTests(unittest.TestCase):
+    """A course whose dates are all single appointments (a mentor programme, a
+    block seminar) is not in /users/{id}/schedule; its dates still belong in the
+    calendar."""
+
+    COURSE = "mentorcourse"
+
+    def setUp(self):
+        from unibot import schedule
+        schedule._COURSE_EVENTS_CACHE.clear()
+        self.addCleanup(schedule._COURSE_EVENTS_CACHE.clear)
+        self.calls = []
+
+    def _dates(self):
+        def date(start, end, **extra):
+            return {"id": start, "attributes": {"title": "Mentor programme cohort 3", "start": start, "end": end,
+                                                 "location": extra.get("location", ""), "is-cancelled": extra.get("cancelled", False)},
+                    "meta": {"topics": [{"title": "Mentor meeting"}]} if extra.get("topic") else {}}
+        return [date("2023-11-07T10:15:00+01:00", "2023-11-07T11:15:00+01:00"),   # years ago
+                date("2026-11-09T09:00:00+01:00", "2026-11-09T10:00:00+01:00", topic=True),  # Monday
+                date("2026-11-24T19:00:00+01:00", "2026-11-24T22:00:00+01:00")]    # a later week
+
+    def _week(self, fail_for=()):
+        from datetime import date
+        from unibot import schedule
+
+        async def get_all(path, params=None, session=None, user_id=None):
+            self.calls.append(path)
+            if path == f"/courses/{self.COURSE}/events":
+                if self.COURSE in fail_for:
+                    raise RuntimeError("HTTP 403")
+                return self._dates(), []
+            return [], []
+
+        with mock.patch.object(schedule, "studip_api_get_all", get_all), \
+                mock.patch.object(schedule, "studip_api_user_id", mock.AsyncMock(return_value="u1")), \
+                mock.patch.object(schedule, "fetch_user_schedule_api", mock.AsyncMock(return_value=[])), \
+                mock.patch.object(schedule, "student_courses", lambda uid: {self.COURSE: "Mentor programme"}), \
+                mock.patch.object(schedule, "_fetch_course_rooms_map", mock.AsyncMock(return_value={})):
+            return asyncio.run(schedule.get_calendar_events(object(), date(2026, 11, 9), user_id=UID))
+
+    def test_the_monday_meeting_shows_and_other_weeks_do_not(self):
+        events = self._week()
+        self.assertEqual([e["start_dt"].strftime("%a %H:%M") for e in events], ["Mon 09:00"])
+        self.assertEqual(events[0]["topics"], ["Mentor meeting"])
+        self.assertFalse(events[0]["is_cancelled"])
+
+    def test_the_course_is_asked_once_within_ten_minutes(self):
+        self._week()
+        self._week()
+        self.assertEqual(self.calls.count(f"/courses/{self.COURSE}/events"), 1)
+
+    def test_a_course_that_cannot_be_read_does_not_break_the_calendar(self):
+        self.assertEqual(self._week(fail_for=(self.COURSE,)), [])
+        from unibot import schedule
+        self.assertNotIn(self.COURSE, schedule._COURSE_EVENTS_CACHE)  # a failure is not remembered
+
+    def test_a_timetable_course_is_not_asked_twice(self):
+        from datetime import date
+        from unibot import schedule
+        slot = {"id": "s1", "type": "x", "title": "Lecture", "description": "", "start": "10:00", "end": "12:00",
+                "weekday": 2, "location": "A1", "recurrence": {}, "course_id": self.COURSE}
+
+        async def get_all(path, params=None, session=None, user_id=None):
+            self.calls.append(path)
+            return [], []
+
+        with mock.patch.object(schedule, "studip_api_get_all", get_all), \
+                mock.patch.object(schedule, "studip_api_user_id", mock.AsyncMock(return_value="u1")), \
+                mock.patch.object(schedule, "fetch_user_schedule_api", mock.AsyncMock(return_value=[slot])), \
+                mock.patch.object(schedule, "student_courses", lambda uid: {self.COURSE: "Lecture"}):
+            asyncio.run(schedule._get_calendar_events_api(date(2026, 11, 9), user_id=UID, session=object()))
+        self.assertEqual(self.calls.count(f"/courses/{self.COURSE}/events"), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

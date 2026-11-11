@@ -343,6 +343,8 @@ async def fetch_user_schedule_api(timestamp: Optional[int] = None, user_id: Opti
 
 
 USER_EVENTS_WINDOW_DAYS = 14  # how far ahead one /users/{id}/events request looks
+EXTRA_COURSE_EVENTS_CACHE_SECONDS = 600  # dates of courses outside the weekly timetable
+_COURSE_EVENTS_CACHE: dict[str, tuple[float, list]] = {}  # cid -> (expires at, /courses/{cid}/events data)
 
 
 async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[int] = None, session: Optional[object] = None) -> list[dict]:
@@ -390,7 +392,28 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
             logging.debug("_get_calendar_events_api: /courses/%s/events failed: %s", cid, exc)
             return cid, []
 
-    course_results = await asyncio.gather(*(_fetch_course_evs(cid) for cid in sorted(course_ids)))
+    # Courses outside the weekly timetable (/users/{id}/schedule lists only regular
+    # slots) keep their dates as single appointments: a mentor programme, a block
+    # seminar, a colloquium. Their dates are read too, from a short-lived cache.
+    owned = student_courses(user_id) if user_id else dict(state.courses_map)
+    extra_ids = set(owned) - course_ids
+
+    async def _fetch_extra_course_evs(cid: str) -> tuple[str, list]:
+        cached = _COURSE_EVENTS_CACHE.get(cid)
+        if cached and cached[0] > time.time():
+            return cid, cached[1]
+        try:
+            data, _ = await studip_api_get_all(f"/courses/{cid}/events", session=session, user_id=user_id)
+        except Exception as exc:
+            logging.debug("_get_calendar_events_api: /courses/%s/events failed: %s", cid, exc)
+            return cid, []
+        _COURSE_EVENTS_CACHE[cid] = (time.time() + EXTRA_COURSE_EVENTS_CACHE_SECONDS, data)
+        return cid, data
+
+    course_results = await asyncio.gather(
+        *(_fetch_course_evs(cid) for cid in sorted(course_ids)),
+        *(_fetch_extra_course_evs(cid) for cid in sorted(extra_ids)),
+    )
     courses_with_concrete_events: set[str] = set()
 
     for cid, ev_list in course_results:
