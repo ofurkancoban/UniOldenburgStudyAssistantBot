@@ -268,7 +268,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━\n"
             "🎓 <b>Student Account Status</b>\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Stud.IP Account:</b> {profile_name or 'Not linked'}\n"
+            f"👤 <b>Stud.IP Account:</b> {html.escape(profile_name or 'Not linked')}\n"
             f"🔑 <b>Connection:</b> {studip_status}\n"
             f"📆 <b>Current Semester:</b> {default_semester_label}\n"
             f"📍 <b>Campus / Weather:</b> {weather_location_label}\n"

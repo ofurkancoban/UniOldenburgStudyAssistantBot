@@ -320,5 +320,25 @@ class MessageAlertTests(unittest.TestCase):
         self.assertIn("Short", texts[1])
 
 
+class StatusCommandTests(unittest.TestCase):
+    def test_a_students_studip_name_is_escaped(self):
+        from unibot import system
+
+        class _Sess:
+            async def is_logged_in(self):
+                return True
+
+        message = mock.AsyncMock()
+        update = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=UID), message=message)
+        with mock.patch.object(system, "is_user_admin", return_value=False), \
+                mock.patch.object(system, "get_user_session", lambda uid=None: _Sess()), \
+                mock.patch.object(system, "get_studip_user_profile", mock.AsyncMock(return_value={"formatted_name": "Hans & <Gretel>"})), \
+                mock.patch.object(system, "_login_public_url", lambda: "http://localhost"):
+            asyncio.run(system.status_command(update, None))
+        text = message.reply_text.call_args.args[0]
+        self.assertIn("Hans &amp; &lt;Gretel&gt;", text)
+        self.assertNotIn("<Gretel>", text)
+
+
 if __name__ == "__main__":
     unittest.main()

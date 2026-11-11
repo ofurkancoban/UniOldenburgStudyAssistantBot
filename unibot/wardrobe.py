@@ -403,6 +403,9 @@ async def handle_wardrobe_remove(update: Update, context: ContextTypes.DEFAULT_T
 
 async def handle_wardrobe_clear_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_user_admin(query.from_user.id):
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
+        return
     await query.answer()
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Yes, clear all", callback_data="wardrobe_clear_confirm"),
@@ -413,6 +416,9 @@ async def handle_wardrobe_clear_ask(update: Update, context: ContextTypes.DEFAUL
 
 async def handle_wardrobe_clear_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_user_admin(query.from_user.id):
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
+        return
     await query.answer("Cleared")
     user_id = query.from_user.id
     clear_wardrobe_items(user_id)
