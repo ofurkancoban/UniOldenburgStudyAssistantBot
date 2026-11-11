@@ -265,5 +265,42 @@ class FileDateTests(unittest.TestCase):
             asyncio.run(monitoring_alerts._send_file_alerts(mock.AsyncMock(), events))
 
 
+class ExamReminderEscapingTests(unittest.TestCase):
+    def test_form_and_examiner_are_escaped(self):
+        import exam_reminder
+        sent = []
+
+        async def broadcast(bot, text, **kwargs):
+            sent.append(text)
+
+        exam = {"title": "Statistics", "unit_id": "1", "exam_form": "Hausarbeit & <Praesentation>",
+                "examiner": "Dr. A & B", "date_line": "Wednesday 11/4/26 No time defined",
+                "date": "2026-11-04T00:00:00", "start_datetime": None}
+        with mock.patch.object(exam_reminder, "get_registered_exam_schedule", mock.AsyncMock(return_value=[exam])), \
+                mock.patch.object(exam_reminder, "berlin_now", lambda: datetime(2026, 11, 4, 8)), \
+                mock.patch.object(exam_reminder, "load_exam_cache", lambda *a, **k: {}), \
+                mock.patch.object(exam_reminder, "save_exam_cache", lambda *a, **k: None):
+            asyncio.run(exam_reminder.check_exam_date_reminders(None, None, broadcast))
+        (text,) = sent
+        self.assertIn("Hausarbeit &amp; &lt;Praesentation&gt;", text)
+        self.assertIn("Dr. A &amp; B", text)
+
+    def test_registration_window_is_escaped(self):
+        import exam_reminder
+        sent = []
+
+        async def broadcast(bot, text, **kwargs):
+            sent.append(text)
+
+        exam = {"code": "M1", "unit_id": "1", "title": "Statistics", "start_date": "2026-11-01T00:00:00",
+                "end_date": None, "raw": "01.11. - 20.11. <late & early>"}
+        with mock.patch.object(exam_reminder, "get_open_exam_registrations", mock.AsyncMock(return_value=[exam])), \
+                mock.patch.object(exam_reminder, "load_exam_cache", lambda *a, **k: {}), \
+                mock.patch.object(exam_reminder, "save_exam_cache", lambda *a, **k: None):
+            asyncio.run(exam_reminder.check_exam_reminders(None, None, broadcast, {}))
+        (text,) = sent
+        self.assertIn("&lt;late &amp; early&gt;", text)
+
+
 if __name__ == "__main__":
     unittest.main()

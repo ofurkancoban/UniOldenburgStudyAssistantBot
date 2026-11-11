@@ -270,7 +270,7 @@ async def handle_examopen_wa_confirm(update: Update, context: ContextTypes.DEFAU
     class_line = f"👥 <b>Class:</b> {_h(info['group_label'])}\n" if info.get("group_label") else ""
     room_line = f"📍 <b>Room:</b> {_h(info['room'])}\n" if info.get("room") else ""
     exam_date_line = f"📅 <b>Exam Date:</b> {_h(info['exam_date_display'])}\n" if info.get("exam_date_display") else ""
-    window_line = f"🗓 <b>Window:</b> {info['window_display']}\n" if info.get("window_display") else ""
+    window_line = f"🗓 <b>Window:</b> {_h(info['window_display'])}\n" if info.get("window_display") else ""
     text = (
         "🆕 <b>EXAM REGISTRATION OPEN</b>\n"
         "━━━━━━━━━━━━━━━━━\n"

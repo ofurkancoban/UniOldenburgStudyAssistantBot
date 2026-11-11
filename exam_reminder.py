@@ -282,13 +282,13 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
         for threshold in threshold_days:
             if days_left == threshold and threshold not in sent_days:
                 when_line = "🔴 <b>Exam is TODAY!</b>" if threshold == 0 else f"⏳ <b>{threshold} day(s) left</b>"
-                form_line = f"🎯 <b>Form:</b> {exam['exam_form']}\n" if exam.get("exam_form") else ""
-                examiner_line = f"👤 <b>Examiner:</b> {exam['examiner']}\n" if exam.get("examiner") else ""
+                form_line = f"🎯 <b>Form:</b> {_h(exam['exam_form'])}\n" if exam.get("exam_form") else ""
+                examiner_line = f"👤 <b>Examiner:</b> {_h(exam['examiner'])}\n" if exam.get("examiner") else ""
                 text = (
                     "📚 <b>UPCOMING EXAM</b>\n"
                     "━━━━━━━━━━━━━━━━━\n"
                     f"📘 <b>Course:</b> {_h(exam['title'])}\n"
-                    f"📅 <b>Date:</b> {exam['date_line']}\n"
+                    f"📅 <b>Date:</b> {_h(exam['date_line'])}\n"
                     f"{form_line}"
                     f"{examiner_line}"
                     f"{when_line}\n"
@@ -309,12 +309,12 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> None:
             start_dt = datetime.fromisoformat(exam["start_datetime"])
             hours_left = (start_dt - now).total_seconds() / 3600
             if 0 <= hours_left <= hours_before:
-                form_line = f"🎯 <b>Form:</b> {exam['exam_form']}\n" if exam.get("exam_form") else ""
+                form_line = f"🎯 <b>Form:</b> {_h(exam['exam_form'])}\n" if exam.get("exam_form") else ""
                 text = (
                     "⏰ <b>EXAM STARTING SOON</b>\n"
                     "━━━━━━━━━━━━━━━━━\n"
                     f"📘 <b>Course:</b> {_h(exam['title'])}\n"
-                    f"📅 <b>Date:</b> {exam['date_line']}\n"
+                    f"📅 <b>Date:</b> {_h(exam['date_line'])}\n"
                     f"{form_line}"
                     f"⌛ <b>Starts in ~{int(hours_left)} hour(s)</b>\n"
                     "━━━━━━━━━━━━━━━━━"
@@ -424,7 +424,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
                 f"{exam_date_line}"
                 f"{class_line}"
                 f"{room_line}"
-                f"🗓 <b>Window:</b> {exam.get('window_display') or exam['raw']}\n"
+                f"🗓 <b>Window:</b> {_h(exam.get('window_display') or exam['raw'])}\n"
                 "━━━━━━━━━━━━━━━━━"
             )
             try:
