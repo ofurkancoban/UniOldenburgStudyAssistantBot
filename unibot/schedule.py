@@ -127,6 +127,18 @@ async def _run_morning_slot(bot, user_ids, now: datetime, send_time) -> None:
     )
 
 
+MEETING_KINDS = {"meeting", "sitzung", "besprechung", "treffen"}  # a date's type in Stud.IP
+
+
+def reminder_heading(event: dict) -> str:
+    """"LECTURE REMINDER" for a regular lesson; a date that is no lesson (a
+    meeting of a course without weekly slot, a personal appointment) says what it is."""
+    if event.get("lesson", True):
+        return "LECTURE REMINDER"
+    kind = (event.get("categories") or "").strip().lower()
+    return "MEETING REMINDER" if kind in MEETING_KINDS else "APPOINTMENT REMINDER"
+
+
 @single_flight
 async def check_calendar_reminders(bot, chat_id, silent: bool = False):
     """Check for upcoming classes and send reminders 30 minutes before."""
@@ -213,7 +225,7 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                     if markup:
                         switch_line += "\n📎 Catch up on what you miss:"
                 text = (
-                    "🔔 <b>LECTURE REMINDER</b>\n"
+                    f"🔔 <b>{reminder_heading(event)}</b>\n"
                     "━━━━━━━━━━━━━━━━━━\n"
                     f"📘 <b>{html.escape(title)}</b>\n"
                     f"🕒 Starting in <b>{int(minutes_left)} minutes</b>\n"
@@ -454,6 +466,9 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
                 "description": desc,
                 "topics": topics,
                 "course_id": cid,
+                # False for a single date of a course outside the weekly timetable (a meeting,
+                # a colloquium): shown and reminded of, but not as a lecture
+                "lesson": cid not in extra_ids,
             })
 
     # 2. Expand seminar-cycle-dates for any slot whose course did not return concrete events
@@ -550,6 +565,7 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
                 "description": (attr.get("description") or "").strip(),
                 "topics": [],
                 "course_id": None,
+                "lesson": False,  # a personal appointment
             })
     except Exception as exc:
         # the personal calendar is optional, but a missing one should show in the log

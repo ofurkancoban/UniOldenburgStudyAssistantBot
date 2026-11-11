@@ -684,6 +684,7 @@ class CourseDatesOutsideTheTimetableTests(unittest.TestCase):
         self.assertEqual([e["start_dt"].strftime("%a %H:%M") for e in events], ["Mon 09:00"])
         self.assertEqual(events[0]["topics"], ["Mentor meeting"])
         self.assertFalse(events[0]["is_cancelled"])
+        self.assertIs(events[0]["lesson"], False)  # shown, but not as a lecture
 
     def test_the_course_is_asked_once_within_ten_minutes(self):
         self._week()
@@ -711,6 +712,79 @@ class CourseDatesOutsideTheTimetableTests(unittest.TestCase):
                 mock.patch.object(schedule, "student_courses", lambda uid: {self.COURSE: "Lecture"}):
             asyncio.run(schedule._get_calendar_events_api(date(2026, 11, 9), user_id=UID, session=object()))
         self.assertEqual(self.calls.count(f"/courses/{self.COURSE}/events"), 1)
+
+
+class ReminderHeadingTests(unittest.TestCase):
+    def _reminder(self, **extra):
+        """The reminder texts sent 45 minutes before a 10:00 event."""
+        from tests.test_review_round_thirteen import _Frozen, _at, _class
+        from unibot import schedule
+        sent = []
+
+        async def send_message(**kwargs):
+            sent.append(kwargs["text"])
+
+        bot = mock.MagicMock()
+        bot.send_message = send_message
+        _Frozen.frozen = _at("09:15")
+        event = {**_class("Mentor programme", "10:00"), **extra}
+        wet = {"is_wet": True, "emoji": "x", "description": "rain", "temp_min": 5, "temp_max": 9,
+               "precip_chance": 80, "location_name": "Oldenburg"}
+        with mock.patch.object(schedule, "datetime", _Frozen), \
+                mock.patch.object(schedule, "get_calendar_events", mock.AsyncMock(return_value=[event])), \
+                mock.patch.object(schedule, "get_user_session", lambda uid=None: None), \
+                mock.patch.object(schedule, "get_weather_snapshot", mock.AsyncMock(return_value=wet)), \
+                mock.patch.object(schedule, "load_reminders_cache", lambda user_id=None: {}), \
+                mock.patch.object(schedule, "save_reminders_cache", lambda data, user_id=None: None):
+            asyncio.run(schedule.check_calendar_reminders(bot, UID, silent=True))
+        return [t for t in sent if "REMINDER" in t]
+
+    def test_a_regular_lesson_says_lecture(self):
+        for extra in ({}, {"lesson": True}):
+            (text,) = self._reminder(**extra)
+            self.assertIn("LECTURE REMINDER", text)
+
+    def test_a_meeting_date_says_meeting(self):
+        (text,) = self._reminder(lesson=False, categories="Meeting")
+        self.assertIn("MEETING REMINDER", text)
+        self.assertNotIn("LECTURE", text)
+
+    def test_other_dates_say_appointment(self):
+        for categories in ("", "Sonstiges", "Exkursion"):
+            (text,) = self._reminder(lesson=False, categories=categories)
+            self.assertIn("APPOINTMENT REMINDER", text)
+
+    def test_the_headings(self):
+        from unibot.schedule import reminder_heading
+        self.assertEqual(reminder_heading({"lesson": True}), "LECTURE REMINDER")
+        self.assertEqual(reminder_heading({"lesson": False, "categories": "Sitzung"}), "MEETING REMINDER")
+        self.assertEqual(reminder_heading({"lesson": False}), "APPOINTMENT REMINDER")
+
+    def test_dates_get_their_flag_from_where_they_come(self):
+        from datetime import date
+        from unibot import schedule
+
+        async def get_all(path, params=None, session=None, user_id=None):
+            if path == "/courses/tt1/events":
+                return [{"id": "e1", "attributes": {"title": "Statistics", "start": "2026-11-10T10:00:00+01:00",
+                                                     "end": "2026-11-10T12:00:00+01:00"}}], []
+            if path == "/courses/mc/events":
+                return [{"id": "e2", "attributes": {"title": "Mentor programme", "start": "2026-11-09T09:00:00+01:00",
+                                                     "end": "2026-11-09T10:00:00+01:00", "categories": "Meeting"}}], []
+            if path.startswith("/users/"):
+                return [{"id": "p1", "attributes": {"title": "Dentist", "start": "2026-11-11T08:00:00+01:00",
+                                                     "end": "2026-11-11T09:00:00+01:00"}}], []
+            return [], []
+
+        slot = {"id": "s1", "type": "x", "title": "Statistics", "description": "", "start": "10:00", "end": "12:00",
+                "weekday": 2, "location": "A1", "recurrence": {}, "course_id": "tt1"}
+        with mock.patch.object(schedule, "studip_api_get_all", get_all), \
+                mock.patch.object(schedule, "studip_api_user_id", mock.AsyncMock(return_value="u1")), \
+                mock.patch.object(schedule, "fetch_user_schedule_api", mock.AsyncMock(return_value=[slot])), \
+                mock.patch.object(schedule, "student_courses", lambda uid: {"tt1": "Statistics", "mc": "Mentor"}):
+            events = asyncio.run(schedule._get_calendar_events_api(date(2026, 11, 9), user_id=UID, session=object()))
+        flags = {e["title"]: e["lesson"] for e in events}
+        self.assertEqual(flags, {"Statistics": True, "Mentor programme": False, "Dentist": False})
 
 
 if __name__ == "__main__":
