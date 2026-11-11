@@ -269,8 +269,10 @@ async def run_fast_enroll(session, sem_id: str, target_time_str: str, target_dat
             break
         await asyncio.sleep(remaining - SPIN_WINDOW)
 
+    # a 1 ms sleep instead of a busy loop: the loop spun the one event loop
+    # for up to SPIN_WINDOW, stalling every other student's request meanwhile
     while local_now_as_site() < target_ts:
-        pass
+        await asyncio.sleep(min(0.001, max(0.0, target_ts - local_now_as_site())))
 
     status, html = await _submit_enrollment(session, sem_id, security_token)
 

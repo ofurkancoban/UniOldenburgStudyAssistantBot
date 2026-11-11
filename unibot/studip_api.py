@@ -798,7 +798,21 @@ async def get_fresh_file_url(cid, filename, current_url=None, session=None, user
 # ── recursive ZIP (downloads all files + subfolders) ───────────────────────────
 # Downloads stop once this much raw data is collected: Telegram takes 50 MB at
 # most, and the whole archive is built in memory.
-ZIP_RAW_LIMIT_BYTES = 150 * 1024 * 1024
+ZIP_RAW_LIMIT_BYTES = 100 * 1024 * 1024
+
+
+_zip_slot: Optional[asyncio.Semaphore] = None
+_zip_slot_loop: object = None
+
+
+def _zip_semaphore() -> asyncio.Semaphore:
+    """One ZIP is built at a time: each holds up to ZIP_RAW_LIMIT_BYTES in
+    memory, so parallel requests could exhaust a small server."""
+    global _zip_slot, _zip_slot_loop
+    loop = asyncio.get_running_loop()
+    if _zip_slot is None or _zip_slot_loop is not loop:
+        _zip_slot, _zip_slot_loop = asyncio.Semaphore(1), loop
+    return _zip_slot
 
 
 async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=None, session=None, user_id=None):
@@ -809,6 +823,11 @@ async def create_recursive_zip(cid, base_url, root_name: str, progress_callback=
     active_session: Any = session or get_user_session(user_id) or (state.global_session if user_id is None else None)
     if active_session is None:
         return BytesIO(), 0, root_name, 0, 0
+    async with _zip_semaphore():
+        return await _build_zip(cid, base_url, root_name, progress_callback, active_session, user_id)
+
+
+async def _build_zip(cid, base_url, root_name, progress_callback, active_session, user_id):
 
     async def _crawl(url, path_prefix, collected, empty_folders):
         try:

@@ -9,7 +9,7 @@ import logging
 import os
 import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from exam_reminder import (
@@ -167,9 +167,13 @@ async def _run_scheduled_jobs(bot, session, now: datetime):
 
     # Weekly content-aware study plan (Sunday evening, opt-in toggle).
     plan_uids = [uid for uid in active_uids if get_pref(uid, "weekly_study_plan")]
-    if now.weekday() == 6 and now.hour >= 18 and plan_uids:
+    # Sunday evening, or Monday morning when the bot was down then: the
+    # period is the week of that Sunday, so a Monday run uses yesterday's
+    sunday = now if now.weekday() == 6 else now - timedelta(days=1)
+    plan_due = (now.weekday() == 6 and now.hour >= 18) or (now.weekday() == 0 and now.hour < 12)
+    if plan_due and plan_uids:
         await _run_once_per_period(
-            "last_weekly_study_plan", now.strftime("%G-W%V"), "Weekly study plan",
+            "last_weekly_study_plan", sunday.strftime("%G-W%V"), "Weekly study plan",
             "📘 Generating weekly study plan...", _run_weekly_study_plan_all_users, bot, plan_uids, session,
         )
 

@@ -229,9 +229,14 @@ def _takes_course(uid: int, cid: str) -> bool:
 
 def _is_inactive(uid: int) -> bool:
     """A student who used /stop, deleted their data or blocked the bot gets
-    nothing until they come back with /start."""
+    nothing until they come back with /start. An account an administrator
+    blocked is out too, at once (not only when the next scan rebuilds the
+    course members)."""
     try:
-        return db.get_lifecycle(uid)["state"] == "inactive"
+        if db.get_lifecycle(uid)["state"] == "inactive":
+            return True
+        user = db.get_user(uid)
+        return user is not None and not user.get("is_active")
     except Exception:
         logging.debug("Lifecycle lookup failed", exc_info=True)
         return False
