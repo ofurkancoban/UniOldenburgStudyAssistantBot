@@ -708,9 +708,12 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
     if user_id is not None:
         # a completed interactive sign-in ends a paused (expired) state even
         # when the Stud.IP check below can't confirm it yet: paused students
-        # are never checked in the background, so nothing else would
+        # are never checked in the background, so nothing else would. It
+        # also resumes a stopped student (after /stop or deleting their
+        # data, where they are told to sign in again): signing in is a
+        # clear wish to use the bot again.
         _renewal_failures.pop(user_id, None)
-        if lifecycle_state(user_id) == NEEDS_REAUTH and db.set_lifecycle(user_id, ACTIVE, "signed in again"):
+        if lifecycle_state(user_id) in (NEEDS_REAUTH, INACTIVE) and db.set_lifecycle(user_id, ACTIVE, "signed in again"):
             logging.info("User %s signed in again: active", user_id)
 
     # Signed in through StuMS: sign the same session in to Stud.IP as well.

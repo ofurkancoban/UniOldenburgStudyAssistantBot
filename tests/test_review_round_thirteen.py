@@ -403,5 +403,26 @@ class GwdgQuotaTests(unittest.TestCase):
         posted.assert_awaited_once()  # no second try with a used-up quota
 
 
+class SignInResumesTests(unittest.TestCase):
+    def test_a_stopped_student_who_signs_in_again_is_active(self):
+        import studip_oauth
+        import stums_client
+        from unibot import auth, studip_api
+        uid = 9804
+        db.upsert_user(telegram_id=uid, role="user")
+        db.set_lifecycle(uid, "inactive", "deleted their data")
+        session = mock.MagicMock()
+        session.session = None
+        session.save_cookies = mock.AsyncMock()
+        session.is_html_logged_in = mock.AsyncMock(return_value=True)
+        with mock.patch.object(auth, "get_user_session", lambda user_id=None: session), \
+                mock.patch.object(studip_oauth, "oauth_enabled", return_value=False), \
+                mock.patch.object(studip_api, "get_studip_user_profile", mock.AsyncMock(return_value={})), \
+                mock.patch.object(stums_client, "_establish_stums_session", mock.AsyncMock(return_value="r")), \
+                mock.patch.object(auth.state, "_menu_app", None):
+            asyncio.run(auth._on_proxy_session_authenticated(uid))
+        self.assertEqual(auth.lifecycle_state(uid), auth.ACTIVE)
+
+
 if __name__ == "__main__":
     unittest.main()
