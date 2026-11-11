@@ -101,6 +101,7 @@ async def cancel_fastenroll_job(chat_id: int, sem_id: str) -> str:
     task = fastenroll_tasks.get(chat_id, {}).get(sem_id)
     if task and not task.done():
         task.cancel()
+        clear_pending_job(chat_id, sem_id)  # the task keeps the stored job on cancellation (restarts)
         return f"🛑 Cancelled fast-enroll job for course {sem_id}."
     clear_pending_job(chat_id, sem_id)
     return f"No running job found for {sem_id}, removed from pending list if present."

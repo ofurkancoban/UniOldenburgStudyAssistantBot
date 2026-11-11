@@ -59,14 +59,19 @@ async def _run_fastenroll_task(chat_id: int, sem_id: str, target_time_str: str, 
         icon = "✅" if success else "❌"
         await context.bot.send_message(chat_id=chat_id, text=f"{icon} {message}")
     except asyncio.CancelledError:
+        # The stored job is kept: a shutdown (deploy, restart) cancels every
+        # task and the job is restored at the next start. A student who
+        # cancels it themselves clears it in the cancel handler.
         logging.info("fastenroll job for chat %s, course %s was cancelled", chat_id, sem_id)
         raise
     except Exception as e:
         logging.error("fastenroll failed: %s", e, exc_info=True)
         await context.bot.send_message(chat_id=chat_id, text=f"❌ Fast enroll failed: {e}")
+        clear_pending_job(chat_id, sem_id)
+    else:
+        clear_pending_job(chat_id, sem_id)
     finally:
         fastenroll_tasks.get(chat_id, {}).pop(sem_id, None)
-        clear_pending_job(chat_id, sem_id)
 
 
 # ── Personal tasks / reminders (todo list with an optional due time) ───────────

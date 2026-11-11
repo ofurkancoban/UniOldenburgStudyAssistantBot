@@ -340,5 +340,46 @@ class StatusCommandTests(unittest.TestCase):
         self.assertNotIn("<Gretel>", text)
 
 
+class FastEnrollShutdownTests(unittest.TestCase):
+    def test_a_cancelled_job_keeps_its_stored_entry_but_a_finished_one_clears_it(self):
+        from unibot import tasks
+
+        async def forever(*a, **k):
+            await asyncio.sleep(3600)
+
+        async def done(*a, **k):
+            return True, "Enrolled"
+
+        async def scenario(runner):
+            cleared = []
+            context = types.SimpleNamespace(bot=mock.AsyncMock())
+            with mock.patch.object(tasks, "login_studip", mock.AsyncMock(return_value=object())), \
+                    mock.patch.object(tasks, "run_fast_enroll", runner), \
+                    mock.patch.object(tasks, "clear_pending_job", lambda *a: cleared.append(a)):
+                task = asyncio.ensure_future(tasks._run_fastenroll_task(UID, "s1", "08:00:00", None, context))
+                await asyncio.sleep(0.01)
+                if runner is forever:
+                    task.cancel()  # what a bot shutdown does to every task
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            return cleared
+
+        self.assertEqual(asyncio.run(scenario(forever)), [])  # restored at the next start
+        self.assertEqual(asyncio.run(scenario(done)), [(UID, "s1")])
+
+    def test_a_students_own_cancel_clears_the_stored_job(self):
+        from unibot import enrollment
+        cleared = []
+        running = mock.MagicMock()
+        running.done.return_value = False
+        with mock.patch.dict(enrollment.fastenroll_tasks, {UID: {"s1": running}}, clear=True), \
+                mock.patch.object(enrollment, "clear_pending_job", lambda *a: cleared.append(a)):
+            asyncio.run(enrollment.cancel_fastenroll_job(UID, "s1"))
+        running.cancel.assert_called_once()
+        self.assertEqual(cleared, [(UID, "s1")])
+
+
 if __name__ == "__main__":
     unittest.main()
