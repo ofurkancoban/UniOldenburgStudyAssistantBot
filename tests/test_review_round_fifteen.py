@@ -578,5 +578,65 @@ class LargeAccountMessageTests(unittest.TestCase):
             self.assertEqual(strip("".join(parts)), strip(text), f"case {case}")
 
 
+class PersonalCalendarWindowTests(unittest.TestCase):
+    """/users/{id}/events answers with the events from filter[timestamp] on for two
+    weeks and nothing before it (Stud.IP's UserEventsIndex); the calendar must ask
+    from the first day of the week, or a Monday to Wednesday meeting never shows."""
+
+    WEEK = None
+
+    def _events(self, days):
+        from datetime import date
+        from unibot import schedule
+        week_start = date(2026, 11, 9)  # a Monday
+        meetings = {"Team meeting": "2026-11-10T10:00:00+01:00",   # Tuesday: yesterday's case
+                    "Supervisor call": "2026-11-09T08:30:00+01:00",  # Monday
+                    "Colloquium": "2026-11-13T14:00:00+01:00"}       # Friday
+        asked = []
+
+        async def get_all(path, params=None, session=None, user_id=None):
+            if path.endswith("/events") and path.startswith("/users/"):
+                from datetime import datetime, timedelta
+                since = datetime.fromtimestamp(params["filter[timestamp]"], schedule.TZ_BERLIN)
+                asked.append(since.date())
+                until = since + timedelta(days=14)  # what Stud.IP really answers
+                return [{"id": title, "attributes": {"title": title, "start": start, "end": start.replace("T10", "T11")
+                                                      .replace("T08", "T09").replace("T14", "T15")}}
+                        for title, start in meetings.items()
+                        if since <= datetime.fromisoformat(start) < until], []
+            return [], []
+
+        with mock.patch.object(schedule, "studip_api_get_all", get_all), \
+                mock.patch.object(schedule, "studip_api_user_id", mock.AsyncMock(return_value="u1")), \
+                mock.patch.object(schedule, "fetch_user_schedule_api", mock.AsyncMock(return_value=[])):
+            events = asyncio.run(schedule._get_calendar_events_api(week_start, days=days, user_id=UID, session=object()))
+        return events, asked
+
+    def test_monday_to_wednesday_meetings_are_shown(self):
+        events, asked = self._events(7)
+        self.assertEqual(sorted(e["title"] for e in events), ["Colloquium", "Supervisor call", "Team meeting"])
+        self.assertEqual(asked[0].isoformat(), "2026-11-09")  # from the first day, not from Thursday
+
+    def test_a_longer_range_asks_in_two_week_steps(self):
+        _events, asked = self._events(21)
+        self.assertEqual([d.isoformat() for d in asked], ["2026-11-09", "2026-11-23"])
+
+    def test_a_failing_personal_calendar_is_logged(self):
+        from datetime import date
+        from unibot import schedule
+
+        async def get_all(path, params=None, session=None, user_id=None):
+            if path.startswith("/users/"):
+                raise RuntimeError("HTTP 500")
+            return [], []
+
+        with mock.patch.object(schedule, "studip_api_get_all", get_all), \
+                mock.patch.object(schedule, "studip_api_user_id", mock.AsyncMock(return_value="u1")), \
+                mock.patch.object(schedule, "fetch_user_schedule_api", mock.AsyncMock(return_value=[])), \
+                self.assertLogs(level="WARNING") as logs:
+            asyncio.run(schedule._get_calendar_events_api(date(2026, 11, 9), user_id=UID, session=object()))
+        self.assertIn("Personal calendar events unavailable", " ".join(logs.output))
+
+
 if __name__ == "__main__":
     unittest.main()

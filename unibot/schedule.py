@@ -342,6 +342,9 @@ async def fetch_user_schedule_api(timestamp: Optional[int] = None, user_id: Opti
     return slots
 
 
+USER_EVENTS_WINDOW_DAYS = 14  # how far ahead one /users/{id}/events request looks
+
+
 async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[int] = None, session: Optional[object] = None) -> list[dict]:
     """Fetch and merge calendar events for `[week_start, week_start + days)` from:
       1. `/users/{id}/schedule` (recurring `seminar-cycle-dates` + schedule entries)
@@ -484,9 +487,16 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
                 "course_id": cid,
             })
 
-    # 3. Personal user events (`/users/{id}/events`)
+    # 3. Personal user events (`/users/{id}/events`). Stud.IP returns the events from
+    # filter[timestamp] on for the next two weeks and nothing before it, so the window
+    # starts at the first day asked for (the middle of the week lost Monday to Wednesday).
     try:
-        user_evs, _ = await studip_api_get_all(f"/users/{uid}/events", {"filter[timestamp]": mid_ts}, session=session, user_id=user_id)
+        user_evs: list = []
+        for chunk_start in range(0, days, USER_EVENTS_WINDOW_DAYS):
+            first_day = datetime.combine(week_start + timedelta(days=chunk_start), datetime.min.time(), tzinfo=TZ_BERLIN)
+            chunk, _ = await studip_api_get_all(f"/users/{uid}/events", {"filter[timestamp]": int(first_day.timestamp())},
+                                                session=session, user_id=user_id)
+            user_evs += chunk
         for uev in user_evs:
             attr = uev.get("attributes", {})
             start_dt = _api_berlin(attr.get("start"))
@@ -519,7 +529,8 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
                 "course_id": None,
             })
     except Exception as exc:
-        logging.debug("_get_calendar_events_api: /users/%s/events skipped: %s", uid, exc)
+        # the personal calendar is optional, but a missing one should show in the log
+        logging.warning("Personal calendar events unavailable: %s: %s", type(exc).__name__, exc)
 
     events.sort(key=lambda e: e["start_dt"])
     return events
