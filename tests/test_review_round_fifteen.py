@@ -205,5 +205,100 @@ class BlockedStudentAlertTests(unittest.TestCase):
         self.assertNotIn(9952, targets)
 
 
+class UploadRespectsTitleOnlyTests(unittest.TestCase):
+    def _fan(self, fmt):
+        from unibot import course_registry as cr
+        bot = mock.AsyncMock()
+        sent_full = []
+
+        async def send_full(b, uid):
+            sent_full.append(uid)
+            return True
+
+        with mock.patch.object(cr, "delivery_format", lambda uid, cid, kind: fmt), \
+                mock.patch.object(cr, "get_pref", lambda uid, key: "upload" if key == "file_delivery" else None), \
+                mock.patch.object(cr, "_hold_reason", lambda uid, now: None), \
+                mock.patch.object(cr, "broadcast_targets", lambda cid, members=None: {UID}), \
+                mock.patch.object(cr.asyncio, "sleep", mock.AsyncMock()):
+            asyncio.run(cr.fan_out(bot, "c1", "files", "FULL", "TITLE", send_full=send_full))
+        return sent_full, bot.send_message.call_args
+
+    def test_title_only_course_gets_a_line_not_the_file(self):
+        sent_full, call = self._fan("title")
+        self.assertEqual(sent_full, [])
+        self.assertEqual(call.kwargs["text"], "TITLE")
+
+    def test_other_formats_still_upload_the_file(self):
+        for fmt in ("full", "silent"):
+            sent_full, _call = self._fan(fmt)
+            self.assertEqual(sent_full, [UID])
+
+
+class ButtonTextTests(unittest.TestCase):
+    def test_buttons_old_and_new_are_recognised(self):
+        cases = {"📁 Files": "files", "⬇️ Files": "files", "📅 Schedule": "calendar", "✅ Tasks": "tasks",
+                 "🍽️ Mensa": "menu", "📝 Exams": "exams", "🔄 Check": "check", "🔁 Check": "check",
+                 "⚙️ Status": "status", "ℹ️ Status": "status", "exam": "exams", "Status": "status"}
+        for text, target in cases.items():
+            self.assertEqual(menus.button_target(text), target, text)
+
+    def test_sentences_are_not_buttons(self):
+        for text in ("status of my exam?", "please check the task list for tomorrow", "I want to start studying",
+                     "what is the schedule for friday", ""):
+            self.assertIsNone(menus.button_target(text), text)
+
+    def test_a_sentence_gets_a_hint_not_a_command(self):
+        message = mock.AsyncMock()
+        message.text = "status of my exam?"
+        update = types.SimpleNamespace(callback_query=None, message=message, effective_message=message,
+                                       effective_user=types.SimpleNamespace(id=UID))
+        with mock.patch.object(menus, "is_user_allowed", return_value=True), \
+                mock.patch.object(menus, "handle_pending_step", mock.AsyncMock(return_value=False)), \
+                mock.patch.object(menus, "status_command", mock.AsyncMock()) as status, \
+                mock.patch.object(menus, "exams_command", mock.AsyncMock()) as exams:
+            asyncio.run(menus.handle_reply_buttons(update, types.SimpleNamespace(user_data={})))
+        status.assert_not_awaited()
+        exams.assert_not_awaited()
+        self.assertIn("buttons", message.reply_text.call_args.args[0])
+
+
+class CourseViewCallbackTests(unittest.TestCase):
+    def test_a_garbled_index_says_the_list_expired(self):
+        query = mock.AsyncMock()
+        query.data = "course_view|abc"
+        query.from_user = types.SimpleNamespace(id=UID)
+        update = types.SimpleNamespace(callback_query=query)
+        context = types.SimpleNamespace(user_data={"course_view_options": [("A", "c1")]})
+        with mock.patch.object(menus, "is_user_allowed", return_value=True):
+            asyncio.run(menus.handle_course_view(update, context))
+        self.assertIn("expired", query.message.reply_text.call_args.args[0])
+
+
+class OAuthRefreshPerAccountTests(unittest.TestCase):
+    def test_one_students_failed_refresh_does_not_block_another(self):
+        import studip_oauth
+        studip_oauth._refresh_blocked.clear()
+        expired = {"access_token": "old", "refresh_token": "r", "expires_at": 0}
+        fresh = {"access_token": "new", "refresh_token": "r2", "expires_at": 9e12}
+
+        async def refresh(tokens, user_id=None):
+            if user_id == 1:
+                raise RuntimeError("down")
+            return fresh
+
+        with mock.patch.object(studip_oauth, "load_tokens", lambda user_id=None: expired), \
+                mock.patch.object(studip_oauth, "refresh", refresh):
+            self.assertIsNone(asyncio.run(studip_oauth.get_access_token(user_id=1)))
+            self.assertEqual(asyncio.run(studip_oauth.get_access_token(user_id=2)), "new")
+        studip_oauth._refresh_blocked.clear()
+
+
+class TaskButtonsSurviveRestartTests(unittest.TestCase):
+    def test_announcement_and_forum_task_buttons_are_stored(self):
+        from unibot import monitoring_alerts
+        for cache in (monitoring_alerts.task_suggestion_cache, monitoring_alerts.announcement_task_cache):
+            self.assertEqual(type(cache).__name__, "_PersistentLinkCache")
+
+
 if __name__ == "__main__":
     unittest.main()

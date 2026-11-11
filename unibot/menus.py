@@ -1298,6 +1298,31 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
     return False
 
 
+# Keyboard buttons, current and older (a phone may still show an old keyboard):
+# a text counts as a button only when it carries a button emoji, or is nothing
+# but a button's own word, so a sentence mentioning "exam" is left alone.
+_BUTTON_EMOJI = (
+    ("files", ("📁", "📚", "⬇️")), ("calendar", ("📅",)), ("tasks", ("✅",)), ("menu", ("🍽️",)),
+    ("progress", ("📊",)), ("exams", ("📝",)), ("check", ("🔄", "🔁")), ("status", ("⚙️", "ℹ️")),
+)
+_BUTTON_WORDS = {
+    "files": "files", "schedule": "calendar", "calendar": "calendar", "tasks": "tasks", "task": "tasks",
+    "mensa": "menu", "progress": "progress", "exams": "exams", "exam": "exams", "check": "check",
+    "status": "status", "start": "start",
+}
+
+
+def button_target(text: str) -> Optional[str]:
+    """Which keyboard button a text is ("files", "calendar", ...), or None."""
+    text = (text or "").strip()
+    if len(text) > 30:
+        return None
+    for target, emojis in _BUTTON_EMOJI:
+        if any(e in text for e in emojis):
+            return target
+    return _BUTTON_WORDS.get(text.lower())
+
+
 async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Support both keyboard and inline callback
     query = update.callback_query
@@ -1327,27 +1352,14 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         if text in study_buttons:
             await study_buttons[text](update, context)
             return
-        # Check all buttons
-        if "📁" in text or "📚" in text or "⬇️" in text or "files" in text.lower():
-            data = ["files"]
-        elif "📅" in text or "schedule" in text.lower() or "calendar" in text.lower():
-            data = ["calendar"]
-        elif "✅" in text or "task" in text.lower():
-            data = ["tasks"]
-        elif "🍽️" in text or "mensa" in text.lower():
-            data = ["menu"]
-        elif "📊" in text or "progress" in text.lower():
-            data = ["progress"]
-        elif "📝" in text or "exam" in text.lower():
-            data = ["exams"]
-        elif "🔄" in text or "🔁" in text or "check" in text.lower():
-            data = ["check"]
-        elif "⚙️" in text or "ℹ️" in text or "status" in text.lower():
-            data = ["status"]
-        elif "start" in text.lower():
-            data = ["start"]
-        else:
-            data = [text.replace("📅", "").strip()] # Fallback for other text commands
+        target = button_target(text)
+        if target is None:
+            # an ordinary sentence ("status of my exam?") is not a button
+            if is_user_allowed(update.effective_user.id):
+                await message.reply_text("👇 Use the buttons below, or /status for everything else.",
+                                         reply_markup=get_main_keyboard())
+            return
+        data = [target]
         chat_id = message.chat_id
         sender = message
 
@@ -1484,7 +1496,8 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     options = context.user_data.get("course_view_options", [])
-    idx = int(query.data.split("|", 1)[1])
+    raw_idx = query.data.split("|", 1)[1]
+    idx = int(raw_idx) if raw_idx.isdigit() else -1
     if not (0 <= idx < len(options)):
         await query.message.reply_text("⚠️ This course list has expired - tap 📘 By Course again.")
         return

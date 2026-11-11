@@ -65,8 +65,17 @@ EXPIRY_LEEWAY = 120
 # before trying again instead of hitting the token endpoint on every API call.
 REFRESH_RETRY_BACKOFF = 60
 
-_refresh_lock = asyncio.Lock()
-_refresh_blocked_until = 0.0
+# one lock and one backoff per account: a failed refresh of one student must
+# not hold back everybody else's token (None is the shared admin account)
+_refresh_locks: dict = {}
+_refresh_blocked: dict = {}
+
+
+def _refresh_lock_for(user_id) -> asyncio.Lock:
+    lock = _refresh_locks.get(user_id)
+    if lock is None:
+        lock = _refresh_locks[user_id] = asyncio.Lock()
+    return lock
 
 
 class RefreshRejected(RuntimeError):
@@ -354,8 +363,7 @@ async def get_access_token(force_refresh: bool = False, user_id: Optional[int] =
     if not force_refresh and not is_expired(tokens):
         return tokens.get("access_token")
 
-    global _refresh_blocked_until
-    async with _refresh_lock:
+    async with _refresh_lock_for(user_id):
         tokens = load_tokens(user_id=user_id)
         if tokens is None:
             return None
@@ -364,7 +372,7 @@ async def get_access_token(force_refresh: bool = False, user_id: Optional[int] =
         recently_refreshed = (_now() - float(tokens.get("refreshed_at", 0))) < 10
         if not is_expired(tokens) and (not force_refresh or recently_refreshed):
             return tokens.get("access_token")
-        if _now() < _refresh_blocked_until:
+        if _now() < _refresh_blocked.get(user_id, 0.0):
             return None if is_expired(tokens, leeway=0) else tokens.get("access_token")
         try:
             if user_id is not None:
@@ -374,7 +382,7 @@ async def get_access_token(force_refresh: bool = False, user_id: Optional[int] =
                     tokens = await refresh(tokens)
             else:
                 tokens = await refresh(tokens)
-            _refresh_blocked_until = 0.0
+            _refresh_blocked.pop(user_id, None)
             return tokens.get("access_token")
         except RefreshRejected as exc:
             # A dead refresh token never recovers; drop it so callers fall
@@ -384,7 +392,7 @@ async def get_access_token(force_refresh: bool = False, user_id: Optional[int] =
             return None
         except Exception as exc:
             logger.warning("Token refresh failed: %s (retrying in %ss)", exc, REFRESH_RETRY_BACKOFF)
-            _refresh_blocked_until = _now() + REFRESH_RETRY_BACKOFF
+            _refresh_blocked[user_id] = _now() + REFRESH_RETRY_BACKOFF
             if is_expired(tokens, leeway=0):
                 return None
         return tokens.get("access_token")

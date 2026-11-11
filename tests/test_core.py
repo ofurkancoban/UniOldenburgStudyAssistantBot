@@ -226,7 +226,7 @@ class OAuthTests(unittest.TestCase):
         ]
         for p in self.patches:
             p.start()
-        studip_oauth._refresh_blocked_until = 0.0
+        studip_oauth._refresh_blocked.clear()
 
     def tearDown(self):
         for p in reversed(self.patches):

@@ -337,7 +337,8 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
                 queue_alert(uid, kind, cid, title_text, markup, reason, now)
                 counts["queued"] += 1
                 continue
-            if files_mode == "upload" and send_full is not None and await send_full(bot, uid):
+            # "title only" for this course means just a line, whatever the file delivery
+            if files_mode == "upload" and fmt != "title" and send_full is not None and await send_full(bot, uid):
                 counts[fmt] += 1
                 await asyncio.sleep(0.3)
                 continue
