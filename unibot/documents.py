@@ -130,6 +130,13 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
             return
 
         clean_script = script.strip().strip('"')
+    except Exception as e:
+        # an expired session or a Stud.IP error must not leave the student
+        # with a "Preparing..." message that never changes
+        logging.warning("Audio summary for %s failed: %s", fname, e)
+        await _stop_loading_animation(stop_evt, anim_task)
+        await status_msg.edit_text(f"⚠️ Could not prepare the summary: {html.escape(str(e)[:200])}", parse_mode="HTML")
+        return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
 

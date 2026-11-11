@@ -424,5 +424,22 @@ class SignInResumesTests(unittest.TestCase):
         self.assertEqual(auth.lifecycle_state(uid), auth.ACTIVE)
 
 
+class AudioSummaryTests(unittest.TestCase):
+    def test_an_expired_session_is_reported_on_the_status_message(self):
+        from unibot import documents
+        query = mock.AsyncMock()
+        query.data = "file_audio_sum|s9"
+        query.from_user = types.SimpleNamespace(id=UID)
+        status = mock.AsyncMock()
+        query.message.reply_text = mock.AsyncMock(return_value=status)
+        with mock.patch.dict(documents.link_cache, {"s9": {"cid": "c1", "name": "slides.pdf"}}), \
+                mock.patch.object(documents, "is_user_allowed", return_value=True), \
+                mock.patch.object(documents, "login_studip", mock.AsyncMock(side_effect=RuntimeError("Failed to log in to Stud.IP."))), \
+                mock.patch.object(documents, "_start_loading_animation", lambda *a: (None, None)), \
+                mock.patch.object(documents, "_stop_loading_animation", mock.AsyncMock()):
+            asyncio.run(documents.handle_file_audio_summary(types.SimpleNamespace(callback_query=query), None))
+        self.assertIn("Failed to log in", status.edit_text.call_args.args[0])
+
+
 if __name__ == "__main__":
     unittest.main()
