@@ -302,5 +302,23 @@ class ExamReminderEscapingTests(unittest.TestCase):
         self.assertIn("&lt;late &amp; early&gt;", text)
 
 
+class MessageAlertTests(unittest.TestCase):
+    def test_an_over_long_message_is_cut_and_the_next_one_still_goes_out(self):
+        from unibot import monitoring
+        messages = [{"id": "m1", "title": "Long", "sender": "Ada", "date": "01/11/26 10:00", "url": "u1", "body": "&" * 3300},
+                    {"id": "m2", "title": "Short", "sender": "Ada", "date": "02/11/26 10:00", "url": "u2", "body": "hi"}]
+        bot = mock.AsyncMock()
+        with mock.patch.object(monitoring, "get_user_session", lambda uid=None: object()), \
+                mock.patch.object(monitoring, "_message_owner", lambda uid=None: UID), \
+                mock.patch.object(monitoring, "_fetch_messages_api", mock.AsyncMock(return_value=messages)), \
+                mock.patch.object(monitoring, "stored_messages", lambda owner: []), \
+                mock.patch.object(monitoring, "save_messages", lambda owner, msgs: None):
+            self.assertTrue(asyncio.run(monitoring.check_new_messages(bot, UID, silent=True)))
+        texts = [c.kwargs["text"] for c in bot.send_message.call_args_list]
+        self.assertEqual(len(texts), 2)
+        self.assertLessEqual(max(len(t) for t in texts), 4096)
+        self.assertIn("Short", texts[1])
+
+
 if __name__ == "__main__":
     unittest.main()

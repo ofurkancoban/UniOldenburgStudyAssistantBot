@@ -47,6 +47,7 @@ from unibot.formatting import (
     clean_for_html,
     clean_html_text,
     parse_date_safe,
+    truncate_html,
 )
 from unibot.monitoring_alerts import (  # noqa: F401 - the notification layer, re-exported for callers
     _file_alert,
@@ -888,8 +889,13 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
                     btn_rows.append([InlineKeyboardButton("↩️ Reply on Stud.IP", callback_data=f"msg_reply|{msg['id']}")])
                 btn_rows.append([InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")])
                 markup = markup_for(chat_id, InlineKeyboardMarkup(btn_rows))
-            # a Stud.IP message is private: only its recipient gets it
-            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
+            # a Stud.IP message is private: only its recipient gets it. One
+            # too long for Telegram (escaped markup grows) is cut, so the
+            # rest of the batch isn't lost with it: the cache is updated already
+            try:
+                await bot.send_message(chat_id=chat_id, text=truncate_html(text), parse_mode="HTML", reply_markup=markup)
+            except Exception as e:
+                logging.error("check_new_messages: could not send message %s: %s", msg.get("id"), e)
             await asyncio.sleep(0.3)
         return True
     except Exception as e:
