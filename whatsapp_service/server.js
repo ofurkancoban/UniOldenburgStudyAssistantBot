@@ -53,7 +53,11 @@ app.use((req, res, next) => {
 });
 app.use(express.json({ limit: '1mb' }));
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const ALLOWED_USER_IDS = process.env.ALLOWED_USER_IDS ? process.env.ALLOWED_USER_IDS.split(',') : [];
+// The QR code and alerts go to the bot's primary administrator (WA_NOTIFY_USER_ID, set by the
+// bot), else to the first ALLOWED_USER_IDS entry.
+const ALLOWED_USER_IDS = process.env.WA_NOTIFY_USER_ID
+    ? [process.env.WA_NOTIFY_USER_ID]
+    : (process.env.ALLOWED_USER_IDS ? process.env.ALLOWED_USER_IDS.split(',') : []);
 const AUTH_DIR = 'baileys_auth';
 const LOCK_FILE = 'whatsapp_service.lock';
 

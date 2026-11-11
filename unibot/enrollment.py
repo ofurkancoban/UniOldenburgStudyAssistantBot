@@ -46,6 +46,16 @@ def extract_sem_id(text: str) -> Optional[str]:
     return match.group(1) if match else None
 
 
+def normalize_enroll_time(text: Optional[str]) -> Optional[str]:
+    """"8:30" and "08:30" mean 08:30:00; a full HH:MM:SS stays as it is;
+    anything else comes back unchanged (the validator then rejects it)."""
+    value = (text or "").strip()
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", value)
+    if not m:
+        return text
+    return f"{int(m.group(1)):02d}:{m.group(2)}:{m.group(3) or '00'}"
+
+
 def validate_fastenroll_args(sem_id: Optional[str], target_time_str: Optional[str], target_date_str: Optional[str]) -> Optional[str]:
     """Return an error message if invalid, else None."""
     if not sem_id or not re.fullmatch(r"[a-f0-9]{32}", sem_id):
@@ -495,7 +505,7 @@ async def handle_toggle_watch_prev_sem(update: Update, context: ContextTypes.DEF
         await query.edit_message_text("✅ Now also watching the previous semester's courses for new announcements, files, and forum posts - takes effect on the next check cycle.")
     else:
         await query.edit_message_text("🔲 Back to only watching the current semester's courses - takes effect on the next check cycle.")
-FASTENROLL_ASK_TIME = "Please type the enrollment time (HH:MM:SS, Europe/Berlin):"
+FASTENROLL_ASK_TIME = "Please type the enrollment time (HH:MM or HH:MM:SS, Europe/Berlin):"
 FASTENROLL_ASK_LINK = "Please paste the course link (or its sem_id):"
 
 
@@ -524,9 +534,10 @@ async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.
         return True
 
     if step == "fastenroll_time":
+        text = normalize_enroll_time(text) or text
         if not re.fullmatch(r"[0-9]{2}:[0-9]{2}:[0-9]{2}", text):
             await update.message.reply_text(
-                "Please use HH:MM:SS (Europe/Berlin), e.g. 08:30:00.",
+                "Please use HH:MM or HH:MM:SS (Europe/Berlin), e.g. 08:30 or 08:30:00.",
                 reply_markup=get_main_keyboard(),
             )
             return True  # pending_step stays "fastenroll_time" - ask again

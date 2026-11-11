@@ -300,5 +300,150 @@ class TaskButtonsSurviveRestartTests(unittest.TestCase):
             self.assertEqual(type(cache).__name__, "_PersistentLinkCache")
 
 
+class ConfigWarningAndRecipientTests(unittest.TestCase):
+    def test_empty_allowlist_warning_is_accurate(self):
+        from unibot import config
+        with mock.patch.object(config, "TELEGRAM_TOKEN", "t"), mock.patch.object(config, "ALLOWED_USER_IDS", set()):
+            warnings = config.validate_settings()
+        text = " ".join(warnings)
+        self.assertIn("invite code", text)
+        self.assertNotIn("every Telegram user will be rejected", text)
+
+    def test_the_whatsapp_service_is_told_who_the_administrator_is(self):
+        import subprocess
+        env = {**os.environ, "ALLOWED_USER_IDS": "5,6", "ADMIN_USER_IDS": "6",
+               "BOT_LOG_FILE": os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")}
+        out = subprocess.run([sys.executable, "-c", "import os, unibot.config; print(os.environ['WA_NOTIFY_USER_ID'])"],
+                             cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.stdout.strip().splitlines()[-1], "6")
+
+
+class FirstDietTests(unittest.TestCase):
+    def test_halal_is_only_carried_over_with_the_old_food_file(self):
+        from unibot import db, preferences
+        with mock.patch.object(preferences, "PRIMARY_ADMIN_ID", 9961):
+            self.assertEqual(preferences.get_prefs(9961)["diet"], "all")  # a fresh install
+            db.save("food_preferences.json", {"avoid_codes": ["Kn"], "avoid_keywords": []})
+            try:
+                with mock.patch.object(preferences, "PRIMARY_ADMIN_ID", 9962):
+                    prefs = preferences.get_prefs(9962)
+                self.assertEqual(prefs["diet"], "halal")
+                self.assertEqual(prefs["food_avoid_codes"], ["Kn"])
+            finally:
+                db.delete("food_preferences.json")
+
+
+class SignInIsNotActivityTests(unittest.TestCase):
+    def test_the_profile_link_leaves_last_active_alone(self):
+        import studip_oauth
+        import stums_client
+        from unibot import auth, db, studip_api
+        uid = 9963
+        db.upsert_user(telegram_id=uid, role="user")
+        with db._lock:
+            db._connection().execute("UPDATE users SET last_active_at = 1000 WHERE telegram_id = ?", (uid,))
+        session = mock.MagicMock()
+        session.session = None
+        session.save_cookies = mock.AsyncMock()
+        session.is_html_logged_in = mock.AsyncMock(return_value=True)
+        with mock.patch.object(auth, "get_user_session", lambda user_id=None: session), \
+                mock.patch.object(studip_oauth, "oauth_enabled", return_value=False), \
+                mock.patch.object(studip_api, "get_studip_user_profile",
+                                  mock.AsyncMock(return_value={"username": "ab1234", "display_name": "A B"})), \
+                mock.patch.object(stums_client, "_establish_stums_session", mock.AsyncMock(return_value="r")), \
+                mock.patch.object(auth.state, "_menu_app", None):
+            asyncio.run(auth._on_proxy_session_authenticated(uid))
+        user = db.get_user(uid)
+        self.assertEqual(user["studip_username"], "ab1234")
+        self.assertEqual(user["last_active_at"], 1000)
+
+
+class RegistrySemesterTests(unittest.TestCase):
+    def test_sync_does_not_write_one_students_semester_into_the_shared_table(self):
+        from unibot import course_registry, db, storage
+        storage.save_default_semester("w26", "WiSe 26/27", user_id=9964)
+        course_registry.sync_registry({"cs1": "Statistics"}, {"cs1": {9964}}, {9964})
+        self.assertIsNone(db.get_global_course("cs1")["semester"])
+
+
+class AudioSummarySessionTests(unittest.TestCase):
+    def test_the_fresh_link_is_fetched_with_the_students_own_session(self):
+        from unibot import documents
+        query = mock.AsyncMock()
+        query.data = "file_audio_sum|s7"
+        query.from_user = types.SimpleNamespace(id=UID)
+        query.message.reply_text = mock.AsyncMock(return_value=mock.AsyncMock())
+        own = object()
+        fresh = mock.AsyncMock(return_value=None)
+        with mock.patch.dict(documents.link_cache, {"s7": {"cid": "c1", "name": "slides.pdf"}}), \
+                mock.patch.object(documents, "is_user_allowed", return_value=True), \
+                mock.patch.object(documents, "login_studip", mock.AsyncMock(return_value=own)), \
+                mock.patch.object(documents, "get_fresh_file_url", fresh), \
+                mock.patch.object(documents, "_start_loading_animation", lambda *a: (None, None)), \
+                mock.patch.object(documents, "_stop_loading_animation", mock.AsyncMock()):
+            asyncio.run(documents.handle_file_audio_summary(types.SimpleNamespace(callback_query=query), None))
+        self.assertIs(fresh.call_args.kwargs["session"], own)
+        self.assertEqual(fresh.call_args.kwargs["user_id"], UID)
+
+
+class FolderViewCleanupTests(unittest.TestCase):
+    def test_the_cache_is_pruned_twice_not_three_times(self):
+        query = mock.AsyncMock()
+        calls = []
+        with mock.patch.object(menus, "cleanup_link_cache", lambda: calls.append(1)):
+            asyncio.run(menus.send_folder(query, [{"type": "file", "name": "a.pdf", "size": "1", "modified": "x",
+                                                    "url": "https://elearning.uni-oldenburg.de/f"}], "c1", UID))
+        self.assertEqual(len(calls), 2)
+
+
+class EnrollTimeFormatTests(unittest.TestCase):
+    def test_short_times_are_accepted(self):
+        from unibot.enrollment import normalize_enroll_time, validate_fastenroll_args
+        self.assertEqual(normalize_enroll_time("8:30"), "08:30:00")
+        self.assertEqual(normalize_enroll_time("08:30"), "08:30:00")
+        self.assertEqual(normalize_enroll_time("08:30:15"), "08:30:15")
+        self.assertEqual(normalize_enroll_time("soon"), "soon")
+        self.assertIsNone(validate_fastenroll_args("a" * 32, normalize_enroll_time("8:30"), None))
+        self.assertIsNotNone(validate_fastenroll_args("a" * 32, normalize_enroll_time("soon"), None))
+
+    def test_the_scheduler_takes_a_short_time(self):
+        from unibot import schedule
+        saved = []
+
+        async def run(*args):
+            return None
+
+        with mock.patch.object(schedule, "save_pending_job", lambda *a: saved.append(a)), \
+                mock.patch("unibot.tasks._run_fastenroll_task", run), \
+                mock.patch.dict(schedule.fastenroll_tasks, {}, clear=True):
+            reply = asyncio.run(schedule.schedule_fastenroll_job(UID, "a" * 32, "8:30", None, None))
+        self.assertIn("scheduled", reply)
+        self.assertEqual(saved[0][2], "08:30:00")
+
+
+class TaskTimePhraseTests(unittest.TestCase):
+    NOW = None
+
+    def _p(self, text):
+        from datetime import datetime
+        from studip_utils import TZ_BERLIN
+        from unibot.tasks import _parse_task_due_time
+        return _parse_task_due_time(text, datetime(2026, 11, 11, 10, 0, tzinfo=TZ_BERLIN))  # a Wednesday
+
+    def test_new_phrases(self):
+        self.assertEqual(self._p("tomorrow").isoformat(), "2026-11-12T09:00:00+01:00")
+        self.assertEqual(self._p("yarın").isoformat(), "2026-11-12T09:00:00+01:00")
+        self.assertEqual(self._p("next friday").isoformat(), "2026-11-13T09:00:00+01:00")
+        self.assertEqual(self._p("friday 15:30").isoformat(), "2026-11-13T15:30:00+01:00")
+        self.assertEqual(self._p("Mittwoch").isoformat(), "2026-11-18T09:00:00+01:00")  # never today
+        self.assertEqual(self._p("14:00").isoformat(), "2026-11-11T14:00:00+01:00")
+        self.assertEqual(self._p("09:00").isoformat(), "2026-11-12T09:00:00+01:00")  # already past today
+
+    def test_nonsense_is_still_rejected(self):
+        for text in ("hello", "sometime", "next never"):
+            with self.assertRaises(ValueError):
+                self._p(text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -248,9 +248,9 @@ class FastEnrollWizardTests(unittest.TestCase):
         context = mock.MagicMock()
         context.user_data = {"pending_step": "fastenroll_time"}
         with mock.patch.object(enrollment, "get_main_keyboard", lambda: None):
-            handled, answer = self._reply(context, "fastenroll_time", "8:30")
+            handled, answer = self._reply(context, "fastenroll_time", "half past eight")
         self.assertTrue(handled)
-        self.assertIn("HH:MM:SS", answer)
+        self.assertIn("HH:MM", answer)
         self.assertEqual(context.user_data["pending_step"], "fastenroll_time")
 
     def test_unrelated_step_is_left_alone(self):

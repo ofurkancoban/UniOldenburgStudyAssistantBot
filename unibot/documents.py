@@ -90,7 +90,7 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
                 content = None
 
         if not content:
-            fresh_url = await get_fresh_file_url(cid, fname, info.get("current_url"))
+            fresh_url = await get_fresh_file_url(cid, fname, info.get("current_url"), session=session, user_id=user_id)
             if fresh_url:
                 info["url"] = fresh_url
                 link_cache[sid] = {**info, "ts": time.time()}

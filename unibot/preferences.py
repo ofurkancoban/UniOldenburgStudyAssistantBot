@@ -175,10 +175,11 @@ def _initial(user_id: int) -> dict:
                 food = db.load("food_preferences.json") or {}
                 prefs["food_avoid_codes"] = list(food.get("avoid_codes") or [])
                 prefs["food_avoid_keywords"] = list(food.get("avoid_keywords") or [])
+                # the old global recommendation always left out pork, alcohol and gelatine:
+                # an account that had such a file keeps that, a fresh install starts with "all"
+                prefs["diet"] = "halal"
         except Exception:
             logging.debug("No food preferences to carry over", exc_info=True)
-        # the recommendation always left out pork, alcohol and gelatine for this account
-        prefs["diet"] = "halal"
     return prefs
 
 

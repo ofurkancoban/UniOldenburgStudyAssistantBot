@@ -463,9 +463,6 @@ async def send_folder(query, files, cid, user_id, current_url=None):
             meta = f" ({f['size']}, {f['modified']})"
             keyboard.append([InlineKeyboardButton(f"📄 {f['name']}{meta}", callback_data=f"file|{sid}")])
 
-    # Clean cache (remove old entries)
-    cleanup_link_cache()
-
     # Navigation buttons
     nav_btns = []
     stack_len = len(nav_stack.get(user_id, []))
@@ -509,8 +506,7 @@ async def send_folder(query, files, cid, user_id, current_url=None):
         }
         keyboard.append([InlineKeyboardButton("📦 Download Entire Folder (ZIP)", callback_data=f"nav|{zip_id}")])
 
-    # Final link cache cleanup
-    cleanup_link_cache()
+    cleanup_link_cache()  # once more now that this view's entries are added (the size cap)
 
     # Title (breadcrumb)
     title = _breadcrumb(user_id)

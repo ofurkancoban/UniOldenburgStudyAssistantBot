@@ -147,6 +147,9 @@ WA_SERVICE_URL = f"http://127.0.0.1:{WA_SERVICE_PORT}"
 WA_SERVICE_TOKEN = os.getenv("WA_SERVICE_TOKEN", "").strip() or secrets.token_urlsafe(32)
 os.environ["WA_SERVICE_TOKEN"] = WA_SERVICE_TOKEN
 WA_HEADERS = {"X-WA-Service-Token": WA_SERVICE_TOKEN}
+# who the WhatsApp service sends its QR code and alerts to: the primary administrator
+if PRIMARY_ADMIN_ID is not None:
+    os.environ["WA_NOTIFY_USER_ID"] = str(PRIMARY_ADMIN_ID)
 
 
 # ════ Settings read from the environment (.env) ════════════════════════════════
@@ -254,7 +257,8 @@ def validate_settings() -> list[str]:
         raise SystemExit("TELEGRAM_TOKEN is not set (add it to .env).")
     warnings = []
     if not ALLOWED_USER_IDS:
-        warnings.append("ALLOWED_USER_IDS is empty or invalid: every Telegram user will be rejected.")
+        warnings.append("ALLOWED_USER_IDS is empty or invalid: there is no administrator from the environment, so only students "
+                        "with an invite code (and administrators stored in the database) can use the bot.")
     for name, value, low, high in (
         ("WEATHER_LATITUDE", WEATHER_LATITUDE, -90, 90),
         ("WEATHER_LONGITUDE", WEATHER_LONGITUDE, -180, 180),

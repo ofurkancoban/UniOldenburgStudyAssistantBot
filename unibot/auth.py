@@ -753,9 +753,9 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
 
     if profile and user_id is not None:
         studip_user = profile.get("username")
-        display_name = profile.get("display_name")
-        if studip_user or display_name:
-            db.upsert_user(telegram_id=user_id, studip_username=studip_user)
+        if studip_user:
+            # only the link to the Stud.IP account: not a sign of activity (upsert_user touches last_active_at)
+            db.update_user_studip(user_id, studip_user)
 
     # One sign-in connects both services: sign this session in to StuMS on
     # the server while the NetIQ SSO session from the Mini App is fresh.

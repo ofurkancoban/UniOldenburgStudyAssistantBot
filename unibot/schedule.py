@@ -1973,6 +1973,8 @@ async def schedule_fastenroll_job(chat_id: int, sem_id: Optional[str], target_ti
     """Validate, persist and launch a fast-enroll job. Returns the reply text to show the user."""
     from unibot.tasks import _run_fastenroll_task
     from unibot.enrollment import validate_fastenroll_args
+    from unibot.enrollment import normalize_enroll_time
+    target_time_str = normalize_enroll_time(target_time_str)
     error = validate_fastenroll_args(sem_id, target_time_str, target_date_str)
     if error or sem_id is None or target_time_str is None:  # the validator rejects missing values
         return f"⚠️ {error}"

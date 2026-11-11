@@ -35,7 +35,6 @@ from unibot import db, state
 from unibot.auth import ACTIVE, has_stored_login, is_user_allowed, lifecycle_state
 from unibot.formatting import TELEGRAM_HTML_LIMIT, truncate_html
 from unibot.preferences import DIGEST_HOUR, get_pref, in_quiet_hours, morning_send_time
-from unibot.storage import load_default_semester
 from unibot.studip_api import BASE_URL
 from unibot.telegram_ui import WA_FORWARD_CALLBACK_PREFIX, broadcast_targets, markup_for
 
@@ -165,21 +164,12 @@ def record_scan(cid: str, session, *, file_hash: Optional[str] = None, forum_has
         logging.debug("Recording the scan of %s failed", cid, exc_info=True)
 
 
-def _semester_label() -> Optional[str]:
-    try:
-        return load_default_semester().get("label")
-    except Exception:
-        logging.debug("Default semester unavailable", exc_info=True)
-        return None
-
-
 def sync_registry(titles: dict, members: dict, known_uids) -> dict:
     """Write the watch plan into the registry: every course into
     global_courses, and the followed courses of each user whose course list is
     known into user_courses. Returns the counters for the digest."""
-    semester = _semester_label()
     for cid, title in titles.items():
-        db.upsert_global_course(cid, str(title), semester)
+        db.upsert_global_course(cid, str(title))  # no semester: the only default known here is one student's
     by_user: dict[int, set] = {uid: set() for uid in known_uids}
     for cid, uids in members.items():
         for uid in uids:

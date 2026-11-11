@@ -76,7 +76,7 @@ async def _run_fastenroll_task(chat_id: int, sem_id: str, target_time_str: str, 
 
 # ── Personal tasks / reminders (todo list with an optional due time) ───────────
 TASK_ASK_TEXT = "📝 What's the task?"
-TASK_ASK_TIME = "⏰ When should I remind you? (e.g. 'tomorrow 15:00', '20.09 09:00', 'in 2 hours') Type 'skip' for no reminder time."
+TASK_ASK_TIME = "⏰ When should I remind you? (e.g. 'tomorrow 15:00', 'next friday', '20.09 09:00', 'in 2 hours') Type 'skip' for no reminder time."
 TASK_SKIP_WORDS = {"skip", "yok", "hayır", "hayir", "none", "-"}
 
 
@@ -103,6 +103,13 @@ def parse_task_due_time(text: str):
     return due
 
 
+DEFAULT_REMINDER_HOUR = 9  # a day without a time reminds at 09:00
+WEEKDAY_NAMES = {
+    "monday": 0, "mon": 0, "montag": 0, "pazartesi": 0, "tuesday": 1, "tue": 1, "dienstag": 1, "salı": 1,
+    "wednesday": 2, "wed": 2, "mittwoch": 2, "çarşamba": 2, "thursday": 3, "thu": 3, "donnerstag": 3,
+    "perşembe": 3, "friday": 4, "fri": 4, "freitag": 4, "cuma": 4, "saturday": 5, "sat": 5, "samstag": 5,
+    "cumartesi": 5, "sunday": 6, "sun": 6, "sonntag": 6, "pazar": 6,
+}
 TASK_TIME_UNKNOWN = "Could not understand the date/time:"
 TASK_TIME_INVALID = "That date or time doesn't exist:"
 TASK_TIME_PAST = "That time has already passed:"
@@ -148,6 +155,20 @@ def _parse_task_due_time(t: str, now: datetime) -> datetime:
                 return candidate
         raise ValueError(f"{TASK_TIME_INVALID} {t}")
 
+    m = re.match(r"^(?:yarın|yarin|tomorrow)$", t, re.IGNORECASE)
+    if m:
+        target_date = (now + timedelta(days=1)).date()
+        return datetime(target_date.year, target_date.month, target_date.day, DEFAULT_REMINDER_HOUR, 0, tzinfo=TZ_BERLIN)
+    m = re.match(r"^(\d{1,2}):(\d{2})$", t)
+    if m:  # a bare time: today when it is still ahead, else tomorrow
+        candidate = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
+        return candidate if candidate >= now else candidate + timedelta(days=1)
+    m = re.match(r"^(?:(?:next|nächsten|naechsten|gelecek)\s+)?([a-zçğıöşü]+)(?:\s+(\d{1,2}):(\d{2}))?$", t, re.IGNORECASE)
+    if m and m.group(1).lower() in WEEKDAY_NAMES:
+        ahead = (WEEKDAY_NAMES[m.group(1).lower()] - now.weekday()) % 7 or 7  # the next one, never today
+        weekday_date = (now + timedelta(days=ahead)).date()
+        at_hour, at_minute = (int(m.group(2)), int(m.group(3))) if m.group(2) else (DEFAULT_REMINDER_HOUR, 0)
+        return datetime(weekday_date.year, weekday_date.month, weekday_date.day, at_hour, at_minute, tzinfo=TZ_BERLIN)
     raise ValueError(f"{TASK_TIME_UNKNOWN} {t}")
 
 
