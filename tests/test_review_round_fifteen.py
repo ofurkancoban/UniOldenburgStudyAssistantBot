@@ -479,5 +479,104 @@ class DeadCodeTests(unittest.TestCase):
         self.assertFalse(hasattr(telegram_ui, "delete_text"))
 
 
+def _html_problems(part: str, limit: int) -> list[str]:
+    """What Telegram would reject in one HTML message: too long, unbalanced
+    tags, a bare '<' or '&', or an entity cut in half."""
+    import re
+    from html.parser import HTMLParser
+    problems = []
+    if len(part) > limit:
+        problems.append(f"{len(part)} characters")
+    stack, errors = [], []
+
+    class Checker(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            stack.append(tag)
+
+        def handle_endtag(self, tag):
+            if not stack or stack[-1] != tag:
+                errors.append(f"</{tag}> closes {stack[-1:] or 'nothing'}")
+            else:
+                stack.pop()
+
+    checker = Checker(convert_charrefs=False)
+    checker.feed(part)
+    checker.close()
+    if stack:
+        problems.append(f"unclosed {stack}")
+    problems += errors
+    plain = re.sub(r"<[^>]*>", "", part)
+    if re.search(r"&(?!(amp|lt|gt|quot|#\d+);)", plain):
+        problems.append("bare or cut '&'")
+    if "<" in plain or ">" in plain:
+        problems.append("bare '<' or '>'")
+    return problems
+
+
+class LargeAccountMessageTests(unittest.TestCase):
+    """A student with far more courses than any real one (production has at most
+    22, titles up to 92 characters): every message part must be valid and fit."""
+
+    def _plan(self, n):
+        names = {f"c{i}": f"Course {i}: R&D <Advanced> Topics in Economics & Statistics, Part {i} " + "x" * 40 for i in range(n)}
+        sessions = []
+        for i in range(n):
+            sessions.append({"day": ["Mon", "Tue", "Wed", "Thu", "Fri"][i % 5], "date": f"2026-11-{9 + i % 5:02d}",
+                             "start": "09:00", "end": "10:30", "pieces": [
+                                 {"cid": f"c{i}", "unit": f"u{i}", "course": names[f"c{i}"], "unit_label": "Lecture " + "L&M " * 20,
+                                  "reason": "behind", "title": "Read slides <chapter> & exercises", "minutes": 45,
+                                  "task_minutes": 90, "part": "1/2"}]})
+        stats = {"needed": {c: 120 for c in names}, "scheduled": {c: 45 for c in names}, "names": names,
+                 "free_minutes": 900, "missed_prep": []}
+        rows = [{"name": names[c], "backlog": [1, 2, 3], "backlog_minutes": 180} for c in names]
+        return {"sessions": sessions, "stats": stats}, rows
+
+    def test_weekly_plan_for_60_courses_splits_into_valid_parts(self):
+        from unibot.monitoring import render_weekly_study_plan_message
+        plan, rows = self._plan(60)
+        text = render_weekly_study_plan_message(plan, [], [], rows)
+        self.assertGreater(len(text), 8000)  # really needs several messages
+        parts = formatting.split_html(text, 3800)
+        self.assertGreater(len(parts), 2)
+        for i, part in enumerate(parts):
+            self.assertEqual(_html_problems(part, 4096), [], f"part {i}")
+        import re
+        strip = lambda t: re.sub(r"<[^>]*>|\s+", "", t)  # noqa: E731
+        self.assertEqual(strip("".join(parts)), strip(text))  # nothing lost or doubled
+
+    def test_full_message_view_of_a_huge_inbox_message(self):
+        body = ("Dear students, R&D <meeting> & lab: please read & reply. " * 400)
+        parts = formatting.escaped_chunks(body, 3500)
+        header = "✉️ <b>FULL MESSAGE</b>\n" + "x" * 300
+        for part in parts:
+            self.assertEqual(_html_problems(header + part, 4096), [])
+
+    def test_random_html_always_splits_into_valid_parts(self):
+        import random
+        import re
+        rng = random.Random(20261111)
+        words = ["alpha", "R&amp;D", "&lt;x&gt;", "lecture", "Übung", "😀", "a" * 150, "\n", "\n\n", " "]
+        for case in range(300):
+            out, depth = [], []
+            for _ in range(rng.randint(5, 400)):
+                roll = rng.random()
+                if roll < 0.12 and len(depth) < 4:
+                    tag = rng.choice(["b", "i", "u", "code"])
+                    out.append(f"<{tag}>")
+                    depth.append(tag)
+                elif roll < 0.24 and depth:
+                    out.append(f"</{depth.pop()}>")
+                else:
+                    out.append(rng.choice(words))
+            out += [f"</{t}>" for t in reversed(depth)]
+            text = "".join(out)
+            limit = rng.choice([300, 800, 3800])
+            parts = formatting.split_html(text, limit)
+            for part in parts:
+                self.assertEqual(_html_problems(part, limit), [], f"case {case} limit {limit}")
+            strip = lambda t: re.sub(r"<[^>]*>|\s+", "", t)  # noqa: E731
+            self.assertEqual(strip("".join(parts)), strip(text), f"case {case}")
+
+
 if __name__ == "__main__":
     unittest.main()
