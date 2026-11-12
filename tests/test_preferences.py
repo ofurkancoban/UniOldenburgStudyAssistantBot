@@ -216,6 +216,27 @@ class MorningTests(unittest.TestCase):
         self.assertEqual(prepared, [[8050], [8051]])
         self.assertEqual([slot for slot, _u in delivered], ["07:00", "08:15"])
 
+    def test_naive_schedule_time_is_normalized_for_delivery(self):
+        preferences.set_pref(8050, "morning_time", "07:00")
+        captured = []
+
+        async def prepare(bot, user_ids):
+            return {"texts": {}}
+
+        async def deliver(bot, user_ids, prepared, send_at, today_str, slot):
+            captured.append(send_at)
+
+        async def run():
+            await self.schedule.run_morning_summary_schedule(
+                None, [8050], _at(6, 40).replace(tzinfo=None),
+            )
+            await asyncio.sleep(0)
+
+        with mock.patch("unibot.morning.prepare_morning_summary", prepare), \
+                mock.patch("unibot.morning._deliver_morning_summary_at", deliver):
+            asyncio.run(run())
+        self.assertEqual(captured, [_at(7, 0)])
+
     def test_already_sent_slots_are_not_repeated(self):
         from unibot import morning
         morning._mark_morning_summary_sent("2026-11-04", "07:00")

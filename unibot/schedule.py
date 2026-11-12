@@ -94,6 +94,10 @@ async def run_morning_summary_schedule(bot, user_ids, now: datetime) -> None:
     summary is prepared from MORNING_PREPARE_LEAD_MINUTES before that time,
     once, and handed to a task that sends it exactly then. If the time has
     already passed (bot started late), it is prepared and sent right away."""
+    # The scheduled-jobs loop uses berlin_now(), which is intentionally naive
+    # for Stud.IP dates. Delivery tasks subtract an aware Berlin timestamp, so
+    # normalize here before constructing send_at.
+    now = now.replace(tzinfo=TZ_BERLIN) if now.tzinfo is None else now.astimezone(TZ_BERLIN)
     groups: dict = {}
     for uid in user_ids:
         try:
