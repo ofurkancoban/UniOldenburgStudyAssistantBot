@@ -115,6 +115,38 @@ class ProxyCookieTests(unittest.TestCase):
         self.assertEqual(response.status, 503)
         resolve.assert_called_once()
 
+    def test_opaque_origin_with_same_origin_metadata_is_allowed(self):
+        sid = self.server._create_proxy_session(7)
+        request = mock.MagicMock()
+        request.cookies = {studip_login_server.PROXY_COOKIE: sid}
+        request.method = "POST"
+        request.path = "/dispatch.php/login"
+        request.headers = {
+            "Sec-Fetch-Site": "same-origin",
+            "Origin": "null",
+        }
+        resolve = mock.MagicMock(return_value=None)
+        with mock.patch.object(self.server, "_resolve_session", resolve):
+            response = asyncio.run(self.server._proxy(request))
+        self.assertEqual(response.status, 503)
+        resolve.assert_called_once()
+
+    def test_explicit_mismatched_origin_is_still_refused(self):
+        sid = self.server._create_proxy_session(7)
+        request = mock.MagicMock()
+        request.cookies = {studip_login_server.PROXY_COOKIE: sid}
+        request.method = "POST"
+        request.path = "/dispatch.php/login"
+        request.headers = {
+            "Sec-Fetch-Site": "same-origin",
+            "Origin": "https://other-origin.example",
+        }
+        resolve = mock.MagicMock()
+        with mock.patch.object(self.server, "_resolve_session", resolve):
+            response = asyncio.run(self.server._proxy(request))
+        self.assertEqual(response.status, 403)
+        resolve.assert_not_called()
+
 class InviteGuessLimitTests(unittest.TestCase):
     def setUp(self):
         auth._reset_invite_failures()

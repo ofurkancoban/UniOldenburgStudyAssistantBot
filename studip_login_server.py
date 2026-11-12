@@ -536,6 +536,8 @@ class LoginServer:
     @staticmethod
     def _origin_for_log(value: str) -> str:
         """Return only the scheme, host and port for safe origin diagnostics."""
+        if value.strip().lower() == "null":
+            return "opaque"
         try:
             parts = urlsplit(value)
             scheme = parts.scheme.lower()
@@ -791,6 +793,14 @@ class LoginServer:
         )
         fetch_site = request.headers.get("Sec-Fetch-Site", "").lower()
         same_origin = self._is_same_origin_request(request) if requires_same_origin else True
+        # Some Telegram WebViews submit same-origin forms with an opaque
+        # Origin. Accept that narrow case only when browser Fetch Metadata
+        # independently says same-origin. A concrete mismatched Origin and
+        # all cross-site requests remain blocked.
+        if (requires_same_origin and not same_origin
+                and request.headers.get("Origin", "").strip().lower() == "null"
+                and fetch_site == "same-origin"):
+            same_origin = True
         if requires_same_origin and not same_origin:
             # The cookie is SameSite=None (Mini App iframe), so another site
             # could otherwise trigger state-changing requests through the
