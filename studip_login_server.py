@@ -533,6 +533,20 @@ class LoginServer:
         expected_origin = origin_parts(expected)
         return expected_origin is not None and origin_parts(actual) == expected_origin
 
+    @staticmethod
+    def _origin_for_log(value: str) -> str:
+        """Return only the scheme, host and port for safe origin diagnostics."""
+        try:
+            parts = urlsplit(value)
+            scheme = parts.scheme.lower()
+            host = (parts.hostname or "").lower()
+            port = parts.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            return "invalid"
+        if scheme not in ("http", "https") or not host or parts.username is not None:
+            return "invalid"
+        return f"{scheme}://{host}:{port}"[:240]
+
     def _create_proxy_session(self, user_id: int) -> str:
         self._purge()
         exp = int(time.time() + PROXY_SESSION_TTL)
@@ -775,6 +789,7 @@ class LoginServer:
             or (request.method in ("GET", "HEAD")
                 and request.path.startswith("/dispatch.php/course/enrolment/apply/"))
         )
+        fetch_site = request.headers.get("Sec-Fetch-Site", "").lower()
         same_origin = self._is_same_origin_request(request) if requires_same_origin else True
         if requires_same_origin and not same_origin:
             # The cookie is SameSite=None (Mini App iframe), so another site
@@ -784,11 +799,12 @@ class LoginServer:
             # validate the browser-controlled Origin/Referer against our
             # configured public origin instead.
             logger.warning(
-                "Cross-site %s to the proxy refused (fetch_site=%s origin_present=%s referer_present=%s)",
+                "Cross-site %s to the proxy refused (fetch_site=%s expected=%s origin=%s referer=%s)",
                 request.method,
-                request.headers.get("Sec-Fetch-Site", "")[:32],
-                bool(request.headers.get("Origin")),
-                bool(request.headers.get("Referer")),
+                fetch_site[:32],
+                self._origin_for_log(self.base_url()),
+                self._origin_for_log(request.headers.get("Origin", "")),
+                self._origin_for_log(request.headers.get("Referer", "")),
             )
             return web.Response(text="Cross-site request refused", status=403)
         user_id = proxy_sess.get("user_id")

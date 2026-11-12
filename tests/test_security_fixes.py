@@ -115,7 +115,6 @@ class ProxyCookieTests(unittest.TestCase):
         self.assertEqual(response.status, 503)
         resolve.assert_called_once()
 
-
 class InviteGuessLimitTests(unittest.TestCase):
     def setUp(self):
         auth._reset_invite_failures()
