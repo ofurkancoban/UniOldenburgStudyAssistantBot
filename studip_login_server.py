@@ -95,7 +95,7 @@ _STRIP_RESP_HEADERS = {
 
 
 def _proxy_headers(headers) -> dict:
-    forwarded = {}
+    forwarded: dict[str, str] = {}
     for key, value in headers.items():
         if key.lower() in _STRIP_RESP_HEADERS:
             continue
