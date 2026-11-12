@@ -775,14 +775,13 @@ class LoginServer:
             or (request.method in ("GET", "HEAD")
                 and request.path.startswith("/dispatch.php/course/enrolment/apply/"))
         )
-        fetch_site = request.headers.get("Sec-Fetch-Site", "").lower()
-        if requires_same_origin and (
-                (fetch_site and fetch_site not in ("same-origin", "none"))
-                or not self._is_same_origin_request(request)):
+        if requires_same_origin and not self._is_same_origin_request(request):
             # The cookie is SameSite=None (Mini App iframe), so another site
             # could otherwise trigger state-changing requests through the
-            # student's signed-in proxy. Fetch Metadata and request origin
-            # must both agree.
+            # student's signed-in proxy. Some Telegram WebViews label an
+            # embedded same-origin form POST as cross-site in Fetch Metadata;
+            # validate the browser-controlled Origin/Referer against our
+            # configured public origin instead.
             logger.warning("Cross-site %s to the proxy refused", request.method)
             return web.Response(text="Cross-site request refused", status=403)
         user_id = proxy_sess.get("user_id")

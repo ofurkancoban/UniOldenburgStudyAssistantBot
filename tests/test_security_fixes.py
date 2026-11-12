@@ -98,6 +98,23 @@ class ProxyCookieTests(unittest.TestCase):
         self.assertEqual(response.status, 403)
         resolve.assert_not_called()
 
+    def test_telegram_webview_fetch_metadata_does_not_override_same_origin(self):
+        sid = self.server._create_proxy_session(7)
+        request = mock.MagicMock()
+        request.cookies = {studip_login_server.PROXY_COOKIE: sid}
+        request.method = "POST"
+        request.path = "/dispatch.php/messages/write"
+        request.headers = {
+            "Sec-Fetch-Site": "cross-site",
+            "Origin": self.server.base_url(),
+        }
+        resolve = mock.MagicMock(return_value=None)
+        with mock.patch.object(self.server, "_resolve_session", resolve):
+            response = asyncio.run(self.server._proxy(request))
+        # The request passed the origin gate and reached session resolution.
+        self.assertEqual(response.status, 503)
+        resolve.assert_called_once()
+
 
 class InviteGuessLimitTests(unittest.TestCase):
     def setUp(self):
