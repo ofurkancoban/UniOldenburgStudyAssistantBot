@@ -9,9 +9,11 @@ exam_reminder fetches the pages and acts on what these return.
 from __future__ import annotations
 
 import logging
+import math
 import re
 from datetime import datetime
 from typing import Optional
+from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
@@ -62,6 +64,15 @@ EXAM_TIME_RANGE_RE = re.compile(r"^\d{1,2}:\d{2}\s*[AP]M\s*-\s*\d{1,2}:\d{2}\s*[
 
 
 WEEKDAY_RE = re.compile(r"^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$")
+
+
+def _query_param(url: str, name: str) -> Optional[str]:
+    """Read one query parameter independent of its position or encoding."""
+    try:
+        values = parse_qs(urlsplit(url).query).get(name)
+    except ValueError:
+        return None
+    return values[0] if values else None
 
 
 GROUP_LABEL_RE = re.compile(r"\(([^)]*(?:group|Gruppe)[^)]*)\)", re.IGNORECASE)
@@ -115,15 +126,15 @@ def _parse_candidate_units(html_text: str) -> list[dict]:
             continue
 
         href = str(details_link["href"])
-        m_unit = re.search(r"unitId=(\d+)", href)
-        m_period = re.search(r"periodId=(\d+)", href)
+        unit_id = _query_param(href, "unitId")
+        period_id = _query_param(href, "periodId")
 
         seen[code] = {
             "code": code,
             "title": title_text,
             "info": info_text,
-            "unit_id": m_unit.group(1) if m_unit else None,
-            "period_id": m_period.group(1) if m_period else None,
+            "unit_id": unit_id,
+            "period_id": period_id,
         }
 
     return list(seen.values())
@@ -188,9 +199,9 @@ def _parse_registration_status(html_text: str) -> list[dict]:
         if not details_link:
             continue
         href = str(details_link["href"])
-        m_unit = re.search(r"unitId=(\d+)", href)
-        m_period = re.search(r"periodId=(\d+)", href)
-        if not m_unit:
+        unit_id = _query_param(href, "unitId")
+        period_id = _query_param(href, "periodId")
+        if not unit_id:
             continue
 
         anmeld_btn = node.find("button", id=lambda x: x and x.endswith(":anmelden"))
@@ -206,8 +217,8 @@ def _parse_registration_status(html_text: str) -> list[dict]:
             "code": code,
             "title": title_text,
             "info": info_text,
-            "unit_id": m_unit.group(1),
-            "period_id": m_period.group(1) if m_period else None,
+            "unit_id": unit_id,
+            "period_id": period_id,
             "action_type": action_type,
             "action": action,
             "status": status_text,
@@ -425,6 +436,36 @@ def is_passed_exam(exam: dict) -> bool:
     return (exam.get("status") or "").strip().lower() in ("passed", "bestanden")
 
 
+def normalize_grade_status(value) -> str:
+    """Canonical English form for final result labels in English or German."""
+    status = re.sub(r"\s+", " ", str(value or "").strip().casefold())
+    return {
+        "bestanden": "passed",
+        "nicht bestanden": "not passed",
+    }.get(status, status)
+
+
+def _parse_localized_number(value) -> Optional[float]:
+    """Parse a decimal written with either German or English separators."""
+    if value is None:
+        return None
+    text = re.sub(r"[\s\u00a0\u202f]", "", str(value))
+    if not text:
+        return None
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
+    try:
+        number = float(text)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def filter_exams_by_module_codes(exams: list[dict], module_codes: set[str]) -> list[dict]:
     """Keep only exam entries whose base module code matches one of the given
     Stud.IP module codes. This is far more reliable than matching by title: Stud.IP
@@ -461,23 +502,22 @@ def compute_transcript_summary(grades: list[dict]) -> dict:
         if SUMMARY_ROW_TITLE_RE.search(title):
             continue
 
-        status_title = (entry.get("status_title") or "").lower()
+        status_title = normalize_grade_status(entry.get("status_title"))
         grade_str = entry.get("grade")
         credit_str = entry.get("credit_points")
 
-        try:
-            credits = float(credit_str) if credit_str else 0.0
-        except ValueError:
-            credits = 0.0
+        parsed_credits = _parse_localized_number(credit_str)
+        credits = max(0.0, parsed_credits or 0.0)
 
         if status_title == "passed":
             item = {"title": title, "grade": grade_str, "credits": credits}
             passed.append(item)
             try:
-                if grade_str:
-                    weighted_sum += float(grade_str) * credits
+                grade_value = _parse_localized_number(grade_str)
+                if grade_value is not None:
+                    weighted_sum += grade_value * credits
                     total_credits += credits
-            except ValueError:
+            except (TypeError, ValueError):
                 pass
         elif status_title == "not passed":
             failed.append({"title": title, "grade": grade_str, "credits": credits})

@@ -20,7 +20,7 @@ from exam_reminder import filter_exams_by_module_codes, get_all_exam_dates
 from fast_enroll import get_semester_options, semester_display
 from studip_utils import berlin_now, html_escape as _h, redact_url
 
-from unibot import state
+from unibot import db, state
 from unibot.config import (
     WA_HEADERS,
     WA_SERVICE_URL,
@@ -34,6 +34,7 @@ from unibot.storage import (
     get_user_name,
     set_travel_mode,
     link_cache,
+    link_cache_owned_by,
     load_default_semester,
     rebuild_watched_courses,
     user_tasks,
@@ -67,6 +68,8 @@ from unibot.auth import (
     login_studip,
 )
 from unibot.studip_api import (
+    DownloadTooLargeError,
+    LoginPageResponseError,
     ZIP_RAW_LIMIT_BYTES,
     _api_message,
     _api_names,
@@ -76,6 +79,7 @@ from unibot.studip_api import (
     get_studip_user_profile,
     list_courses,
     list_files,
+    read_response_limited,
     studip_api_get,
 )
 from unibot.weather import geocode_location, save_weather_location
@@ -84,6 +88,7 @@ from unibot.mensa import (
     get_menu_navigation_keyboard,
     get_todays_menu_enhanced,
     menu_command,
+    send_menu_content,
 )
 from unibot.schedule import get_calendar_events, send_daily_calendar
 from unibot.monitoring import (
@@ -229,16 +234,15 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
         if should_reply:
-            await query.message.reply_text(
-                menu_text,
-                parse_mode="HTML",
-                reply_markup=get_menu_navigation_keyboard(prev, next_, current_path=sub_path)
+            await send_menu_content(
+                query.message, menu_text,
+                get_menu_navigation_keyboard(prev, next_, current_path=sub_path),
             )
         else:
-            await query.edit_message_text(
-                menu_text,
-                parse_mode="HTML",
-                reply_markup=get_menu_navigation_keyboard(prev, next_, current_path=sub_path)
+            await send_menu_content(
+                query.message, menu_text,
+                get_menu_navigation_keyboard(prev, next_, current_path=sub_path),
+                editor=query,
             )
 
     except Exception as e:
@@ -448,6 +452,10 @@ async def send_folder(query, files, cid, user_id, current_url=None):
             "name": f["name"],
             "ts": time.time(),
             "user_id": user_id,
+            # A stale download URL must be refreshed from the directory that
+            # contained this item; looking only at the course root fails for
+            # files inside nested folders.
+            "current_url": current_url,
         }
 
         # Normalize the URL and store it in the link cache
@@ -772,6 +780,8 @@ async def _selection_course(update, context, query, data, user_id):
     nav_names[user_id] = [course_name]
     user_sess = get_user_session(user_id)
     files = await list_files(cid, root_url, session=user_sess, user_id=user_id)
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        return
     await send_folder(query, files, cid, user_id, current_url=root_url)
 
 
@@ -780,6 +790,9 @@ async def _selection_folder(update, context, query, data, user_id):
     """Inline button callback: folder."""
     sid = data[1]
     info = link_cache.get(sid, {})
+    if not link_cache_owned_by(info, user_id):
+        await query.message.reply_text("⚠️ This folder link belongs to another account.")
+        return
     folder_url = info.get("url")
     cid = info.get("cid")
     folder_name = info.get("name", "Folder")
@@ -804,6 +817,8 @@ async def _selection_folder(update, context, query, data, user_id):
 
     user_sess = get_user_session(user_id)
     files = await list_files(cid, folder_url, session=user_sess, user_id=user_id)
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        return
     await send_folder(query, files, cid, user_id, current_url=folder_url)
 
 
@@ -812,6 +827,9 @@ async def _selection_file(update, context, query, data, user_id):
     """Inline button callback: file."""
     sid = data[1]
     info = link_cache.get(sid, {})
+    if not link_cache_owned_by(info, user_id):
+        await query.message.reply_text("⚠️ This file link belongs to another account.")
+        return
     cid = info.get("cid")
     fname = info.get("name")
 
@@ -821,9 +839,11 @@ async def _selection_file(update, context, query, data, user_id):
         await query.message.reply_text("⚠️ Invalid file reference. Cache may have expired.")
         logging.error("❌ Invalid file reference: cid=%s, fname=%s", cid, fname)
         return
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        return
 
     # Check cached or current URL
-    temp_url = info.get("url")
+    temp_url = _normalize_url(info.get("url"))
     current_url = info.get("current_url")
     # always the tapping student's own session: Stud.IP decides what they may download
     user_sess = active_session = get_user_session(user_id)
@@ -835,22 +855,29 @@ async def _selection_file(update, context, query, data, user_id):
         try:
             async with await active_session.get(temp_url) as resp:
                 if resp.status == 200:
-                    content = await resp.read()
+                    content = await read_response_limited(resp, 48 * 1024 * 1024)
                     if len(content) > 48 * 1024 * 1024:
                         await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
+                        return
+
+                    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
                         return
 
                     await _send_file_bytes(query.message, content, fname, sid)
                     logging.info("✅ Downloaded via cached URL: %s", fname)
 
                     # Update cache (refresh TTL)
-                    link_cache[sid] = {
-                        **info,
-                        "ts": time.time()
-                    }
+                    if is_user_allowed(user_id) and db.private_context_is_current(user_id):
+                        link_cache[sid] = {**info, "ts": time.time()}
                     return
                 else:
                     logging.warning("⚠️ Cached URL returned HTTP %s, getting fresh URL", resp.status)
+        except DownloadTooLargeError:
+            await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
+            return
+        except LoginPageResponseError:
+            await query.message.reply_text("🔐 Your Stud.IP session expired. Sign in with /login, then try downloading again.")
+            return
         except Exception as e:
             logging.warning("⚠️ Cached URL failed, getting fresh URL: %s", e)
 
@@ -863,6 +890,8 @@ async def _selection_file(update, context, query, data, user_id):
 
     try:
         url = await get_fresh_file_url(cid, fname, current_url, session=user_sess, user_id=user_id)
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
         if not url:
             await query.message.reply_text(f"⚠️ Could not get download link for:\n{fname}")
             logging.error("❌ No download URL found for: %s", fname)
@@ -884,14 +913,21 @@ async def _selection_file(update, context, query, data, user_id):
                     logging.error("❌ Download failed: HTTP %s for %s", resp.status, redact_url(url))
                     return
 
-                content = await resp.read()
+                content = await read_response_limited(resp, 48 * 1024 * 1024)
                 if len(content) > 48 * 1024 * 1024:
                     await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
+                    return
+
+                if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
                     return
 
                 await _send_file_bytes(query.message, content, fname, sid, caption=f"✅ {fname}")
                 logging.info("✅ Successfully downloaded: %s", fname)
 
+        except DownloadTooLargeError:
+            await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
+        except LoginPageResponseError:
+            await query.message.reply_text("🔐 Your Stud.IP session expired. Sign in with /login, then try downloading again.")
         except Exception as e:
             logging.error("❌ Download failed for %s: %s", fname, e)
             await query.message.reply_text(f"⚠️ Download failed:\n{str(e)[:200]}")
@@ -909,6 +945,9 @@ async def _selection_nav(update, context, query, data, user_id):
     """Inline button callback: nav."""
     sid = data[1]
     info = link_cache.get(sid, {})
+    if not link_cache_owned_by(info, user_id):
+        await query.message.reply_text("⚠️ This navigation link belongs to another account.")
+        return
     action = info.get("action")
     cid = info.get("cid")
 
@@ -921,6 +960,8 @@ async def _selection_nav(update, context, query, data, user_id):
         if nav_stack.get(user_id):
             back_url = nav_stack[user_id][-1]
             files = await list_files(cid, back_url, session=get_user_session(user_id), user_id=user_id)
+            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+                return
             await send_folder(query, files, cid, user_id, current_url=back_url)
         else:
             # Fallback: course root'a git
@@ -929,6 +970,8 @@ async def _selection_nav(update, context, query, data, user_id):
             nav_names[user_id] = [student_courses(user_id).get(cid, f"Course {cid[:6]}")]
             user_sess = get_user_session(user_id)
             files = await list_files(cid, root_url, session=user_sess, user_id=user_id)
+            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+                return
             await send_folder(query, files, cid, user_id, current_url=root_url)
 
     elif action == "home":
@@ -937,14 +980,20 @@ async def _selection_nav(update, context, query, data, user_id):
         nav_names[user_id] = [student_courses(user_id).get(cid, f"Course {cid[:6]}")]
         user_sess = get_user_session(user_id)
         files = await list_files(cid, root_url, session=user_sess, user_id=user_id)
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
         await send_folder(query, files, cid, user_id, current_url=root_url)
 
     elif action == "courses":
         user_sess = get_user_session(user_id)
         courses = await list_courses(session=user_sess, user_id=user_id)
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
         await _send_courses_menu(query, courses)
 
     elif action == "zip":
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
         current_url = info.get("current_url") or (
             nav_stack.get(user_id, [None])[-1] if nav_stack.get(user_id) else None)
         if not current_url:
@@ -957,6 +1006,8 @@ async def _selection_nav(update, context, query, data, user_id):
         await _show_typing(query, action=ChatAction.UPLOAD_DOCUMENT)
 
         async def progress(total, current):
+            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+                return
             pct = int((current / total) * 100) if total else 100
             try:
                 await msg.edit_text(f"📦 Preparing ZIP... ({pct}%)")
@@ -964,13 +1015,25 @@ async def _selection_nav(update, context, query, data, user_id):
                 pass
 
         user_sess = get_user_session(user_id)
-        buf, total, folder_name, success_count, total_size = await create_recursive_zip(
-            cid, current_url, root_name=root_name, progress_callback=progress,
-            session=user_sess, user_id=user_id,
-        )
+        try:
+            buf, total, folder_name, success_count, total_size = await create_recursive_zip(
+                cid, current_url, root_name=root_name, progress_callback=progress,
+                session=user_sess, user_id=user_id,
+            )
+        except Exception as e:
+            logging.warning("ZIP listing failed for user %s, course %s: %s", user_id, cid, e)
+            await msg.edit_text("⚠️ Could not read every folder, so no ZIP was created. Please try again.")
+            return
 
         if total == 0:
             await msg.edit_text("⚠️ No downloadable files found.")
+            return
+
+        if success_count == 0:
+            await msg.edit_text("⚠️ None of the files could be downloaded, so no ZIP was created.")
+            return
+
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
             return
 
         zip_name = f"{root_name}.zip"
@@ -999,6 +1062,8 @@ async def _selection_nav(update, context, query, data, user_id):
             await query.message.reply_text(summary, parse_mode="HTML")
             return
 
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
         await msg.edit_text(f"✅ {success_count} files added, sending ZIP...")
         await query.message.reply_document(document=buf, filename=zip_name)
         await msg.delete()
@@ -1011,6 +1076,9 @@ async def _selection_message(update, context, query, data, user_id):
     """Inline button callback: message."""
     sid = data[1]
     info = link_cache.get(sid, {})
+    if not link_cache_owned_by(info, user_id):
+        await query.message.reply_text("⚠️ This message link belongs to another account.")
+        return
     msg_id = info.get("message_id")
 
     if not msg_id:
@@ -1054,6 +1122,9 @@ async def _selection_message(update, context, query, data, user_id):
             body_container = soup.select_one("div.formatted-content, .message-content, .formatted-content.ck-content")
             content = clean_html_text(body_container) if body_container else "No content found."
 
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
+
         # Send to Telegram
         header = (
             "✉️ <b>FULL MESSAGE</b>\n"
@@ -1070,6 +1141,8 @@ async def _selection_message(update, context, query, data, user_id):
         if chunks:
             await query.message.reply_text(f"{header}{chunks[0]}", parse_mode="HTML")
             for part in chunks[1:]:
+                if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+                    return
                 await query.message.reply_text(part, parse_mode="HTML")
         else:
             await query.message.reply_text(f"{header}No message content found.", parse_mode="HTML")
@@ -1145,6 +1218,21 @@ async def handle_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
 PENDING_STEP_STATE = ("pending_step", "task_wizard", "fastenroll_wizard", "studip_reply_target")
 
 
+async def cancel_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel the current multi-step flow, including text-only prompts."""
+    data = user_data(context)
+    keys = (*PENDING_STEP_STATE, "pending_voice", "pending_voice_clarify")
+    had_pending = any(key in data for key in keys)
+    for key in keys:
+        data.pop(key, None)
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(
+            "✅ Cancelled." if had_pending else "ℹ️ There is nothing to cancel.",
+            reply_markup=get_main_keyboard(),
+        )
+
+
 async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE, text_override: Optional[str] = None) -> bool:
     """If the user has an active multi-step wizard pending, consume this message
     as that step's answer and return True. Otherwise return False so the caller
@@ -1190,7 +1278,6 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         return True
 
     if step == "weather_location":
-        context.user_data.pop("pending_step", None)
         query_text = text.strip()[:100]
         if not query_text:
             await update.effective_message.reply_text("🤷 That didn't look like a place name - try again from /status.")
@@ -1199,8 +1286,14 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
         if not resolved:
             await update.effective_message.reply_text(f"🤷 Couldn't find \"{query_text}\" - try a more specific city name, or check the spelling.")
             return True
-        save_weather_location(resolved["name"], resolved["country"], resolved["latitude"], resolved["longitude"],
-                              user_id=update.effective_user.id)
+        saved = save_weather_location(resolved["name"], resolved["country"], resolved["latitude"], resolved["longitude"],
+                                      user_id=update.effective_user.id)
+        if not saved:
+            await update.effective_message.reply_text(
+                "⚠️ I couldn't save that location. Please try again or use /status to start over."
+            )
+            return True
+        context.user_data.pop("pending_step", None)
         await update.effective_message.reply_text(
             f"📍 Got it - checking weather for {resolved['name']}, {resolved['country']} from now on.",
             reply_markup=get_main_keyboard(),
@@ -1251,9 +1344,16 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
             "━━━━━━━━━━━━━━━━━━\n"
             "<i>Sent to all registered students.</i>"
         )
-        await broadcast(context.bot, announcement, parse_mode="HTML", disable_notification=False)
+        result = await broadcast(context.bot, announcement, parse_mode="HTML", disable_notification=False)
+        sent_count = len(result["sent"])
+        failed_count = len(result["failed"])
+        if failed_count:
+            confirmation = (f"⚠️ <b>Partial delivery:</b> {sent_count} student(s) received the announcement; "
+                            f"delivery failed for {failed_count} student(s). Check the bot logs for details.")
+        else:
+            confirmation = f"✅ <b>Broadcast delivered to {sent_count} active student(s).</b>"
         await update.effective_message.reply_text(
-            "✅ <b>Broadcast sent successfully!</b>\nAll active students have received your announcement.",
+            confirmation,
             parse_mode="HTML",
             reply_markup=get_main_keyboard(),
         )
@@ -1458,7 +1558,7 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.answer()
 
     user_id = query.from_user.id
-    if not is_user_allowed(user_id):
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
         return
 
     options = context.user_data.get("course_view_options", [])
@@ -1491,7 +1591,11 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
             lines.append("━━━━━━━━━━━━━━━━━")
 
         session = await login_studip()  # the acting user's own session
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
         module_codes = await get_my_module_codes(session, [(course_name, course_cid)])
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
         exams = await get_all_exam_dates(session)
         matched = filter_exams_by_module_codes(exams, module_codes)
         today = berlin_now().date()
@@ -1503,6 +1607,9 @@ async def handle_course_view(update: Update, context: ContextTypes.DEFAULT_TYPE)
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
         await _delete_status_message(status_msg)
+
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        return
 
     if upcoming is None:
         lines.append("📅 <b>Exams:</b> could not load right now")

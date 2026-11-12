@@ -28,7 +28,7 @@ from telegram.ext import (
 from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 
 
-from unibot import state
+from unibot import db, state
 from unibot.config import (
     ALLOWED_USER_IDS,
     PROJECT_ROOT,
@@ -39,6 +39,7 @@ from unibot.config import (
 from unibot.storage import close_shared_http, link_cache
 from unibot.telegram_ui import TelegramSafetyLimiter, _show_typing
 from unibot.auth import (
+    ACTIVE,
     _authorization_gate,
     _get_login_server,
     _start_login_infra,
@@ -47,6 +48,8 @@ from unibot.auth import (
     pick_watcher_session,
     login_command,
     login_studip,
+    is_user_allowed,
+    lifecycle_state,
     logout_command,
     release_instance_lock,
 )
@@ -91,6 +94,7 @@ from unibot.schedule import (
     handle_calendar_week,
     handle_calendar_weekly,
     handle_upcoming_dashboard,
+    stop_fastenroll_jobs,
     timetable_command,
 )
 from unibot.whatsapp import (
@@ -180,6 +184,7 @@ from unibot.system import (
 )
 from unibot.menus import (
     _send_courses_menu,
+    cancel_pending_step,
     handle_change_semester,
     handle_course_noop,
     handle_course_view,
@@ -192,7 +197,7 @@ from unibot.menus import (
     menu_button_handler,
     start,
 )
-from unibot.watcher import start_unified_watcher
+from unibot.watcher import start_unified_watcher, stop_unified_watcher
 
 
 start_in_progress: set[int] = set()  # chat_id currently running /start
@@ -227,7 +232,19 @@ async def _run_begin_flow(message, user, context: ContextTypes.DEFAULT_TYPE):
 
         # Actual operations
         await login_studip()
+        if not is_user_allowed(user.id) or not db.private_context_is_current(user.id):
+            try:
+                await temp_message.delete()
+            except TelegramError:
+                pass
+            return
         courses = await list_courses()
+        if not is_user_allowed(user.id) or not db.private_context_is_current(user.id):
+            try:
+                await temp_message.delete()
+            except TelegramError:
+                pass
+            return
 
         # DELETE TEMPORARY MESSAGE!
         await temp_message.delete()
@@ -261,6 +278,7 @@ def register_handlers(app) -> None:
 
     # Command & Callback handlers
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel_pending_step))
     app.add_handler(CallbackQueryHandler(onboarding.handle_setup, pattern=r"^setup(_sem)?\|.+$"))
     app.add_handler(CallbackQueryHandler(onboarding.handle_setup_done, pattern="^setup_done$"))
     onboarding.register(app)
@@ -369,7 +387,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_toggle_weekly_study_plan, pattern="^toggle_weekly_study_plan$"))
     app.add_handler(CallbackQueryHandler(handle_outfit_menu, pattern="^(outfit_menu|outfit_menu_toggle)$"))
     app.add_handler(CallbackQueryHandler(handle_status_group, pattern=r"^(status_group|status_group_toggle)\|.*$"))
-    app.add_handler(CallbackQueryHandler(handle_study_plan_toggle, pattern=r"^sp_plan\|\d+$"))
+    app.add_handler(CallbackQueryHandler(handle_study_plan_toggle, pattern=r"^sp_plan\|[0-9a-f]{12}\|\d+$"))
     app.add_handler(CallbackQueryHandler(handle_study_block_feedback, pattern=r"^sp_block\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_calendar_sync, pattern=r"^cal_sync(\|.*)?$"))
     app.add_handler(CallbackQueryHandler(handle_study_buddy, pattern=r"^buddy(\|.*)?$"))
@@ -434,6 +452,11 @@ async def main():
         logging.error("❌ Another bot instance is already running. Exiting.")
         return
 
+    # Never let a second bot process clean up the active process's WhatsApp
+    # service before it discovers that the single-instance lock is occupied.
+    start_whatsapp_microservice()
+    atexit.register(stop_whatsapp_microservice)
+
     try:
         from unibot.diagnostics import record_start
         record_start()  # the daily digest tells deploys from crashes by this
@@ -448,6 +471,8 @@ async def main():
         logging.warning("Could not drop retired exam file data: %s", exc)
 
     app = None
+    watcher_start_task = None
+    whatsapp_supervisor_task = None
     try:
         # Bootstrap admin users and migrate existing credentials to DB vault
         try:
@@ -467,9 +492,25 @@ async def main():
             logging.debug("Credentials DB bootstrap skipped: %s", exc)
 
         state.global_session = pick_watcher_session()
+        watcher_uid = getattr(state.global_session, "user_id", None)
+        watcher_session_active = (
+            watcher_uid is None
+            or (is_user_allowed(watcher_uid) and lifecycle_state(watcher_uid) == ACTIVE)
+        )
 
         logging.info("🔐 Checking Stud.IP session...")
-        if not await state.global_session.login():
+        if watcher_session_active:
+            try:
+                logged_in = await state.global_session.login()
+            except Exception as exc:
+                # The Telegram bot and /login Mini App must still start when the
+                # university is temporarily unreachable at process startup.
+                logging.warning("⚠️ Stud.IP session check failed at startup: %s", exc)
+                logged_in = False
+        else:
+            logging.info("Skipping Stud.IP startup check for an inactive or blocked watcher account")
+            logged_in = False
+        if not logged_in:
             logging.warning("⚠️ Not logged in to Stud.IP yet. Starting bot so you can sign in via /login.")
 
         # validate_settings() requires the token; every API call is spaced and survives flood waits
@@ -501,24 +542,29 @@ async def main():
             logging.error("⚠️ Login infrastructure failed to start: %s", exc)
 
         # Pre-fetch Stud.IP profile to sync user name
-        try:
-            await get_studip_user_profile()
-        except Exception as exc:
-            logging.debug("Initial Stud.IP profile sync skipped: %s", exc)
+        if watcher_session_active:
+            try:
+                await get_studip_user_profile()
+            except Exception as exc:
+                logging.debug("Initial Stud.IP profile sync skipped: %s", exc)
 
         logging.info("🚀 Starting unified watcher...")
         # Run watcher in background task
-        state.spawn(start_unified_watcher(app), name="start_unified_watcher")
+        watcher_start_task = state.spawn(start_unified_watcher(app), name="start_unified_watcher")
 
         await restore_pending_fastenroll_jobs(app)
 
         logging.info("🤖 Starting Telegram bot polling...")
         await app.updater.start_polling(drop_pending_updates=True)
+        logging.info("✅ Telegram polling started successfully")
 
         logging.info("💬 Bot is now online and listening for messages.")
 
         # Run until the process is stopped
         stop_event = asyncio.Event()
+        whatsapp_supervisor_task = state.spawn(
+            _supervise_whatsapp_microservice(stop_event), name="whatsapp_service_supervisor"
+        )
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -533,18 +579,54 @@ async def main():
 
     except Exception as e:
         logging.error("❌ Fatal error in main: %s", e, exc_info=True)
+        raise
     finally:
         logging.info("🧹 Cleaning up...")
-        stop_whatsapp_microservice()
+        if watcher_start_task is not None and not watcher_start_task.done():
+            watcher_start_task.cancel()
+            try:
+                await watcher_start_task
+            except asyncio.CancelledError:
+                pass
+        if whatsapp_supervisor_task is not None and not whatsapp_supervisor_task.done():
+            whatsapp_supervisor_task.cancel()
+            try:
+                await whatsapp_supervisor_task
+            except asyncio.CancelledError:
+                pass
+        try:
+            await stop_unified_watcher()
+        except Exception:
+            logging.error("Error stopping watcher tasks", exc_info=True)
+        morning_tasks = list(state._morning_delivery_tasks.values())
+        for task in morning_tasks:
+            if not task.done():
+                task.cancel()
+        if morning_tasks:
+            await asyncio.gather(*morning_tasks, return_exceptions=True)
+        try:
+            await stop_fastenroll_jobs()
+        except Exception:
+            logging.error("Error stopping fast-enroll jobs", exc_info=True)
+        if app:
+            if app.updater and app.updater.running:
+                try:
+                    await app.updater.stop()
+                except Exception:
+                    logging.error("Error stopping Telegram updater", exc_info=True)
+            if app.running:
+                try:
+                    await app.stop()
+                except Exception:
+                    logging.error("Error stopping Telegram application", exc_info=True)
+
         if app:
             try:
-                if app.updater and app.updater.running:
-                    await app.updater.stop()
-                if app.running:
-                    await app.stop()
                 await app.shutdown()
             except Exception as se:
-                logging.error("Error during app shutdown: %s", se)
+                logging.error("Error shutting down Telegram application: %s", se)
+
+        stop_whatsapp_microservice()
             
         if state.quick_tunnel:
             try:
@@ -560,10 +642,16 @@ async def main():
         try:
             # write out a debounced link_cache change that hasn't fired yet
             link_cache.flush()
+        except Exception:
+            logging.error("Error flushing link cache", exc_info=True)
+        try:
             await close_shared_http()
+        except Exception:
+            logging.error("Error closing shared HTTP session", exc_info=True)
+        try:
             await close_all_sessions()
         except Exception:
-            logging.error("Error while closing sessions", exc_info=True)
+            logging.error("Error closing Stud.IP sessions", exc_info=True)
         finally:
             release_instance_lock()
         logging.info("✅ Bot shutdown complete")
@@ -643,6 +731,53 @@ def start_whatsapp_microservice():
         logging.error("Failed to start WhatsApp microservice: %s", exc)
 
 
+async def _supervise_whatsapp_microservice(stop_event: asyncio.Event) -> None:
+    """Restart the WhatsApp child if it exits or cannot be started.
+
+    The Telegram bot is the process supervisor, so a Node crash must not leave
+    WhatsApp offline until an administrator manually restarts the whole bot.
+    Backoff caps repeated failures caused by a persistent configuration or
+    port problem.
+    """
+    retry_delay = 5
+    loop = asyncio.get_running_loop()
+    process_started_at = loop.time()
+    while not stop_event.is_set():
+        process = state.wa_process
+        if process is not None and process.poll() is None:
+            if loop.time() - process_started_at >= 60:
+                retry_delay = 5
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+            continue
+
+        if process is not None:
+            logging.error("WhatsApp microservice exited with status %s", process.returncode)
+            if loop.time() - process_started_at < 60:
+                retry_delay = min(retry_delay * 2, 60)
+            else:
+                retry_delay = 5
+            state.wa_process = None
+
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=retry_delay)
+        except asyncio.TimeoutError:
+            pass
+        if stop_event.is_set():
+            return
+
+        logging.warning("Restarting WhatsApp microservice after %s seconds", retry_delay)
+        start_whatsapp_microservice()
+        process = state.wa_process
+        if process is not None and process.poll() is None:
+            process_started_at = loop.time()
+        else:
+            process_started_at = loop.time()
+            retry_delay = min(retry_delay * 2, 60)
+
+
 def stop_whatsapp_microservice():
     if state.wa_process is None:
         return
@@ -677,8 +812,5 @@ def run() -> None:
 
     for warning in validate_settings():
         logging.warning("⚠️ Config: %s", warning)
-
-    start_whatsapp_microservice()
-    atexit.register(stop_whatsapp_microservice)
 
     asyncio.run(main())

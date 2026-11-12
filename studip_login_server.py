@@ -47,6 +47,7 @@ TOKEN_TTL = 600          # seconds a link token stays valid
 INITDATA_MAX_AGE = 3600  # seconds a Mini App payload stays valid
 PROXY_COOKIE = "_bot_proxy_auth"
 PROXY_SESSION_TTL = 3600
+AUTH_DATE_FUTURE_SKEW_SECONDS = 60
 
 ELEARN_ORIGIN = "https://elearning.uni-oldenburg.de"
 LOGIN_ORIGIN = "https://login.uni-oldenburg.de"
@@ -139,12 +140,18 @@ def verify_init_data(init_data: str, bot_token: str,
         auth_date = int(pairs.get("auth_date", "0"))
     except ValueError:
         return None
-    if max_age and time.time() - auth_date > max_age:
-        logger.warning("initData is stale (%ss old)", int(time.time() - auth_date))
+    now = time.time()
+    age = now - auth_date
+    if age < -AUTH_DATE_FUTURE_SKEW_SECONDS:
+        logger.warning("initData auth_date is %ss in the future", int(-age))
+        return None
+    if max_age and age > max_age:
+        logger.warning("initData is stale (%ss old)", int(age))
         return None
 
     try:
-        return json.loads(pairs.get("user", "{}")) or None
+        user = json.loads(pairs.get("user", "{}"))
+        return user if isinstance(user, dict) else None
     except ValueError:
         return None
 
@@ -328,7 +335,7 @@ class LoginServer:
         # per Telegram user, so two students signing in at once both get
         # their post-login hook (StuMS handoff, profile sync)
         self._last_auth_notify: dict = {}
-        self._hook_tasks: set = set()
+        self._hook_tasks: dict[Optional[int], set[asyncio.Task]] = {}
         # (method, path, handler) the bot adds before start(), e.g. the
         # calendar feed; they go in front of the catch-all Stud.IP proxy
         self.extra_routes: list[tuple[str, str, Callable]] = []
@@ -344,7 +351,8 @@ class LoginServer:
         explicit = os.getenv("LOGIN_HOST", "").strip()
         if explicit:
             return explicit
-        if os.getenv("LOGIN_PUBLIC_URL", "").strip() or os.getenv("CLOUDFLARE_TUNNEL", "").strip():
+        tunnel_mode = os.getenv("CLOUDFLARE_TUNNEL", "").strip().lower()
+        if os.getenv("LOGIN_PUBLIC_URL", "").strip() or tunnel_mode in ("quick", "named"):
             return "127.0.0.1"
         return "0.0.0.0"
 
@@ -361,22 +369,29 @@ class LoginServer:
     def _resolve_session(self, user_id: Optional[int] = None):
         if not self.session_provider:
             return None
-        try:
-            return self.session_provider(user_id)
-        except TypeError:
-            return self.session_provider()
+        # Do not retry without user_id on TypeError: an error inside the
+        # provider must never fall through to a shared/admin session.
+        return self.session_provider(user_id)
 
     def revoke_all(self) -> None:
         """Invalidate every link token and proxy cookie (called on /logout)."""
+        for tasks in self._hook_tasks.values():
+            for task in tasks:
+                task.cancel()
+        self._hook_tasks.clear()
         self._tokens.clear()
         self._proxy_sessions.clear()
         self._revoked_until.clear()
+        self._last_auth_notify.clear()
         self._cookie_salt = secrets.token_bytes(16)
 
     def revoke_user(self, user_id: int) -> None:
         """Invalidate one student's link tokens and proxy cookies (their own
         /logout, an admin revoke, a data deletion). Cookies stay signed, so
         every cookie of this user issued up to now is refused by its expiry."""
+        for task in self._hook_tasks.pop(user_id, set()):
+            task.cancel()
+        self._last_auth_notify.pop(user_id, None)
         for token in [t for t, d in self._tokens.items() if d.get("user_id") == user_id]:
             self._tokens.pop(token, None)
         for sid in [s for s, d in self._proxy_sessions.items() if d.get("user_id") == user_id]:
@@ -423,6 +438,41 @@ class LoginServer:
     def _csrf_token(self, sid: str) -> str:
         """Per-session token required by state-changing GET links (Relink)."""
         return hmac.new(self._cookie_key(), f"csrf:{sid}".encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+    def _is_same_origin_request(self, request: web.Request) -> bool:
+        """Require browser origin metadata for state-changing proxy requests.
+
+        Fetch Metadata is useful when available, but older webviews may omit
+        it. In that case Origin or Referer must still match the configured
+        public URL so a missing header cannot silently disable CSRF checks.
+        """
+        try:
+            expected = urlsplit(self.base_url())
+            origin = request.headers.get("Origin")
+            if origin:
+                actual = urlsplit(origin)
+            else:
+                referer = request.headers.get("Referer")
+                if not referer:
+                    return False
+                actual = urlsplit(referer)
+        except ValueError:
+            return False
+
+        def origin_parts(parts):
+            scheme = parts.scheme.lower()
+            host = (parts.hostname or "").lower()
+            try:
+                port = parts.port
+            except ValueError:
+                return None
+            if (scheme not in ("http", "https") or not host
+                    or parts.username is not None or parts.password is not None):
+                return None
+            return scheme, host, port or (443 if scheme == "https" else 80)
+
+        expected_origin = origin_parts(expected)
+        return expected_origin is not None and origin_parts(actual) == expected_origin
 
     def _create_proxy_session(self, user_id: int) -> str:
         self._purge()
@@ -471,6 +521,13 @@ class LoginServer:
                 self._proxy_sessions[sid] = sess
                 return sess
         return None
+
+    def _proxy_session_is_current(self, request: web.Request, user_id: Optional[int]) -> bool:
+        """Recheck authorization after an await and before a proxy side effect."""
+        if not isinstance(user_id, int) or isinstance(user_id, bool):
+            return False
+        current = self._check_proxy_session(request)
+        return bool(current and current.get("user_id") == user_id)
 
     def _set_auth_cookie(self, response: web.StreamResponse, sid: str, request: web.Request) -> None:
         is_https = (
@@ -552,15 +609,22 @@ class LoginServer:
         if studip_sess is not None and self._entry_target(request) == "stums" and not relogin:
             studip_sess.last_interactive_activity = time.time()
             await studip_sess.ensure_session()
+            if not self._proxy_session_is_current(request, user_id):
+                raise web.HTTPFound("/app")
             studip_sess.stums.verified_at = 0.0
             raise web.HTTPFound(STUMS_SSO_ENTRY_PATH)
         if studip_sess is not None:
             studip_sess.last_interactive_activity = time.time()
             await studip_sess.ensure_session()
+            if not self._proxy_session_is_current(request, user_id):
+                raise web.HTTPFound("/app")
             if relogin:
                 await studip_sess.logout()
                 studip_sess.last_interactive_activity = time.time()
             elif await studip_sess.is_html_logged_in(use_cache=False):
+                current_auth = self._check_proxy_session(request)
+                if not current_auth or current_auth.get("user_id") != user_id:
+                    raise web.HTTPFound("/app")
                 studip_sess.explicitly_logged_out = False
                 studip_sess.last_interactive_activity = 0.0
                 # the hook also signs this session in to StuMS on the server
@@ -598,8 +662,17 @@ class LoginServer:
         self._last_auth_notify[user_id] = now
         if self.on_session_authenticated:
             task = asyncio.create_task(self._run_auth_hook(user_id))
-            self._hook_tasks.add(task)  # keep a reference until it is done
-            task.add_done_callback(self._hook_tasks.discard)
+            tasks = self._hook_tasks.setdefault(user_id, set())
+            tasks.add(task)  # keep a reference until it is done
+
+            def discard(done_task: asyncio.Task) -> None:
+                current = self._hook_tasks.get(user_id)
+                if current is not None:
+                    current.discard(done_task)
+                    if not current:
+                        self._hook_tasks.pop(user_id, None)
+
+            task.add_done_callback(discard)
 
     async def _run_auth_hook(self, user_id: Optional[int] = None) -> None:
         try:
@@ -617,11 +690,23 @@ class LoginServer:
             if request.path in ("/", "/app"):
                 return await self._app_gate(request)
             raise web.HTTPFound("/app")
-        if request.method not in _SAFE_METHODS and \
-                request.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
+        # Stud.IP's apply dialog is not guaranteed to be read-only: some
+        # courses complete enrolment as a side effect of this GET. Since the
+        # proxy cookie is SameSite=None for the Telegram WebView, protect this
+        # route from cross-site navigation just like a POST.
+        requires_same_origin = (
+            request.method not in _SAFE_METHODS
+            or (request.method in ("GET", "HEAD")
+                and request.path.startswith("/dispatch.php/course/enrolment/apply/"))
+        )
+        fetch_site = request.headers.get("Sec-Fetch-Site", "").lower()
+        if requires_same_origin and (
+                (fetch_site and fetch_site not in ("same-origin", "none"))
+                or not self._is_same_origin_request(request)):
             # The cookie is SameSite=None (Mini App iframe), so another site
-            # could otherwise post forms through the student's signed-in
-            # proxy; every real form here comes from a proxied page.
+            # could otherwise trigger state-changing requests through the
+            # student's signed-in proxy. Fetch Metadata and request origin
+            # must both agree.
             logger.warning("Cross-site %s to the proxy refused", request.method)
             return web.Response(text="Cross-site request refused", status=403)
         user_id = proxy_sess.get("user_id")
@@ -631,6 +716,9 @@ class LoginServer:
         if studip_sess is None:
             return web.Response(text="Bot session not initialized", status=503)
         await studip_sess.ensure_session()
+        if not self._proxy_session_is_current(request, user_id):
+            return web.Response(text="Login session expired.", status=401,
+                                headers={"Cache-Control": "no-store"})
         stums_signed_in = time.time() - studip_sess.stums.verified_at < 120
         if request.path.startswith(("/nidp", "/osp", "/sso.php", "/dispatch.php/login")) or (
                 request.path.startswith("/qisserver") and not stums_signed_in):
@@ -666,6 +754,12 @@ class LoginServer:
             fwd_headers[k] = v
 
         body = await request.read() if request.can_read_body else None
+        # Request-body reads and session preparation can yield to logout,
+        # account blocking or personal-data deletion. Check at the last point
+        # before the upstream request, since it may mutate the student's data.
+        if not self._proxy_session_is_current(request, user_id):
+            return web.Response(text="Login session expired.", status=401,
+                                headers={"Cache-Control": "no-store"})
 
         try:
             with interactive_requests():
@@ -684,6 +778,18 @@ class LoginServer:
         except Exception as exc:
             logger.error("Proxy upstream error for %s: %s", redact_url(target_url), exc)
             return web.Response(text=f"Upstream error: {exc}", status=502)
+
+        # A user can log out, lose access, or delete their data while the
+        # upstream request is in flight. Revoking the proxy cookie blocks new
+        # requests, but this already-authorized request must not deliver its
+        # response afterward (including binary files and other non-HTML data).
+        current_auth = self._check_proxy_session(request)
+        if not current_auth or current_auth.get("user_id") != user_id:
+            return web.Response(
+                text="Login session expired.",
+                status=401,
+                headers={"Cache-Control": "no-store"},
+            )
 
         resp_headers = {}
         for k, v in up_headers.items():
@@ -737,6 +843,10 @@ class LoginServer:
                 studip_sess.stums.blocked_until = 0.0  # interactive sign-in lifts the pause
 
             if is_studip_auth or is_stums_auth:
+                current_auth = self._check_proxy_session(request)
+                if not current_auth or current_auth.get("user_id") != user_id:
+                    return web.Response(text="Login session expired.", status=401,
+                                        headers={"Cache-Control": "no-store"})
                 studip_sess.explicitly_logged_out = False
                 studip_sess.last_interactive_activity = 0.0
                 # The hook signs in to the other service on the server

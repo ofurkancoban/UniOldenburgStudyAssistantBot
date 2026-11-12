@@ -20,16 +20,22 @@ from unibot.config import (
     GWDG_API_KEY,
     GWDG_API_URL,
 )
-from unibot import state
-from unibot.storage import link_cache, shared_http
+from unibot import db, state
+from unibot.storage import get_ai_personal_enabled, link_cache, link_cache_owned_by, shared_http
 from unibot.formatting import clean_course_title, truncate_html
 from unibot.telegram_ui import _start_loading_animation, _stop_loading_animation
 from unibot.auth import is_user_allowed, login_studip
-from unibot.studip_api import get_fresh_file_url
+from unibot.studip_api import (
+    DownloadTooLargeError,
+    _normalize_url,
+    get_fresh_file_url,
+    read_response_limited,
+)
 from unibot.ai import (
     _call_openrouter,
     _gwdg_throttle,
     _record_gwdg_quota,
+    personal_ai_allowed,
 )
 
 
@@ -47,6 +53,15 @@ FILE_AUDIO_SUMMARY_SYSTEM_PROMPT = (
 )
 
 
+def _personal_ai_allowed(user_id: Optional[int]) -> bool:
+    """Whether this task may still send the user's document to an AI provider.
+
+    The generation check prevents a request started before personal-data
+    deletion from continuing into another provider after the first one fails.
+    """
+    return personal_ai_allowed(user_id)
+
+
 async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle `file_audio_sum|<sid>` callback: extract text from the PDF/slide deck,
     generate a 1-minute spoken summary via LLM, and send it as a Telegram voice note."""
@@ -57,16 +72,26 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
         return
+    if not get_ai_personal_enabled(user_id):
+        await query.message.reply_text(
+            "🔒 Course-file summaries use an outside AI service. Allow personal AI use under /settings → Privacy to continue."
+        )
+        return
 
     parts = (query.data or "").split("|", 1)
     sid = parts[1].strip() if len(parts) > 1 else ""
     info = link_cache.get(sid, {})
+    if not link_cache_owned_by(info, user_id):
+        await query.message.reply_text("⚠️ This file link belongs to another account.")
+        return
     cid = info.get("cid")
     fname = info.get("name")
     course_name = info.get("course") or (state.courses_map.get(cid) if cid else "") or "Course"
 
     if not cid or not fname:
         await query.message.reply_text("⚠️ File reference expired. Please open the file list again.")
+        return
+    if not db.private_context_is_current(user_id):
         return
 
     status_msg = await query.message.reply_text(
@@ -75,41 +100,70 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
     )
     stop_evt, anim_task = _start_loading_animation(status_msg, f"Preparing 1-Min Audio Summary for {fname}...")
 
+    async def cancel_if_stale() -> bool:
+        if (is_user_allowed(user_id) and db.private_context_is_current(user_id)
+                and get_ai_personal_enabled(user_id)):
+            return False
+        try:
+            await status_msg.edit_text("⚠️ Request cancelled because access, data or AI permission changed.")
+        except Exception:
+            logging.debug("Could not update a cancelled file summary", exc_info=True)
+        return True
+
     try:
         session = await login_studip()
-        file_url = info.get("url")
+        if await cancel_if_stale():
+            return
+        file_url = _normalize_url(info.get("url"))
         content = None
 
         if file_url:
             try:
                 async with await session.get(file_url) as r:
                     if r.status == 200:
-                        content = await r.read()
+                        content = await read_response_limited(r, 48 * 1024 * 1024)
+            except DownloadTooLargeError:
+                raise
             except Exception:
                 logging.debug("File download failed", exc_info=True)
                 content = None
 
         if not content:
+            if await cancel_if_stale():
+                return
             fresh_url = await get_fresh_file_url(cid, fname, info.get("current_url"), session=session, user_id=user_id)
             if fresh_url:
+                if await cancel_if_stale():
+                    return
                 info["url"] = fresh_url
                 link_cache[sid] = {**info, "ts": time.time()}
                 async with await session.get(fresh_url) as r:
                     if r.status == 200:
-                        content = await r.read()
+                        content = await read_response_limited(r, 48 * 1024 * 1024)
 
         if not content:
+            if await cancel_if_stale():
+                return
             await _stop_loading_animation(stop_evt, anim_task)
             await status_msg.edit_text(f"⚠️ Could not download <b>{html.escape(fname)}</b> from Stud.IP.", parse_mode="HTML")
             return
 
-        extracted = await extract_text_from_file_async(fname, content)
+        if await cancel_if_stale():
+            return
+        extracted = await extract_text_from_file_async(fname, content, user_id=user_id)
+        if await cancel_if_stale():
+            return
         if not extracted or len(extracted.strip()) < 40:
             await _stop_loading_animation(stop_evt, anim_task)
             await status_msg.edit_text(
                 f"⚠️ Could not extract readable text from <b>{html.escape(fname)}</b>.",
                 parse_mode="HTML",
             )
+            return
+
+        # Revoked access or deleted personal data must stop an in-flight request
+        # before document contents are sent to an AI provider.
+        if await cancel_if_stale():
             return
 
         user_prompt = (
@@ -123,6 +177,7 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
             temperature=0.3,
             timeout=35,
             reasoning=False,
+            can_send=lambda: _personal_ai_allowed(user_id),
         )
         if not script:
             await _stop_loading_animation(stop_evt, anim_task)
@@ -130,6 +185,10 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
             return
 
         clean_script = script.strip().strip('"')
+    except DownloadTooLargeError:
+        await _stop_loading_animation(stop_evt, anim_task)
+        await status_msg.edit_text("⚠️ This file is too large to prepare an audio summary.")
+        return
     except Exception as e:
         # an expired session or a Stud.IP error must not leave the student
         # with a "Preparing..." message that never changes
@@ -140,6 +199,11 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
 
+    # The user may have deleted their data while the AI request was running.
+    # Suppress both the text result and its voice version in that case.
+    if await cancel_if_stale():
+        return
+
     summary_card = (
         f"🎧 <b>1-Minute Study Summary</b>\n"
         f"📘 <b>{html.escape(clean_course_title(course_name))}</b>\n"
@@ -148,7 +212,9 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
         f"{html.escape(clean_script)}"
     )
     await status_msg.edit_text(truncate_html(summary_card), parse_mode="HTML")
-    await _try_send_voice(query.message, clean_script)
+    if await cancel_if_stale():
+        return
+    await _try_send_voice(query.message, clean_script, user_id=user_id)
 
 
 # A scanned or handwritten PDF gives pypdf next to nothing (55 characters
@@ -157,16 +223,22 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
 DOCLING_MIN_CHARS_PER_PAGE = 100
 
 
-async def convert_with_docling(filename: str, content: bytes) -> Optional[str]:
+async def convert_with_docling(filename: str, content: bytes,
+                               user_id: Optional[int] = None) -> Optional[str]:
     """Markdown text of a document via GWDG's Docling service (layout
     analysis + OCR), or None if GWDG is unset, rate limited or failed."""
-    if not GWDG_API_KEY or time.monotonic() < state._gwdg_blocked_until:
+    if (user_id is None or not _personal_ai_allowed(user_id)
+            or not GWDG_API_KEY or time.monotonic() < state._gwdg_blocked_until):
         return None
     form = aiohttp.FormData()
     form.add_field("files", content, filename=filename)
     try:
         await _gwdg_throttle()
+        if not _personal_ai_allowed(user_id):
+            return None
         async with shared_http() as session:
+            if not _personal_ai_allowed(user_id):
+                return None
             async with session.post(
                 f"{GWDG_API_URL}/documents/convert/file",
                 headers={"Authorization": f"Bearer {GWDG_API_KEY}", "accept": "application/json"},
@@ -178,13 +250,16 @@ async def convert_with_docling(filename: str, content: bytes) -> Optional[str]:
                     logging.warning("Docling conversion failed for %s: HTTP %s", filename, resp.status)
                     return None
                 data = await resp.json(content_type=None)
+        if not _personal_ai_allowed(user_id):
+            return None
         return ((data.get("document") or {}).get("md_content") or "").strip() or None
     except Exception as e:
         logging.warning("Docling conversion failed for %s: %s: %s", filename, type(e).__name__, e)
         return None
 
 
-async def extract_text_from_file_async(filename: str, content: bytes) -> Optional[str]:
+async def extract_text_from_file_async(filename: str, content: bytes,
+                                       user_id: Optional[int] = None) -> Optional[str]:
     """extract_text_from_file, with GWDG Docling as the fallback for PDFs
     and PPTX files the local parsers get (almost) no text from, typically
     scans and handwritten notes. Typed files never use the quota."""
@@ -198,7 +273,7 @@ async def extract_text_from_file_async(filename: str, content: bytes) -> Optiona
         pages = await asyncio.to_thread(_pdf_page_count, content)
     if text and len(text.strip()) >= DOCLING_MIN_CHARS_PER_PAGE * pages:
         return text
-    converted = await convert_with_docling(filename, content)
+    converted = await convert_with_docling(filename, content, user_id=user_id)
     if converted and len(converted) > len((text or "").strip()):
         logging.info("Docling read %s: %s -> %s characters", filename, len((text or '').strip()), len(converted))
         return converted
@@ -277,7 +352,8 @@ LECTURE_FILE_TOPIC_SYSTEM_PROMPT = (
 )
 
 
-async def summarize_lecture_file(filename: str, extracted_text: str) -> Optional[str]:
+async def summarize_lecture_file(filename: str, extracted_text: str,
+                                user_id: Optional[int] = None) -> Optional[str]:
     """Turn a lecture file's extracted text into a short topic label for
     the weekly study plan's "known topics per course" prompt input.
     Truncates to the first 6000 characters before calling the LLM -
@@ -286,11 +362,12 @@ async def summarize_lecture_file(filename: str, extracted_text: str) -> Optional
     only defense against unbounded prompt size, since no token-budget
     handling exists anywhere else in this codebase."""
     text = (extracted_text or "")[:6000].strip()
-    if not text:
+    if not text or not _personal_ai_allowed(user_id):
         return None
     raw = await _call_openrouter(
         LECTURE_FILE_TOPIC_SYSTEM_PROMPT,
         f"Filename: {filename}\n\nExtracted text:\n{text}",
         temperature=0,
+        can_send=lambda: _personal_ai_allowed(user_id),
     )
     return raw.strip() if raw else None

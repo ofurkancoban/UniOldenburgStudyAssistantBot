@@ -19,6 +19,7 @@ from unibot.config import PRIMARY_ADMIN_ID
 from unibot.storage import (
     get_scan_previous_semester_enabled,
     get_watch_previous_semester_enabled,
+    get_wardrobe_feature_enabled,
     get_weekly_study_plan_enabled,
 )
 
@@ -83,7 +84,7 @@ DEFAULTS: dict[str, Any] = {
     "food_avoid_keywords": [],
     "morning_time": "07:00",
     "morning_sections": {key: True for key in MORNING_SECTIONS},
-    "outfit": True,
+    "outfit": False,
     "quiet_hours": {"start": "23:00", "end": "08:00"},
     "delivery_mode": "instant",
     "file_delivery": "card",
@@ -114,11 +115,13 @@ def validate(key: str, value) -> Any:
         "file_delivery": set(FILE_DELIVERY),
     }
     if key in choices:
-        if value not in choices[key]:
+        if not isinstance(value, str) or value not in choices[key]:
             raise ValueError(f"{key} must be one of {sorted(choices[key])}")
         return value
     if key in ("watch_previous_semester", "scan_previous_semester", "weekly_study_plan", "outfit"):
-        return bool(value)
+        if not isinstance(value, bool):
+            raise ValueError(f"{key} must be a boolean")
+        return value
     if key == "morning_time":
         if value != "off" and value not in morning_time_options():
             raise ValueError("morning_time is 'off' or 07:00 to 09:30 in 15 minute steps")
@@ -126,7 +129,9 @@ def validate(key: str, value) -> Any:
     if key == "morning_sections":
         if not isinstance(value, dict) or set(value) - set(MORNING_SECTIONS):
             raise ValueError("unknown morning section")
-        return {k: bool(value.get(k, True)) for k in MORNING_SECTIONS}
+        if any(not isinstance(enabled, bool) for enabled in value.values()):
+            raise ValueError("morning section settings must be booleans")
+        return {k: value.get(k, True) for k in MORNING_SECTIONS}
     if key == "quiet_hours":
         if value is None:
             return None
@@ -146,6 +151,7 @@ def validate(key: str, value) -> Any:
 _LEGACY_GLOBAL_SWITCHES = {
     "scan_previous_semester": get_scan_previous_semester_enabled,
     "weekly_study_plan": get_weekly_study_plan_enabled,
+    "outfit": get_wardrobe_feature_enabled,
 }
 
 
@@ -189,13 +195,26 @@ def get_prefs(user_id: int) -> dict:
     stored = scope.private(PREFS_KIND)
     if stored is None:
         stored = _initial(user_id)
-        scope.save_private(PREFS_KIND, stored)
+    elif not isinstance(stored, dict):
+        logging.warning("Resetting malformed preferences for user %s", user_id)
+        stored = _initial(user_id)
     elif user_id == PRIMARY_ADMIN_ID and any(k not in stored for k in _LEGACY_GLOBAL_SWITCHES):
         # preferences made before these switches became per student
         stored = {**_legacy_switches(), **stored}
-        scope.save_private(PREFS_KIND, stored)
-    merged = {**DEFAULTS, **{k: v for k, v in stored.items() if k in DEFAULTS}}
-    merged["morning_sections"] = {**DEFAULTS["morning_sections"], **(stored.get("morning_sections") or {})}
+
+    # Private records survive deployments and may contain older or malformed
+    # JSON shapes. Validate every known field before handing it to callers so
+    # one bad nested value cannot break a settings screen or watcher job.
+    merged = {}
+    for key, default in DEFAULTS.items():
+        candidate = stored.get(key, default)
+        try:
+            merged[key] = validate(key, candidate)
+        except (TypeError, ValueError):
+            logging.warning("Resetting malformed preference %s for user %s", key, user_id)
+            merged[key] = validate(key, default)
+    if stored != merged:
+        scope.save_private(PREFS_KIND, merged)
     return merged
 
 
@@ -218,9 +237,11 @@ def set_pref(user_id: int, key: str, value) -> Any:
     """Validate and store one preference; returns the stored value."""
     value = validate(key, value)
     scope = db.get_user_scope(user_id)
-    stored = dict(scope.private(PREFS_KIND) or _initial(user_id))
+    stored = get_prefs(user_id)
     stored[key] = value
     scope.save_private(PREFS_KIND, stored)
+    if scope.private(PREFS_KIND) != stored:
+        raise RuntimeError(f"Preference {key!r} was not saved for this user")
     return value
 
 

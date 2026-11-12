@@ -12,24 +12,25 @@ from typing import Optional
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from studip_utils import safe_filename
-from unibot import course_registry, state
-from unibot.auth import get_user_session
+from unibot import course_registry, db, state
+from unibot.auth import ACTIVE, get_user_session, is_user_allowed, lifecycle_state
 from unibot.config import PRIMARY_ADMIN_ID
 from unibot.formatting import (
     TELEGRAM_HTML_LIMIT,
     _short_id,
+    _telegram_length,
     truncate_html,
 )
 from unibot.monitoring_fetch import FORUM_OMITTED
-from unibot.storage import link_cache, persistent_callback_cache
-from unibot.studip_api import file_date_sort_key
+from unibot.storage import has_course_access, link_cache, persistent_callback_cache
+from unibot.studip_api import _normalize_url, file_date_sort_key, read_response_limited
 from unibot.telegram_ui import (  # noqa: F401 - broadcast is re-exported for callers
     broadcast,
     markup_for,
 )
 
-# short_id -> { text, due_time (ISO or None), course }; persisted, so the
-# button works after a restart and for every follower of the course
+# short_id -> { course, thread, body }; persisted so the per-user AI task
+# suggestion button can find its source forum post after a restart.
 task_suggestion_cache = persistent_callback_cache("task_suggestions.json")
 # short_id -> { course, subject, body } - raw announcement, converted to a
 # task on demand when "📝 Add as Task" is tapped
@@ -93,36 +94,58 @@ def _full_file_sender(it: dict, text: str, keyboard, downloader_uid: Optional[in
     shared: dict = {}
 
     async def send(bot, uid) -> bool:
+        if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                or lifecycle_state(uid) != ACTIVE or not has_course_access(uid, it.get("cid"))):
+            return False
         if shared.get("failed") or not it.get("url"):
             return False
         document = shared.get("file_id")
         if document is None:
             try:
+                if not is_user_allowed(downloader_uid) or lifecycle_state(downloader_uid) != ACTIVE:
+                    raise RuntimeError("designated downloader is no longer active")
                 session = get_user_session(downloader_uid) or state.global_session
                 if session is None:
                     raise RuntimeError("no session")
-                async with await session.get(it["url"]) as resp:
+                file_url = _normalize_url(it["url"])
+                if not file_url:
+                    raise RuntimeError("file URL was not a trusted university URL")
+                async with await session.get(file_url) as resp:
                     if resp.status != 200:
                         raise RuntimeError(f"HTTP {resp.status}")
-                    content = await resp.read()
+                    content = await read_response_limited(resp, FULL_FILE_MAX_BYTES)
                 if len(content) > FULL_FILE_MAX_BYTES:
                     raise RuntimeError(f"{len(content)} bytes")
+                if not is_user_allowed(downloader_uid) or lifecycle_state(downloader_uid) != ACTIVE:
+                    raise RuntimeError("designated downloader was blocked during the download")
             except Exception as e:
                 logging.info("Full file alert for %s falls back to the card: %s", it.get("name"), e)
                 shared["failed"] = True
                 return False
             document = io.BytesIO(content)
+        if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                or lifecycle_state(uid) != ACTIVE or not has_course_access(uid, it.get("cid"))):
+            return False
         try:
             msg = await bot.send_document(
                 chat_id=uid, document=document, filename=safe_filename(str(it.get("name") or "file")),
-                caption=text[:1024], parse_mode="HTML", reply_markup=markup_for(uid, keyboard),
+                caption=truncate_html(text, 1024), parse_mode="HTML", reply_markup=markup_for(uid, keyboard),
             )
-        finally:
+        except Exception as e:
+            logging.info("Full file alert for %s failed for user %s; falling back to its card: %s",
+                         it.get("name"), uid, e)
             if isinstance(document, io.BytesIO):
-                document.close()  # later followers get the file_id, not the bytes
+                document.seek(0)
+            return False
         file_id = getattr(getattr(msg, "document", None), "file_id", None)
         if file_id:
             shared["file_id"] = file_id
+            if isinstance(document, io.BytesIO):
+                document.close()  # later followers get the file_id, not the bytes
+        elif isinstance(document, io.BytesIO):
+            # A successful API call should include the uploaded document, but
+            # keep the bytes reusable if a Telegram response omitted its id.
+            document.seek(0)
         return True
 
     return send
@@ -142,8 +165,7 @@ async def _send_file_alerts(bot, events: list) -> None:
                 "course": it["course"],
                 "url": it.get("url"),
                 "ts": time.time(),
-                # a participant's session can download it (an admin's may not be enrolled)
-                "user_id": downloader,
+                "shared": True,
             }
             text, keyboard = _file_alert(it, sid)
             await course_registry.fan_out(
@@ -176,27 +198,31 @@ def _forum_alert_text(p: dict, limit: int = TELEGRAM_HTML_LIMIT) -> str:
     heading, *rest = body.split("\n\n")
     entries = [block for block in rest if block != FORUM_OMITTED]
     omitted = len(entries) != len(rest)
-    while len(head) + len(body) + len(tail) > limit and len(entries) > 1:
+    while (_telegram_length(head) + _telegram_length(body) + _telegram_length(tail) > limit
+           and len(entries) > 1):
         entries.pop(0)
         omitted = True
         body = "\n\n".join([heading] + ([FORUM_OMITTED] if omitted else []) + entries)
-    return head + truncate_html(body, limit - len(head) - len(tail)) + tail
+    body_limit = limit - _telegram_length(head) - _telegram_length(tail)
+    return head + truncate_html(body, body_limit) + tail
 
 
-async def _forum_alert_markup(p: dict) -> InlineKeyboardMarkup:
-    """Forward button, plus an "Add as task" button when the AI finds a task."""
-    from unibot.tasks import extract_task_suggestion
+def _forum_alert_markup(p: dict) -> InlineKeyboardMarkup:
+    """Forward button and a user-initiated task-suggestion button.
+
+    Forum text is sent to the AI only after an individual recipient taps the
+    button and their current personal-AI permission is checked.
+    """
     buttons = [[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]]
     if p.get("last_message_plain"):
-        try:
-            suggestion = await extract_task_suggestion(p.get('course', ''), p.get('thread'), p['last_message_plain'])
-        except Exception as e:
-            logging.warning("Task suggestion extraction failed for forum post: %s", e)
-            suggestion = None
-        if suggestion:
-            sid = _short_id()
-            task_suggestion_cache[sid] = {**suggestion, "course": p.get('course')}
-            buttons.append([InlineKeyboardButton(f"📝 Add as task: {suggestion['text'][:40]}", callback_data=f"tasksug_add|{sid}")])
+        sid = _short_id()
+        task_suggestion_cache[sid] = {
+            "cid": p.get("cid"),
+            "course": p.get("course"),
+            "thread": p.get("thread"),
+            "body": p.get("last_message_plain"),
+        }
+        buttons.append([InlineKeyboardButton("📝 Suggest task", callback_data=f"tasksug_add|{sid}")])
     return InlineKeyboardMarkup(buttons)
 
 

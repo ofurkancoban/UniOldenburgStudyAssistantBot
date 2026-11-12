@@ -18,6 +18,14 @@ from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
+_PROXY_TARGET_HOSTS = frozenset({
+    "studip.uni-oldenburg.de",
+    "elearning.uni-oldenburg.de",
+    "stums.uni-oldenburg.de",
+    "idp.uni-oldenburg.de",
+    "login.uni-oldenburg.de",
+    "auth.uni-oldenburg.de",
+})
 
 
 # ── time ──────────────────────────────────────────────────────────────────────
@@ -144,26 +152,17 @@ def route_proxy_url(
         worker_parts = urlsplit(worker_url)
         worker_host = (worker_parts.hostname or "").lower()
 
-        target_hosts = {
-            "studip.uni-oldenburg.de",
-            "elearning.uni-oldenburg.de",
-            "stums.uni-oldenburg.de",
-            "idp.uni-oldenburg.de",
-            "login.uni-oldenburg.de",
-            "auth.uni-oldenburg.de",
-        }
-
         routed = str(url)
         target_host = None
 
-        if host in target_hosts:
+        if host in _PROXY_TARGET_HOSTS:
             target_host = host
             base_worker_path = worker_parts.path.rstrip("/")
             routed_path = f"{base_worker_path}/{target_host}{parts.path}"
             routed = urlunsplit((worker_parts.scheme, worker_parts.netloc, routed_path, parts.query, ""))
         elif host == worker_host:
             path_segments = [s for s in parts.path.split("/") if s]
-            if path_segments and path_segments[0].lower() in target_hosts:
+            if path_segments and path_segments[0].lower() in _PROXY_TARGET_HOSTS:
                 target_host = path_segments[0].lower()
 
         if target_host:
@@ -177,7 +176,7 @@ def route_proxy_url(
             # different host), so inject the ones matching the full target URL
             # (path-scoped cookies such as StuMS' /qisserver session included).
             # StudIPSession.request() injects them itself and passes no jar.
-            if cookie_jar is not None and host in target_hosts:
+            if cookie_jar is not None and host in _PROXY_TARGET_HOSTS:
                 try:
                     from yarl import URL as YarlURL
                     matching_cookies = cookie_jar.filter_cookies(YarlURL(str(url)))
@@ -218,7 +217,7 @@ def unroute_proxy_url(url: str) -> str:
             if base and path.startswith(base + "/"):
                 path = path[len(base):]
             segment, _, rest = path.lstrip("/").partition("/")
-            if segment.lower().endswith(".uni-oldenburg.de"):
+            if segment.lower() in _PROXY_TARGET_HOSTS:
                 # university hosts are HTTPS-only, whatever the worker URL uses
                 return urlunsplit(("https", segment.lower(), "/" + rest, parts.query, parts.fragment))
     except Exception:

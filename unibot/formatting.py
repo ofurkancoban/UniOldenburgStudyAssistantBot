@@ -18,14 +18,31 @@ TELEGRAM_HTML_LIMIT = 4000  # under Telegram's 4096 characters per message
 _HTML_TAG_RE = re.compile(r"<(/?)([a-zA-Z-]+)[^>]*>")
 
 
+def _telegram_length(text: str) -> int:
+    """Count UTF-16 code units, the length Telegram uses for message limits."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _prefix_by_telegram_length(text: str, limit: int) -> str:
+    size = 0
+    end = 0
+    for end, char in enumerate(text, start=1):
+        units = 2 if ord(char) > 0xFFFF else 1
+        if size + units > limit:
+            return text[:end - 1]
+        size += units
+    return text[:end] if text else ""
+
+
 def truncate_html(text: str, limit: int = TELEGRAM_HTML_LIMIT, marker: str = "…") -> str:
     """Telegram HTML cut to at most `limit` characters without breaking it:
     never inside a tag or an entity (&amp;), and every tag still open at the
     cut is closed again (a blind text[:limit] can make Telegram reject the
     whole message)."""
-    if len(text) <= limit:
+    if _telegram_length(text) <= limit:
         return text
-    cut = text[:max(0, limit - len(marker) - 40)]  # room for the closing tags
+    marker_length = _telegram_length(marker)
+    cut = _prefix_by_telegram_length(text, max(0, limit - marker_length - 40))
     cut = re.sub(r"<[^>]*$", "", cut)              # a tag cut in half
     cut = re.sub(r"&#?[a-zA-Z0-9]*$", "", cut)     # an entity cut in half
     open_tags: list[str] = []
@@ -47,11 +64,12 @@ def escaped_chunks(text: str, limit: int) -> list[str]:
     size = 0
     for ch in text:
         piece = html.escape(ch, quote=False)
-        if size + len(piece) > limit:
+        piece_size = _telegram_length(piece)
+        if size + piece_size > limit:
             parts.append("".join(current))
             current, size = [], 0
         current.append(piece)
-        size += len(piece)
+        size += piece_size
     if current:
         parts.append("".join(current))
     return parts
@@ -62,8 +80,9 @@ def split_html(text: str, limit: int = 3800) -> list[str]:
     falls between tags, preferably at a line break; a tag still open there is
     closed and opened again at the start of the next part, so every part is
     valid on its own. Text longer than the limit is cut inside the text,
-    never inside a tag or an entity."""
+    never inside a tag or an entity. Lengths use UTF-16 units as Telegram does."""
     tokens: list[str] = []
+    text_limit = max(1, limit - 100)  # leave space for tags reopened across a split
     for part in re.split(r"(<[^>]*>)", text):
         if not part:
             continue
@@ -71,9 +90,11 @@ def split_html(text: str, limit: int = 3800) -> list[str]:
             tokens.append(part)
             continue
         for line in part.splitlines(keepends=True):
-            while len(line) > limit // 2:
-                cut = limit // 2
-                head = re.sub(r"&#?[a-zA-Z0-9]*$", "", line[:cut]) or line[:cut]
+            while _telegram_length(line) > text_limit:
+                head = _prefix_by_telegram_length(line, text_limit)
+                safe_head = re.sub(r"&#?[a-zA-Z0-9]*$", "", head)
+                if safe_head:
+                    head = safe_head
                 tokens.append(head)
                 line = line[len(head):]
             tokens.append(line)
@@ -92,7 +113,8 @@ def split_html(text: str, limit: int = 3800) -> list[str]:
         current = "".join(tag for _, tag in open_tags)
 
     for token in tokens:
-        if len(current) + len(token) + len(closing()) + 20 > limit:
+        if (_telegram_length(current) + _telegram_length(token)
+                + _telegram_length(closing()) + 20 > limit):
             flush()
         current += token
         m = re.fullmatch(r"<(/?)([a-zA-Z-]+)[^>]*>", token)
@@ -105,7 +127,7 @@ def split_html(text: str, limit: int = 3800) -> list[str]:
                         break
             else:
                 open_tags.append((name, token))
-        elif token.endswith("\n") and len(current) > limit * 0.8:
+        elif token.endswith("\n") and _telegram_length(current) > limit * 0.8:
             flush()  # prefer a cut at a line break
     if current.strip():
         parts.append(current.rstrip("\n"))

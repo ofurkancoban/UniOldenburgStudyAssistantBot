@@ -29,11 +29,17 @@ forum_cache.json
 link_cache.json
 studip_cookies.json
 studip_cookies.json.tmp
+studip_cookies_*.json
+studip_cookies_*.json.tmp
 studip_oauth_tokens.json
 studip_oauth_tokens.json.tmp
 studip_oauth_tokens.json.bak
 fastenroll_pending.json
 exam_reminder_cache.json
+exam_reminder_cache_*.json
+reminders_cache_*.json
+messages_cache_*.json
+study_progress_*.json
 tasks_cache.json
 food_preferences.json
 user_names.json

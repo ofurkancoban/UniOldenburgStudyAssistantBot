@@ -11,6 +11,7 @@ import hashlib
 import html
 import io
 import logging
+import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote
@@ -20,8 +21,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from studip_utils import TZ_BERLIN, format_hours
-from unibot import state
-from unibot.auth import INACTIVE, acting_as, get_user_session, has_stored_login, is_user_allowed, lifecycle_state
+from unibot import db, state
+from unibot.auth import ACTIVE, INACTIVE, acting_as, get_user_session, has_stored_login, is_user_allowed, lifecycle_state
 from unibot.config import CLOUDFLARE_TUNNEL
 from unibot.schedule import get_calendar_events, plan_study_day
 from unibot.storage import (
@@ -49,11 +50,17 @@ async def plan_entries(user_id: int, week_start: date, session=None) -> list[dic
     """The student's study windows and lunch breaks for Mon-Fri of one week
     (see schedule.plan_study_day), from their own timetable; [] without a
     stored login."""
+    if not is_user_allowed(user_id):
+        return []
     session = session or get_user_session(user_id)
     if not has_stored_login(session):
         return []
     with acting_as(user_id):
+        if not db.private_context_is_current(user_id) or not is_user_allowed(user_id):
+            return []
         events = await get_calendar_events(session=session, week_start=week_start, user_id=user_id) or []
+        if not db.private_context_is_current(user_id) or not is_user_allowed(user_id):
+            return []
         entries: list[dict] = []
         for offset in range(5):
             plan = plan_study_day(events, week_start + timedelta(days=offset), user_id=user_id)
@@ -63,8 +70,12 @@ async def plan_entries(user_id: int, week_start: date, session=None) -> list[dic
 
 # ── calendar feed (iCalendar, RFC 5545) ───────────────────────────────────────
 def _ics_text(value: str) -> str:
-    return (value.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
-            .replace("\r\n", "\\n").replace("\n", "\\n"))
+    # Normalize every newline form before escaping. Escaping LF first would
+    # turn CRLF into a literal CR plus an escaped LF, leaving an invalid raw
+    # control character inside the iCalendar property value.
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    return (normalized.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+            .replace("\n", "\\n"))
 
 
 def _ics_fold(line: str) -> list[str]:
@@ -146,8 +157,14 @@ async def feed_handler(request: web.Request) -> web.Response:
     except Exception as e:
         logging.warning("Calendar feed failed for %s: %s", user_id, e)
         return web.Response(status=503, text="Try again later")
+    # Generating the feed awaits multiple timetable requests. The owner may
+    # pause the bot, delete their data, or revoke this link while those
+    # requests are in flight; do not return the already-built private feed.
+    if (lifecycle_state(user_id) == INACTIVE or not is_user_allowed(user_id)
+            or user_for_calendar_token(token) != user_id):
+        return web.Response(status=404, text="Not found")
     return web.Response(text=body, content_type="text/calendar", charset="utf-8",
-                        headers={"Cache-Control": "private, max-age=900"})
+                        headers={"Cache-Control": "private, no-store"})
 
 
 def register_calendar_feed(server) -> None:
@@ -198,13 +215,22 @@ async def handle_calendar_sync(update: Update, context: ContextTypes.DEFAULT_TYP
     action = data.split("|")[1] if "|" in data else ""
     if action == "file":
         await query.answer("Preparing your calendar...")
+        if not db.private_context_is_current(user_id):
+            return
         body = await calendar_for(user_id)
+        if (not db.private_context_is_current(user_id)
+                or lifecycle_state(user_id) == INACTIVE or not is_user_allowed(user_id)):
+            return
         with io.BytesIO(body.encode("utf-8")) as buffer:
             await query.message.reply_document(document=buffer, filename="study-blocks.ics",
                                                caption="📅 Open this file to add your study blocks to your calendar.")
         return
     if action == "reset":
-        reset_calendar_token(user_id)
+        try:
+            reset_calendar_token(user_id)
+        except RuntimeError:
+            await query.answer("Could not save the new link. Please try again.", show_alert=True)
+            return
         await query.answer("New link created")
     else:
         await query.answer()
@@ -250,15 +276,43 @@ def buddy_candidates(user_id: int) -> list[tuple[int, list[str]]]:
 
 
 async def study_buddy_matches(user_id: int, week_start: date, after: Optional[datetime] = None) -> list[dict]:
+    with acting_as(user_id):
+        if not db.private_context_is_current(user_id):
+            return []
+        return await _study_buddy_matches(user_id, week_start, after)
+
+
+async def _study_buddy_matches(user_id: int, week_start: date, after: Optional[datetime] = None) -> list[dict]:
     """[{"user_id", "name", "courses", "windows"}] of opted-in classmates with
     common free time in that week (only windows ending after `after`)."""
+    if (not db.private_context_is_current(user_id) or lifecycle_state(user_id) == INACTIVE):
+        return []
     candidates = buddy_candidates(user_id)
     if not candidates:
         return []
     mine = await plan_entries(user_id, week_start)
+    if (not db.private_context_is_current(user_id) or lifecycle_state(user_id) == INACTIVE):
+        return []
     matches = []
     for other, shared in candidates:
-        windows = common_windows(mine, await plan_entries(other, week_start))
+        if (not is_user_allowed(other) or lifecycle_state(other) != ACTIVE
+                or not get_study_buddy_enabled(other)):
+            continue
+        # Keep the classmate's generation bound across the network wait. If
+        # they delete their data and /start reactivates the account before
+        # this request finishes, the old timetable must not be used in a new
+        # match just because the lifecycle is active again.
+        with acting_as(other):
+            if (not db.private_context_is_current(other) or not is_user_allowed(other)
+                    or lifecycle_state(other) != ACTIVE or not get_study_buddy_enabled(other)):
+                continue
+            their_entries = await plan_entries(other, week_start)
+            if (not db.private_context_is_current(other) or not is_user_allowed(other)
+                    or lifecycle_state(other) != ACTIVE or not get_study_buddy_enabled(other)):
+                continue
+        if (not db.private_context_is_current(user_id) or lifecycle_state(user_id) == INACTIVE):
+            return []
+        windows = common_windows(mine, their_entries)
         if after is not None:
             windows = [w for w in windows if w["end_dt"] > after]
         if windows:
@@ -302,11 +356,19 @@ async def handle_study_buddy(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_user_allowed(user_id):
         await query.answer("Not authorized.")
         return
-    await query.answer()
     toggle = query.data == "buddy|toggle"
     if toggle:
-        set_study_buddy_enabled(user_id, not get_study_buddy_enabled(user_id))
+        try:
+            set_study_buddy_enabled(user_id, not get_study_buddy_enabled(user_id))
+        except RuntimeError:
+            await query.answer("Could not save this preference. Please try again.", show_alert=True)
+            return
+        await query.answer()
+    else:
+        await query.answer()
     text, markup = await study_buddy_view(user_id)
+    if not db.private_context_is_current(user_id):
+        return
     if toggle:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     else:
@@ -320,15 +382,25 @@ def deadline_weeks(outcomes: list[dict], now: datetime) -> dict[date, dict]:
     weeks: dict[date, dict] = {}
     for o in outcomes:
         try:
-            due = datetime.fromisoformat(o["due"]).astimezone(TZ_BERLIN)
+            due = datetime.fromisoformat(o["due"])
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=TZ_BERLIN)
+            else:
+                due = due.astimezone(TZ_BERLIN)
         except (KeyError, TypeError, ValueError):
             continue
         late_after = due.timestamp() + TASK_ON_TIME_GRACE_SECONDS
         done = o.get("done")
-        if done is None and now.timestamp() <= late_after:
+        try:
+            done_ts = float(done) if done is not None and not isinstance(done, bool) else None
+        except (TypeError, ValueError, OverflowError):
+            done_ts = None
+        if done_ts is not None and not math.isfinite(done_ts):
+            done_ts = None
+        if done_ts is None and now.timestamp() <= late_after:
             continue  # still open, not late yet
         week = weeks.setdefault(_week_start(due.date()), {"on_time": 0, "missed": []})
-        if done is not None and done <= late_after:
+        if done_ts is not None and done_ts <= late_after:
             week["on_time"] += 1
         else:
             week["missed"].append(o.get("text") or "a deadline")
@@ -349,13 +421,22 @@ def deadline_streak(outcomes: list[dict], now: datetime) -> tuple[int, list[str]
     return streak, missed_now
 
 
-async def weekly_report(user_id: int, now: Optional[datetime] = None) -> str:
+async def weekly_report(user_id: int, now: Optional[datetime] = None) -> Optional[str]:
+    with acting_as(user_id):
+        if not db.private_context_is_current(user_id):
+            return None
+        return await _weekly_report(user_id, now)
+
+
+async def _weekly_report(user_id: int, now: Optional[datetime] = None) -> Optional[str]:
     """The Sunday mini report: this week's free time between classes and
     how much of it went into study blocks, the deadline streak and next
     week's common free time with study buddies."""
     now = now or datetime.now(TZ_BERLIN)
     monday = _week_start(now.date())
     windows = [e for e in await plan_entries(user_id, monday) if e.get("kind") != "lunch"]
+    if not db.private_context_is_current(user_id):
+        return None
     free = sum(w["duration_minutes"] for w in windows)
     week_from = datetime.combine(monday, datetime.min.time(), tzinfo=TZ_BERLIN).timestamp()
     blocks = study_block_log(user_id, week_from, now.timestamp())
@@ -382,6 +463,8 @@ async def weekly_report(user_id: int, now: Optional[datetime] = None) -> str:
         lines.append("✅ Every deadline this week done on time.")
 
     buddies = await study_buddy_matches(user_id, monday + timedelta(days=7))
+    if not db.private_context_is_current(user_id):
+        return None
     if buddies:
         lines += ["", "<b>Next week</b>"] + format_buddy_lines(buddies, limit=2)
     return "\n".join(lines)

@@ -9,7 +9,7 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -18,9 +18,12 @@ from telegram.error import BadRequest, Forbidden, TelegramError
 
 from fast_enroll import clear_pending_job, run_fast_enroll
 from studip_utils import TZ_BERLIN
+from unibot import db
 
 from unibot.storage import (
     add_user_task,
+    get_ai_personal_enabled,
+    has_course_access,
     recall_user_callback,
     record_task_outcome,
     remember_user_callback,
@@ -31,9 +34,10 @@ from unibot.storage import (
     user_tasks,
 )
 from unibot.telegram_ui import get_main_keyboard, markup_for, user_data
-from unibot.auth import acting_as, get_user_session, is_user_allowed, login_studip
+from unibot.auth import ACTIVE, NEEDS_REAUTH, acting_as, get_user_session, is_user_allowed, lifecycle_state, login_studip
+from unibot.formatting import truncate_html
 from unibot.studip_api import list_courses
-from unibot.ai import _call_openrouter, _extract_json_object
+from unibot.ai import _call_openrouter, _extract_json_object, personal_ai_allowed
 from unibot.schedule import fastenroll_tasks
 from unibot.monitoring import announcement_task_cache, task_suggestion_cache
 
@@ -44,20 +48,53 @@ from unibot.monitoring import announcement_task_cache, task_suggestion_cache
 
 
 async def _run_fastenroll_task(chat_id: int, sem_id: str, target_time_str: str, target_date_str: Optional[str], context: ContextTypes.DEFAULT_TYPE):
+    # Scheduled jobs restored after a restart have no Telegram update context.
+    # Bind the owner's data generation for the whole task so deletion can
+    # invalidate progress and result messages already in flight.
+    with acting_as(chat_id):
+        await _run_fastenroll_task_inner(chat_id, sem_id, target_time_str, target_date_str, context)
+
+
+async def _run_fastenroll_task_inner(chat_id: int, sem_id: str, target_time_str: str, target_date_str: Optional[str], context: ContextTypes.DEFAULT_TYPE):
     async def on_progress(msg: str):
+        if (not db.private_context_is_current(chat_id)
+                or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+            return
         try:
             await context.bot.send_message(chat_id=chat_id, text=f"⏱️ {msg}", disable_notification=True)
         except Exception:
             logging.warning("fastenroll progress notify failed", exc_info=True)
 
+    async def send_result(text: str):
+        if (not db.private_context_is_current(chat_id) or not is_user_allowed(chat_id)
+                or lifecycle_state(chat_id) not in (ACTIVE, NEEDS_REAUTH)):
+            return
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            # The enrollment attempt is already complete; a Telegram outage
+            # must not leave it queued to be mistaken for an active job.
+            logging.warning("fastenroll result notify failed for chat %s, course %s", chat_id, sem_id,
+                            exc_info=True)
+
     try:
+        if (not db.private_context_is_current(chat_id)
+                or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+            return
         # always the student who scheduled it: a job restored after a restart
         # runs outside any update, where the acting user would be the bot's
         with acting_as(chat_id):
+            if (not db.private_context_is_current(chat_id)
+                    or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+                return
             session = await login_studip(user_id=chat_id)
-            success, message = await run_fast_enroll(session, sem_id, target_time_str, target_date_str, on_progress=on_progress)
-        icon = "✅" if success else "❌"
-        await context.bot.send_message(chat_id=chat_id, text=f"{icon} {message}")
+            if (not db.private_context_is_current(chat_id)
+                    or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+                return
+            success, message = await run_fast_enroll(
+                session, sem_id, target_time_str, target_date_str,
+                on_progress=on_progress, user_id=chat_id,
+            )
     except asyncio.CancelledError:
         # The stored job is kept: a shutdown (deploy, restart) cancels every
         # task and the job is restored at the next start. A student who
@@ -66,12 +103,16 @@ async def _run_fastenroll_task(chat_id: int, sem_id: str, target_time_str: str, 
         raise
     except Exception as e:
         logging.error("fastenroll failed: %s", e, exc_info=True)
-        await context.bot.send_message(chat_id=chat_id, text=f"❌ Fast enroll failed: {e}")
         clear_pending_job(chat_id, sem_id)
+        await send_result(f"❌ Fast enroll failed: {e}")
     else:
         clear_pending_job(chat_id, sem_id)
+        icon = "✅" if success else "❌"
+        await send_result(f"{icon} {message}")
     finally:
-        fastenroll_tasks.get(chat_id, {}).pop(sem_id, None)
+        task_map = fastenroll_tasks.get(chat_id, {})
+        if task_map.get(sem_id) is asyncio.current_task():
+            task_map.pop(sem_id, None)
 
 
 # ── Personal tasks / reminders (todo list with an optional due time) ───────────
@@ -91,13 +132,13 @@ def parse_task_due_time(text: str):
     now = datetime.now(TZ_BERLIN)
     try:
         due = _parse_task_due_time(t, now)
-    except ValueError as exc:
+    except (ValueError, OverflowError) as exc:
         if str(exc).startswith((TASK_TIME_UNKNOWN, TASK_TIME_INVALID)):
             raise
         # datetime's own message ("day is out of range for month") means
         # nothing to a student; the date itself does not exist
         raise ValueError(f"{TASK_TIME_INVALID} {text}") from exc
-    if due < now - TASK_PAST_GRACE:
+    if due.astimezone(timezone.utc) < now.astimezone(timezone.utc) - TASK_PAST_GRACE:
         # it would fire at once: "today 08:00" in the afternoon, a date gone by
         raise ValueError(f"{TASK_TIME_PAST} {text}")
     return due
@@ -105,7 +146,8 @@ def parse_task_due_time(text: str):
 
 DEFAULT_REMINDER_HOUR = 9  # a day without a time reminds at 09:00
 WEEKDAY_NAMES = {
-    "monday": 0, "mon": 0, "montag": 0, "pazartesi": 0, "tuesday": 1, "tue": 1, "dienstag": 1, "salı": 1,
+    "monday": 0, "mon": 0, "montag": 0, "pazartesi": 0, "tuesday": 1, "tue": 1, "dienstag": 1,
+    "salı": 1, "sali": 1,
     "wednesday": 2, "wed": 2, "mittwoch": 2, "çarşamba": 2, "thursday": 3, "thu": 3, "donnerstag": 3,
     "perşembe": 3, "friday": 4, "fri": 4, "freitag": 4, "cuma": 4, "saturday": 5, "sat": 5, "samstag": 5,
     "cumartesi": 5, "sunday": 6, "sun": 6, "sonntag": 6, "pazar": 6,
@@ -116,30 +158,59 @@ TASK_TIME_PAST = "That time has already passed:"
 TASK_PAST_GRACE = timedelta(minutes=1)
 
 
+def _berlin_task_wall_time(day, hour: int, minute: int, second: int = 0, fold: int = 0,
+                           description: str = "") -> datetime:
+    candidate = datetime(day.year, day.month, day.day, hour, minute, second, tzinfo=TZ_BERLIN, fold=fold)
+    round_trip = candidate.astimezone(timezone.utc).astimezone(TZ_BERLIN)
+    if round_trip.replace(tzinfo=None) != candidate.replace(tzinfo=None):
+        raise ValueError(f"{TASK_TIME_INVALID} {description}".rstrip())
+    return candidate
+
+
+def _berlin_task_wall_time_not_before(day, hour: int, minute: int, now: datetime,
+                                      description: str = "") -> datetime:
+    """Resolve an ambiguous Berlin wall time to its next occurrence today."""
+    candidates: list[datetime] = []
+    for fold in (0, 1):
+        try:
+            candidate = _berlin_task_wall_time(day, hour, minute, fold=fold, description=description)
+        except ValueError:
+            continue
+        if all(candidate.timestamp() != other.timestamp() for other in candidates):
+            candidates.append(candidate)
+    if not candidates:
+        raise ValueError(f"{TASK_TIME_INVALID} {description}".rstrip())
+
+    now_ts = now.timestamp()
+    upcoming = [candidate for candidate in candidates if candidate.timestamp() >= now_ts]
+    return min(upcoming or candidates, key=lambda candidate: candidate.timestamp())
+
+
 def _parse_task_due_time(t: str, now: datetime) -> datetime:
 
     m = re.match(r"^(\d+)\s*(?:saat|hours?)\s*sonra$", t, re.IGNORECASE) or re.match(r"^in\s+(\d+)\s*hours?$", t, re.IGNORECASE)
     if m:
-        return now + timedelta(hours=int(m.group(1)))
+        return (now.astimezone(timezone.utc) + timedelta(hours=int(m.group(1)))).astimezone(TZ_BERLIN)
 
     m = re.match(r"^(\d+)\s*(?:gün|gun|days?)\s*sonra$", t, re.IGNORECASE) or re.match(r"^in\s+(\d+)\s*days?$", t, re.IGNORECASE)
     if m:
-        return now + timedelta(days=int(m.group(1)))
+        return (now.astimezone(timezone.utc) + timedelta(days=int(m.group(1)))).astimezone(TZ_BERLIN)
 
     m = re.match(r"^(?:yarın|yarin|tomorrow)\s+(\d{1,2}):(\d{2})$", t, re.IGNORECASE)
     if m:
         target_date = (now + timedelta(days=1)).date()
-        return datetime(target_date.year, target_date.month, target_date.day, int(m.group(1)), int(m.group(2)), tzinfo=TZ_BERLIN)
+        return _berlin_task_wall_time_not_before(target_date, int(m.group(1)), int(m.group(2)), now, t)
 
     m = re.match(r"^(?:bugün|bugun|today)\s+(\d{1,2}):(\d{2})$", t, re.IGNORECASE)
     if m:
         target_date = now.date()
-        return datetime(target_date.year, target_date.month, target_date.day, int(m.group(1)), int(m.group(2)), tzinfo=TZ_BERLIN)
+        return _berlin_task_wall_time_not_before(target_date, int(m.group(1)), int(m.group(2)), now, t)
 
     m = re.match(r"^(\d{1,2})\.(\d{1,2})\.(\d{4})\s+(\d{1,2}):(\d{2})$", t)
     if m:
         day, month, year, hour, minute = map(int, m.groups())
-        return datetime(year, month, day, hour, minute, tzinfo=TZ_BERLIN)
+        target_date = datetime(year, month, day).date()
+        return _berlin_task_wall_time_not_before(target_date, hour, minute, now, t)
 
     m = re.match(r"^(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})$", t)
     if m:
@@ -148,10 +219,11 @@ def _parse_task_due_time(t: str, now: datetime) -> datetime:
         # the next time this day comes round; 29.02 waits for a leap year
         for year in range(now.year, now.year + 9):
             try:
-                candidate = datetime(year, month, day, hour, minute, tzinfo=TZ_BERLIN)
+                target_date = datetime(year, month, day).date()
+                candidate = _berlin_task_wall_time_not_before(target_date, hour, minute, now, t)
             except ValueError:
                 continue
-            if candidate >= now:
+            if candidate.astimezone(timezone.utc) >= now.astimezone(timezone.utc):
                 return candidate
         raise ValueError(f"{TASK_TIME_INVALID} {t}")
 
@@ -162,13 +234,35 @@ def _parse_task_due_time(t: str, now: datetime) -> datetime:
     m = re.match(r"^(\d{1,2}):(\d{2})$", t)
     if m:  # a bare time: today when it is still ahead, else tomorrow
         candidate = now.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=0, microsecond=0)
-        return candidate if candidate >= now else candidate + timedelta(days=1)
+        wall_day = candidate.date()
+        try:
+            first = _berlin_task_wall_time(wall_day, candidate.hour, candidate.minute, fold=0, description=t)
+        except ValueError:
+            first = None
+        now_utc = now.astimezone(timezone.utc)
+        if first is not None and first.astimezone(timezone.utc) >= now_utc:
+            return first
+        if first is not None:
+            try:
+                second = _berlin_task_wall_time(wall_day, candidate.hour, candidate.minute, fold=1, description=t)
+                if (second.astimezone(timezone.utc) > first.astimezone(timezone.utc)
+                        and second.astimezone(timezone.utc) >= now_utc):
+                    return second
+            except ValueError:
+                pass
+        # A time already passed today, or skipped by the spring clock change,
+        # means the next occurrence is tomorrow.
+        next_day = wall_day + timedelta(days=1)
+        try:
+            return _berlin_task_wall_time(next_day, candidate.hour, candidate.minute, description=t)
+        except ValueError:
+            return _berlin_task_wall_time(next_day + timedelta(days=1), candidate.hour, candidate.minute, description=t)
     m = re.match(r"^(?:(?:next|nächsten|naechsten|gelecek)\s+)?([a-zçğıöşü]+)(?:\s+(\d{1,2}):(\d{2}))?$", t, re.IGNORECASE)
     if m and m.group(1).lower() in WEEKDAY_NAMES:
         ahead = (WEEKDAY_NAMES[m.group(1).lower()] - now.weekday()) % 7 or 7  # the next one, never today
         weekday_date = (now + timedelta(days=ahead)).date()
         at_hour, at_minute = (int(m.group(2)), int(m.group(3))) if m.group(2) else (DEFAULT_REMINDER_HOUR, 0)
-        return datetime(weekday_date.year, weekday_date.month, weekday_date.day, at_hour, at_minute, tzinfo=TZ_BERLIN)
+        return _berlin_task_wall_time_not_before(weekday_date, at_hour, at_minute, now, t)
     raise ValueError(f"{TASK_TIME_UNKNOWN} {t}")
 
 
@@ -181,15 +275,22 @@ async def send_tasks_menu(sender):
 
 
 async def send_task_list(message, user_id: int):
+    if not db.private_context_is_current(user_id):
+        return
     tasks = user_tasks(user_id)
     if not tasks:
         await message.reply_text("ℹ️ No tasks yet. Use ➕ Add Task to create one.")
         return
 
-    reminders = sorted((t for t in tasks if t.get("due_time")), key=lambda t: t["due_time"])
-    plain = [t for t in tasks if not t.get("due_time")]
+    reminders = [t for t in tasks if t.get("due_time") and _task_due(t) is not None]
+    reminders.sort(key=lambda t: _task_due(t).timestamp())
+    # Keep malformed legacy due dates visible and manageable instead of
+    # silently hiding those tasks from the list.
+    plain = [t for t in tasks if not t.get("due_time") or _task_due(t) is None]
 
     for t in reminders:
+        if not db.private_context_is_current(user_id):
+            return
         due = _task_due(t)
         if due is None:
             continue
@@ -198,12 +299,16 @@ async def send_task_list(message, user_id: int):
         await message.reply_text(f"⏰ {due.strftime('%d.%m.%Y %H:%M')} - {t['text']}{course_line}", reply_markup=keyboard)
 
     for t in plain:
+        if not db.private_context_is_current(user_id):
+            return
         course_line = f" [{t['course']}]" if t.get("course") else ""
+        reminder_note = ("\n⚠️ Reminder disabled because Telegram rejected it; the task is still saved."
+                         if t.get("reminder_error") == "telegram_rejected" else "")
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("✔️ Done", callback_data=f"task_done|{t['id']}"),
             InlineKeyboardButton("❌ Delete", callback_data=f"task_delete|{t['id']}"),
         ]])
-        await message.reply_text(f"📝 {t['text']}{course_line}", reply_markup=keyboard)
+        await message.reply_text(f"📝 {t['text']}{course_line}{reminder_note}", reply_markup=keyboard)
 
 
 async def handle_task_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -213,6 +318,8 @@ async def handle_task_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
+        return
+    if not db.private_context_is_current(user_id):
         return
 
     if query.data == "task_add":
@@ -250,13 +357,15 @@ async def _handle_task_wizard_reply(update: Update, context: ContextTypes.DEFAUL
     state = context.user_data.setdefault("task_wizard", {})
 
     if step == "task_text":
+        user_id = update.effective_user.id if update.effective_user else None
         try:
-            extracted = await extract_task_from_text(text)
+            extracted = await extract_task_from_text(text, user_id=user_id)
         except Exception as e:
             logging.warning("extract_task_from_text failed: %s", e)
             extracted = None
+        if user_id is None or not db.private_context_is_current(user_id):
+            return True
 
-        user_id = update.effective_user.id if update.effective_user else None
         if extracted and extracted.get("due_time"):
             # A date/time was already stated in the same message (e.g.
             # "yarın rapor teslim et saat 15:00'te") - skip the separate
@@ -307,6 +416,8 @@ async def _send_task_course_picker(message, context: ContextTypes.DEFAULT_TYPE, 
     except Exception as e:
         logging.warning("Task course picker: failed to fetch courses: %s", e)
         courses = []
+    if user_id is not None and not db.private_context_is_current(user_id):
+        return
 
     state = context.user_data.setdefault("task_wizard", {})
     state["course_options"] = courses
@@ -327,6 +438,8 @@ async def handle_task_course_pick(update: Update, context: ContextTypes.DEFAULT_
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
         return
+    if not db.private_context_is_current(user_id):
+        return
 
     state = context.user_data.get("task_wizard")
     if not state or "text" not in state:
@@ -342,7 +455,7 @@ async def handle_task_course_pick(update: Update, context: ContextTypes.DEFAULT_
             course_name = options[idx][0]
 
     task = {
-        "id": str(uuid.uuid4())[:8],
+        "id": uuid.uuid4().hex,
         "user_id": user_id,
         "text": state["text"],
         "due_time": state.get("due_time"),
@@ -361,12 +474,13 @@ async def handle_task_course_pick(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(f"✅ Task added: {task['text']}{course_line}")
 
 
-def _save_task_and_confirmation_text(user_id: int, text: str, due_time: Optional[str], course: Optional[str]) -> str:
+def _save_task_and_confirmation_text(user_id: int, text: str, due_time: Optional[str], course: Optional[str],
+                                    source_key: Optional[str] = None) -> str:
     """Save a task built from an AI extraction/conversion (announcement or
     forum suggestion) and return the confirmation line to show the user.
     Shared by handle_task_suggestion_add and handle_announcement_to_task."""
     task = {
-        "id": str(uuid.uuid4())[:8],
+        "id": uuid.uuid4().hex,
         "user_id": user_id,
         "text": text,
         "due_time": due_time,
@@ -374,7 +488,10 @@ def _save_task_and_confirmation_text(user_id: int, text: str, due_time: Optional
         "created_at": datetime.now(TZ_BERLIN).isoformat(),
         "notified": False,
     }
-    add_user_task(user_id, task)
+    if source_key:
+        task["source_key"] = source_key
+    if not add_user_task(user_id, task):
+        return "ℹ️ This announcement task was already added."
 
     course_line = f" [{course}]" if course else ""
     if due_time:
@@ -384,11 +501,7 @@ def _save_task_and_confirmation_text(user_id: int, text: str, due_time: Optional
 
 
 async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle tasksug_add|<sid> -- save the task the "📝 Add as task?" button
-    on a new forum notification suggested (see extract_task_suggestion /
-    task_suggestion_cache). The course is already known from the source
-    post, so this saves directly with no course-picker step, unlike the
-    ➕ Add Task wizard."""
+    """Handle tasksug_add|<sid>; analyze the source post only after this tap."""
     query = update.callback_query
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
@@ -396,13 +509,40 @@ async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAU
         return
 
     sid = query.data.split("|", 1)[1]
-    info = task_suggestion_cache.get(sid)  # every follower may add it
+    info = task_suggestion_cache.get(sid)
     if not info:
         await query.answer("This suggestion has expired.", show_alert=True)
         return
-    await query.answer()
-
-    confirmation = _save_task_and_confirmation_text(user_id, info["text"], info.get("due_time"), info.get("course"))
+    cid = info.get("cid")
+    if not has_course_access(user_id, cid):
+        await query.answer("This post is unavailable for your account. Reopen the course updates.", show_alert=True)
+        return
+    if not get_ai_personal_enabled(user_id):
+        await query.answer("Enable AI use in /settings > Privacy to analyze this post.", show_alert=True)
+        return
+    await query.answer("Checking the post for a task...")
+    if not db.private_context_is_current(user_id) or not _course_task_allowed(user_id, cid):
+        return
+    source_body = info.get("body")
+    if not isinstance(source_body, str) or not source_body.strip():
+        await query.message.reply_text("⚠️ This forum post has expired. Try adding a task manually.")
+        return
+    try:
+        suggestion = await extract_task_suggestion(
+            info.get("course") or "", info.get("thread"), source_body, user_id=user_id, course_id=cid,
+        )
+    except Exception as e:
+        logging.warning("Task suggestion extraction failed for user %s: %s", user_id, e)
+        suggestion = None
+    if (not db.private_context_is_current(user_id) or not _course_task_allowed(user_id, cid)):
+        return
+    if not suggestion:
+        await query.message.reply_text("ℹ️ No actionable task was found in this post.")
+        return
+    confirmation = _save_task_and_confirmation_text(
+        user_id, suggestion["text"], suggestion.get("due_time"), info.get("course"),
+        source_key=f"forum-suggestion:{sid}",
+    )
     try:
         await query.edit_message_reply_markup(reply_markup=None)
     except TelegramError:
@@ -428,19 +568,37 @@ async def handle_announcement_to_task(update: Update, context: ContextTypes.DEFA
     if not info:
         await query.answer("This announcement has expired.", show_alert=True)
         return
+    cid = info.get("cid")
+    if not has_course_access(user_id, cid):
+        await query.answer("This announcement is unavailable for your account. Reopen the course updates.", show_alert=True)
+        return
     await query.answer("Converting to task...")
+    if not db.private_context_is_current(user_id):
+        return
+    if not get_ai_personal_enabled(user_id):
+        await query.message.reply_text("🔒 Enable AI use in /settings > Privacy before converting announcements into tasks.")
+        return
+    if not _course_task_allowed(user_id, cid):
+        return
 
     try:
-        result = await convert_announcement_to_task(info["course"], info.get("subject"), info["body"])
+        result = await convert_announcement_to_task(
+            info["course"], info.get("subject"), info["body"], user_id=user_id, course_id=cid,
+        )
     except Exception as e:
         logging.warning("convert_announcement_to_task failed: %s", e)
         result = None
+    if not db.private_context_is_current(user_id) or not _course_task_allowed(user_id, cid):
+        return
 
     if not result:
         await query.message.reply_text("⚠️ Couldn't convert this to a task right now - try again in a bit, or add it manually via ➕ Add Task.")
         return
 
-    confirmation = _save_task_and_confirmation_text(user_id, result["text"], result.get("due_time"), info["course"])
+    confirmation = _save_task_and_confirmation_text(
+        user_id, result["text"], result.get("due_time"), info["course"],
+        source_key=f"announcement:{sid}",
+    )
     try:
         await query.edit_message_reply_markup(reply_markup=markup_for(
             user_id, InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])))
@@ -461,32 +619,93 @@ async def check_task_reminders(bot):
     after it's already been removed from the student's list."""
     now = datetime.now(TZ_BERLIN)
     for uid in students_with_tasks():
-        fired_ids: set = set()
-        for task in user_tasks(uid):
-            due = _task_due(task)
-            if due is None or due > now:
+        if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+            # /stop, data deletion and a required sign-in pause background
+            # reminders. Keep tasks so resuming or signing in can restore them.
+            continue
+        with acting_as(uid):
+            disabled_reminder_ids: set = set()
+            if not db.private_context_is_current(uid):
                 continue
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✔️ Done", callback_data=f"task_reminder_done|{task['id']}")],
-                [InlineKeyboardButton(label, callback_data=f"task_reminder_snooze|{task['id']}|{code}") for code, label in TASK_SNOOZE_OPTIONS],
-            ])
-            try:
-                await bot.send_message(chat_id=uid, text=f"⏰ <b>Reminder:</b> {html.escape(str(task['text']))}", parse_mode="HTML", reply_markup=keyboard)
-            except (Forbidden, BadRequest) as e:
-                # the chat is gone or the student blocked the bot: retrying won't help
-                logging.error("Failed to send task reminder %s: %s", task['id'], e)
-            except Exception as e:
-                # anything else (a network blip, a flood wait, a bug) may pass:
-                # the task stays and fires again next minute, never lost unseen
-                logging.warning("Task reminder %s not sent yet: %s", task['id'], e)
-                continue
-            else:
-                remember_user_callback(uid, f"task:{task['id']}", task)
-                record_task_outcome(uid, task)  # due now; done or not comes later
-            fired_ids.add(task["id"])
-        if fired_ids:
-            # removed by id on a fresh read: tasks added while sending survive
-            remove_user_tasks(uid, fired_ids)
+            for task in user_tasks(uid):
+                if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                        or lifecycle_state(uid) != ACTIVE):
+                    break
+                due = _task_due(task)
+                if due is None or due.astimezone(timezone.utc) > now.astimezone(timezone.utc):
+                    continue
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✔️ Done", callback_data=f"task_reminder_done|{task['id']}")],
+                    [InlineKeyboardButton(label, callback_data=f"task_reminder_snooze|{task['id']}|{code}") for code, label in TASK_SNOOZE_OPTIONS],
+                ])
+                # Persist the action before sending a message that exposes its
+                # buttons. A fast tap must never arrive before its task record.
+                if not remember_user_callback(uid, f"task:{task['id']}", task):
+                    logging.error("Could not persist reminder action for task %s; leaving it queued", task["id"])
+                    continue
+                if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                        or lifecycle_state(uid) != ACTIVE):
+                    recall_user_callback(uid, f"task:{task['id']}", forget=True)
+                    break
+                try:
+                    reminder_text = truncate_html(
+                        f"⏰ <b>Reminder:</b> {html.escape(str(task['text']))}",
+                    )
+                    await bot.send_message(chat_id=uid, text=reminder_text, parse_mode="HTML", reply_markup=keyboard)
+                except Forbidden as e:
+                    # The rate limiter marks blocked/deactivated students
+                    # inactive. Stop this batch too, so every task does not
+                    # produce another forbidden API call in the same cycle.
+                    logging.error("Failed to send task reminder %s: %s", task['id'], e)
+                    recall_user_callback(uid, f"task:{task['id']}", forget=True)
+                    break
+                except BadRequest as e:
+                    # Telegram rejects this payload permanently. Keep the
+                    # task as a plain to-do rather than retrying the same
+                    # invalid reminder on every watcher cycle.
+                    logging.error("Telegram rejected task reminder %s: %s", task['id'], e)
+                    recall_user_callback(uid, f"task:{task['id']}", forget=True)
+                    disabled_reminder_ids.add(task["id"])
+                except Exception as e:
+                    # anything else (a network blip, a flood wait, a bug) may pass:
+                    # the task stays and fires again next minute, never lost unseen
+                    logging.warning("Task reminder %s not sent yet: %s", task['id'], e)
+                    continue
+                else:
+                    # The send may have been in flight while the account was
+                    # deleted. Its old task generation must not update the
+                    # retained task list after deletion completes.
+                    if not db.private_context_is_current(uid):
+                        break
+                    try:
+                        record_task_outcome(uid, task)  # due now; done or not comes later
+                    except Exception:
+                        # The reminder and its durable action are already
+                        # visible. A metrics write failure must not make the
+                        # due task fire again and send a duplicate message.
+                        logging.error("Could not record task outcome for %s", task["id"], exc_info=True)
+                    # Telegram can deliver a tap while send_message is still
+                    # awaiting its response. A snooze may therefore have
+                    # already restored this task with a new due time. Only
+                    # remove the exact due version we just sent, so the late
+                    # send response cannot erase the snoozed task.
+                    try:
+                        current = next((pending for pending in user_tasks(uid)
+                                        if pending.get("id") == task["id"]), None)
+                        if current is not None and current.get("due_time") == task.get("due_time"):
+                            remove_user_tasks(uid, {task["id"]})
+                    except Exception:
+                        logging.error("Could not remove fired task %s immediately", task["id"], exc_info=True)
+            if disabled_reminder_ids and db.private_context_is_current(uid):
+                # Update by id on a fresh read: tasks added while sending
+                # survive, and permanent send failures remain as plain tasks.
+                remaining = []
+                for pending in user_tasks(uid):
+                    if pending["id"] in disabled_reminder_ids:
+                        pending["due_time"] = None
+                        pending["reminder_error"] = "telegram_rejected"
+                    remaining.append(pending)
+                save_user_tasks(uid, remaining)
 
 
 _task_due = task_due  # kept under its old name for callers and tests
@@ -506,6 +725,8 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
     if not is_user_allowed(user_id):
         await query.answer()
         return
+    if not db.private_context_is_current(user_id):
+        return
 
     parts = query.data.split("|")
     action, task_id = parts[0], parts[1]
@@ -514,28 +735,63 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
         return
     # looked up in the tapping student's own record: another student's
     # reminder button (forwarded, in a group) finds nothing
-    task = recall_user_callback(user_id, f"task:{task_id}", forget=True)
+    task = recall_user_callback(user_id, f"task:{task_id}")
     if task:
         task = {k: v for k, v in task.items() if k != "ts"}
     if not task:
         await query.answer("This reminder has expired.", show_alert=True)
         return
     await query.answer()
-
-    try:
-        await query.edit_message_reply_markup(reply_markup=None)
-    except TelegramError:
-        pass
+    if not db.private_context_is_current(user_id):
+        return
+    # Consume only after Telegram accepted the callback answer. If that request
+    # fails transiently, the durable task action remains usable on a retry.
+    task = recall_user_callback(user_id, f"task:{task_id}", forget=True)
+    if task:
+        task = {k: v for k, v in task.items() if k != "ts"}
+    if not task:
+        await query.message.reply_text("⚠️ This reminder was already handled.")
+        return
 
     if action == "task_reminder_done":
-        record_task_outcome(user_id, task, time.time())
+        try:
+            record_task_outcome(user_id, task, time.time())
+            # Usually the reminder worker removed it after Telegram accepted
+            # the send. A fast tap can arrive before that await returns; remove
+            # it here too so a crash in the worker cannot re-send a task the
+            # student already marked done.
+            remove_user_tasks(user_id, {task_id})
+        except Exception:
+            # The task was removed when the reminder was sent. Restore its
+            # action record if completion could not be saved, so the button
+            # remains usable after a transient database failure.
+            remember_user_callback(user_id, f"task:{task_id}", task)
+            raise
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        if not db.private_context_is_current(user_id):
+            return
         await query.message.reply_text(f"✔️ Done: {task['text']}")
         return
 
     code = parts[2]
-    new_due = datetime.now(TZ_BERLIN) + _snooze_offset(code)
+    now = datetime.now(TZ_BERLIN)
+    offset = _snooze_offset(code)
+    new_due = now + offset if code == "1d" else (now.astimezone(timezone.utc) + offset).astimezone(TZ_BERLIN)
     task["due_time"] = new_due.isoformat()
-    add_user_task(user_id, task)
+    try:
+        add_user_task(user_id, task)
+    except Exception:
+        remember_user_callback(user_id, f"task:{task_id}", task)
+        raise
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
+    if not db.private_context_is_current(user_id):
+        return
     await query.message.reply_text(f"⏰ Snoozed - reminding you again at {new_due.strftime('%d.%m.%Y %H:%M')}: {task['text']}")
 
 
@@ -553,32 +809,58 @@ def _resolve_task_due_time(due_date: Optional[str], due_time_str: Optional[str])
     due_date is missing or unparseable."""
     if not due_date:
         return None
+    if not isinstance(due_date, str) or (due_time_str is not None and not isinstance(due_time_str, str)):
+        return None
     try:
         time_part = due_time_str or "09:00"
-        due_dt = datetime.strptime(f"{due_date} {time_part}", "%Y-%m-%d %H:%M").replace(tzinfo=TZ_BERLIN)
+        parsed = datetime.strptime(f"{due_date} {time_part}", "%Y-%m-%d %H:%M")
+        due_dt = _berlin_task_wall_time(parsed.date(), parsed.hour, parsed.minute,
+                                        description=f"{due_date} {time_part}")
     except ValueError:
         return None
-    if due_dt < datetime.now(TZ_BERLIN):
+    if due_dt.astimezone(timezone.utc) < datetime.now(TZ_BERLIN).astimezone(timezone.utc):
         # a deadline already gone would remind at once; it stays a plain to-do
         # (or, typed by the student, they are asked for the time)
         return None
     return due_dt.isoformat()
 
 
-async def extract_task_suggestion(course_name: str, thread_title: Optional[str], body_text: str) -> Optional[dict]:
+def _validated_model_task_text(value) -> Optional[str]:
+    """Accept only usable task text from an untrusted model response."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned[:200] if cleaned else None
+
+
+def _course_task_allowed(user_id: Optional[int], course_id: Optional[str]) -> bool:
+    return (user_id is not None and has_course_access(user_id, course_id)
+            and personal_ai_allowed(user_id))
+
+
+async def extract_task_suggestion(course_name: str, thread_title: Optional[str], body_text: str,
+                                 user_id: Optional[int] = None, course_id: Optional[str] = None) -> Optional[dict]:
     """Ask the LLM whether an announcement/forum post body mentions an
     actionable deadline/task, for the "📝 Add as task?" suggestion button
     on new forum notifications. Returns {"text", "due_time"} (due_time is
     an ISO string or None) on a detected task, or None if no task was
     found or the call/parse failed - callers should just skip the
     suggestion button in that case, never treat it as an error."""
+    if not _course_task_allowed(user_id, course_id):
+        return None
     today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
     user_text = f"Today is {today_str}.\nCourse: {course_name}\n" + (f"Thread: {thread_title}\n" if thread_title else "") + f"\n{body_text}"
-    raw = await _call_openrouter(TASK_SUGGESTION_SYSTEM_PROMPT, user_text)
+    raw = await _call_openrouter(
+        TASK_SUGGESTION_SYSTEM_PROMPT, user_text,
+        can_send=lambda: _course_task_allowed(user_id, course_id),
+    )
     parsed = _extract_json_object(raw)
-    if not parsed or not parsed.get("has_task") or not parsed.get("task_text"):
+    if not parsed or parsed.get("has_task") is not True:
         return None
-    return {"text": str(parsed["task_text"])[:200], "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
+    task_text = _validated_model_task_text(parsed.get("task_text"))
+    if task_text is None:
+        return None
+    return {"text": task_text, "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
 
 
 ANNOUNCEMENT_TO_TASK_SYSTEM_PROMPT = """You convert a university course announcement into a short, actionable personal to-do for the student reading it - rephrase it in task language ("Review ...", "Submit ...", "Prepare ...", "Read ...", "Bring ...") rather than restating the announcement. Always produce a task_text, even for a purely informational announcement with no deadline (e.g. "Review posted lecture slides for <course>") - this button is tapped deliberately by the student, so there's always something reasonable to turn it into.
@@ -588,20 +870,29 @@ If the announcement clearly mentions a concrete date/deadline (a submission date
 Respond with strict JSON only, no other text: {"task_text": "<short actionable task>", "due_date": "<YYYY-MM-DD>" or null, "due_time": "<HH:MM 24h>" or null}. Resolve relative dates ("by Friday", "next Monday") against today's date, which you're given in the prompt."""
 
 
-async def convert_announcement_to_task(course_name: str, subject: Optional[str], body_text: str) -> Optional[dict]:
+async def convert_announcement_to_task(course_name: str, subject: Optional[str], body_text: str,
+                                      user_id: Optional[int] = None, course_id: Optional[str] = None) -> Optional[dict]:
     """Ask the LLM to rephrase an announcement as a task, for the always-
     present "📝 Add as Task" button on announcement notifications (unlike
     extract_task_suggestion, this doesn't gate on whether a deadline was
     found - it's only called when the student deliberately taps the
     button, so it always tries to produce something). Returns
     {"text", "due_time"}, or None if the call/parse failed."""
+    if not _course_task_allowed(user_id, course_id):
+        return None
     today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
     user_text = f"Today is {today_str}.\nCourse: {course_name}\n" + (f"Subject: {subject}\n" if subject else "") + f"\n{body_text}"
-    raw = await _call_openrouter(ANNOUNCEMENT_TO_TASK_SYSTEM_PROMPT, user_text)
+    raw = await _call_openrouter(
+        ANNOUNCEMENT_TO_TASK_SYSTEM_PROMPT, user_text,
+        can_send=lambda: _course_task_allowed(user_id, course_id),
+    )
     parsed = _extract_json_object(raw)
-    if not parsed or not parsed.get("task_text"):
+    if not parsed:
         return None
-    return {"text": str(parsed["task_text"])[:200], "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
+    task_text = _validated_model_task_text(parsed.get("task_text"))
+    if task_text is None:
+        return None
+    return {"text": task_text, "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
 
 
 TASK_FROM_TEXT_SYSTEM_PROMPT = """You read a person's own task/to-do request (typed or spoken, Turkish or English) for a university assistant bot's task list, and extract a clean task description plus a due date/time - but only if they actually stated one in the same sentence.
@@ -611,22 +902,31 @@ Respond with strict JSON only, no other text: {"task_text": "<short, clean task 
 due_date/due_time are ONLY set if the person stated an actual date/time themselves (e.g. "tomorrow", "yarın 15:00", "next Friday", "20 Ekim", "in 3 days"); if they only described the task with no date at all, both must be null - never invent one. Resolve relative dates against today's date, given in the prompt."""
 
 
-async def extract_task_from_text(text: str) -> Optional[dict]:
+async def extract_task_from_text(text: str, user_id: Optional[int] = None) -> Optional[dict]:
     """Ask the LLM to clean up a task description and pull out a due
     date/time if one was actually stated in the same sentence (e.g. "yarın
     rapor teslim et saat 15:00'te") - lets task creation (voice or typed,
     see _handle_task_wizard_reply's "task_text" step) skip the separate
     "when is this due?" question when the date was already given upfront,
     the same way create_exam_reminder_task already resolves an exam's date
-    in one shot instead of asking a follow-up. Returns {"text", "due_time"}
-    (due_time ISO or None), or None on any failure - callers should fall
-    back to the existing explicit ask-for-time step in that case."""
-    today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
-    raw = await _call_openrouter(TASK_FROM_TEXT_SYSTEM_PROMPT, f"Today is {today_str}.\n\n{text}")
-    parsed = _extract_json_object(raw)
-    if not parsed or not parsed.get("task_text"):
+    in one shot instead of asking a follow-up. The raw task text is sent to
+    an external AI, so this is skipped when personal-data AI consent is off.
+    Returns {"text", "due_time"} (due_time ISO or None), or None on any
+    failure or when not consented; callers then ask for the time explicitly."""
+    if user_id is None or not get_ai_personal_enabled(user_id):
         return None
-    return {"text": str(parsed["task_text"])[:200], "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
+    today_str = datetime.now(TZ_BERLIN).strftime("%A, %B %d, %Y")
+    raw = await _call_openrouter(
+        TASK_FROM_TEXT_SYSTEM_PROMPT, f"Today is {today_str}.\n\n{text}",
+        can_send=lambda: personal_ai_allowed(user_id),
+    )
+    parsed = _extract_json_object(raw)
+    if not parsed:
+        return None
+    task_text = _validated_model_task_text(parsed.get("task_text"))
+    if task_text is None:
+        return None
+    return {"text": task_text, "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
 
 
 EXAM_REMINDER_TASK_SYSTEM_PROMPT = """You extract the details of an exam reminder request (spoken in Turkish or English) for a university assistant bot. The user wants a task/reminder created some amount of time before a named exam.
@@ -646,23 +946,36 @@ If the course/exam name or the offset can't be determined, use null for that fie
 Respond with strict JSON only, no other text: {"course_query": "<name or null>", "offset_value": <int or null>, "offset_unit": "<days|hours>"}"""
 
 
-async def extract_exam_reminder_task(transcript: str) -> dict:
+async def extract_exam_reminder_task(transcript: str, user_id: Optional[int] = None) -> dict:
     """Extract {"course_query", "offset_value", "offset_unit"} from a spoken
     "remind me about <exam> N days/hours before" request. Falls back to all
     None/"days" on any failure - the caller must treat missing course_query or
     offset_value as "couldn't understand" rather than guessing."""
-    raw = await _call_openrouter(EXAM_REMINDER_TASK_SYSTEM_PROMPT, transcript)
+    if user_id is None or not get_ai_personal_enabled(user_id):
+        return {"course_query": None, "offset_value": None, "offset_unit": "days"}
+    raw = await _call_openrouter(
+        EXAM_REMINDER_TASK_SYSTEM_PROMPT, transcript,
+        can_send=lambda: personal_ai_allowed(user_id),
+    )
     parsed = _extract_json_object(raw)
     if not parsed:
         return {"course_query": None, "offset_value": None, "offset_unit": "days"}
-    offset_value = parsed.get("offset_value")
-    try:
-        offset_value = int(offset_value) if offset_value is not None else None
-    except (TypeError, ValueError):
+    raw_offset = parsed.get("offset_value")
+    if isinstance(raw_offset, int) and not isinstance(raw_offset, bool):
+        offset_value = raw_offset
+    elif isinstance(raw_offset, str) and raw_offset.isdecimal():
+        offset_value = int(raw_offset)
+    else:
         offset_value = None
+    # An offset over 100 years cannot be a useful exam reminder and could
+    # underflow datetime arithmetic if a malformed model response supplied it.
+    if offset_value is not None and not 0 <= offset_value <= 36_500:
+        offset_value = None
+    raw_course = parsed.get("course_query")
+    course_query = raw_course.strip()[:200] if isinstance(raw_course, str) else None
     offset_unit = parsed.get("offset_unit") if parsed.get("offset_unit") in ("days", "hours") else "days"
     return {
-        "course_query": parsed.get("course_query") or None,
+        "course_query": course_query or None,
         "offset_value": offset_value,
         "offset_unit": offset_unit,
     }

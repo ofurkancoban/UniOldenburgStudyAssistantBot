@@ -26,9 +26,9 @@ from studip_utils import aread_bytes
 from studip_utils import md_escape as _md
 from unibot.formatting import split_html
 from studip_utils import safe_filename as _safe_filename
-from unibot import db, state
+from unibot import db
 from unibot.config import ADMIN_USER_IDS, ALLOWED_USER_IDS
-from unibot.storage import load_student_progress
+from unibot.storage import has_course_access
 
 nav_names: dict[int, list[str]] = {}  # user_id -> [name1, name2, ...]  (for breadcrumb)
 
@@ -186,8 +186,8 @@ def broadcast_targets(cid: Optional[str] = None, members=None) -> set:
     Without `cid` and `members`: every allowed and active user (an admin
     announcement). `members` without `cid` is exactly the audience (the
     admins, one student). With `cid`: only students who take that course
-    (the given `members`, their course list, the course registry) or track
-    it on /progress; nobody else, administrators included."""
+    verified by their course list or course registry. Explicit members are
+    candidates, never a substitute for authorization, including admins."""
     if cid is None:
         if members is not None:
             targets = set(members)
@@ -199,7 +199,7 @@ def broadcast_targets(cid: Optional[str] = None, members=None) -> set:
                 logging.debug("User list unavailable", exc_info=True)
         return {uid for uid in targets if not _is_inactive(uid)}
 
-    targets = set(members) if members is not None else set()
+    targets = {uid for uid in members if _takes_course(uid, cid)} if members is not None else set()
     try:
         for u in db.get_all_users():
             uid = u["telegram_id"]
@@ -213,17 +213,8 @@ def broadcast_targets(cid: Optional[str] = None, members=None) -> set:
 
 
 def _takes_course(uid: int, cid: str) -> bool:
-    """Whether the student takes or tracks the course (from what the bot
-    knows about them, never from anyone else's list)."""
-    if cid in (state.user_courses_map.get(uid) or {}):
-        return True
-    try:
-        if cid in db.get_user_scope(uid).course_ids():
-            return True
-        return cid in (load_student_progress(uid).get("tracked") or [])
-    except Exception:
-        logging.debug("Course membership unavailable", exc_info=True)
-        return False
+    """Whether trusted enrollment data permits this student's course access."""
+    return has_course_access(uid, cid)
 
 
 def _is_inactive(uid: int) -> bool:
@@ -238,7 +229,10 @@ def _is_inactive(uid: int) -> bool:
         return user is not None and not user.get("is_active")
     except Exception:
         logging.debug("Lifecycle lookup failed", exc_info=True)
-        return False
+        # When the database cannot confirm that a user is active, do not
+        # include them in a broadcast. This keeps revoked or stopped users
+        # from receiving private alerts during a database outage.
+        return True
 
 
 async def broadcast(
@@ -250,19 +244,34 @@ async def broadcast(
     cid: Optional[str] = None,
     members=None,
 ):
-    """Send a message with optional reply markup to broadcast_targets()."""
+    """Send a message with optional reply markup; return delivery counts.
+
+    HTML announcements may exceed Telegram's per-message limit after escaping
+    user text. Split them into valid Telegram messages and count a recipient as
+    delivered only after every part succeeds.
+    """
+    sent_ids = []
+    failed_ids = []
+    messages = split_html(text) if parse_mode == "HTML" else [text]
     for uid in broadcast_targets(cid, members):
         try:
-            await bot.send_message(
-                chat_id=uid,
-                text=text,
-                parse_mode=parse_mode,
-                disable_notification=disable_notification,
-                reply_markup=markup_for(uid, reply_markup),
-            )
+            for index, message in enumerate(messages):
+                await bot.send_message(
+                    chat_id=uid,
+                    text=message,
+                    parse_mode=parse_mode,
+                    disable_notification=disable_notification,
+                    reply_markup=(markup_for(uid, reply_markup)
+                                  if index == len(messages) - 1 else None),
+                )
+                if index < len(messages) - 1:
+                    await asyncio.sleep(0.3)
+            sent_ids.append(uid)
             await asyncio.sleep(0.3)  # Telegram rate limit safety
         except Exception as e:
+            failed_ids.append(uid)
             logging.warning("Failed to send broadcast to %s: %s", uid, e)
+    return {"sent": sent_ids, "failed": failed_ids}
 
 
 async def _show_typing(sender, action=ChatAction.TYPING):
@@ -382,6 +391,9 @@ def get_main_keyboard():
     )
 
 
+MAX_TELEGRAM_IMAGE_BYTES = 10 * 1024 * 1024
+
+
 async def _download_telegram_file(bot, file_id: str) -> Optional[bytes]:
     """Download a Telegram-hosted file (photo) to a transient temp path, read
     it into memory, then remove the temp file - same disposable-temp-file
@@ -390,7 +402,13 @@ async def _download_telegram_file(bot, file_id: str) -> Optional[bytes]:
     path = os.path.join(tempfile.gettempdir(), f"wardrobe_{uuid.uuid4().hex}.jpg")
     try:
         file = await bot.get_file(file_id)
+        if file.file_size is not None and file.file_size > MAX_TELEGRAM_IMAGE_BYTES:
+            logging.warning("Telegram image exceeds the %s byte limit", MAX_TELEGRAM_IMAGE_BYTES)
+            return None
         await file.download_to_drive(path)
+        if os.path.getsize(path) > MAX_TELEGRAM_IMAGE_BYTES:
+            logging.warning("Downloaded Telegram image exceeds the %s byte limit", MAX_TELEGRAM_IMAGE_BYTES)
+            return None
         return await aread_bytes(path)
     except Exception as e:
         logging.warning("_download_telegram_file failed: %s", e)

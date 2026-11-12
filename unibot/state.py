@@ -28,8 +28,11 @@ def spawn(coro, name: Optional[str] = None) -> asyncio.Task:
 
     def _done(t: asyncio.Task) -> None:
         _background_tasks.discard(t)
-        if not t.cancelled() and t.exception() is not None:
-            logging.error("Background task %s failed", t.get_name(), exc_info=t.exception())
+        if not t.cancelled() and (exc := t.exception()) is not None:
+            logging.error(
+                "Background task %s failed", t.get_name(),
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
 
     task.add_done_callback(_done)
     return task
@@ -44,9 +47,13 @@ global_watcher_paused = False
 message_poll_task: Optional[asyncio.Task] = None  # see message_poll_loop
 session_keepalive_task: Optional[asyncio.Task] = None  # see session_keepalive_loop
 unified_watcher_task: Optional[asyncio.Task] = None
+scheduled_jobs_task: Optional[asyncio.Task] = None
+deadline_reminders_task: Optional[asyncio.Task] = None
 watcher_controller_running = False
 courses_map: dict[str, str] = {}  # cid -> course_name
+courses_map_complete = False  # latest watcher course map did not omit a semester on fetch failure
 user_courses_map: dict[int, dict[str, str]] = {}  # user_id -> {cid: course_name}
+course_watch_plan_complete = False  # latest watched_courses() plan includes every active signed-in user's course list
 
 
 _shared_http_session: Optional[aiohttp.ClientSession] = None
@@ -66,16 +73,19 @@ _last_notified_studip_cookie: Optional[str] = None
 
 
 _courses_map_built_with_prev: Optional[bool] = None  # tracks whether the shared courses_map currently reflects get_watch_previous_semester_enabled() == True/False, so it's rebuilt only when that's actually changed
+_courses_map_refreshed_at: float = 0.0  # last successful watcher course-list rebuild
 _studip_api_user_id: Optional[str] = None
 _studip_user_profile: Optional[dict] = None
-_studip_api_semester_starts: Optional[dict] = None  # {semester_id: start datetime}, fetched once per process
+_studip_api_semester_starts: Optional[dict] = None  # {semester_id: start datetime}
 _studip_api_current_semester: Optional[str] = None
+_studip_api_semesters_refreshed_at = 0.0
 
 # Today's prepared summary ({"date": "YYYY-MM-DD", "data": <prepare_morning_summary result>})
 # and the task that delivers it at MORNING_SUMMARY_HOUR. In memory only: if
 # the bot restarts in between, the watcher just prepares it again.
 _prepared_morning: dict = {}  # "YYYY-MM-DD#HH:MM" -> prepared summary of that morning slot
 _morning_delivery_tasks: dict = {}  # "YYYY-MM-DD#HH:MM" -> task sending that slot at its time
+_morning_delivery_data: dict = {}  # same key -> data retained by the delivery task
 
 
 # ──────────────────────────────────────────────────────────────────────────────

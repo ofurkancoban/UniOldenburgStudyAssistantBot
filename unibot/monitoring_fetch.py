@@ -17,11 +17,13 @@ from unibot.formatting import (
 )
 from unibot.studip_api import (
     BASE_URL,
+    _normalize_url,
     _api_berlin,
     _api_html_to_text,
     _api_message,
     _api_names,
     _api_rel_id,
+    STUDIP_API_PAGE_LIMIT,
     studip_api_get,
     studip_api_get_all,
     studip_api_user_id,
@@ -86,8 +88,12 @@ async def _course_announcements_api(cid, course_name, session=None) -> list:
 
 async def fetch_message_body(session, message_url):
     """Fetch message body from detail page with improved parsing."""
+    safe_url = _normalize_url(message_url)
+    if not safe_url:
+        logging.warning("Rejected untrusted message detail URL: %s", redact_url(message_url))
+        return "[Invalid message URL]"
     try:
-        async with await session.get(message_url) as resp:
+        async with await session.get(safe_url) as resp:
             if resp.status != 200:
                 return f"[HTTP Error: {resp.status}]"
             html = await resp.text()
@@ -131,17 +137,52 @@ async def fetch_message_body(session, message_url):
         return f"[Error fetching content: {str(e)[:100]}]"
 
 
-# How many of the newest inbox messages each check compares against the
-# cache (the overview page showed about this many).
-MESSAGE_CHECK_LIMIT = 20
+# The first inbox check establishes a baseline from one page. Later checks
+# walk older pages until they reach a message already in the user's cache.
+MESSAGE_CHECK_LIMIT = STUDIP_API_PAGE_LIMIT
 
 
-async def _fetch_messages_api(limit: int = MESSAGE_CHECK_LIMIT, session=None) -> list:
-    """The newest `limit` inbox messages, newest first, bodies included."""
+async def _fetch_messages_api(limit: int = MESSAGE_CHECK_LIMIT, session=None,
+                              known_ids: Optional[set[str]] = None) -> list:
+    """Fetch messages newest first, paging back to the cached inbox boundary.
+
+    With no cache, one page is enough to establish a baseline. With a cache,
+    keep paging until a known message is reached so a busy inbox cannot hide
+    messages beyond an arbitrary newest-N window.
+    """
     uid = await studip_api_user_id(session=session)
-    page = await studip_api_get(f"/users/{uid}/inbox", {"page[limit]": limit, "include": "sender"}, session=session)
-    names = _api_names(page.get("included", []))
-    return [_api_message(m, names) for m in page.get("data", [])]
+    path = f"/users/{uid}/inbox"
+    page_limit = max(1, min(int(limit), STUDIP_API_PAGE_LIMIT))
+    offset = 0
+    known = {str(message_id) for message_id in known_ids} if known_ids is not None else None
+    messages = []
+    fingerprints = set()
+    while True:
+        page = await studip_api_get(path, {
+            "page[limit]": page_limit, "page[offset]": offset, "include": "sender",
+        }, session=session)
+        data = page.get("data", [])
+        if not isinstance(data, list):
+            raise ValueError("inbox API page data is not a list")
+        if not data:
+            break
+        fingerprint = tuple(str(item.get("id")) for item in data if isinstance(item, dict))
+        if fingerprint in fingerprints:
+            raise ValueError(f"inbox API repeated a page at offset {offset}")
+        fingerprints.add(fingerprint)
+        names = _api_names(page.get("included", []))
+        found_known = False
+        for message in data:
+            if not isinstance(message, dict) or message.get("id") is None:
+                raise ValueError("inbox API returned a malformed message")
+            if known is not None and str(message["id"]) in known:
+                found_known = True
+                break
+            messages.append(_api_message(message, names))
+        if known is None or found_known or len(data) < page_limit:
+            break
+        offset += page_limit
+    return messages
 
 
 async def _fetch_messages_html(session) -> list:
@@ -149,6 +190,10 @@ async def _fetch_messages_html(session) -> list:
     url = f"{BASE_URL}/dispatch.php/messages/overview"
     async with await session.get(url) as resp:
         html_text = await resp.text()
+        if resp.status != 200:
+            raise RuntimeError(f"inbox overview answered HTTP {resp.status}")
+    if "loginform" in html_text.lower():
+        raise RuntimeError("inbox overview returned the login form")
 
     # lxml, not html.parser: see the comment in check_new_announcements_parallel
     # on the same inline-SVG-icon parse-tree corruption bug.
@@ -189,10 +234,8 @@ def _forum_author_name(posts_data: dict, author_id) -> str:
 def _friendly_forum_date(iso_str) -> str:
     if not iso_str:
         return "Unknown date"
-    try:
-        return datetime.fromisoformat(iso_str).strftime("%Y-%m-%d %H:%M")
-    except (ValueError, TypeError):
-        return str(iso_str)
+    parsed = _api_berlin(iso_str)
+    return parsed.strftime("%Y-%m-%d %H:%M") if parsed else str(iso_str)
 
 
 def _post_author_id(post: dict):
@@ -229,7 +272,9 @@ def _forum_thread_entry(course_name: str, cid: str, disc: dict, posts_data: dict
 
     last_post = posts[-1]
     last_attrs = last_post.get("attributes", {})
-    time_str = _friendly_forum_date(last_attrs.get("mkdate", berlin_now().isoformat()))
+    raw_timestamp = last_attrs.get("mkdate") or berlin_now().isoformat()
+    parsed_timestamp = _api_berlin(raw_timestamp)
+    time_str = parsed_timestamp.strftime("%Y-%m-%d %H:%M") if parsed_timestamp else _friendly_forum_date(raw_timestamp)
     last_content_html = last_attrs.get("content-html", "")
     last_message_plain = _html_to_text(last_content_html) if last_content_html else ""
     if len(history) > 1:
@@ -239,16 +284,22 @@ def _forum_thread_entry(course_name: str, cid: str, disc: dict, posts_data: dict
         final_body = f"📩 <b>Last message:</b>\n{html.escape(body)}"
 
     return {
+        "cid": cid,
         "course": course_name,
         "thread": title,
         "author": _forum_author_name(posts_data, _post_author_id(last_post)),
         "date": time_str,
         "body": final_body,
         "last_message_plain": last_message_plain,
+        # Stable per-post identifier lets the watcher distinguish a new reply
+        # in an existing discussion from a discussion it already cached.
+        "last_post_id": last_post.get("id"),
         "key": f"{cid}:{title}:{disc_id}",
         # A thread counts as new when Stud.IP reports unread postings
         "is_new": disc.get("meta", {}).get("unread-postings-count", 0) > 0,
-        "timestamp": time_str,
+        # Keep full precision for ordering and legacy-cache diffing; `date`
+        # remains the shorter display form shown to students.
+        "timestamp": parsed_timestamp.isoformat() if parsed_timestamp else time_str,
     }
 
 
@@ -258,17 +309,15 @@ async def _fetch_course_forum_strict(session, course_name: str, cid: str) -> lis
     access), so the course registry can hand the scan to another member."""
     url = f"{BASE_URL}/jsonapi.php/v1/courses/{cid}/forum-discussions"
     async with await session.get(url, headers=JSONAPI_HEADERS) as r:
-        if r.status in (401, 403):
-            raise PermissionError(f"forum of {cid} answered HTTP {r.status}")
         if r.status != 200:
-            return []
+            raise RuntimeError(f"forum of {cid} answered HTTP {r.status}")
         data = await r.json()
     entries = []
     for disc in data.get("data", [])[:10]:
         posts_url = f"{BASE_URL}/jsonapi.php/v1/forum-discussions/{disc.get('id')}/postings?include=author"
         async with await session.get(posts_url, headers=JSONAPI_HEADERS) as r2:
             if r2.status != 200:
-                continue
+                raise RuntimeError(f"postings of discussion {disc.get('id')} answered HTTP {r2.status}")
             posts_data = await r2.json()
         entry = _forum_thread_entry(course_name, cid, disc, posts_data)
         if entry:

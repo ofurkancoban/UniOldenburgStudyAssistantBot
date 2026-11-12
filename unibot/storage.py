@@ -9,6 +9,7 @@ import functools
 import hashlib
 import hmac
 import logging
+import math
 import secrets
 import time
 import uuid
@@ -23,6 +24,22 @@ from unibot.config import PRIMARY_ADMIN_ID
 
 # navigation & cache
 LINK_CACHE_PATH = "link_cache.json"
+
+
+def _finite_number(value: Any) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _link_timestamp(value: Any, default: float) -> float:
+    if not isinstance(value, dict) or "ts" not in value:
+        return default
+    raw = value["ts"]
+    return raw if _finite_number(raw) else 0.0
 
 
 class _PersistentLinkCache(dict):
@@ -44,7 +61,13 @@ class _PersistentLinkCache(dict):
         try:
             data = db.load(path)
             if isinstance(data, dict):
-                super().update(data)
+                valid = {
+                    key: value for key, value in data.items()
+                    if isinstance(key, str) and isinstance(value, dict)
+                }
+                if len(valid) != len(data):
+                    logging.warning("Ignored malformed entries in %s", path)
+                super().update(valid)
         except FileNotFoundError:
             pass
         except Exception as exc:
@@ -67,7 +90,7 @@ class _PersistentLinkCache(dict):
 
         def ts(key):
             value = dict.get(self, key)
-            return value.get("ts", now) if isinstance(value, dict) else now
+            return _link_timestamp(value, now)
 
         if self._ttl is not None:
             for key in [k for k in self if now - ts(k) > self._ttl]:
@@ -78,8 +101,8 @@ class _PersistentLinkCache(dict):
 
     def flush(self) -> None:
         self._flush_handle = None
-        self._prune()
         try:
+            self._prune()
             db.save(self._path, dict(self), indent=None)
         except Exception as exc:
             logging.warning("Could not save %s: %s", self._path, exc)
@@ -103,6 +126,78 @@ class _PersistentLinkCache(dict):
 
 
 link_cache = _PersistentLinkCache(LINK_CACHE_PATH)  # short_id -> { url, cid, name?, action?, user_id?, current_url?, ts }
+
+
+def link_cache_owned_by(info: Any, user_id: int) -> bool:
+    """Allow explicitly shared course links and the student's own browser links."""
+    if not isinstance(info, dict):
+        return False
+    owner = info.get("user_id")
+    if owner is None:
+        # `shared` is explicit on current course alert cards. Keep their
+        # pre-marker form usable during the cache TTL: older shared cards had
+        # course metadata, while personal browser navigation links did not.
+        return info.get("shared") is True or bool(
+            info.get("cid") and info.get("course") and info.get("name") and not info.get("action")
+        )
+    return str(owner) == str(int(user_id))
+
+
+def forget_user_link_cache(user_id: int) -> int:
+    """Remove persistent file-browser links owned by one student."""
+    uid = int(user_id)
+    persisted = db.load(LINK_CACHE_PATH) if db.exists(LINK_CACHE_PATH) else {}
+    if not isinstance(persisted, dict):
+        raise RuntimeError("persistent file-link cache has an invalid shape")
+    keys = {
+        key for key, value in link_cache.items()
+        if isinstance(value, dict) and str(value.get("user_id")) == str(uid)
+    }
+    keys.update(
+        key for key, value in persisted.items()
+        if isinstance(value, dict) and str(value.get("user_id")) == str(uid)
+    )
+    for key in keys:
+        link_cache.pop(key, None)
+    for key in keys:
+        persisted.pop(key, None)
+    # Deletion must reach SQLite before the confirmation is sent. Save the
+    # persistent snapshot directly so unrelated pending in-memory entries do
+    # not reintroduce an owned link if a prior debounced write was delayed.
+    if keys:
+        db.save(LINK_CACHE_PATH, persisted, indent=None)
+    # The pre-migration file can contain older links absent from both the
+    # current DB document and this process's memory. It is only a backup, so
+    # discard it before treating the user's links as deleted.
+    if db.has_imported_backup(LINK_CACHE_PATH):
+        db.delete_imported_backup(LINK_CACHE_PATH)
+    if db.has_imported_backup(LINK_CACHE_PATH):
+        raise RuntimeError("stale imported file-link cache remains after deletion")
+    saved = db.load(LINK_CACHE_PATH) if db.exists(LINK_CACHE_PATH) else {}
+    if not isinstance(saved, dict) or any(
+        isinstance(value, dict) and str(value.get("user_id")) == str(uid)
+        for value in saved.values()
+    ):
+        raise RuntimeError("owned file links remain in the persistent cache")
+    return len(keys)
+
+
+def has_course_access(user_id: Optional[int], cid: Optional[str]) -> bool:
+    """Authorize course content using enrollment data, never study selections."""
+    if (not isinstance(user_id, int) or isinstance(user_id, bool)
+            or not isinstance(cid, str) or not cid):
+        return False
+    if cid in (state.user_courses_map.get(user_id) or {}):
+        return True
+    try:
+        if cid in db.get_user_scope(user_id).course_ids():
+            return True
+    except Exception:
+        logging.warning("Course access lookup failed for %s", user_id, exc_info=True)
+        return False
+    watcher = state.global_session
+    return (watcher is not None and getattr(watcher, "user_id", None) == user_id
+            and cid in state.courses_map)
 
 
 def student_courses(user_id: Optional[int]) -> dict:
@@ -151,27 +246,67 @@ USER_CALLBACKS_KIND = "callbacks"
 USER_CALLBACK_MAX_ITEMS = 300
 
 
-def remember_user_callback(user_id: int, key: str, value: dict) -> None:
+def _durable_user_callback(key: str) -> bool:
+    """A fired task reminder remains actionable until its owner acts on it."""
+    return key.startswith("task:")
+
+
+def remember_user_callback(user_id: int, key: str, value: dict) -> bool:
+    """Persist a user's button action; False when it could not be saved."""
     try:
         scope = db.get_user_scope(int(user_id))
-        data = dict(scope.private(USER_CALLBACKS_KIND) or {})
+        raw = scope.private(USER_CALLBACKS_KIND)
+        data = ({key: value for key, value in raw.items()
+                 if isinstance(key, str) and isinstance(value, dict)}
+                if isinstance(raw, dict) else {})
         now = time.time()
         data[key] = {**value, "ts": now}
-        data = {k: v for k, v in data.items() if now - v.get("ts", now) <= CALLBACK_TTL_SECONDS}
-        if len(data) > USER_CALLBACK_MAX_ITEMS:
-            data = dict(sorted(data.items(), key=lambda kv: kv[1].get("ts", 0))[-USER_CALLBACK_MAX_ITEMS:])
+        data = {k: v for k, v in data.items()
+                if _durable_user_callback(k) or now - _link_timestamp(v, 0.0) <= CALLBACK_TTL_SECONDS}
+        durable = {k: v for k, v in data.items() if _durable_user_callback(k)}
+        if len(durable) > USER_CALLBACK_MAX_ITEMS:
+            overflow = sorted(durable.items(), key=lambda kv: kv[1].get("ts", 0))[
+                :len(durable) - USER_CALLBACK_MAX_ITEMS
+            ]
+            for old_key, old_value in overflow:
+                task_id = old_key.removeprefix("task:")
+                if (not task_id or str(old_value.get("id")) != task_id
+                        or not isinstance(old_value.get("text"), str)
+                        or (old_value.get("user_id") is not None and old_value.get("user_id") != int(user_id))):
+                    continue
+                scope.add_task({k: v for k, v in old_value.items() if k != "ts"})
+                durable.pop(old_key, None)
+            # Tasks whose durable reminder action no longer fits are returned
+            # to the regular task list before their callback row is pruned.
+            transient = {k: v for k, v in data.items() if not _durable_user_callback(k)}
+            keep = max(0, USER_CALLBACK_MAX_ITEMS - len(durable))
+            transient = dict(sorted(transient.items(), key=lambda kv: kv[1].get("ts", 0))[-keep:]) if keep else {}
+            data = {**transient, **durable}
+        elif len(data) > USER_CALLBACK_MAX_ITEMS:
+            transient = {k: v for k, v in data.items() if not _durable_user_callback(k)}
+            keep = max(0, USER_CALLBACK_MAX_ITEMS - len(durable))
+            transient = dict(sorted(transient.items(), key=lambda kv: kv[1].get("ts", 0))[-keep:]) if keep else {}
+            data = {**transient, **durable}
         scope.save_private(USER_CALLBACKS_KIND, data)
+        saved = scope.private(USER_CALLBACKS_KIND)
+        if not isinstance(saved, dict) or saved.get(key) != data[key]:
+            return False
+        return True
     except Exception:
         logging.warning("Could not keep a button action for user %s", user_id, exc_info=True)
+        return False
 
 
 def recall_user_callback(user_id: int, key: str, forget: bool = False) -> Optional[dict]:
     """The student's own stored button action, or None (expired or not theirs)."""
     try:
         scope = db.get_user_scope(int(user_id))
-        data = dict(scope.private(USER_CALLBACKS_KIND) or {})
+        raw = scope.private(USER_CALLBACKS_KIND)
+        data = raw if isinstance(raw, dict) else {}
         value = data.get(key)
-        if value is None or time.time() - value.get("ts", 0) > CALLBACK_TTL_SECONDS:
+        if (not isinstance(value, dict)
+                or (not _durable_user_callback(key)
+                    and time.time() - _link_timestamp(value, 0.0) > CALLBACK_TTL_SECONDS)):
             return None
         if forget:
             data.pop(key, None)
@@ -193,13 +328,20 @@ def cleanup_link_cache():
     try:
         now_ts = time.time()
         # Expire by TTL
-        expired_keys = [k for k, v in link_cache.items() if (now_ts - v.get("ts", now_ts)) > LINK_CACHE_TTL_SECONDS]
+        expired_keys = [
+            k for k, v in link_cache.items()
+            if not isinstance(v, dict)
+            or (now_ts - _link_timestamp(v, now_ts)) > LINK_CACHE_TTL_SECONDS
+        ]
         for k in expired_keys:
             link_cache.pop(k, None)
         # Cap size by removing oldest
         if len(link_cache) > LINK_CACHE_MAX_ITEMS:
             # Sort by ts ascending (oldest first)
-            sorted_keys = sorted(link_cache.keys(), key=lambda k: link_cache[k].get("ts", 0.0))
+            sorted_keys = sorted(
+                link_cache.keys(),
+                key=lambda k: _link_timestamp(link_cache.get(k), 0.0),
+            )
             for k in sorted_keys[: max(0, len(link_cache) - LINK_CACHE_MAX_ITEMS)]:
                 link_cache.pop(k, None)
     except Exception:
@@ -218,7 +360,18 @@ def load_files_cache():
     """Safely load JSON cache of previous file states."""
     if db.exists(FILES_CACHE_PATH):
         try:
-            return db.load(FILES_CACHE_PATH)
+            value = db.load(FILES_CACHE_PATH)
+            if not isinstance(value, dict):
+                logging.warning("File cache has an invalid top-level shape; starting empty")
+                return {}
+            clean = {}
+            for cid, files in value.items():
+                if isinstance(cid, str) and isinstance(files, dict):
+                    clean[cid] = {key: info for key, info in files.items()
+                                  if isinstance(key, str) and isinstance(info, dict)}
+                else:
+                    logging.warning("Ignoring malformed course entry in file cache")
+            return clean
         except Exception as e:
             logging.warning("Could not load file cache: %s", e)
     return {}
@@ -244,7 +397,14 @@ def load_study_plan_cache() -> dict:
     than cached as a placeholder (see collect_course_topics)."""
     if db.exists(STUDY_PLAN_CACHE_PATH):
         try:
-            return db.load(STUDY_PLAN_CACHE_PATH)
+            value = db.load(STUDY_PLAN_CACHE_PATH)
+            if isinstance(value, dict):
+                return {
+                    cid: {key: entry for key, entry in files.items() if isinstance(entry, dict)}
+                    for cid, files in value.items()
+                    if isinstance(cid, str) and isinstance(files, dict)
+                }
+            logging.warning("Study plan cache has an invalid top-level shape; starting empty")
         except Exception as e:
             logging.warning("Could not load study plan cache: %s", e)
     return {}
@@ -261,7 +421,10 @@ def load_reminders_cache(user_id: Optional[int] = None):
     path = f"reminders_cache_{user_id}.json" if user_id else REMINDERS_CACHE_PATH
     if db.exists(path):
         try:
-            return db.load(path)
+            value = db.load(path)
+            if isinstance(value, dict):
+                return value
+            logging.warning("Reminder cache %s has an invalid top-level shape; starting empty", path)
         except Exception as e:
             logging.warning("Could not load reminders cache: %s", e)
     return {}
@@ -278,7 +441,10 @@ def save_reminders_cache(data, user_id: Optional[int] = None):
 def load_general_cache():
     if db.exists(GENERAL_CACHE_PATH):
         try:
-            return db.load(GENERAL_CACHE_PATH)
+            value = db.load(GENERAL_CACHE_PATH)
+            if isinstance(value, dict):
+                return value
+            logging.warning("General cache has an invalid top-level shape; starting empty")
         except Exception as e:
             logging.warning("Could not load general cache: %s", e)
     return {}
@@ -370,7 +536,7 @@ def tasks_due_between(tasks: list, first_day, last_day) -> list:
     inclusive), soonest first. One unreadable task is left out, not all."""
     due = [(task_due(t), t) for t in tasks]
     picked = [(d, t) for d, t in due if d is not None and first_day <= d.date() <= last_day]
-    return [t for _d, t in sorted(picked, key=lambda pair: pair[0])]
+    return [t for _d, t in sorted(picked, key=lambda pair: pair[0].timestamp())]
 
 
 def user_tasks(user_id) -> list:
@@ -384,13 +550,46 @@ def save_user_tasks(user_id, tasks: list) -> None:
     db.get_user_scope(user_id).save_tasks(tasks)
 
 
-def add_user_task(user_id, task: dict) -> None:
-    db.get_user_scope(user_id).add_task(task)
+def add_user_task(user_id, task: dict) -> bool:
+    return db.get_user_scope(user_id).add_task(task)
 
 
 def remove_user_tasks(user_id, ids) -> list:
     """Drop the student's tasks with these ids; returns the removed ones."""
     return db.get_user_scope(user_id).remove_tasks(ids)
+
+
+def restore_pending_reminder_tasks(user_id: int) -> int:
+    """Move fired reminders back into the task list before personal data is
+    deleted. Tasks normally leave that list once their reminder is sent, and
+    their durable action records are the only remaining copy until Done or
+    Snooze is tapped. The privacy flow promises to keep tasks, so merge those
+    unacknowledged reminders into the retained task record first."""
+    scope = db.get_user_scope(user_id)
+    raw = scope.private(USER_CALLBACKS_KIND)
+    if not isinstance(raw, dict):
+        return 0
+    tasks = scope.tasks()
+    known = {str(task.get("id")) for task in tasks}
+    restored = []
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key.startswith("task:") or not isinstance(value, dict):
+            continue
+        task_id = key.removeprefix("task:")
+        if (not task_id or str(value.get("id")) != task_id
+                or not isinstance(value.get("text"), str)
+                or (value.get("user_id") is not None and value.get("user_id") != int(user_id))
+                or task_id in known):
+            continue
+        restored.append({k: v for k, v in value.items() if k != "ts"})
+        known.add(task_id)
+    if not restored:
+        return 0
+    scope.save_tasks(tasks + restored)
+    saved_ids = {str(task.get("id")) for task in scope.tasks()}
+    if any(str(task.get("id")) not in saved_ids for task in restored):
+        raise RuntimeError("Could not preserve every pending reminder task")
+    return len(restored)
 
 
 def students_with_tasks() -> list[int]:
@@ -431,6 +630,9 @@ def load_default_semester(user_id=None) -> dict:
             legacy = db.load(DEFAULT_SEMESTER_CACHE_PATH) or {}
             if legacy:
                 save_personal_record(uid, DEFAULT_SEMESTER_RECORD, legacy)
+                if not db.get_user_scope(uid).has_private(PERSONAL_RECORD_PREFIX + DEFAULT_SEMESTER_RECORD):
+                    logging.warning("Could not migrate the default semester; keeping its legacy copy")
+                    return {}
             db.delete(DEFAULT_SEMESTER_CACHE_PATH)
             return legacy
     except Exception as e:
@@ -442,10 +644,11 @@ def save_default_semester(semester_id: str, label: str, user_id=None) -> None:
     uid = _setting_owner(user_id)
     if uid is None:
         return
-    try:
-        save_personal_record(uid, DEFAULT_SEMESTER_RECORD, {"id": semester_id, "label": label})
-    except Exception as e:
-        logging.error("Could not save default semester: %s", e)
+    value = {"id": semester_id, "label": label}
+    save_personal_record(uid, DEFAULT_SEMESTER_RECORD, value)
+    stored = db.get_user_scope(uid).private(PERSONAL_RECORD_PREFIX + DEFAULT_SEMESTER_RECORD)
+    if stored != value:
+        raise RuntimeError("Default semester was not saved for this user")
 
 
 def rebuild_watched_courses(user_id) -> None:
@@ -457,6 +660,7 @@ def rebuild_watched_courses(user_id) -> None:
     watcher = state.global_session
     if watcher is not None and user_id is not None and getattr(watcher, "user_id", None) == int(user_id):
         state._courses_map_built_with_prev = None
+        state._courses_map_refreshed_at = 0.0
 
 
 SETUP_RECORD = "setup"
@@ -476,11 +680,13 @@ def setup_done(user_id) -> bool:
         return True  # unsure: don't nag
 
 
-def mark_setup_done(user_id) -> None:
+def mark_setup_done(user_id) -> bool:
     try:
         save_personal_record(user_id, SETUP_RECORD, {"done": int(time.time())})
+        return bool(personal_record(user_id, SETUP_RECORD))
     except Exception as e:
         logging.error("Could not save the setup state: %s", e)
+        return False
 
 
 def clear_default_semester(user_id=None) -> None:
@@ -538,7 +744,10 @@ def load_user_names() -> dict:
     each student's own record on first use)."""
     if db.exists(USER_NAMES_CACHE_PATH):
         try:
-            return db.load(USER_NAMES_CACHE_PATH)
+            value = db.load(USER_NAMES_CACHE_PATH)
+            if isinstance(value, dict):
+                return value
+            logging.warning("User name cache has an invalid top-level shape; starting empty")
         except Exception as e:
             logging.warning("Could not load user names: %s", e)
     return {}
@@ -644,20 +853,33 @@ def _migrate_shared_wardrobe() -> None:
         if not db.exists(WARDROBE_CACHE_PATH):
             return
         shared = db.load(WARDROBE_CACHE_PATH) or {}
+        if not isinstance(shared, dict):
+            logging.warning("Shared wardrobe has an invalid top-level shape; leaving it untouched")
+            return
         if not shared:
             return
     except Exception as e:
         logging.warning("Could not read the shared wardrobe: %s", e)
         return
+    unresolved = {}
     for key, entry in shared.items():
         try:
             scope = db.get_user_scope(int(key))
-        except ValueError:
+        except (TypeError, ValueError):
+            unresolved[key] = entry
+            continue
+        if not isinstance(entry, dict):
+            logging.warning("Skipped malformed legacy wardrobe for user %s", key)
+            unresolved[key] = entry
             continue
         if not scope.has_private(WARDROBE_KIND):
             scope.save_private(WARDROBE_KIND, entry)
-    db.save(WARDROBE_CACHE_PATH, {})
-    logging.info("Moved %s wardrobe(s) into private records", len(shared))
+            # Private writes can be rejected while this user's data is being
+            # deleted. Keep the source until the encrypted copy is confirmed.
+            if not scope.has_private(WARDROBE_KIND):
+                unresolved[key] = entry
+    db.save(WARDROBE_CACHE_PATH, unresolved)
+    logging.info("Moved %s wardrobe(s) into private records", len(shared) - len(unresolved))
 
 
 def get_wardrobe_entry(user_id) -> dict:
@@ -670,10 +892,7 @@ def get_wardrobe_entry(user_id) -> dict:
 
 
 def _save_wardrobe_entry(user_id, entry: dict) -> None:
-    try:
-        db.get_user_scope(user_id).save_private(WARDROBE_KIND, entry)
-    except Exception as e:
-        logging.error("Could not save wardrobe: %s", e)
+    db.get_user_scope(user_id).save_private(WARDROBE_KIND, entry)
 
 
 def add_wardrobe_item(user_id, tags: dict, file_id: Optional[str] = None, image_url: Optional[str] = None) -> dict:
@@ -701,11 +920,16 @@ def add_wardrobe_item(user_id, tags: dict, file_id: Optional[str] = None, image_
     return item
 
 
-def save_wardrobe_item_descriptions(descriptions: dict) -> None:
-    """Store {item_id: description} on the matching items, in whichever
-    student's wardrobe holds them (each opened in its own scope)."""
+def save_wardrobe_item_descriptions(descriptions: dict, user_id: Optional[int] = None) -> None:
+    """Store {item_id: description} in the named student's wardrobe.
+
+    Without an owner, retain the legacy bulk-update behavior for maintenance
+    callers. Runtime AI work must always pass its owner so a colliding item id
+    cannot write one student's description into another student's wardrobe.
+    """
     _migrate_shared_wardrobe()
-    for uid in db.private_owner_ids(WARDROBE_KIND):
+    owners = [int(user_id)] if user_id is not None else db.private_owner_ids(WARDROBE_KIND)
+    for uid in owners:
         entry = get_wardrobe_entry(uid)
         changed = False
         for it in entry.get("items", []):
@@ -772,16 +996,29 @@ def personal_record(user_id, section: str, default: Any = None) -> Any:
         cache = load_general_cache()
         entries = cache.get(section)
         if isinstance(entries, dict) and str(uid) in entries:
-            value = entries.pop(str(uid))
+            value = entries[str(uid)]
             scope.save_private(kind, value)
-            save_general_cache(cache)
-        _legacy_checked.add((uid, section))
+            # A stale task context or an active deletion can reject the
+            # private write. Do not erase the only remaining copy in that
+            # case, and allow a later read to retry the migration.
+            if scope.has_private(kind):
+                entries.pop(str(uid), None)
+                save_general_cache(cache)
+                _legacy_checked.add((uid, section))
+        else:
+            _legacy_checked.add((uid, section))
     return default if value is None else value
 
 
 def save_personal_record(user_id, section: str, value: Any) -> None:
     uid = int(user_id)
-    db.get_user_scope(uid).save_private(PERSONAL_RECORD_PREFIX + section, value)
+    scope = db.get_user_scope(uid)
+    kind = PERSONAL_RECORD_PREFIX + section
+    scope.save_private(kind, value)
+    # Deletion can reject a stale private write without raising. Retain any
+    # legacy shared copy until the replacement row is confirmed to exist.
+    if not scope.has_private(kind):
+        return
     if (uid, section) in _legacy_checked:
         return
     # a legacy entry must not come back on a later first read
@@ -807,6 +1044,98 @@ STUDY_PROGRESS_RECORD = "study_progress"
 LEGACY_SHARED_PROGRESS = "study_progress.json"  # an admin's progress, mirrored in plain text
 
 
+def _normalize_student_progress(data: Any, user_id: int) -> dict:
+    """Keep valid progress fields and repair malformed persisted sections."""
+    if not isinstance(data, dict):
+        logging.warning("Ignoring malformed study progress for user %s", user_id)
+        return {}
+
+    result = dict(data)
+    for key in ("held", "studied", "task_minutes"):
+        value = result.get(key)
+        if key in result and not isinstance(value, dict):
+            logging.warning("Resetting malformed study progress section %s for user %s", key, user_id)
+            result[key] = {}
+
+    held = result.get("held")
+    if isinstance(held, dict):
+        result["held"] = {
+            cid: count for cid, count in held.items()
+            if isinstance(cid, str) and isinstance(count, int) and not isinstance(count, bool) and count >= 0
+        }
+
+    studied = result.get("studied")
+    if isinstance(studied, dict):
+        result["studied"] = {
+            cid: [unit for unit in units if isinstance(unit, str)]
+            for cid, units in studied.items()
+            if isinstance(cid, str) and isinstance(units, list)
+        }
+
+    task_minutes = result.get("task_minutes")
+    if isinstance(task_minutes, dict):
+        clean_minutes = {}
+        for cid, values in task_minutes.items():
+            if not isinstance(cid, str) or not isinstance(values, dict):
+                continue
+            valid = {
+                key: minutes for key, minutes in values.items()
+                if isinstance(key, str) and _finite_number(minutes) and minutes >= 0
+            }
+            clean_minutes[cid] = valid
+        result["task_minutes"] = clean_minutes
+
+    tracked = result.get("tracked")
+    if tracked is not None and (not isinstance(tracked, list)
+                                or not all(isinstance(cid, str) for cid in tracked)):
+        logging.warning("Resetting malformed tracked-course selection for user %s", user_id)
+        result.pop("tracked", None)
+
+    held_date = result.get("held_date")
+    if held_date is not None:
+        try:
+            if not isinstance(held_date, str):
+                raise ValueError
+            datetime.fromisoformat(held_date)
+        except ValueError:
+            logging.warning("Dropping malformed held-date cache for user %s", user_id)
+            result.pop("held_date", None)
+
+    last_plan = result.get("last_plan")
+    plan_valid = isinstance(last_plan, list) and all(
+        isinstance(session, dict)
+        and isinstance(session.get("day"), str)
+        and isinstance(session.get("start"), str)
+        and isinstance(session.get("pieces"), list)
+        and all(
+            isinstance(piece, dict)
+            and isinstance(piece.get("cid"), str)
+            and isinstance(piece.get("task_key"), str)
+            and isinstance(piece.get("course"), str)
+            and _finite_number(piece.get("minutes"))
+            and piece["minutes"] >= 0
+            for piece in session["pieces"]
+        )
+        for session in last_plan
+    )
+    if "last_plan" in result and not plan_valid:
+        logging.warning("Dropping malformed saved study plan for user %s", user_id)
+        result["last_plan"] = []
+        result["last_plan_done"] = []
+    elif isinstance(last_plan, list):
+        done = result.get("last_plan_done", [])
+        done_indices = done if isinstance(done, list) else []
+        valid_done = {
+            index for index in done_indices
+            if isinstance(index, int) and not isinstance(index, bool)
+            and 0 <= index < len(last_plan)
+        }
+        result["last_plan_done"] = sorted(valid_done)
+    elif "last_plan_done" in result:
+        result["last_plan_done"] = []
+    return result
+
+
 def load_student_progress(user_id) -> dict:
     """The student's /progress state from their encrypted record. The old
     plain documents (their own, and the shared admin mirror for the primary
@@ -814,7 +1143,10 @@ def load_student_progress(user_id) -> dict:
     uid = int(user_id)
     data = personal_record(uid, STUDY_PROGRESS_RECORD)
     if data is not None:
-        return data
+        normalized = _normalize_student_progress(data, uid)
+        if normalized != data:
+            save_personal_record(uid, STUDY_PROGRESS_RECORD, normalized)
+        return normalized
     own = f"study_progress_{uid}.json"
     sources = [own] + ([LEGACY_SHARED_PROGRESS] if uid == PRIMARY_ADMIN_ID else [])
     for key in sources:
@@ -825,7 +1157,14 @@ def load_student_progress(user_id) -> dict:
         except Exception as e:
             logging.warning("Could not read old study progress: %s", e)
             continue
+        if not isinstance(data, dict):
+            logging.warning("Leaving malformed legacy study progress %s in place", key)
+            continue
+        data = _normalize_student_progress(data, uid)
         save_personal_record(uid, STUDY_PROGRESS_RECORD, data)
+        if not db.get_user_scope(uid).has_private(PERSONAL_RECORD_PREFIX + STUDY_PROGRESS_RECORD):
+            logging.warning("Could not migrate study progress for user %s; keeping its legacy copy", uid)
+            return {}
         for old in sources:
             if db.exists(old):
                 db.delete(old)
@@ -834,7 +1173,8 @@ def load_student_progress(user_id) -> dict:
 
 
 def save_student_progress(user_id, data: dict) -> None:
-    save_personal_record(int(user_id), STUDY_PROGRESS_RECORD, data)
+    uid = int(user_id)
+    save_personal_record(uid, STUDY_PROGRESS_RECORD, _normalize_student_progress(data, uid))
 
 
 STUDY_BLOCK_LOG_DAYS = 35  # how long sent study blocks and their feedback are kept
@@ -847,8 +1187,12 @@ def record_study_block(user_id, start_ts: int, status: str, course: Optional[str
     "skipped" from the student's answer (course and minutes are kept from "sent")."""
     if status not in STUDY_BLOCK_STATUSES:
         raise ValueError(status)
-    log = dict(personal_record(user_id, "study_blocks", {}))
-    entry = log.get(str(start_ts), {})
+    raw = personal_record(user_id, "study_blocks", {})
+    if not isinstance(raw, dict):
+        logging.warning("Resetting malformed study block history for user %s", user_id)
+        raw = {}
+    log = {key: value for key, value in raw.items() if isinstance(key, str) and isinstance(value, dict)}
+    entry = dict(log.get(str(start_ts), {}))
     entry["status"] = status
     if course is not None:
         entry["course"] = course
@@ -856,16 +1200,33 @@ def record_study_block(user_id, start_ts: int, status: str, course: Optional[str
         entry["minutes"] = int(minutes)
     log[str(start_ts)] = entry
     cutoff = time.time() - STUDY_BLOCK_LOG_DAYS * 86400
-    for key in [k for k in log if int(k) < cutoff]:
-        del log[key]
+    for key in list(log):
+        try:
+            expired = int(key) < cutoff
+        except (TypeError, ValueError, OverflowError):
+            expired = True
+        if expired:
+            del log[key]
     save_personal_record(user_id, "study_blocks", log)
 
 
 def study_block_log(user_id, since_ts: float, until_ts: float) -> list[dict]:
     """[{"ts", "status", "course"}] of the student's blocks in [since, until), oldest first."""
     log = personal_record(user_id, "study_blocks", {}) or {}
-    return [{"ts": int(k), **v} for k, v in sorted(log.items(), key=lambda kv: int(kv[0]))
-            if since_ts <= int(k) < until_ts]
+    if not isinstance(log, dict):
+        logging.warning("Ignoring malformed study block history for user %s", user_id)
+        return []
+    entries = []
+    for key, value in log.items():
+        if not isinstance(value, dict):
+            continue
+        try:
+            timestamp = int(key)
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if since_ts <= timestamp < until_ts:
+            entries.append({"ts": timestamp, **value})
+    return sorted(entries, key=lambda entry: entry["ts"])
 
 
 # ── task deadlines kept or missed (tasks are deleted once done) ─────────────
@@ -876,13 +1237,19 @@ def record_task_outcome(user_id, task: dict, done_ts: Optional[float] = None) ->
     """Remember a deadline task: when it was due and, once the student marks
     it done, when that was. The first due time is kept, so a snoozed task
     finished later still counts as late."""
-    if not task.get("due_time") or not task.get("id"):
+    due = task_due(task)
+    if due is None or not task.get("id"):
         return
-    log = dict(personal_record(user_id, "task_outcomes", {}))
-    entry = log.get(task["id"]) or {"due": task["due_time"], "text": str(task.get("text") or "")[:120]}
+    task_id = str(task["id"])
+    raw = personal_record(user_id, "task_outcomes", {})
+    if not isinstance(raw, dict):
+        logging.warning("Resetting malformed task outcome history for user %s", user_id)
+        raw = {}
+    log = {key: value for key, value in raw.items() if isinstance(key, str) and isinstance(value, dict)}
+    entry = dict(log.get(task_id) or {"due": due.isoformat(), "text": str(task.get("text") or "")[:120]})
     if done_ts is not None and not entry.get("done"):
         entry["done"] = int(done_ts)
-    log[task["id"]] = entry
+    log[task_id] = entry
     cutoff = time.time() - TASK_OUTCOME_KEEP_DAYS * 86400
     for key in [k for k, v in log.items() if _iso_ts(v.get("due")) < cutoff]:
         del log[key]
@@ -891,13 +1258,18 @@ def record_task_outcome(user_id, task: dict, done_ts: Optional[float] = None) ->
 
 def task_outcomes(user_id) -> list[dict]:
     """[{"due" (ISO), "done" (timestamp or None), "text"}] of the student's deadline tasks."""
-    log = personal_record(user_id, "task_outcomes", {}) or {}
-    return [{"id": k, **v} for k, v in log.items()]
+    log = personal_record(user_id, "task_outcomes", {})
+    if not isinstance(log, dict):
+        return []
+    return [{"id": k, **v} for k, v in log.items() if isinstance(v, dict)]
 
 
 def _iso_ts(value) -> float:
     try:
-        return datetime.fromisoformat(value).timestamp()
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=TZ_BERLIN)
+        return parsed.timestamp()
     except (TypeError, ValueError):
         return 0.0
 
@@ -913,8 +1285,16 @@ def _token_digest(token: str) -> str:
 
 
 def _index_calendar_token(user_id, token: Optional[str], old: Optional[str] = None) -> None:
+    # A token save can be rejected when this coroutine started before the
+    # user's data deletion. Do not leave a shared lookup entry for a token
+    # that is no longer present in the private record.
+    if token and personal_record(user_id, "calendar_tokens") != token:
+        return
     cache = load_general_cache()
-    index = dict(cache.get(CALENDAR_TOKEN_INDEX) or {})
+    current_index = cache.get(CALENDAR_TOKEN_INDEX)
+    index = dict(current_index) if isinstance(current_index, dict) else {}
+    if current_index is not None and not isinstance(current_index, dict):
+        logging.warning("Calendar token index has an invalid shape; rebuilding it")
     if old:
         index.pop(_token_digest(old), None)
     if token:
@@ -941,6 +1321,8 @@ def reset_calendar_token(user_id) -> str:
     old = personal_record(user_id, "calendar_tokens")
     token = secrets.token_urlsafe(24)
     save_personal_record(user_id, "calendar_tokens", token)
+    if personal_record(user_id, "calendar_tokens") != token:
+        raise RuntimeError("Calendar link could not be saved")
     _index_calendar_token(user_id, token, old=old)
     return token
 
@@ -953,17 +1335,35 @@ def forget_calendar_token(user_id) -> None:
 
 
 def user_for_calendar_token(token: str) -> Optional[int]:
-    if not token:
+    if not isinstance(token, str) or not token or not token.isascii():
         return None
-    uid = (load_general_cache().get(CALENDAR_TOKEN_INDEX) or {}).get(_token_digest(token))
+    cache = load_general_cache()
+    index = cache.get(CALENDAR_TOKEN_INDEX)
+    uid = index.get(_token_digest(token)) if isinstance(index, dict) else None
     if uid is None:
         # a link from before the move: its token is still in the shared cache
-        for legacy_uid, known in (load_general_cache().get("calendar_tokens") or {}).items():
-            if hmac.compare_digest(str(known), token):
-                return int(legacy_uid) if calendar_token(int(legacy_uid), create=False) == token else None
+        legacy_tokens = cache.get("calendar_tokens")
+        if not isinstance(legacy_tokens, dict):
+            return None
+        for legacy_uid, known in legacy_tokens.items():
+            if isinstance(known, str) and known.isascii() and hmac.compare_digest(known, token):
+                try:
+                    owner = int(legacy_uid)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                return owner if calendar_token(owner, create=False) == token else None
+        return None
+    if isinstance(uid, bool) or not isinstance(uid, (int, str)):
+        logging.warning("Calendar token index contains an invalid owner")
+        return None
+    try:
+        uid = int(uid)
+    except (TypeError, ValueError, OverflowError):
+        logging.warning("Calendar token index contains an invalid owner")
         return None
     known = personal_record(uid, "calendar_tokens")
-    return int(uid) if known and hmac.compare_digest(str(known), token) else None
+    return uid if (isinstance(known, str) and known.isascii()
+                   and hmac.compare_digest(known, token)) else None
 
 
 def get_study_buddy_enabled(user_id) -> bool:
@@ -973,7 +1373,10 @@ def get_study_buddy_enabled(user_id) -> bool:
 
 
 def set_study_buddy_enabled(user_id, enabled: bool) -> None:
-    save_personal_record(user_id, "study_buddy", bool(enabled))
+    enabled = bool(enabled)
+    save_personal_record(user_id, "study_buddy", enabled)
+    if get_study_buddy_enabled(user_id) != enabled:
+        raise RuntimeError("Study buddy preference could not be saved")
 
 
 def get_ai_grades_enabled(user_id) -> bool:
@@ -987,14 +1390,13 @@ def set_ai_grades_enabled(user_id, enabled: bool) -> None:
     save_personal_record(user_id, "ai_grades", bool(enabled))
 
 
-AI_PERSONAL_OFF_NOTE = ("🔒 Your timetable, tasks and exams aren't shared with the AI service, so there is no "
+AI_PERSONAL_OFF_NOTE = ("🔒 Your timetable, tasks, exams, course files, course announcements, forum posts and wardrobe photos aren't shared with AI services, so there is no "
                         "spoken version. You can allow it under /settings > 🔒 Privacy.")
 
 
 def get_ai_personal_enabled(user_id) -> bool:
-    """Opt in: only then do the student's timetable, tasks, registered exams,
-    name and weather place go to the AI provider (OpenRouter), for the
-    spoken morning summary, 🔊 Listen and spoken questions. Grades have
+    """Opt in: only then may personal context, course files and wardrobe
+    photos go to external AI services for supported features. Grades have
     their own switch (get_ai_grades_enabled)."""
     if user_id is None:
         return False
@@ -1012,24 +1414,145 @@ PERSONAL_CACHE_SECTIONS = ("study_blocks", "task_outcomes", "calendar_tokens", "
                            "outfit_history", "outfit_today_cache", "pinned_morning_summary", "user_schedule_slots")
 
 
+def _load_general_cache_for_deletion() -> dict:
+    """Load the shared cache strictly so a failed read cannot look like a
+    successful deletion of the user's entries."""
+    if not db.exists(GENERAL_CACHE_PATH):
+        return {}
+    cache = db.load(GENERAL_CACHE_PATH)
+    if not isinstance(cache, dict):
+        raise ValueError("general cache must contain an object")
+    return cache
+
+
 def forget_personal_cache(user_id) -> list[str]:
     """Drop the student's entries from every per-student cache section."""
-    cache = load_general_cache()
+    uid = str(int(user_id))
+    cache = _load_general_cache_for_deletion()
     removed = []
     for section in PERSONAL_CACHE_SECTIONS:
         entries = cache.get(section)
-        if isinstance(entries, dict) and str(user_id) in entries:
-            entries.pop(str(user_id))
+        if isinstance(entries, dict) and uid in entries:
+            entries.pop(uid)
             removed.append(section)
     index = cache.get(CALENDAR_TOKEN_INDEX)
     if isinstance(index, dict):
-        stale = [digest for digest, uid in index.items() if str(uid) == str(user_id)]
+        stale = [digest for digest, owner in index.items() if str(owner) == uid]
         for digest in stale:
             index.pop(digest)
         if stale:
             removed.append(CALENDAR_TOKEN_INDEX)
     if removed:
-        save_general_cache(cache)
+        db.save(GENERAL_CACHE_PATH, cache)
+        saved = _load_general_cache_for_deletion()
+        saved_index = saved.get(CALENDAR_TOKEN_INDEX)
+        personal_remains = any(
+            isinstance(saved.get(section), dict) and uid in saved[section]
+            for section in PERSONAL_CACHE_SECTIONS
+        )
+        index_remains = isinstance(saved_index, dict) and any(
+            str(owner) == uid for owner in saved_index.values()
+        )
+        if personal_remains or index_remains:
+            raise RuntimeError("personal cache entries remain after deletion")
+    # The imported snapshot predates the current document and may still hold
+    # this user's records even when the live cache had nothing to remove.
+    if db.has_imported_backup(GENERAL_CACHE_PATH):
+        db.delete_imported_backup(GENERAL_CACHE_PATH)
+    if db.has_imported_backup(GENERAL_CACHE_PATH):
+        raise RuntimeError("stale general cache backup remains after personal data deletion")
+    return removed
+
+
+def forget_user_legacy_data(user_id: int) -> list[str]:
+    """Remove personal records that may still be waiting in pre-migration documents.
+
+    Older releases kept names and wardrobes in shared dictionaries and kept a
+    few primary-admin settings in standalone documents. If left behind, their
+    lazy migration would recreate data after the user's deletion.
+    """
+    uid = int(user_id)
+    removed: list[str] = []
+
+    failures: list[str] = []
+
+    def remove_shared_entry(path: str, key: str) -> None:
+        try:
+            if not db.exists(path):
+                if db.has_imported_backup(path):
+                    db.delete_imported_backup(path)
+                if db.has_imported_backup(path):
+                    raise RuntimeError(f"stale imported backup remains for {path}")
+                return
+            data = db.load(path)
+            if not isinstance(data, dict):
+                raise ValueError(f"{path} must contain an object")
+            if key not in data:
+                db.delete_imported_backup(path)
+                if db.has_imported_backup(path):
+                    raise RuntimeError(f"stale imported backup remains for {path}")
+                return
+            data.pop(key, None)
+            if data:
+                db.save(path, data)
+            else:
+                db.delete(path)
+            if db.exists(path):
+                saved = db.load(path)
+                if not isinstance(saved, dict) or key in saved:
+                    raise RuntimeError(f"entry {key!r} remains in {path}")
+            if db.has_imported_backup(path):
+                raise RuntimeError(f"stale imported backup remains for {path}")
+            removed.append(path)
+        except Exception:
+            logging.warning("Could not remove a legacy personal entry from %s", path, exc_info=True)
+            failures.append(path)
+
+    remove_shared_entry(USER_NAMES_CACHE_PATH, str(uid))
+    if uid == PRIMARY_ADMIN_ID:
+        remove_shared_entry(USER_NAMES_CACHE_PATH, "studip_name")
+    remove_shared_entry(WARDROBE_CACHE_PATH, str(uid))
+
+    if uid == PRIMARY_ADMIN_ID:
+        legacy_switches = ("scan_previous_semester", "watch_previous_semester", "weekly_study_plan_enabled")
+        try:
+            cache = _load_general_cache_for_deletion()
+            changed = False
+            for key in legacy_switches:
+                if key in cache:
+                    cache.pop(key, None)
+                    changed = True
+                    removed.append(f"general_cache:{key}")
+            if changed:
+                db.save(GENERAL_CACHE_PATH, cache)
+                saved = _load_general_cache_for_deletion()
+                if any(key in saved for key in legacy_switches):
+                    raise RuntimeError("legacy settings remain in the general cache")
+            if db.has_imported_backup(GENERAL_CACHE_PATH):
+                db.delete_imported_backup(GENERAL_CACHE_PATH)
+            if db.has_imported_backup(GENERAL_CACHE_PATH):
+                raise RuntimeError("stale general cache backup remains after deletion")
+        except Exception:
+            logging.warning("Could not remove legacy settings from the general cache", exc_info=True)
+            failures.append(GENERAL_CACHE_PATH)
+        for path in (
+            DEFAULT_SEMESTER_CACHE_PATH,
+            "weather_location.json",
+            LEGACY_SHARED_PROGRESS,
+            "exam_reminder_cache.json",
+            "food_preferences.json",
+        ):
+            try:
+                if db.exists(path) or db.has_imported_backup(path):
+                    db.delete(path)
+                    if db.exists(path) or db.has_imported_backup(path):
+                        raise RuntimeError(f"{path} remains after deletion")
+                    removed.append(path)
+            except Exception:
+                logging.warning("Could not remove legacy personal document %s", path, exc_info=True)
+                failures.append(path)
+    if failures:
+        raise RuntimeError("Could not verify deletion of legacy data: " + ", ".join(dict.fromkeys(failures)))
     return removed
 
 

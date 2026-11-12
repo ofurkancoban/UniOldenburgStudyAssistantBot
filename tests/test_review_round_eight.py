@@ -223,10 +223,22 @@ class WatcherWithoutAdminTests(unittest.TestCase):
         seen, logs = self._cycles(mock.AsyncMock(side_effect=RuntimeError("Failed to log in to Stud.IP.")))
         names = [name for name, _session in seen]
         self.assertEqual(names.count("_run_content_watchers"), 2)
-        self.assertIn("_run_scheduled_jobs", names)
+        self.assertNotIn("_run_scheduled_jobs", names)  # slow jobs have their own loop
         self.assertTrue(all(session is None for _name, session in seen))
         self.assertEqual(sum("No admin Stud.IP session" in m for m in logs), 1)  # once, not per cycle
         self.assertFalse(any("Login error" in m for m in logs))
+
+    def test_independent_scheduler_runs_without_an_admin_session(self):
+        from unibot import state, watcher
+        job = mock.AsyncMock()
+        with mock.patch.object(state, "global_session", None), \
+                mock.patch.object(state, "global_watcher_paused", False), \
+                mock.patch.object(watcher, "_run_scheduled_jobs", job), \
+                mock.patch.object(watcher.asyncio, "sleep", mock.AsyncMock(side_effect=_Stop)):
+            with self.assertRaises(_Stop):
+                asyncio.run(watcher.scheduled_jobs_loop(mock.MagicMock()))
+        job.assert_awaited_once()
+        self.assertIsNone(job.await_args.args[1])
 
     def test_a_signed_out_admin_no_longer_pauses_everyone(self):
         admin = mock.MagicMock(explicitly_logged_out=True, last_interactive_activity=0.0)

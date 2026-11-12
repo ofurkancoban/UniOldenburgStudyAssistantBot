@@ -15,7 +15,7 @@ import re
 import time
 from datetime import datetime
 from typing import Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
@@ -28,6 +28,7 @@ from stums_parsers import (
     _parse_examination_periods,
     _parse_invoice_table_rows,
     _parse_registration_status,
+    _query_param,
 )
 
 _TZ_BERLIN = ZoneInfo("Europe/Berlin")
@@ -39,7 +40,31 @@ def berlin_now() -> datetime:
     return datetime.now(_TZ_BERLIN).replace(tzinfo=None)
 
 
+def _require_study_planner_tree(html_text: str) -> None:
+    """Reject a changed or incomplete planner page instead of treating it as no exams."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    tree = soup.find(id=lambda value: value and value.endswith("studyPlannerTree"))
+    if tree is None or tree.find("table") is None:
+        raise RuntimeError("StuMS study planner did not contain its expected exam tree")
+
+
 STUMS_BASE = "https://stums.uni-oldenburg.de"
+STUMS_DOCUMENT_MAX_BYTES = 25 * 1024 * 1024
+
+
+async def _read_stums_document_limited(response) -> bytes:
+    """Read an official document with a hard cap even when its size is unknown."""
+    length = getattr(response, "content_length", None)
+    if length is not None and length > STUMS_DOCUMENT_MAX_BYTES:
+        raise RuntimeError("StuMS document exceeds the 25 MB download limit")
+    chunks = []
+    total = 0
+    async for chunk in response.content.iter_chunked(256 * 1024):
+        total += len(chunk)
+        if total > STUMS_DOCUMENT_MAX_BYTES:
+            raise RuntimeError("StuMS document exceeds the 25 MB download limit")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 SSO_ENTRY_URL = f"{STUMS_BASE}/qisserver/api/identityprovider/redirect/2/login"
@@ -64,6 +89,10 @@ class StumsLoginUnavailable(RuntimeError):
     def __init__(self, message: str, quiet: bool = False):
         super().__init__(message)
         self.quiet = quiet
+
+
+class StumsSessionExpired(RuntimeError):
+    """StuMS explicitly returned a login page or redirected to university SSO."""
 
 
 # Background checks (watcher) respect the retry pause; anything the user
@@ -126,6 +155,27 @@ def _mark_stums_verified(session, referer: str) -> str:
     return referer
 
 
+async def _read_stums_page(session, url: str, referer: str) -> tuple[str, str]:
+    """Fetch a StuMS HTML page and reject HTTP errors, SSO redirects and login forms."""
+    async with await session.get(url, allow_redirects=True, headers={"Referer": referer}) as r:
+        text = await r.text()
+        status = r.status
+        final_url = str(getattr(r, "url", "") or "")
+    if status == 401:
+        session.stums.verified_at = 0.0
+        raise StumsSessionExpired("StuMS answered HTTP 401")
+    if status != 200:
+        raise RuntimeError(f"StuMS page answered HTTP {status}")
+    if final_url and (urlsplit(final_url).hostname or "").lower() != STUMS_HOST:
+        session.stums.verified_at = 0.0
+        raise StumsSessionExpired("StuMS redirected to the university login")
+    lowered = text.lower()
+    if "login notwendig" in lowered or "loginform" in lowered:
+        session.stums.verified_at = 0.0
+        raise StumsSessionExpired("StuMS session expired; the page returned a login form")
+    return text, final_url
+
+
 async def _establish_stums_session(session) -> str:
     """Make sure this user's session is signed in to StuMS and return a Referer
     for the following requests (the JSF app rejects deep links without one).
@@ -153,7 +203,7 @@ async def _establish_stums_session(session) -> str:
         if _stums_background.get() and time.time() < blocked_until:
             raise StumsLoginUnavailable(
                 f"StuMS refused the login earlier; background checks retry at "
-                f"{time.strftime('%H:%M', time.localtime(blocked_until))}", quiet=True,
+                f"{datetime.fromtimestamp(blocked_until, _TZ_BERLIN):%H:%M}", quiet=True,
             )
 
         known_referer = session.stums.referer or STUMS_START_URL
@@ -161,7 +211,7 @@ async def _establish_stums_session(session) -> str:
             try:
                 if await _stums_logged_in(session, known_referer):
                     return _mark_stums_verified(session, known_referer)
-            except Exception as exc:  # a network blip here just means: do the handoff
+            except StumsSessionExpired as exc:
                 logging.debug("exam_reminder: StuMS pre-check failed: %s", exc)
 
         for attempt in (1, 2):
@@ -212,12 +262,12 @@ def _has_stums_cookie(session) -> bool:
 
 async def _stums_logged_in(session, referer: str) -> bool:
     """Whether StuMS treats this session as signed in (checked on the study planner)."""
-    async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
-        html_text = await r.text()
-        final_url = str(getattr(r, "url", "") or "")
-    if final_url and STUMS_HOST not in final_url:
-        return False  # bounced to the identity provider
-    return "Login notwendig" not in html_text
+    try:
+        await _read_stums_page(session, STUDY_PLANNER_URL, referer)
+        return True
+    except StumsSessionExpired as exc:
+        logging.debug("StuMS session check failed: %s", exc)
+        return False
 
 
 def forget_stums_login(session) -> None:
@@ -231,8 +281,7 @@ async def _fetch_examination_periods(session, referer: str, unit_id: str, period
         f"{STUMS_BASE}/qisserver/pages/startFlow.xhtml?_flowId=detailView-flow"
         f"&unitId={unit_id}&periodId={period_id}&navigationPosition=hisinoneStudyPlanner"
     )
-    async with await session.get(url, allow_redirects=True, headers={"Referer": referer}) as r:
-        text = await r.text()
+    text, _ = await _read_stums_page(session, url, referer)
 
     soup = BeautifulSoup(text, "html.parser")
     body_text = soup.get_text("\n", strip=True)
@@ -253,11 +302,8 @@ async def get_open_exam_registrations(session, failed_codes: Optional[set] = Non
     """
     referer = await _establish_stums_session(session)
 
-    async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
-        html_text = await r.text()
-    if "Login notwendig" in html_text:
-        forget_stums_login(session)
-        raise RuntimeError("StuMS session expired while fetching study planner")
+    html_text, _ = await _read_stums_page(session, STUDY_PLANNER_URL, referer)
+    _require_study_planner_tree(html_text)
 
     candidates = _parse_candidate_units(html_text)
 
@@ -266,10 +312,15 @@ async def get_open_exam_registrations(session, failed_codes: Optional[set] = Non
 
     async def process(unit: dict):
         if not unit["unit_id"] or not unit["period_id"]:
+            if failed_codes is not None:
+                failed_codes.add(unit["code"])
+            logging.warning("exam_reminder: exam detail link is incomplete for %s", unit["code"])
             return
         async with semaphore:
             try:
                 periods = await _fetch_examination_periods(session, referer, unit["unit_id"], unit["period_id"])
+                if not periods:
+                    raise RuntimeError("exam detail contained no readable examination periods")
             except Exception as e:
                 logging.warning("exam_reminder: failed to fetch detail for %s: %s", unit['code'], e)
                 if failed_codes is not None:
@@ -288,11 +339,8 @@ async def get_registered_exams(session) -> list[dict]:
     button present), i.e. candidates for deregistration."""
     referer = await _establish_stums_session(session)
 
-    async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
-        html_text = await r.text()
-    if "Login notwendig" in html_text:
-        forget_stums_login(session)
-        raise RuntimeError("StuMS session expired while fetching study planner")
+    html_text, _ = await _read_stums_page(session, STUDY_PLANNER_URL, referer)
+    _require_study_planner_tree(html_text)
 
     units = _parse_registration_status(html_text)
     return [u for u in units if u["action_type"] == "deregister"]
@@ -305,15 +353,14 @@ async def get_registered_exam_schedule(session) -> list[dict]:
     sitting the student is enrolled in, including its date and, if set, time.
     """
     referer = await _establish_stums_session(session)
-    async with await session.get(ENROLLMENT_INFO_URL, allow_redirects=True, headers={"Referer": referer}) as r:
-        html_text = await r.text()
-    if "Login notwendig" in html_text:
-        forget_stums_login(session)
-        raise RuntimeError("StuMS session expired while fetching registered exam schedule")
+    html_text, _ = await _read_stums_page(session, ENROLLMENT_INFO_URL, referer)
 
     soup = BeautifulSoup(html_text, "html.parser")
+    tables = soup.find_all("table", class_="belegungen")
+    if not tables:
+        raise RuntimeError("StuMS registered-exams page did not contain its expected exam table")
     results = []
-    for table in soup.find_all("table", class_="belegungen"):
+    for table in tables:
         for row in table.find_all("tr"):
             cell0 = row.find("td", class_="column0")
             if not cell0:
@@ -344,8 +391,7 @@ async def get_registered_exam_schedule(session) -> list[dict]:
             details_link = actions_cell.find("a", href=lambda x: x and "detailView-flow" in x) if actions_cell else None
             unit_id = None
             if details_link:
-                m = re.search(r"unitId=(\d+)", tag_attr(details_link, "href"))
-                unit_id = m.group(1) if m else None
+                unit_id = _query_param(tag_attr(details_link, "href"), "unitId")
 
             if not unit_id or not schedule["date"]:
                 continue
@@ -370,24 +416,27 @@ async def get_all_exam_dates(session) -> list[dict]:
     """
     referer = await _establish_stums_session(session)
 
-    async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
-        html_text = await r.text()
-    if "Login notwendig" in html_text:
-        forget_stums_login(session)
-        raise RuntimeError("StuMS session expired while fetching study planner")
+    html_text, _ = await _read_stums_page(session, STUDY_PLANNER_URL, referer)
+    _require_study_planner_tree(html_text)
 
     units = _parse_registration_status(html_text)
 
     results: list[dict] = []
     semaphore = asyncio.Semaphore(3)
+    failed_units: list[str] = []
 
     async def process(unit: dict):
         if not unit["unit_id"] or not unit["period_id"]:
+            failed_units.append(unit["code"])
+            logging.warning("exam_reminder: exam detail link is incomplete for %s", unit["code"])
             return
         async with semaphore:
             try:
                 periods = await _fetch_examination_periods(session, referer, unit["unit_id"], unit["period_id"])
+                if not periods:
+                    raise RuntimeError("exam detail contained no readable examination periods")
             except Exception as e:
+                failed_units.append(unit["code"])
                 logging.warning("exam_reminder: failed to fetch detail for %s: %s", unit['code'], e)
                 return
         for period in periods:
@@ -395,6 +444,11 @@ async def get_all_exam_dates(session) -> list[dict]:
                 results.append({**unit, **period})
 
     await asyncio.gather(*(process(u) for u in units))
+    if failed_units:
+        raise RuntimeError(
+            f"Could not read exam dates for {len(failed_units)} unit(s): "
+            + ", ".join(sorted(set(failed_units))[:5])
+        )
     return results
 
 
@@ -418,6 +472,11 @@ async def _submit_action(session, soup, page_url: str, action: dict) -> tuple[st
     async with await session.post(form_action_url, data=payload, headers={"Referer": page_url}) as r:
         result_text = await r.text()
         result_url = str(r.url)
+        if r.status != 200:
+            raise RuntimeError(f"StuMS action answered HTTP {r.status}")
+    if "loginform" in result_text.lower() or "login notwendig" in result_text.lower():
+        session.stums.verified_at = 0.0
+        raise RuntimeError("StuMS session expired while submitting the action")
     return result_text, result_url
 
 
@@ -457,9 +516,7 @@ async def submit_exam_action(session, unit_id: str, action_type: str) -> dict:
     expected_aktion = "ANMELDUNG" if action_type == "anmelden" else "ABMELDUNG"
 
     referer = await _establish_stums_session(session)
-    async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer}) as r:
-        html_text = await r.text()
-        page_url = str(r.url)
+    html_text, page_url = await _read_stums_page(session, STUDY_PLANNER_URL, referer)
 
     soup = BeautifulSoup(html_text, "html.parser")
     tree = soup.find(id=lambda x: x and x.endswith("studyPlannerTree"))
@@ -472,7 +529,7 @@ async def submit_exam_action(session, unit_id: str, action_type: str) -> dict:
             if not node:
                 continue
             details_link = node.find("a", href=lambda x: x and "detailView-flow" in x)
-            if not details_link or f"unitId={unit_id}&" not in details_link["href"]:
+            if not details_link or _query_param(tag_attr(details_link, "href"), "unitId") != str(unit_id):
                 continue
             btn = node.find("button", id=lambda x: x and x.endswith(f":{action_type}"))
             if not btn:
@@ -511,8 +568,8 @@ async def submit_exam_action(session, unit_id: str, action_type: str) -> dict:
     # Re-fetch the tree fresh to verify the change actually took effect, rather
     # than trusting the confirmation page's own response.
     referer2 = await _establish_stums_session(session)
-    async with await session.get(STUDY_PLANNER_URL, allow_redirects=True, headers={"Referer": referer2}) as r:
-        verify_text = await r.text()
+    verify_text, _ = await _read_stums_page(session, STUDY_PLANNER_URL, referer2)
+    _require_study_planner_tree(verify_text)
 
     result_units = _parse_registration_status(verify_text)
     result_unit = next((u for u in result_units if u["unit_id"] == str(unit_id)), None)
@@ -570,7 +627,7 @@ async def _expand_grades_tree(session, page_url: str, soup: BeautifulSoup) -> Op
         None,
     )
     if not tree_render_id:
-        return None
+        raise RuntimeError("StuMS grades page did not identify the results tree to expand")
 
     payload = {}
     for inp in form.find_all("input"):
@@ -589,12 +646,19 @@ async def _expand_grades_tree(session, page_url: str, soup: BeautifulSoup) -> Op
     headers = {"Referer": page_url, "Faces-Request": "partial/ajax"}
     async with await session.post(form_action_url, data=payload, headers=headers) as r:
         xml_text = await r.text()
+        if r.status != 200:
+            raise RuntimeError(f"StuMS grades request answered HTTP {r.status}")
+    if "loginform" in xml_text.lower() or "login notwendig" in xml_text.lower():
+        session.stums.verified_at = 0.0
+        raise RuntimeError("StuMS session expired while expanding grades")
 
     m = re.search(
         rf'<update id="{re.escape(tree_render_id)}"><!\[CDATA\[(.*?)\]\]></update>',
         xml_text, re.DOTALL,
     )
-    return m.group(1) if m else None
+    if not m or not m.group(1).strip():
+        raise RuntimeError("StuMS did not return the expanded grades tree")
+    return m.group(1)
 
 
 async def get_grades(session) -> list[dict]:
@@ -609,23 +673,20 @@ async def get_grades(session) -> list[dict]:
     outside the main curriculum tree) is kept via its own "examination" row.
     """
     referer = await _establish_stums_session(session)
-    async with await session.get(GRADES_URL, allow_redirects=True, headers={"Referer": referer}) as r:
-        html_text = await r.text()
-        page_url = str(r.url)
-    if "Login notwendig" in html_text:
-        forget_stums_login(session)
-        raise RuntimeError("StuMS session expired while fetching grades")
+    html_text, page_url = await _read_stums_page(session, GRADES_URL, referer)
 
     soup = BeautifulSoup(html_text, "html.parser")
+    if not soup.find("form", id="examsReadonly"):
+        raise RuntimeError("StuMS grades page did not contain the expected results form")
 
     fragment = await _expand_grades_tree(session, page_url, soup)
     tree_soup = BeautifulSoup(fragment, "html.parser") if fragment else soup
 
-    results = []
-    seen_numbers = set()
+    results_by_number: dict[str, dict] = {}
+    level_by_number: dict[str, str] = {}
     for row in tree_soup.find_all("tr"):
         number = _span_text(row, ":elementnr")
-        if not number or not number.isdigit() or number in seen_numbers:
+        if not number or not number.isdigit():
             continue
 
         icon = row.find("img")
@@ -633,13 +694,19 @@ async def get_grades(session) -> list[dict]:
         if level not in ("module", "examination"):
             continue  # programme/module-group rows carry no individual result
 
-        seen_numbers.add(number)
+        # The module row represents the latest result for a module. Its child
+        # examination rows represent individual attempts and must only serve
+        # as fallback when no module summary row exists, regardless of table
+        # order in the rendered tree.
+        previous_level = level_by_number.get(number)
+        if previous_level == "module" or (previous_level == "examination" and level != "module"):
+            continue
 
         status_span = _find_span(row, ":workstatus")
         status_title = (status_span.get("title") if status_span else None) or ""
         status_code = status_span.get_text(strip=True) if status_span else None
 
-        results.append({
+        results_by_number[number] = {
             "number": number,
             "title": _span_text(row, ":unDeftxt"),
             "attempt": _span_text(row, ":attempt"),
@@ -648,9 +715,10 @@ async def get_grades(session) -> list[dict]:
             "status_code": status_code,
             "status_title": status_title,
             "release_date_text": _span_text(row, ":geplantesFreigabedatum"),
-        })
+        }
+        level_by_number[number] = level
 
-    return results
+    return list(results_by_number.values())
 
 
 STUMS_DOCUMENTS = {
@@ -757,12 +825,7 @@ async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
     referer = await _establish_stums_session(session)
 
     if spec["source"] == "grades":
-        async with await session.get(GRADES_URL, allow_redirects=True, headers={"Referer": referer}) as r:
-            html_text = await r.text()
-            page_url = str(r.url)
-        if "Login notwendig" in html_text:
-            forget_stums_login(session)
-            raise RuntimeError("StuMS session expired while opening My Achievements.")
+        html_text, page_url = await _read_stums_page(session, GRADES_URL, referer)
 
         soup = BeautifulSoup(html_text, "html.parser")
         form = soup.find("form", id="examsReadonly")
@@ -772,16 +835,14 @@ async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
         payload = _build_jsf_form_payload(form, spec["button_id"], spec.get("label_match"))
         action_url = urljoin(page_url, tag_attr(form, "action"))
         async with await session.post(action_url, data=payload, allow_redirects=True, headers={"Referer": page_url}) as r2:
-            raw = await r2.read()
+            raw = await _read_stums_document_limited(r2)
+            status = r2.status
             ctype = (r2.headers.get("Content-Type") or "").lower()
             resp_url = str(r2.url)
+        if status != 200:
+            raise RuntimeError(f"StuMS document request answered HTTP {status}")
     else:
-        async with await session.get(STUDY_SERVICE_URL, allow_redirects=True, headers={"Referer": referer}) as r:
-            html_text = await r.text()
-            page_url = str(r.url)
-        if "Login notwendig" in html_text:
-            forget_stums_login(session)
-            raise RuntimeError("StuMS session expired while opening Student Service.")
+        html_text, page_url = await _read_stums_page(session, STUDY_SERVICE_URL, referer)
 
         soup = BeautifulSoup(html_text, "html.parser")
         form = soup.find("form", id="studyserviceForm")
@@ -794,6 +855,8 @@ async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
             tab_action_url = urljoin(page_url, tag_attr(form, "action"))
             async with await session.post(tab_action_url, data=tab_payload, allow_redirects=True, headers={"Referer": page_url}) as r_tab:
                 html_text = await r_tab.text()
+                if r_tab.status != 200:
+                    raise RuntimeError(f"Could not switch to StuMS Reports tab (HTTP {r_tab.status})")
                 page_url = str(r_tab.url)
             soup = BeautifulSoup(html_text, "html.parser")
             form = soup.find("form", id="studyserviceForm")
@@ -803,9 +866,12 @@ async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
         payload = _build_jsf_form_payload(form, spec["button_id"], spec.get("label_match"))
         action_url = urljoin(page_url, tag_attr(form, "action"))
         async with await session.post(action_url, data=payload, allow_redirects=True, headers={"Referer": page_url}) as r2:
-            raw = await r2.read()
+            raw = await _read_stums_document_limited(r2)
+            status = r2.status
             ctype = (r2.headers.get("Content-Type") or "").lower()
             resp_url = str(r2.url)
+        if status != 200:
+            raise RuntimeError(f"StuMS document request answered HTTP {status}")
 
     if raw.startswith(b"%PDF") or "application/pdf" in ctype:
         return raw, spec["filename"]
@@ -817,7 +883,9 @@ async def download_stums_document(session, doc_key: str) -> tuple[bytes, str]:
         dl_path = html_after[m.start(1):m.end(1)].replace("&amp;", "&")
         dl_url = urljoin(STUMS_BASE, dl_path)
         async with await session.get(dl_url, allow_redirects=True, headers={"Referer": resp_url}) as r_dl:
-            pdf_bytes = await r_dl.read()
+            pdf_bytes = await _read_stums_document_limited(r_dl)
+            if r_dl.status != 200:
+                raise RuntimeError(f"StuMS document download answered HTTP {r_dl.status}")
         if pdf_bytes.startswith(b"%PDF"):
             return pdf_bytes, spec["filename"]
 
@@ -829,12 +897,7 @@ async def get_tuition_status(session) -> dict:
     from StuMS Student Service (`Payments` tab).
     """
     referer = await _establish_stums_session(session)
-    async with await session.get(STUDY_SERVICE_URL, allow_redirects=True, headers={"Referer": referer}) as r:
-        html_text = await r.text()
-        page_url = str(r.url)
-    if "Login notwendig" in html_text:
-        forget_stums_login(session)
-        raise RuntimeError("StuMS session expired while opening Student Service.")
+    html_text, page_url = await _read_stums_page(session, STUDY_SERVICE_URL, referer)
 
     soup = BeautifulSoup(html_text, "html.parser")
     form = soup.find("form", id="studyserviceForm")
@@ -846,17 +909,29 @@ async def get_tuition_status(session) -> dict:
     action_url = urljoin(page_url, tag_attr(form, "action"))
     async with await session.post(action_url, data=tab_payload, allow_redirects=True, headers={"Referer": page_url}) as r2:
         pay_html = await r2.text()
+        if r2.status != 200:
+            raise RuntimeError(f"Could not load StuMS payment status (HTTP {r2.status})")
+    if "loginform" in pay_html.lower() or "login notwendig" in pay_html.lower():
+        forget_stums_login(session)
+        raise RuntimeError("StuMS session expired while loading payment status.")
 
     pay_soup = BeautifulSoup(pay_html, "html.parser")
 
     # 1. Open / unpaid invoices
     open_fs = pay_soup.find(id=lambda x: x and x.endswith("fieldSetInvoiceOffen"))
-    open_text = open_fs.get_text(" ", strip=True) if open_fs else ""
+    if not open_fs:
+        raise RuntimeError("Could not find the open-invoices section on StuMS.")
+    open_text = open_fs.get_text(" ", strip=True)
     open_invoices = _parse_invoice_table_rows(open_fs)
     no_open_flag = (
         "no open payments" in open_text.lower()
         or "keine offenen" in open_text.lower()
     )
+    if not no_open_flag and not open_invoices:
+        # An empty or changed response is not proof that an earlier debt was
+        # paid. Raising lets the reminder job retry without sending a false
+        # payment-confirmed alert or replacing the last known state.
+        raise RuntimeError("StuMS did not clearly report whether open invoices exist.")
     has_open = bool(open_invoices) and not no_open_flag
 
     # 2. Paid / all invoices

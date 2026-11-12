@@ -8,6 +8,7 @@ import html
 import logging
 import re
 import time
+import weakref
 from datetime import date, datetime, time as dtime, timedelta
 from typing import Any, Optional
 
@@ -17,10 +18,11 @@ from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
 from exam_reminder import get_open_exam_registrations, get_registered_exam_schedule
-from fast_enroll import save_pending_job
+from fast_enroll import resolve_target, save_pending_job
 from studip_utils import TZ_BERLIN, berlin_now, format_hours as _format_hours, md_escape as _md
 
 from unibot import state
+from unibot import db
 from unibot.preferences import campus_anchor
 from unibot.preferences import morning_send_time
 from unibot.config import PRIMARY_ADMIN_ID
@@ -37,7 +39,6 @@ from unibot.storage import (
     task_due,
     tasks_due_between,
     save_reminders_cache,
-    single_flight,
 )
 from unibot.formatting import (
     _format_relative,
@@ -49,7 +50,7 @@ from unibot.formatting import (
     clean_course_title,
 )
 from unibot.telegram_ui import _delete_status_message, _show_typing, _start_loading_animation, _stop_loading_animation
-from unibot.auth import acting_as, current_user_id, get_user_session, is_user_allowed, login_studip, signed_in_accounts
+from unibot.auth import ACTIVE, acting_as, current_user_id, get_user_session, is_user_allowed, lifecycle_state, login_studip, signed_in_accounts
 from unibot.studip_api import (
     BASE_URL,
     _api_berlin,
@@ -59,12 +60,28 @@ from unibot.studip_api import (
     studip_api_get_all,
     studip_api_user_id,
 )
+
 from unibot.weather import build_weather_text_line, cached_weather_snapshot, get_weather_snapshot
 from unibot.mensa import fetch_menu_titles, fetch_todays_menu_items
 from unibot.study_day import menu_highlight, plan_day, switch_warning, tight_campus_switches, travel_for, travel_note
 
 
 fastenroll_tasks: dict[int, dict[str, asyncio.Task]] = {}  # chat_id -> {sem_id -> asyncio.Task}
+_FASTENROLL_SCHEDULE_LOCKS: dict[int, asyncio.Lock] = {}
+
+
+async def stop_fastenroll_jobs() -> None:
+    """Cancel scheduled enrollment tasks before sessions/processes stop.
+
+    The backing records deliberately remain in the database when a task is
+    cancelled, allowing a future process to restore jobs whose target is still
+    ahead. Jobs already past their target are discarded by the restore path.
+    """
+    tasks = [task for jobs in fastenroll_tasks.values() for task in jobs.values() if not task.done()]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 MORNING_SUMMARY_HOUR = 7
@@ -92,24 +109,41 @@ async def run_morning_summary_schedule(bot, user_ids, now: datetime) -> None:
 
 async def _run_morning_slot(bot, user_ids, now: datetime, send_time) -> None:
     from unibot.morning import (
+        discard_prepared_morning_user,
         _deliver_morning_summary_at,
-        _mark_morning_summary_sent,
         morning_summary_sent,
         prepare_morning_summary,
     )
+    from unibot.auth import ACTIVE, is_user_allowed, lifecycle_state
     today_str = now.strftime("%Y-%m-%d")
     slot = send_time.strftime("%H:%M")
     key = f"{today_str}#{slot}"
     send_at = now.replace(hour=send_time.hour, minute=send_time.minute, second=0, microsecond=0)
     if now < send_at - timedelta(minutes=MORNING_PREPARE_LEAD_MINUTES):
         return
-    if morning_summary_sent(today_str, slot):
+    user_ids = [uid for uid in user_ids if not morning_summary_sent(today_str, slot, [uid])]
+    if not user_ids:
         return
     task = state._morning_delivery_tasks.get(key)
     if task is not None and not task.done():
         return  # prepared and waiting for send_at
 
     if key not in state._prepared_morning:
+        retry_key = f"morning_prepare_retry:{key}"
+        cache = load_general_cache()
+        retry_at = cache.get(retry_key)
+        if retry_at:
+            try:
+                retry_dt = datetime.fromisoformat(retry_at)
+                if retry_dt.tzinfo is None:
+                    retry_dt = retry_dt.replace(tzinfo=TZ_BERLIN)
+                else:
+                    retry_dt = retry_dt.astimezone(TZ_BERLIN)
+                now_dt = now.replace(tzinfo=TZ_BERLIN) if now.tzinfo is None else now.astimezone(TZ_BERLIN)
+                if retry_dt > now_dt:
+                    return
+            except (TypeError, ValueError):
+                pass
         logging.info("🌞 Preparing the %s morning summary for %s student(s)...", slot, len(user_ids))
         try:
             data = await prepare_morning_summary(bot, user_ids)
@@ -117,14 +151,34 @@ async def _run_morning_slot(bot, user_ids, now: datetime, send_time) -> None:
             logging.error("❌ Morning summary preparation failed: %s", e)
             data = None
         if not data:
-            if datetime.now(TZ_BERLIN) >= send_at:
-                _mark_morning_summary_sent(today_str, slot)  # same no-retry-all-day rule as before
+            cache = load_general_cache()
+            cache[retry_key] = (datetime.now(TZ_BERLIN) + timedelta(minutes=30)).isoformat()
+            save_general_cache(cache)
             return
+        for uid in list(user_ids):
+            if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+                discard_prepared_morning_user(data, uid)
+                user_ids.remove(uid)
+        if not user_ids:
+            return
+        cache = load_general_cache()
+        cache.pop(retry_key, None)
+        save_general_cache(cache)
         state._prepared_morning[key] = data
 
-    state._morning_delivery_tasks[key] = asyncio.create_task(
-        _deliver_morning_summary_at(bot, user_ids, state._prepared_morning.pop(key), send_at, today_str, slot)
+    prepared = state._prepared_morning.pop(key)
+    state._morning_delivery_data[key] = prepared
+    task = asyncio.create_task(
+        _deliver_morning_summary_at(bot, user_ids, prepared, send_at, today_str, slot)
     )
+    state._morning_delivery_tasks[key] = task
+
+    def forget_delivery_data(done_task) -> None:
+        if state._morning_delivery_tasks.get(key) is done_task:
+            state._morning_delivery_tasks.pop(key, None)
+            state._morning_delivery_data.pop(key, None)
+
+    task.add_done_callback(forget_delivery_data)
 
 
 MEETING_KINDS = {"meeting", "sitzung", "besprechung", "treffen"}  # a date's type in Stud.IP
@@ -139,21 +193,41 @@ def reminder_heading(event: dict) -> str:
     return "MEETING REMINDER" if kind in MEETING_KINDS else "APPOINTMENT REMINDER"
 
 
-@single_flight
+_calendar_reminder_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
 async def check_calendar_reminders(bot, chat_id, silent: bool = False):
+    """Run calendar reminders inside the owner's deletion-aware context."""
+    locks = _calendar_reminder_locks.setdefault(asyncio.get_running_loop(), {})
+    with acting_as(chat_id):
+        if (not db.private_context_is_current(chat_id)
+                or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+            return
+        async with locks.setdefault(chat_id, asyncio.Lock()):
+            if db.private_context_is_current(chat_id):
+                await _check_calendar_reminders(bot, chat_id, silent=silent)
+
+
+async def _check_calendar_reminders(bot, chat_id, silent: bool = False):
     """Check for upcoming classes and send reminders 30 minutes before."""
+    if not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE:
+        return
     user_session = get_user_session(chat_id)
     session = user_session or state.global_session
+    reminders = None
+    updated = False
     try:
         if not silent:
             logging.info("⏰ Checking calendar reminders for %s...", chat_id)
 
         reminders = load_reminders_cache(user_id=chat_id)
-        updated = False
 
         today = datetime.now(TZ_BERLIN).date()
         week_start = today - timedelta(days=today.weekday())
         events = await get_calendar_events(session=session, week_start=week_start, user_id=chat_id)
+        if (not db.private_context_is_current(chat_id)
+                or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+            return
         if not events:
             return
 
@@ -172,6 +246,9 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                 first_class_weather = await get_weather_snapshot(first_start_today.date(), user_id=chat_id)
             except Exception as e:
                 logging.warning("check_calendar_reminders: weather fetch failed: %s", e)
+            if (not db.private_context_is_current(chat_id)
+                    or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+                return
 
         # classes reached from the other campus with too little time to travel
         tight_arrivals = {id(s["to_event"]): s for s in tight_campus_switches(
@@ -179,6 +256,9 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
             user_travel(now.date(), chat_id))}
 
         for event in events:
+            if (not db.private_context_is_current(chat_id)
+                    or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+                break
             if not event.get("start_dt") or not event.get("title") or event["title"] == "Untitled":
                 continue
             if event.get("is_cancelled"):
@@ -187,10 +267,16 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
             title = event["title"]
             start_dt = event["start_dt"]
             location = event.get("location", "Unknown location")
-            # Create a unique key for this reminder (Title + Timestamp)
-            event_key = f"{title}|{int(start_dt.timestamp())}"
+            # A title and start time are not unique: two courses (or a course
+            # and a personal appointment) can meet at the same time. Keep the
+            # source event identity in new keys. Accept the old key for one
+            # migration window so deploying this change does not re-notify an
+            # event already sent in the last 24 hours.
+            source_id = event.get("course_id") or f"personal:{event.get('id') or title}"
+            event_key = f"event|{source_id}|{event.get('id') or title}|{int(start_dt.timestamp())}"
+            legacy_event_key = f"{title}|{int(start_dt.timestamp())}"
 
-            if event_key in reminders:
+            if event_key in reminders or legacy_event_key in reminders:
                 continue
 
             diff = start_dt - now
@@ -235,6 +321,9 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                     "━━━━━━━━━━━━━━━━━━"
                 )
                 try:
+                    if (not db.private_context_is_current(chat_id)
+                            or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+                        break
                     await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=markup)
                     logging.info("🔔 Sent reminder for %s to %s", title, chat_id)
                     reminders[event_key] = int(now.timestamp())
@@ -245,6 +334,9 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
         # Study window reminders (30 minutes before, window: 25-35 minutes)
         today_windows = find_study_windows_for_day(events, now.date(), user_id=chat_id)
         for w in today_windows:
+            if (not db.private_context_is_current(chat_id)
+                    or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+                break
             start_dt = w.get("start_dt")
             if not start_dt:
                 continue
@@ -285,6 +377,9 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 try:
+                    if (not db.private_context_is_current(chat_id)
+                            or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+                        break
                     await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
                     logging.info("🔔 Sent study session reminder for %s to %s", desc, chat_id)
                     reminders[study_key] = int(now.timestamp())
@@ -301,6 +396,9 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
                 from unibot.study_plan import build_study_pack, study_pack_course
                 try:
                     pack_text, pack_markup = await build_study_pack(w, chat_id, now)
+                    if (not db.private_context_is_current(chat_id)
+                            or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
+                        break
                     await bot.send_message(chat_id=chat_id, text=pack_text, parse_mode="HTML", reply_markup=pack_markup)
                     logging.info("📚 Sent study pack for the %s block to %s", f"{start_dt:%H:%M}", chat_id)
                     reminders[start_key] = int(now.timestamp())
@@ -315,14 +413,26 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
         cutoff = now.timestamp() - 86400
         new_cache = {k: v for k, v in reminders.items() if v > cutoff}
         if len(new_cache) != len(reminders):
+            reminders = new_cache
             updated = True
-        if updated:
-            save_reminders_cache(new_cache, user_id=chat_id)
     except Exception as e:
-        logging.error("❌ Error in check_calendar_reminders: %s", e)
+        log = logging.debug if getattr(e, "quiet", False) else logging.error
+        log("❌ Error in check_calendar_reminders: %s", e)
+    finally:
+        # Persist any reminders already delivered even if a later event or
+        # study-window operation in this cycle failed. Otherwise the next
+        # watcher pass can send the same successful reminder again.
+        if updated and reminders is not None and db.private_context_is_current(chat_id):
+            try:
+                save_reminders_cache(reminders, user_id=chat_id)
+            except Exception:
+                logging.error("Could not save calendar reminders for %s", chat_id, exc_info=True)
 
 
 # ── Calendar, Schedule & Activity Stream helpers ──────────────────────────────
+
+_SCHEDULE_TIME_RE = re.compile(r"^(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$")
+
 
 async def fetch_user_schedule_api(timestamp: Optional[int] = None, user_id: Optional[int] = None, session: Optional[object] = None) -> list[dict]:
     """Fetch the user's weekly semester timetable (`/users/{id}/schedule`) via JSON:API.
@@ -332,20 +442,47 @@ async def fetch_user_schedule_api(timestamp: Optional[int] = None, user_id: Opti
     params = {"filter[timestamp]": int(timestamp)} if timestamp else None
     payload = await studip_api_get(f"/users/{uid}/schedule", params=params, session=session, user_id=user_id)
     slots = []
-    for item in payload.get("data", []):
+    data = payload.get("data", [])
+    if not isinstance(data, list):
+        raise ValueError("Stud.IP schedule response data is not a list")
+    for item in data:
+        if not isinstance(item, dict):
+            logging.warning("Ignoring a malformed Stud.IP schedule entry")
+            continue
         attr = item.get("attributes", {})
+        if not isinstance(attr, dict):
+            logging.warning("Ignoring a schedule entry with malformed attributes")
+            continue
+        start, end = attr.get("start"), attr.get("end")
+        weekday_raw = attr.get("weekday")
+        try:
+            if not isinstance(weekday_raw, (int, str)) or isinstance(weekday_raw, bool):
+                raise ValueError("weekday must be an integer or numeric string")
+            weekday = int(weekday_raw)
+        except (TypeError, ValueError, OverflowError):
+            logging.warning("Ignoring a schedule entry with invalid weekday")
+            continue
+        if (not isinstance(start, str) or not _SCHEDULE_TIME_RE.fullmatch(start.strip())
+                or not isinstance(end, str) or not _SCHEDULE_TIME_RE.fullmatch(end.strip())
+                or weekday not in range(1, 8)):
+            logging.warning("Ignoring a schedule entry with invalid time or weekday")
+            continue
         rec = attr.get("recurrence") or {}
+        if not isinstance(rec, dict):
+            rec = {}
         owner_id = _api_rel_id(item, "owner")
         locs = attr.get("locations") or []
+        if not isinstance(locs, list):
+            locs = []
         loc_str = ", ".join(str(x).strip() for x in locs if str(x).strip())
         slots.append({
             "id": item.get("id"),
             "type": item.get("type"),
-            "title": (attr.get("title") or "Unknown Course").strip(),
-            "description": (attr.get("description") or "").strip(),
-            "start": attr.get("start") or "00:00",
-            "end": attr.get("end") or "00:00",
-            "weekday": int(attr.get("weekday") or 1),
+            "title": str(attr.get("title") or "Unknown Course").strip(),
+            "description": str(attr.get("description") or "").strip(),
+            "start": start.strip()[:5],
+            "end": end.strip()[:5],
+            "weekday": weekday,
             "location": loc_str,
             "recurrence": rec,
             "course_id": owner_id,
@@ -384,7 +521,13 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
                 cycle_locs[(cid, slot["weekday"], slot["start"][:5])] = slot["location"]
 
     events: list[dict] = []
-    seen_keys: set[tuple] = set()
+    # Event titles and times are not unique: parallel groups can meet under the
+    # same course title at the same time, and students can create duplicate
+    # personal appointments. Prefer Stud.IP's resource ID so only the same
+    # event representation collapses; use its full identifying fields for
+    # older API rows without IDs.
+    seen_keys: set[tuple[Optional[str], str, str]] = set()
+    key: tuple[Optional[str], str, str]
 
     def _status_for(start_dt: datetime, end_dt: datetime, is_cancelled: bool) -> str:
         if is_cancelled:
@@ -401,13 +544,16 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
             data, _ = await studip_api_get_all(f"/courses/{cid}/events", session=session, user_id=user_id)
             return cid, data
         except Exception as exc:
-            logging.debug("_get_calendar_events_api: /courses/%s/events failed: %s", cid, exc)
+            logging.warning("_get_calendar_events_api: /courses/%s/events unavailable: %s", cid, exc)
             return cid, []
 
     # Courses outside the weekly timetable (/users/{id}/schedule lists only regular
     # slots) keep their dates as single appointments: a mentor programme, a block
     # seminar, a colloquium. Their dates are read too, from a short-lived cache.
-    owned = student_courses(user_id) if user_id else dict(state.courses_map)
+    owner_id = user_id
+    if owner_id is None:
+        owner_id = getattr(session, "user_id", None) or current_user_id()
+    owned = student_courses(owner_id) if owner_id is not None else dict(state.courses_map)
     extra_ids = set(owned) - course_ids
 
     async def _fetch_extra_course_evs(cid: str) -> tuple[str, list]:
@@ -417,7 +563,7 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
         try:
             data, _ = await studip_api_get_all(f"/courses/{cid}/events", session=session, user_id=user_id)
         except Exception as exc:
-            logging.debug("_get_calendar_events_api: /courses/%s/events failed: %s", cid, exc)
+            logging.warning("_get_calendar_events_api: /courses/%s/events unavailable: %s", cid, exc)
             return cid, []
         _COURSE_EVENTS_CACHE[cid] = (time.time() + EXTRA_COURSE_EVENTS_CACHE_SECONDS, data)
         return cid, data
@@ -429,16 +575,19 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
     courses_with_concrete_events: set[str] = set()
 
     for cid, ev_list in course_results:
-        if ev_list:
-            courses_with_concrete_events.add(cid)
         for ev in ev_list:
             attr = ev.get("attributes", {})
             start_dt = _api_berlin(attr.get("start"))
             end_dt = _api_berlin(attr.get("end"))
-            if not start_dt or not end_dt:
+            if not start_dt or not end_dt or end_dt <= start_dt:
                 continue
             if not (week_start <= start_dt.date() < week_end):
                 continue
+            # Only suppress recurring timetable expansion when this course
+            # actually has concrete events in the requested range. The API
+            # can return events from other weeks too; using any non-empty
+            # response here hides regular classes for otherwise empty weeks.
+            courses_with_concrete_events.add(cid)
             title = (attr.get("title") or "Unknown Event").strip()
             start_hm = start_dt.strftime("%H:%M")
             loc = (attr.get("location") or "").strip() or cycle_locs.get((cid, start_dt.isoweekday(), start_hm), "")
@@ -448,7 +597,11 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
             titles = ((t.get("title") if isinstance(t, dict) else str(t)) for t in raw_topics)
             topics = [title.strip() for title in titles if title]
             desc = (attr.get("description") or "").strip()
-            key = (start_dt.isoformat(), clean_course_title(title).lower())
+            event_identity = ev.get("id") or "|".join((
+                start_dt.isoformat(), end_dt.isoformat(), loc,
+                str(attr.get("description") or "").strip(),
+            ))
+            key = (cid, str(event_identity), clean_course_title(title).lower())
             seen_keys.add(key)
             events.append({
                 "id": ev.get("id"),
@@ -503,7 +656,8 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
             end_dt = datetime(d.year, d.month, d.day, eh, em, tzinfo=TZ_BERLIN)
             is_cancelled = d in exdates
             title = slot["title"]
-            key = (start_dt.isoformat(), clean_course_title(title).lower())
+            slot_identity = slot.get("id") or "|".join((slot["start"], slot["end"], title))
+            key = (cid, f"schedule:{slot_identity}:{d.isoformat()}", clean_course_title(title).lower())
             if key in seen_keys:
                 continue
             seen_keys.add(key)
@@ -539,12 +693,17 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
             attr = uev.get("attributes", {})
             start_dt = _api_berlin(attr.get("start"))
             end_dt = _api_berlin(attr.get("end"))
-            if not start_dt or not end_dt:
+            if not start_dt or not end_dt or end_dt <= start_dt:
                 continue
             if not (week_start <= start_dt.date() < week_end):
                 continue
             title = (attr.get("title") or "Personal Event").strip()
-            key = (start_dt.isoformat(), clean_course_title(title).lower())
+            event_identity = uev.get("id") or "|".join((
+                start_dt.isoformat(), end_dt.isoformat(),
+                str(attr.get("location") or "").strip(),
+                str(attr.get("description") or "").strip(),
+            ))
+            key = (None, str(event_identity), clean_course_title(title).lower())
             if key in seen_keys:
                 continue
             seen_keys.add(key)
@@ -568,7 +727,8 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
                 "lesson": False,  # a personal appointment
             })
     except Exception as exc:
-        # the personal calendar is optional, but a missing one should show in the log
+        # Personal events are optional; preserve course schedule results if
+        # the personal calendar endpoint is temporarily unavailable.
         logging.warning("Personal calendar events unavailable: %s: %s", type(exc).__name__, exc)
 
     events.sort(key=lambda e: e["start_dt"])
@@ -655,11 +815,14 @@ def _parse_course_rooms_page(page_html: str) -> dict:
     return rooms_map
 
 
-async def _download_course_rooms_map(session, cid: str) -> dict:
-    s = session or state.global_session
+async def _download_course_rooms_map(session, cid: str, user_id: Optional[int] = None) -> dict:
+    # A user's calendar enrichment must use that same user's session. Course
+    # room data is shared, but silently borrowing the admin session here would
+    # bypass the per-user access boundary when the caller omitted `session`.
+    s = session or (get_user_session(user_id) if user_id is not None else state.global_session)
     if not s:
         try:
-            s = await login_studip()
+            s = await login_studip(user_id=user_id)
         except Exception:
             logging.warning("Stud.IP login failed while loading course rooms", exc_info=True)
             return {}
@@ -681,7 +844,7 @@ async def _download_course_rooms_map(session, cid: str) -> dict:
     return rooms_map
 
 
-async def _fetch_course_rooms_map(session, cid: str) -> dict:
+async def _fetch_course_rooms_map(session, cid: str, user_id: Optional[int] = None) -> dict:
     """Cached room assignments of a course (see _parse_course_rooms_page).
     Concurrent callers for the same course share a single download."""
     if not cid:
@@ -691,7 +854,7 @@ async def _fetch_course_rooms_map(session, cid: str) -> dict:
         return cached[1]
     task = _COURSE_ROOMS_INFLIGHT.get(cid)
     if task is None:
-        task = asyncio.create_task(_download_course_rooms_map(session, cid))
+        task = asyncio.create_task(_download_course_rooms_map(session, cid, user_id=user_id))
         _COURSE_ROOMS_INFLIGHT[cid] = task
         def _forget(_task: asyncio.Task, c: str = cid) -> None:
             _COURSE_ROOMS_INFLIGHT.pop(c, None)
@@ -717,7 +880,7 @@ async def get_calendar_events(session, week_start, days: int = 7, user_id: Optio
     }
 
     if cids_to_fetch:
-        tasks = [_fetch_course_rooms_map(session, cid) for cid in cids_to_fetch]
+        tasks = [_fetch_course_rooms_map(session, cid, user_id=user_id) for cid in cids_to_fetch]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         cid_rooms = {
             cid: res for cid, res in zip(cids_to_fetch, results)
@@ -823,8 +986,15 @@ def _plan_entry_lines(entry: dict, indent: str = "", menu: Optional[str] = None,
 
 async def send_daily_calendar(sender, events: list, target_date, week_start):
     """Send a specific day's schedule with a 'Week Plan' button. Matches backup UI."""
+    user_id = current_user_id()
+    if user_id is not None and (
+            not is_user_allowed(user_id) or not db.private_context_is_current(user_id)):
+        return
     today_events = [ev for ev in events if ev["date_key"] == target_date]
     weather = await get_weather_snapshot(target_date)
+    if user_id is not None and (
+            not is_user_allowed(user_id) or not db.private_context_is_current(user_id)):
+        return
     weather_block = f"\n\n{build_weather_text_line(weather, escape=_md)}" if weather else ""
 
     if not today_events:
@@ -858,6 +1028,9 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
     study_windows, lunch = plan["windows"], plan["lunch"]
     if study_windows or lunch:
         menu = await _lunch_menu_highlight(lunch, get_user_session())
+        if user_id is not None and (
+                not is_user_allowed(user_id) or not db.private_context_is_current(user_id)):
+            return
         gap_lines = ["\n📚 *Good Times to Study*", "━━━━━━━━━━━━━━━━━━"]
         for entry in sorted(study_windows + ([lunch] if lunch else []), key=lambda e: e["start_dt"]):
             gap_lines.extend(_plan_entry_lines(entry, menu=menu, remaining=bool(entry.get("is_remaining"))))
@@ -887,6 +1060,10 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if user_id is not None and (
+            not is_user_allowed(user_id) or not db.private_context_is_current(user_id)):
+        return
 
     if hasattr(sender, "edit_message_text"):
         try:
@@ -1019,8 +1196,11 @@ def plan_study_day(events: list, target_date: date, reference_now: Optional[date
 
         # 2. Gaps between classes
         for i in range(len(busy_intervals) - 1):
-            gap_s = busy_intervals[i]["end"]
-            gap_e = busy_intervals[i + 1]["start"]
+            # Class events can start before the study day or end after it.
+            # Keep the suggested gap inside the same 09:00-19:00 bounds as
+            # the before/after-class windows below.
+            gap_s = max(busy_intervals[i]["end"], day_study_start)
+            gap_e = min(busy_intervals[i + 1]["start"], day_study_end)
             mins = (gap_e - gap_s).total_seconds() / 60
             if mins >= STUDY_WINDOW_BETWEEN_MIN_MINUTES:
                 prev_title = busy_intervals[i]["last_title"]
@@ -1108,6 +1288,10 @@ def find_weekly_study_gaps(events: list, week_start: Optional[date] = None) -> l
 
 async def send_weekly_calendar(sender, events: list, week_start):
     """Send the weekly schedule with navigation. Matches backup UI."""
+    user_id = current_user_id()
+    if user_id is not None and (
+            not is_user_allowed(user_id) or not db.private_context_is_current(user_id)):
+        return
     prev_week = week_start - timedelta(days=7)
     next_week = week_start + timedelta(days=7)
     week_end = week_start + timedelta(days=6)
@@ -1203,6 +1387,10 @@ async def send_weekly_calendar(sender, events: list, week_start):
         ],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if user_id is not None and (
+            not is_user_allowed(user_id) or not db.private_context_is_current(user_id)):
+        return
 
     if hasattr(sender, "edit_message_text"):
         try:
@@ -1786,7 +1974,7 @@ def _course_session_events(cid: str, course_name: str, raw: list, now: datetime)
     for ev in raw:
         attr = ev.get("attributes", {})
         start_dt, end_dt = _api_berlin(attr.get("start")), _api_berlin(attr.get("end"))
-        if not start_dt or not end_dt or end_dt < now - timedelta(days=1) or start_dt > horizon:
+        if not start_dt or not end_dt or end_dt <= start_dt or end_dt < now - timedelta(days=1) or start_dt > horizon:
             continue
         events.append({
             "id": ev.get("id") or f"{cid}|{start_dt.isoformat()}",
@@ -1857,7 +2045,7 @@ async def check_course_session_changes(bot, now: Optional[datetime] = None, forc
                 members=course_members(cid), now=now,
                 urgent=start_dt - now <= timedelta(hours=SESSION_URGENT_HOURS))
             stats["alerts"] += 1
-    if plan and stats["courses"]:
+    if plan and stats["courses"] and state.course_watch_plan_complete:
         # forget courses nobody watches any more; an empty or failed round
         # keeps the state, or the next scan would be a silent baseline again
         known = {cid for _, cid, _ in plan}
@@ -1887,40 +2075,56 @@ async def check_personal_timetable_changes(bot, now: Optional[datetime] = None) 
     due.sort(key=lambda a: _timetable_checked_at.get(a.user_id, 0.0))
     for account in due[:PERSONAL_TIMETABLES_PER_CYCLE]:
         uid, sess = account.user_id, account.session
-        try:
-            with acting_as(uid):
+        if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+            continue
+        with acting_as(uid):
+            try:
                 slots = await fetch_user_schedule_api(user_id=uid, session=sess)
-        except Exception as exc:
-            logging.debug("Timetable of a student unavailable: %s", exc)
-            # try again in PERSONAL_TIMETABLE_RETRY_SECONDS, not a whole interval later
-            _timetable_checked_at[uid] = time.time() - PERSONAL_TIMETABLE_CHECK_SECONDS + PERSONAL_TIMETABLE_RETRY_SECONDS
-            continue
-        _timetable_checked_at[uid] = time.time()
-        checked += 1
-        old = personal_record(uid, "user_schedule_slots", {}) or {}
-        if uid == watcher_uid:
-            legacy_moved = True
-        if not old and uid == watcher_uid and isinstance(legacy, dict) and legacy:
-            old = legacy  # the single-account timetable from before
-            save_personal_record(uid, "user_schedule_slots", old)  # moved before the legacy copy goes
-        new = _timetable_map(slots)
-        if old and not new:
-            # A filled timetable that comes back empty is far more often a
-            # Stud.IP hiccup than every course dropped at once: no "removed"
-            # flood, and the old record stays to compare the next read with.
-            _empty_timetable_reads[uid] = _empty_timetable_reads.get(uid, 0) + 1
-            if _empty_timetable_reads[uid] < EMPTY_TIMETABLE_CONFIRMATIONS:
+            except Exception as exc:
+                logging.debug("Timetable of a student unavailable: %s", exc)
+                # try again in PERSONAL_TIMETABLE_RETRY_SECONDS, not a whole interval later
+                _timetable_checked_at[uid] = time.time() - PERSONAL_TIMETABLE_CHECK_SECONDS + PERSONAL_TIMETABLE_RETRY_SECONDS
                 continue
-            # still empty after several reads (semester over): accept it quietly
-            save_personal_record(uid, "user_schedule_slots", new)
-            continue
-        _empty_timetable_reads.pop(uid, None)
-        if old:
-            for text in _diff_timetable(old, new):
-                await course_registry.fan_out(bot, None, "schedule", text, _alert_title(text),
-                                              reply_markup=_SCHEDULE_WA_MARKUP, members={uid}, now=now)
-        if new != old:
-            save_personal_record(uid, "user_schedule_slots", new)
+            if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                    or lifecycle_state(uid) != ACTIVE):
+                continue
+            _timetable_checked_at[uid] = time.time()
+            checked += 1
+            old = personal_record(uid, "user_schedule_slots", {}) or {}
+            scope = db.get_user_scope(uid)
+            if uid == watcher_uid:
+                legacy_moved = scope.has_private("cache.user_schedule_slots")
+            if not old and uid == watcher_uid and isinstance(legacy, dict) and legacy:
+                old = legacy  # the single-account timetable from before
+                save_personal_record(uid, "user_schedule_slots", old)  # moved before the legacy copy goes
+                legacy_moved = scope.has_private("cache.user_schedule_slots")
+                if not legacy_moved:
+                    # A deletion may have invalidated this write. Keep the
+                    # only remaining timetable copy until it can be migrated.
+                    continue
+            new = _timetable_map(slots)
+            if old and not new:
+                # A filled timetable that comes back empty is far more often a
+                # Stud.IP hiccup than every course dropped at once: no "removed"
+                # flood, and the old record stays to compare the next read with.
+                _empty_timetable_reads[uid] = _empty_timetable_reads.get(uid, 0) + 1
+                if _empty_timetable_reads[uid] < EMPTY_TIMETABLE_CONFIRMATIONS:
+                    continue
+                # still empty after several reads (semester over): accept it quietly
+                save_personal_record(uid, "user_schedule_slots", new)
+                continue
+            _empty_timetable_reads.pop(uid, None)
+            if old:
+                for text in _diff_timetable(old, new):
+                    await course_registry.fan_out(bot, None, "schedule", text, _alert_title(text),
+                                                  reply_markup=_SCHEDULE_WA_MARKUP, members={uid}, now=now)
+                    if not db.private_context_is_current(uid):
+                        break
+            if not db.private_context_is_current(uid):
+                legacy_moved = False
+                break
+            if new != old:
+                save_personal_record(uid, "user_schedule_slots", new)
     if legacy is not None and legacy_moved:  # only once the watcher's owner has it
         cache = load_general_cache()
         cache.pop("user_schedule_slots", None)
@@ -1933,9 +2137,13 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
     task reminders into one chronologically-sorted overview."""
     now = datetime.now(TZ_BERLIN)
     items = []  # list of (sort_datetime, line)
+    warnings = []
 
     try:
-        open_exams = await get_open_exam_registrations(session)
+        failed_codes: set = set()
+        open_exams = await get_open_exam_registrations(session, failed_codes=failed_codes)
+        if failed_codes:
+            warnings.append(f"⚠️ Registration details could not be checked for {len(failed_codes)} exam unit(s).")
         seen_units = set()
         for e in open_exams:
             if e["unit_id"] in seen_units or not e.get("end_date"):
@@ -1947,6 +2155,7 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
             items.append((end_dt, f"🔴 <b>Registration closes:</b> {html.escape(e['title'])} – {_format_relative(end_dt, now, show_time=False)}"))
     except Exception as e:
         logging.warning("Upcoming dashboard: exam registration fetch failed: %s", e)
+        warnings.append("⚠️ Exam registration deadlines could not be checked.")
 
     try:
         registered = await get_registered_exam_schedule(session)
@@ -1964,6 +2173,7 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
             items.append((dt, f"📚 <b>Exam:</b> {html.escape(exam['title'])} – {_format_relative(dt, now)}"))
     except Exception as e:
         logging.warning("Upcoming dashboard: exam date fetch failed: %s", e)
+        warnings.append("⚠️ Registered exam dates could not be checked.")
 
     todos: list[str] = []
     for t in user_tasks(user_id):
@@ -1987,6 +2197,10 @@ async def build_upcoming_dashboard(session, user_id: int) -> str:
         lines.append("━━━━━━━━━━━━━━━━━")
         lines.append("📝 <b>To-dos (no date):</b>")
         lines.extend(f"• {t}" for t in todos)
+
+    if warnings:
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.extend(f"<i>{html.escape(warning)}</i>" for warning in warnings)
 
     return "\n".join(lines)
 
@@ -2021,6 +2235,8 @@ async def handle_upcoming_dashboard(update: Update, context: ContextTypes.DEFAUL
 
 async def schedule_fastenroll_job(chat_id: int, sem_id: Optional[str], target_time_str: Optional[str], target_date_str: Optional[str], context: ContextTypes.DEFAULT_TYPE) -> str:
     """Validate, persist and launch a fast-enroll job. Returns the reply text to show the user."""
+    if not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE:
+        return "⏸️ Fast enroll is paused. Send /start before scheduling it."
     from unibot.tasks import _run_fastenroll_task
     from unibot.enrollment import validate_fastenroll_args
     from unibot.enrollment import normalize_enroll_time
@@ -2028,16 +2244,38 @@ async def schedule_fastenroll_job(chat_id: int, sem_id: Optional[str], target_ti
     error = validate_fastenroll_args(sem_id, target_time_str, target_date_str)
     if error or sem_id is None or target_time_str is None:  # the validator rejects missing values
         return f"⚠️ {error}"
+    now = datetime.now(TZ_BERLIN)
+    try:
+        target = resolve_target(target_time_str, target_date_str, now)
+    except (TypeError, ValueError):
+        return "⚠️ Invalid date or time. Use a real Berlin date and time."
+    if target.timestamp() <= now.timestamp():
+        return "⚠️ That date and time has already passed. Choose a future time."
 
-    existing = fastenroll_tasks.get(chat_id, {}).get(sem_id)
-    if existing and not existing.done():
-        return f"A fast-enroll job is already scheduled for course {sem_id}. Cancel it first with /fastenroll_cancel {sem_id}."
+    # Persist the resolved calendar date even when the user entered only a
+    # time. Otherwise a restart after today's target would reinterpret that
+    # old job as the next occurrence and silently schedule it for tomorrow.
+    scheduled_date_str = target.strftime("%d.%m.%Y")
 
-    when = f"{target_date_str} {target_time_str}" if target_date_str else f"{target_time_str} (next occurrence)"
-    save_pending_job(chat_id, sem_id, target_time_str, target_date_str)
-    task = asyncio.create_task(_run_fastenroll_task(chat_id, sem_id, target_time_str, target_date_str, context))
-    fastenroll_tasks.setdefault(chat_id, {})[sem_id] = task
-    return f"🎯 Fast enroll scheduled for course {sem_id} at {when} (Europe/Berlin)."
+    # Pending jobs share one whole-document record, so serialize scheduling
+    # per student as well as preventing two jobs for the same course.
+    lock = _FASTENROLL_SCHEDULE_LOCKS.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        if (not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE
+                or not db.private_context_is_current(chat_id)):
+            return "⏸️ Fast enroll was not scheduled because your account changed. Send /start and try again."
+        existing = fastenroll_tasks.get(chat_id, {}).get(sem_id)
+        if existing and not existing.done():
+            return f"A fast-enroll job is already scheduled for course {sem_id}. Cancel it first with /fastenroll_cancel {sem_id}."
+
+        when = f"{target_date_str} {target_time_str}" if target_date_str else f"{target_time_str} (next occurrence)"
+        save_pending_job(chat_id, sem_id, target_time_str, scheduled_date_str)
+        task = state.spawn(
+            _run_fastenroll_task(chat_id, sem_id, target_time_str, scheduled_date_str, context),
+            name=f"fastenroll:{chat_id}:{sem_id}",
+        )
+        fastenroll_tasks.setdefault(chat_id, {})[sem_id] = task
+        return f"🎯 Fast enroll scheduled for course {sem_id} at {when} (Europe/Berlin)."
 STUDY_PLAN_EXAM_WINDOW_DAYS = 21
 
 

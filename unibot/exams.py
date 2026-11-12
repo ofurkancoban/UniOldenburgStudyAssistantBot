@@ -7,7 +7,9 @@ import asyncio
 import html
 import io
 import logging
+import math
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Optional
@@ -35,15 +37,23 @@ from studip_utils import berlin_now, html_escape as _h
 from unibot import db
 from unibot import state
 from unibot.storage import (
+    CALLBACK_TTL_SECONDS,
     personal_record,
     recall_user_callback,
     remember_user_callback,
     save_personal_record,
 )
-from unibot.telegram_ui import _delete_status_message, _show_typing, _start_loading_animation, _stop_loading_animation, markup_for
+from unibot.telegram_ui import (
+    _delete_status_message,
+    _show_typing,
+    _split_message,
+    _start_loading_animation,
+    _stop_loading_animation,
+    markup_for,
+)
 from unibot.auth import get_user_session, is_user_admin, is_user_allowed, personal_session
 from unibot.studip_api import BASE_URL, list_courses
-from unibot.whatsapp import WA_ADMIN_ONLY, _send_text_to_whatsapp
+from unibot.whatsapp import WA_ADMIN_ONLY, _send_text_to_whatsapp, whatsapp_forward_in_flight
 from unibot.monitoring import _format_exam_dates_message
 
 
@@ -52,19 +62,72 @@ class _ExamActions(dict):
     user_id, ... }. An action that belongs to a student is also kept in
     their private record, so the button still works after a restart."""
 
+    MAX_ITEMS = 2000
+
+    @staticmethod
+    def _created_at(info) -> Optional[float]:
+        if not isinstance(info, dict):
+            return None
+        value = info.get("_cache_ts")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            stamp = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return stamp if math.isfinite(stamp) else None
+
+    def _drop(self, sid: str, info: dict) -> None:
+        dict.pop(self, sid, None)
+        user_id = info.get("user_id")
+        if user_id is not None:
+            recall_user_callback(user_id, f"exam:{sid}", forget=True)
+
+    def _prune(self) -> None:
+        now = time.time()
+        entries = list(dict.items(self))
+        for sid, info in entries:
+            created = self._created_at(info)
+            if created is None or not 0 <= now - created <= CALLBACK_TTL_SECONDS:
+                self._drop(sid, info)
+        remaining = list(dict.items(self))
+        if len(remaining) > self.MAX_ITEMS:
+            oldest = sorted(remaining, key=lambda row: self._created_at(row[1]) or 0)
+            for sid, info in oldest[:len(remaining) - self.MAX_ITEMS]:
+                self._drop(sid, info)
+
     def __setitem__(self, sid, info):
-        super().__setitem__(sid, info)
+        self._prune()
         if isinstance(info, dict) and info.get("user_id") is not None:
-            remember_user_callback(info["user_id"], f"exam:{sid}", info)
+            if not remember_user_callback(info["user_id"], f"exam:{sid}", info):
+                raise RuntimeError("Could not persist the exam button action")
+        cached = {**info, "_cache_ts": time.time()} if isinstance(info, dict) else info
+        super().__setitem__(sid, cached)
+        self._prune()
+
+    def get(self, sid, default=None):
+        self._prune()
+        return super().get(sid, default)
+
+    def items(self):
+        self._prune()
+        return super().items()
+
+    def restore(self, sid: str, info: dict) -> None:
+        """Load a persisted action without extending its original expiry."""
+        dict.__setitem__(self, sid, info)
+        self._prune()
 
     def pop(self, sid, *default):
+        self._prune()
         info = super().pop(sid, *default)
         if isinstance(info, dict) and info.get("user_id") is not None:
             recall_user_callback(info["user_id"], f"exam:{sid}", forget=True)
         return info
 
 
-exam_action_cache: dict[str, dict] = _ExamActions()
+exam_action_cache: _ExamActions = _ExamActions()
+_pending_exam_actions: set[tuple[int, str]] = set()
 
 
 def _exam_action(sid: str, user_id: int) -> Optional[dict]:
@@ -76,8 +139,14 @@ def _exam_action(sid: str, user_id: int) -> Optional[dict]:
         # after a restart: only the tapping student's own record is searched
         stored = recall_user_callback(user_id, f"exam:{sid}")
         if stored:
+            created = _ExamActions._created_at({"_cache_ts": stored.get("ts")})
+            age = time.time() - created if created is not None else None
+            if age is None or not 0 <= age <= CALLBACK_TTL_SECONDS:
+                recall_user_callback(user_id, f"exam:{sid}", forget=True)
+                return None
             info = {k: v for k, v in stored.items() if k != "ts"}
-            dict.__setitem__(exam_action_cache, sid, info)
+            info["_cache_ts"] = created
+            exam_action_cache.restore(sid, info)
     if not info:
         return None
     owner = info.get("user_id")
@@ -91,60 +160,94 @@ async def send_exam_registration_menu(message, user_id: int):
     """Show currently open-for-registration and currently-registered exams on
     the StuMS/HISinOne portal, each with a Register/Deregister button."""
     session = personal_session(user_id)
+    warnings = []
+    failed_codes: set = set()
 
     try:
-        open_exams = await get_open_exam_registrations(session)
+        open_exams = await get_open_exam_registrations(session, failed_codes=failed_codes)
     except Exception as e:
         logging.error("exam menu: failed to fetch open exams: %s", e)
         await message.reply_text("❌ Could not reach the exam registration portal. Please try again later.")
         return
+    if failed_codes:
+        warnings.append(f"⚠️ Could not check {len(failed_codes)} exam unit(s); the open list may be incomplete.")
 
     try:
         registered_exams = await get_registered_exams(session)
     except Exception as e:
         logging.error("exam menu: failed to fetch registered exams: %s", e)
         registered_exams = []
+        warnings.append("⚠️ Could not check your current registrations; the list may be incomplete.")
+
+    if not db.private_context_is_current(user_id):
+        return
 
     keyboard = []
+    action_store_failed = False
 
     if open_exams:
         # A unit can have several open sittings at once; one Register button per unit is enough.
         seen_units = set()
-        keyboard.append([InlineKeyboardButton("📖 Open for registration", callback_data="exam_noop")])
+        open_buttons = []
         for exam in sorted(open_exams, key=lambda e: e["end_date"] or ""):
             if exam["unit_id"] in seen_units:
                 continue
             seen_units.add(exam["unit_id"])
             sid = str(uuid.uuid4())[:8]
-            exam_action_cache[sid] = {
-                "unit_id": exam["unit_id"],
-                "action_type": "anmelden",
-                "title": exam["title"],
-                "user_id": getattr(session, "user_id", None),
-            }
+            try:
+                exam_action_cache[sid] = {
+                    "unit_id": exam["unit_id"],
+                    "action_type": "anmelden",
+                    "title": exam["title"],
+                    "user_id": getattr(session, "user_id", None),
+                }
+            except RuntimeError:
+                logging.warning("Could not persist an exam registration button for user %s", user_id)
+                action_store_failed = True
+                continue
             label = f"📝 {exam['title']}"
             if exam.get("exam_date_text"):
                 label += f" ({exam['exam_date_text']})"
-            keyboard.append([InlineKeyboardButton(label[:64], callback_data=f"exam_ask|{sid}")])
+            open_buttons.append([InlineKeyboardButton(label[:64], callback_data=f"exam_ask|{sid}")])
+        if open_buttons:
+            keyboard.append([InlineKeyboardButton("📖 Open for registration", callback_data="exam_noop")])
+            keyboard.extend(open_buttons)
 
     if registered_exams:
-        keyboard.append([InlineKeyboardButton("📌 Currently registered", callback_data="exam_noop")])
+        registered_buttons = []
         for exam in registered_exams:
             sid = str(uuid.uuid4())[:8]
-            exam_action_cache[sid] = {
-                "unit_id": exam["unit_id"],
-                "action_type": "abmelden",
-                "title": exam["title"],
-                "user_id": getattr(session, "user_id", None),
-            }
-            keyboard.append([InlineKeyboardButton(f"🗑️ {exam['title']}"[:64], callback_data=f"exam_ask|{sid}")])
+            try:
+                exam_action_cache[sid] = {
+                    "unit_id": exam["unit_id"],
+                    "action_type": "abmelden",
+                    "title": exam["title"],
+                    "user_id": getattr(session, "user_id", None),
+                }
+            except RuntimeError:
+                logging.warning("Could not persist an exam registration button for user %s", user_id)
+                action_store_failed = True
+                continue
+            registered_buttons.append([InlineKeyboardButton(f"🗑️ {exam['title']}"[:64], callback_data=f"exam_ask|{sid}")])
+        if registered_buttons:
+            keyboard.append([InlineKeyboardButton("📌 Currently registered", callback_data="exam_noop")])
+            keyboard.extend(registered_buttons)
+
+    if action_store_failed:
+        warnings.append("⚠️ Some action buttons could not be prepared safely.")
 
     if not keyboard:
-        await message.reply_text("ℹ️ No open exam registrations and no active registrations found right now.")
+        if warnings:
+            await message.reply_text("\n".join(warnings + ["ℹ️ Could not build a complete exam list. Please try again later."]))
+        else:
+            await message.reply_text("ℹ️ No open exam registrations and no active registrations found right now.")
         return
 
+    warning_text = "\n".join(f"<i>{_h(warning)}</i>" for warning in warnings)
+    warning_text = f"\n{warning_text}\n" if warning_text else "\n"
     await message.reply_text(
-        "📝 <b>Exam Registration</b>\nSelect an exam to register or deregister:",
+        "📝 <b>Exam Registration</b>\nSelect an exam to register or deregister:"
+        f"{warning_text}",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -198,31 +301,45 @@ async def handle_exam_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if action == "exam_do":
-        status_msg = await query.edit_message_text(f"⏳ Submitting: {verb} {info['title']}...")
-        await _show_typing(query)
-        stop_evt, anim_task = _start_loading_animation(status_msg, f"Submitting: {verb} {info['title']}...")
-        try:
-            # always the tapping student's own StuMS session, never the admin's
-            session = get_user_session(query.from_user.id)
-            result = await submit_exam_action(session, info["unit_id"], info["action_type"])
-        except Exception as e:
-            logging.error("exam action failed: %s", e)
-            await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
+        action_key = (query.from_user.id, sid)
+        if action_key in _pending_exam_actions:
+            await query.message.reply_text("⏳ This exam action is already being submitted.")
             return
-        finally:
-            await _stop_loading_animation(stop_evt, anim_task)
-            await _delete_status_message(status_msg)
-        exam_action_cache.pop(sid, None)
-        title = result.get("title") or info["title"]
-        if result["success"]:
-            if info["action_type"] == "anmelden":
-                status_line = f"\nStatus: {result['status']}" if result.get("status") else ""
-                await query.message.reply_text(f"✅ Registered: {title}{status_line}")
+        _pending_exam_actions.add(action_key)
+        try:
+            status_msg = await query.edit_message_text(f"⏳ Submitting: {verb} {info['title']}...")
+            await _show_typing(query)
+            stop_evt, anim_task = _start_loading_animation(status_msg, f"Submitting: {verb} {info['title']}...")
+            try:
+                # always the tapping student's own StuMS session, never the admin's
+                session = get_user_session(query.from_user.id)
+                if not db.private_context_is_current(user_id):
+                    return
+                result = await submit_exam_action(session, info["unit_id"], info["action_type"])
+            except Exception as e:
+                logging.error("exam action failed: %s", e)
+                await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
+                return
+            finally:
+                await _stop_loading_animation(stop_evt, anim_task)
+                await _delete_status_message(status_msg)
+
+            if not db.private_context_is_current(user_id):
+                return
+
+            exam_action_cache.pop(sid, None)
+            title = result.get("title") or info["title"]
+            if result["success"]:
+                if info["action_type"] == "anmelden":
+                    status_line = f"\nStatus: {result['status']}" if result.get("status") else ""
+                    await query.message.reply_text(f"✅ Registered: {title}{status_line}")
+                else:
+                    await query.message.reply_text(f"🗑️ Deregistered: {title}")
             else:
-                await query.message.reply_text(f"🗑️ Deregistered: {title}")
-        else:
-            failed_verb = "register for" if info["action_type"] == "anmelden" else "deregister from"
-            await query.message.reply_text(f"❌ Failed to {failed_verb} {title}: {result['message']}")
+                failed_verb = "register for" if info["action_type"] == "anmelden" else "deregister from"
+                await query.message.reply_text(f"❌ Failed to {failed_verb} {title}: {result['message']}")
+        finally:
+            _pending_exam_actions.discard(action_key)
 
 
 async def handle_examopen_wa_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -257,11 +374,17 @@ async def handle_examopen_wa_confirm(update: Update, context: ContextTypes.DEFAU
     if not is_user_admin(query.from_user.id):
         await query.answer(WA_ADMIN_ONLY, show_alert=True)
         return
+    forward_key = (query.message.chat_id, query.message.message_id)
+    if whatsapp_forward_in_flight(forward_key):
+        await query.answer("This message is already being sent.", show_alert=True)
+        return
     await query.answer("Sending to WhatsApp...")
     sid = query.data.split("|", 1)[1]
     info = _exam_action(sid, query.from_user.id)
     if not info:
         await query.edit_message_text("⚠️ This notification has expired.")
+        return
+    if not db.private_context_is_current(query.from_user.id):
         return
     # Mirrors the Telegram notification's own format (see exam_reminder.py's
     # check_exam_reminders) instead of just the course title - the WA
@@ -281,7 +404,14 @@ async def handle_examopen_wa_confirm(update: Update, context: ContextTypes.DEFAU
         f"{window_line}"
         "━━━━━━━━━━━━━━━━━"
     )
-    success, message = await _send_text_to_whatsapp(text)
+    success, message = await _send_text_to_whatsapp(
+        text,
+        dedupe_key=forward_key,
+    )
+    if not success and message == "This message is already being sent.":
+        return
+    if not db.private_context_is_current(query.from_user.id):
+        return
     await query.edit_message_text(f"✅ {message}" if success else f"❌ {message}")
 
 
@@ -320,6 +450,8 @@ async def handle_examopen_mute_confirm(update: Update, context: ContextTypes.DEF
         await query.edit_message_text("⚠️ This notification has expired.")
         return
     uid = query.from_user.id  # each student mutes only their own reminders
+    if not db.private_context_is_current(uid):
+        return
     cache = load_exam_cache(user_id=uid)
     muted = set(cache.get("muted_codes", []))
     muted.add(info["code"])
@@ -406,6 +538,9 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
     except Exception as exc:
         logging.error("StuMS document download failed for %s: %s", doc_key, exc)
         await _stop_loading_animation(stop_evt, anim_task)
+        if not db.private_context_is_current(user_id) or not is_user_allowed(user_id):
+            await _delete_status_message(status_msg)
+            return
         server = state.login_server
         kb_rows = []
         if server:
@@ -421,10 +556,19 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
 
+    if not db.private_context_is_current(user_id) or not is_user_allowed(user_id):
+        await _delete_status_message(status_msg)
+        return
+
     try:
         await status_msg.delete()
     except TelegramError:
         pass
+
+    # Deletion, /stop or an administrator block may happen while the status
+    # message is being removed. Recheck immediately before sending the PDF.
+    if not db.private_context_is_current(user_id) or not is_user_allowed(user_id):
+        return
 
     # Zero-disk: the official PDF goes from StuMS to Telegram through a
     # memory buffer only, which is closed (and the bytes dropped) once sent.
@@ -516,6 +660,8 @@ async def handle_tuition_status(update: Update, context: ContextTypes.DEFAULT_TY
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
 
+    if not db.private_context_is_current(user_id):
+        return
     await status_msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -535,6 +681,8 @@ async def tuition_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
 
+    if not db.private_context_is_current(user.id):
+        return
     await status_msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
 
@@ -569,17 +717,7 @@ async def _send_exam_dates_chunks(message, lines: list[str], final_reply_markup=
     """Telegram messages are capped at 4096 chars; split into chunks if needed and
     attach `final_reply_markup` (e.g. a WhatsApp-forward or navigation button) to
     only the last chunk."""
-    chunks = []
-    chunk = ""
-    for line in lines:
-        candidate = chunk + line + "\n"
-        if len(candidate) > 3800:
-            chunks.append(chunk)
-            chunk = line + "\n"
-        else:
-            chunk = candidate
-    if chunk:
-        chunks.append(chunk)
+    chunks = _split_message("\n".join(lines), limit=3800)
 
     for i, chunk in enumerate(chunks):
         is_last = i == len(chunks) - 1
@@ -649,6 +787,9 @@ async def handle_exam_dates_list(update: Update, context: ContextTypes.DEFAULT_T
         await _stop_loading_animation(stop_evt, anim_task)
         await _delete_status_message(status_msg)
 
+    if not db.private_context_is_current(user_id):
+        return
+
     matched = filter_exams_by_module_codes(exams, module_codes)
 
     today = berlin_now().date()
@@ -690,6 +831,9 @@ async def handle_all_exam_dates(update: Update, context: ContextTypes.DEFAULT_TY
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
         await _delete_status_message(status_msg)
+
+    if not db.private_context_is_current(user_id):
+        return
 
     today = berlin_now().date()
     upcoming = [e for e in exams if datetime.fromisoformat(e["exam_date"]).date() >= today]
@@ -733,6 +877,9 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
         await _stop_loading_animation(stop_evt, anim_task)
         await _delete_status_message(status_msg)
 
+    if not db.private_context_is_current(user_id):
+        return
+
     summary = compute_transcript_summary(grades)
 
     lines = ["📜 <b>Transcript Summary</b>", "━━━━━━━━━━━━━━━━━"]
@@ -744,10 +891,13 @@ async def handle_transcript_summary(update: Update, context: ContextTypes.DEFAUL
     lines.append("━━━━━━━━━━━━━━━━━")
 
     for item in summary["passed"]:
-        lines.append(f"✅ {item['title']} - {item['grade']} ({item['credits']} ECTS)")
+        title = html.escape(str(item.get("title") or "Module"))
+        grade = html.escape(str(item.get("grade") or ""))
+        lines.append(f"✅ {title} - {grade} ({item['credits']} ECTS)")
     for item in summary["failed"]:
-        grade_part = f" - {item['grade']}" if item.get("grade") else ""
-        lines.append(f"❌ {item['title']}{grade_part}")
+        title = html.escape(str(item.get("title") or "Module"))
+        grade_part = f" - {html.escape(str(item['grade']))}" if item.get("grade") else ""
+        lines.append(f"❌ {title}{grade_part}")
 
     if not summary["passed"] and not summary["failed"]:
         lines.append("ℹ️ No finalized results yet.")

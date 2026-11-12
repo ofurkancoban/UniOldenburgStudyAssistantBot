@@ -4,6 +4,7 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import asyncio
+import hashlib
 import html
 import operator
 from array import array
@@ -11,6 +12,7 @@ import io
 import logging
 import os
 import re
+import secrets
 import time
 from datetime import datetime, timedelta
 from typing import Optional
@@ -38,6 +40,7 @@ from unibot import state
 from unibot.study_day import plan_day
 from unibot.preferences import campus_anchor, get_pref, set_pref
 from unibot.storage import (
+    get_ai_personal_enabled,
     load_student_progress,
     save_student_progress,
     link_cache,
@@ -61,15 +64,19 @@ from unibot.telegram_ui import (
 )
 from unibot.auth import current_user_id, get_user_session, has_stored_login, is_user_allowed, login_studip
 from unibot.studip_api import (
+    DownloadTooLargeError,
     _ensure_watched_courses_map,
     _parse_file_date_v2,
     file_date_sort_key,
+    file_date_timestamp,
+    read_response_limited,
     _switch_semester_filter,
     list_courses,
     list_files,
 )
 from unibot.ai import (
     GWDG_BURST_WAIT_SECONDS,
+    personal_ai_allowed,
     use_ai_budget,
     _gwdg_throttle,
     _record_gwdg_quota,
@@ -114,6 +121,13 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
     scanned too and merged in - a module can still have an open retake slot
     on a prior term's course instance. Off by default, since most of the
     time it's just doubling the fetch time for nothing."""
+    sender_user = getattr(sender, "from_user", None)
+    user_id = getattr(sender_user, "id", None) or current_user_id()
+
+    def request_is_current() -> bool:
+        return (user_id is not None and is_user_allowed(user_id)
+                and db.private_context_is_current(user_id))
+
     # Explicitly clear the keyboard here: editing text alone leaves whatever
     # buttons were on the previous message (e.g. the prior semester's "Enroll"
     # rows) live and tappable during this network wait, which let an
@@ -128,7 +142,11 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
 
     try:
         session = await login_studip()
+        if not request_is_current():
+            return
         semester_options = await get_semester_options(session)
+        if not request_is_current():
+            return
         current_label = next((label for sid, label in semester_options if sid == semester_id), None)
 
         open_courses = await get_open_courses(session, semester_id=semester_id)
@@ -137,6 +155,8 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
         # those the student is already enrolled in, so that's cross-checked
         # here against the student's own course list before displaying.
         enrolled_cids = {cid for _, cid in await list_courses(semester_id=semester_id)}
+        if not request_is_current():
+            return
         open_courses = [c for c in open_courses if c["sem_id"] not in enrolled_cids]
 
         prev_label = None
@@ -149,6 +169,8 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
                 try:
                     prev_open = await get_open_courses(session, semester_id=prev_id)
                     prev_enrolled = {cid for _, cid in await list_courses(semester_id=prev_id)}
+                    if not request_is_current():
+                        return
                     prev_open = [c for c in prev_open if c["sem_id"] not in prev_enrolled]
                     # Tag each item with its source semester's label, and only
                     # once there are two terms in play, so the grouping below
@@ -176,10 +198,15 @@ async def _render_open_courses_for_semester(sender, semester_id: str):
         # after) this edit and clobber it back to a loading frame.
         await _stop_loading_animation(stop_evt, anim_task)
         logging.error("_render_open_courses_for_semester: failed to fetch open courses: %s", e)
+        if not request_is_current():
+            return
         await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
         return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+
+    if not request_is_current():
+        return
 
     change_semester_row = InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|enroll")
     toggle_label = f"{'✅' if scan_prev else '🔲'} Include Previous Semester"
@@ -245,6 +272,13 @@ async def _render_enrolled_courses_for_semester(sender, semester_id: str):
     pick one to sign out of. Shared by handle_deenroll_semester_pick (explicit
     picker) and handle_browse_my_courses_for_deenroll (when a default
     semester is set, skipping the picker)."""
+    sender_user = getattr(sender, "from_user", None)
+    user_id = getattr(sender_user, "id", None) or current_user_id()
+
+    def request_is_current() -> bool:
+        return (user_id is not None and is_user_allowed(user_id)
+                and db.private_context_is_current(user_id))
+
     # Explicitly clear the keyboard here: editing text alone leaves whatever
     # buttons were on the previous message (e.g. the prior semester's "Sign
     # out" rows) live and tappable during this network wait, which let an
@@ -255,15 +289,22 @@ async def _render_enrolled_courses_for_semester(sender, semester_id: str):
 
     try:
         courses = await list_courses(semester_id=semester_id)
+        if not request_is_current():
+            return
     except Exception as e:
         # Stop before this edits the same status_msg with the error - see
         # the identical note in _render_open_courses_for_semester.
         await _stop_loading_animation(stop_evt, anim_task)
         logging.error("_render_enrolled_courses_for_semester: failed to fetch courses: %s", e)
+        if not request_is_current():
+            return
         await _reply_or_edit(sender, f"❌ Error: {str(e)[:200]}", reply_markup=InlineKeyboardMarkup([]))
         return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
+
+    if not request_is_current():
+        return
 
     change_semester_row = InlineKeyboardButton("📆 Change Semester", callback_data="change_sem|deenroll")
 
@@ -284,8 +325,13 @@ async def _render_enrolled_courses_for_semester(sender, semester_id: str):
     try:
         session = await login_studip()
         type_map = await get_course_type_map(session, semester_id=semester_id)
+        if not request_is_current():
+            return
     except Exception as e:
         logging.warning("_render_enrolled_courses_for_semester: type lookup failed, showing list without types: %s", e)
+
+    if not request_is_current():
+        return
 
     keyboard = []
     for name, cid in courses:
@@ -314,8 +360,9 @@ async def _list_course_files(cid, skip_folder_re=None, session=None) -> list:
             try:
                 sub = await list_files(cid, item["url"], session=session)
             except Exception as e:
-                logging.warning("_list_course_files: list_files failed for folder %s: %s", item.get('name'), e)
-                continue
+                # A partial listing must not be treated as a complete snapshot:
+                # callers use it to prune stale cached course material.
+                raise RuntimeError(f"Could not list course folder {item.get('name')!r}") from e
             out.extend((item["name"], f) for f in sub if f.get("type") == "file")
     return out
 
@@ -359,20 +406,31 @@ def load_course_index() -> dict:
     data: dict = {"files": {}}
     if db.exists(COURSE_INDEX_PATH):
         try:
-            data = db.load(COURSE_INDEX_PATH) or {"files": {}}
+            stored = db.load(COURSE_INDEX_PATH)
+            if not isinstance(stored, dict):
+                raise ValueError("top-level value is not an object")
+            files = stored.get("files")
+            if not isinstance(files, dict):
+                raise ValueError("files value is not an object")
+            data = {**stored, "files": {
+                key: entry for key, entry in files.items()
+                if isinstance(key, str) and isinstance(entry, dict)
+                and isinstance(entry.get("course"), str) and isinstance(entry.get("file"), str)
+            }}
         except Exception as e:
-            logging.warning("Could not load course index: %s", e)
+            logging.warning("Could not load course index (%s); starting with an empty index", e)
     _course_index_cache = data
     return data
 
 
 def save_course_index(data: dict) -> None:
     global _course_index_cache, _course_vectors_cache
-    _course_index_cache, _course_vectors_cache = data, None
     try:
         db.save(COURSE_INDEX_PATH, data)
     except Exception as e:
         logging.error("Failed to save course index: %s", e)
+        raise
+    _course_index_cache, _course_vectors_cache = data, None
 
 
 async def _load_course_index_async() -> dict:
@@ -384,9 +442,23 @@ def _course_vectors(index: dict) -> list:
     if _course_vectors_cache is None:
         rows = []
         for key, entry in (index.get("files") or {}).items():
+            if (not isinstance(key, str) or not isinstance(entry, dict)
+                    or not isinstance(entry.get("course"), str) or not isinstance(entry.get("file"), str)):
+                continue
             cid = key.split("|", 1)[0]
-            for chunk in entry.get("chunks", []):
-                rows.append((cid, entry, chunk, array("f", _unpack_vector(chunk["vec"]))))
+            chunks = entry.get("chunks", [])
+            if not isinstance(chunks, list):
+                continue
+            for chunk in chunks:
+                if not isinstance(chunk, dict) or not isinstance(chunk.get("text"), str):
+                    continue
+                try:
+                    vec = array("f", _unpack_vector(chunk["vec"]))
+                except (KeyError, TypeError, ValueError, struct.error) as exc:
+                    logging.warning("Skipping malformed course-index vector for %s: %s", key, exc)
+                    continue
+                if vec:
+                    rows.append((cid, entry, chunk, vec))
         _course_vectors_cache = rows
     return _course_vectors_cache
 
@@ -394,8 +466,15 @@ def _course_vectors(index: dict) -> list:
 def _score_chunks(index: dict, query: "array[float]", allowed: set) -> list:
     """(score, entry, chunk) for every chunk of the allowed courses, best
     first; plain CPU work, run in a thread."""
-    scored = [(sum(map(operator.mul, query, vec)), entry, chunk)
-              for cid, entry, chunk, vec in _course_vectors(index) if cid in allowed]
+    scored = []
+    for cid, entry, chunk, vec in _course_vectors(index):
+        if cid not in allowed:
+            continue
+        if len(query) != len(vec):
+            logging.warning("Skipping course-index vector with dimension %s; query has dimension %s",
+                            len(vec), len(query))
+            continue
+        scored.append((sum(map(operator.mul, query, vec)), entry, chunk))
     scored.sort(key=lambda x: -x[0])
     return scored
 
@@ -431,14 +510,17 @@ def _chunk_text(text: str) -> list:
     return chunks
 
 
-async def embed_texts(texts: list) -> Optional[list]:
+async def embed_texts(texts: list, user_id: Optional[int] = None) -> Optional[list]:
     """Embedding vectors for texts via GWDG (one request), or None."""
-    if not GWDG_API_KEY or not texts or time.monotonic() < state._gwdg_blocked_until or not use_ai_budget():
+    if (user_id is None or not personal_ai_allowed(user_id) or not GWDG_API_KEY or not texts
+            or time.monotonic() < state._gwdg_blocked_until or not use_ai_budget(user_id=user_id)):
         return None
     try:
         async with shared_http() as session:
             for attempt in range(2):
                 await _gwdg_throttle()
+                if not personal_ai_allowed(user_id):
+                    return None
                 async with session.post(
                     f"{GWDG_API_URL}/embeddings",
                     headers={"Authorization": f"Bearer {GWDG_API_KEY}"},
@@ -454,6 +536,8 @@ async def embed_texts(texts: list) -> Optional[list]:
         if status != 200 or data is None:
             logging.warning("GWDG embeddings failed: HTTP %s", status)
             return None
+        if not personal_ai_allowed(user_id):
+            return None
         return [d["embedding"] for d in sorted(data["data"], key=lambda d: d["index"])]
     except Exception as e:
         logging.warning("GWDG embeddings failed: %s: %s", type(e).__name__, e)
@@ -461,19 +545,21 @@ async def embed_texts(texts: list) -> Optional[list]:
 
 
 @single_flight
-async def index_course_files(session) -> dict:
+async def index_course_files(session, user_id: Optional[int] = None,
+                             prune_unenrolled: bool = True) -> dict:
     """Bring course_index.json up to date with every enrolled course's
     files: new or changed ones are downloaded, read (Docling for scans),
     chunked and embedded; files gone from Stud.IP are dropped. Stops after
     COURSE_INDEX_MAX_CALLS embedding requests and continues next run.
     Returns {"indexed": n_files, "chunks": n_chunks, "removed": n}."""
     stats = {"indexed": 0, "chunks": 0, "removed": 0}
-    if not GWDG_API_KEY:
+    if user_id is None or not get_ai_personal_enabled(user_id) or not GWDG_API_KEY:
         return stats
     # every followed course, each read with one of its own members' sessions
     # (course_registry.pick_scanner): students' courses are indexed too, and
     # nobody's login reads a course they don't take
-    plan = await watched_courses()
+    allowed_courses = set(student_courses(user_id))
+    plan = [row for row in await watched_courses() if row[1] in allowed_courses]
     if not plan:
         return stats  # nothing signed in: keep the index as it is
     index = await _load_course_index_async()
@@ -497,7 +583,8 @@ async def index_course_files(session) -> dict:
             key = f"{cid}|{rel}"
             seen.add(key)
             dt = _parse_file_date_v2(f.get("modified"), f.get("modified_iso"))
-            modified_ts = None if dt == datetime.min else int(dt.timestamp())
+            timestamp = file_date_timestamp(dt)
+            modified_ts = None if timestamp is None else int(timestamp)
             size = str(f.get("size", "-")).strip()
             old = files_index.get(key)
             if old and old.get("size") == size and old.get("modified_ts") == modified_ts:
@@ -508,17 +595,23 @@ async def index_course_files(session) -> dict:
                 async with await http.get(url) as resp:
                     if resp.status != 200:
                         continue
-                    content = await resp.read()
+                    content = await read_response_limited(resp, STUDY_PLAN_MAX_FILE_MB * 1024 * 1024)
+            except DownloadTooLargeError as e:
+                logging.warning("index_course_files: skipped oversized file %s: %s", rel, e)
+                continue
             except Exception as e:
                 logging.warning("index_course_files: download failed for %s: %s", rel, e)
                 continue
-            text = await extract_text_from_file_async(name, content)
+            text = await extract_text_from_file_async(name, content, user_id=user_id)
             chunks = _chunk_text(text or "")
             vectors = []
             for i in range(0, len(chunks), COURSE_INDEX_BATCH):
                 if calls >= COURSE_INDEX_MAX_CALLS:
                     break
-                batch = await embed_texts([f"{course_name} | {rel}\n{c}" for c in chunks[i:i + COURSE_INDEX_BATCH]])
+                batch = await embed_texts(
+                    [f"{course_name} | {rel}\n{c}" for c in chunks[i:i + COURSE_INDEX_BATCH]],
+                    user_id=user_id,
+                )
                 calls += 1
                 if batch is None:
                     break
@@ -539,12 +632,39 @@ async def index_course_files(session) -> dict:
     for key in [k for k in files_index if k not in seen and k.split("|", 1)[0] in enrolled - unread]:
         del files_index[key]
         stats["removed"] += 1
-    for key in [k for k in files_index if k.split("|", 1)[0] not in enrolled]:
-        del files_index[key]
-        stats["removed"] += 1
+    # A missing course can mean its student's course list failed this cycle,
+    # not that the student left it. Only prune courses absent from a complete
+    # watch plan; otherwise a temporary API error would erase their index.
+    if prune_unenrolled and state.course_watch_plan_complete:
+        for key in [k for k in files_index if k.split("|", 1)[0] not in enrolled]:
+            del files_index[key]
+            stats["removed"] += 1
     await asyncio.to_thread(save_course_index, index)
     logging.info("index_course_files: %s, %s embedding calls", stats, calls)
     return stats
+
+
+async def prune_course_index(keep_course_ids: set[str]) -> int:
+    """Prune courses only after the watcher has a complete, cross-user view.
+
+    The material index is shared, while indexing is authorized per student.
+    Calling the per-student indexer's local pruning after every account would
+    delete the previous student's courses. The watcher passes the union here
+    once its full scan is complete.
+    """
+    if not state.course_watch_plan_complete:
+        return 0
+    index = await _load_course_index_async()
+    files_index = index.get("files")
+    if not isinstance(files_index, dict):
+        return 0
+    stale = [key for key in files_index
+             if isinstance(key, str) and key.split("|", 1)[0] not in keep_course_ids]
+    for key in stale:
+        files_index.pop(key, None)
+    if stale:
+        await asyncio.to_thread(save_course_index, index)
+    return len(stale)
 
 
 async def search_course_material(question: str, user_id: Optional[int] = None,
@@ -553,13 +673,15 @@ async def search_course_material(question: str, user_id: Optional[int] = None,
     the question that clear COURSE_SEARCH_MIN_SCORE, as [{"course", "file",
     "text", "score"}], best first; [] without a student, an index or a
     query embedding."""
+    if user_id is None or not get_ai_personal_enabled(user_id):
+        return []
     allowed = set(student_courses(user_id))
     if not allowed:
         return []
     index = await _load_course_index_async()
     if not index.get("files"):
         return []
-    vectors = await embed_texts([COURSE_SEARCH_INSTRUCTION + question])
+    vectors = await embed_texts([COURSE_SEARCH_INSTRUCTION + question], user_id=user_id)
     if not vectors:
         return []
     norm = sum(x * x for x in vectors[0]) ** 0.5 or 1.0
@@ -583,6 +705,15 @@ async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
     exercise material (README, syllabus, quizzes) are never downloaded,
     since the planner doesn't schedule them. When the student picked
     which courses to track, only those are scanned."""
+    if user_id is None or not get_ai_personal_enabled(user_id):
+        cached_topics = load_study_plan_cache()
+        user_courses_map = student_courses(user_id) if user_id is not None else state.courses_map
+        tracked = load_study_progress(user_id=user_id).get("tracked")
+        course_ids = set(user_courses_map)
+        if tracked is not None:
+            course_ids &= set(tracked)
+        return {cid: entries for cid, entries in cached_topics.items() if cid in course_ids}
+
     if user_id is None or (session is not None and session is state.global_session):
         await _ensure_watched_courses_map(session)  # only the watcher's own session rebuilds its map
     tracked = load_study_progress(user_id=user_id).get("tracked")
@@ -607,6 +738,11 @@ async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
                 return
 
             course_cache = cache.setdefault(cid, {})
+            listed_keys = {
+                f"{folder}/{f.get('name')}" if folder else f.get("name")
+                for folder, f in files
+                if f.get("name")
+            }
             for folder, f in files:
                 name = f.get("name")
                 url = f.get("url")
@@ -621,7 +757,8 @@ async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
                 key = f"{folder}/{name}" if folder else name
 
                 dt = _parse_file_date_v2(f.get("modified"), f.get("modified_iso"))
-                modified_ts = None if dt == datetime.min else int(dt.timestamp())
+                timestamp = file_date_timestamp(dt)
+                modified_ts = None if timestamp is None else int(timestamp)
                 cur_size = str(f.get("size", "-")).strip()
 
                 old = course_cache.get(key)
@@ -639,18 +776,28 @@ async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
                     async with await active_session.get(url) as resp:
                         if resp.status != 200:
                             continue
-                        content = await resp.read()
+                        content = await read_response_limited(resp, STUDY_PLAN_MAX_FILE_MB * 1024 * 1024)
+                except DownloadTooLargeError as e:
+                    logging.warning("collect_course_topics: skipped oversized file %s: %s", key, e)
+                    continue
                 except Exception as e:
                     logging.warning("collect_course_topics: download failed for %s: %s", key, e)
                     continue
 
-                text = await extract_text_from_file_async(name, content)
+                text = await extract_text_from_file_async(name, content, user_id=user_id)
                 if not text:
                     continue
-                summary = await summarize_lecture_file(name, text)
-                if not summary:
+                if not get_ai_personal_enabled(user_id):
+                    return
+                summary = await summarize_lecture_file(name, text, user_id=user_id)
+                if not get_ai_personal_enabled(user_id) or not summary:
                     continue
                 course_cache[key] = {"summary": summary, "size": cur_size, "modified_ts": modified_ts, "folder": folder}
+
+            # Remove summaries for files that disappeared from a successfully
+            # listed course. Preserve entries when listing a folder failed above.
+            for stale_key in set(course_cache) - listed_keys:
+                course_cache.pop(stale_key, None)
 
     await asyncio.gather(*(process_course(name, cid) for name, cid in courses))
     save_study_plan_cache(cache)
@@ -837,8 +984,7 @@ async def _list_course_files_deep(cid, session=None) -> list:
         try:
             sub = await list_files(cid, item["url"], session=session)
         except Exception as e:
-            logging.warning("_list_course_files_deep: listing failed for %s: %s", item.get('name'), e)
-            continue
+            raise RuntimeError(f"Could not list course folder {item.get('name')!r}") from e
         for s in sub:
             if s.get("type") == "file":
                 out.append((item["name"], s))
@@ -849,7 +995,7 @@ async def _list_course_files_deep(cid, session=None) -> list:
                 try:
                     out.extend((f"{item['name']}/{s['name']}", f) for f in await list_files(cid, s["url"], session=session) if f.get("type") == "file")
                 except Exception as e:
-                    logging.warning("_list_course_files_deep: listing failed for %s/%s: %s", item['name'], s.get('name'), e)
+                    raise RuntimeError(f"Could not list course folder {item['name']!r}/{s.get('name')!r}") from e
     return out
 
 
@@ -886,7 +1032,8 @@ async def collect_course_workload(session, cids: list) -> dict:
                 if _file_size_mb(cur_size) > STUDY_PLAN_MAX_FILE_MB:
                     continue
                 dt = _parse_file_date_v2(f.get("modified"), f.get("modified_iso"))
-                modified_ts = None if dt == datetime.min else int(dt.timestamp())
+                timestamp = file_date_timestamp(dt)
+                modified_ts = None if timestamp is None else int(timestamp)
                 old = old_entries.get(key)
                 if old is not None and old.get("kind") == kind and str(old.get("size", "-")).strip() == cur_size and not (
                     old.get("modified_ts") and modified_ts and abs(modified_ts - old["modified_ts"]) > 86400
@@ -897,7 +1044,10 @@ async def collect_course_workload(session, cids: list) -> dict:
                     async with await http.get(url) as resp:
                         if resp.status != 200:
                             continue
-                        content = await resp.read()
+                        content = await read_response_limited(resp, STUDY_PLAN_MAX_FILE_MB * 1024 * 1024)
+                except DownloadTooLargeError as e:
+                    logging.warning("collect_course_workload: skipped oversized file %s: %s", key, e)
+                    continue
                 except Exception as e:
                     logging.warning("collect_course_workload: download failed for %s: %s", key, e)
                     continue
@@ -1103,7 +1253,7 @@ def _semester_lecture_start(today):
     return datetime(today.year - 1, 10, 1).date()
 
 
-async def count_lectures_held(session, course_candidates: list) -> dict:
+async def count_lectures_held(session, course_candidates: list, user_id: Optional[int] = None) -> dict:
     """{cid: number of lecture sessions already held this semester}, from
     the Stud.IP calendar. Only "Vorlesung"/"Lecture"/"Seminar" entries count
     (exercises repeat the lecture's material), and cancelled ones are
@@ -1114,7 +1264,7 @@ async def count_lectures_held(session, course_candidates: list) -> dict:
     from unibot.voice import _best_title_match
     today = datetime.now(TZ_BERLIN).date()
     start = _semester_lecture_start(today)
-    events = await get_calendar_events(session, start, days=(today - start).days + 1)
+    events = await get_calendar_events(session, start, days=(today - start).days + 1, user_id=user_id)
     now = datetime.now(TZ_BERLIN)
     known = {cid for _name, cid in course_candidates}
     held: dict = {}
@@ -1143,7 +1293,7 @@ async def _get_lectures_held(session, progress: dict, refresh: bool = False, use
         return progress["held"]
     courses_dict = (student_courses(user_id) if user_id else state.courses_map)
     course_candidates = [(name, cid) for cid, name in courses_dict.items()]
-    held = await count_lectures_held(session, course_candidates)
+    held = await count_lectures_held(session, course_candidates, user_id=user_id)
     progress["held"] = held
     progress["held_date"] = today_iso
     save_study_progress(progress, user_id=user_id)
@@ -1177,8 +1327,12 @@ def compute_course_progress(course_files: dict, held: dict, progress: dict, name
         units = build_course_units(course_files.get(cid, {}), workload.get(cid, {}), video_rate)
         lectures = units["lectures"]
         if units["dated"]:
-            # Dated folders say exactly which material belongs to which
-            # class, so no need to estimate from the held-lecture count.
+            # Dated folders say which class a unit belongs to, but a course
+            # can retain dated folders from earlier semesters. This progress
+            # view is for the current semester, matching count_lectures_held.
+            semester_start = _semester_lecture_start(today)
+            lectures = [u for u in lectures if u["date"] >= semester_start]
+            units["lectures"] = lectures
             covered = [u for u in lectures if u["date"] <= today]
         else:
             covered = list(lectures[:n_held])
@@ -1225,7 +1379,7 @@ def _split_gaps_into_blocks(gaps: list) -> list:
     return blocks
 
 
-def find_free_study_windows(events: list, week_start) -> list:
+def find_free_study_windows(events: list, week_start, user_id: Optional[int] = None) -> list:
     """Free windows of at least STUDY_GAP_MIN_MINUTES within each weekday's
     STUDY_DAY_START_HOUR-STUDY_DAY_END_HOUR study day, in the same dict
     shape as find_weekly_study_gaps. Unlike that function (which is shared
@@ -1269,8 +1423,9 @@ def find_free_study_windows(events: list, week_start) -> list:
                 after = clean_course_title(ev.get("title", "")) or "your previous class"
                 after_location = ev.get("location")
         # travel between campuses and the lunch break are not study time
+        owner_id = user_id if user_id is not None else current_user_id()
         planned = plan_day(busy, day_windows, day, _dtime(STUDY_DAY_START_HOUR, 0), _dtime(STUDY_DAY_END_HOUR, 0),
-                           travel=user_travel(day), anchor=campus_anchor(current_user_id()))
+                           travel=user_travel(day, owner_id), anchor=campus_anchor(owner_id))
         windows.extend(w for w in planned["windows"]
                        if w["duration_minutes"] >= STUDY_GAP_MIN_MINUTES
                        or ("lunch" in (w["after"], w["before"]) and w["duration_minutes"] >= STUDY_LUNCH_PIECE_MIN_MINUTES))
@@ -1286,14 +1441,13 @@ async def gather_weekly_study_inputs(session, user_id: Optional[int] = None) -> 
     from unibot.voice import _best_title_match
     today = datetime.now(TZ_BERLIN).date()
     next_monday = today + timedelta(days=7 - today.weekday())
-    events = await get_calendar_events(session, next_monday)
-    gaps = find_free_study_windows(events, next_monday)
+    events = await get_calendar_events(session, next_monday, user_id=user_id)
+    gaps = find_free_study_windows(events, next_monday, user_id=user_id)
 
-    try:
-        raw_exams = await get_registered_exam_schedule(session)
-    except Exception as e:
-        logging.warning("gather_weekly_study_inputs: get_registered_exam_schedule failed: %s", e)
-        raw_exams = []
+    # An unavailable exam schedule is not an empty exam schedule. Continuing
+    # would build and persist a misleading plan that ignores the student's
+    # registered exams, so let the caller report/retry this run instead.
+    raw_exams = await get_registered_exam_schedule(session)
 
     course_files = await collect_course_topics(session, user_id=user_id)
     courses_dict = (student_courses(user_id) if user_id else state.courses_map)
@@ -1350,7 +1504,7 @@ def render_workload_lines(stats: dict) -> list:
     return lines
 
 
-def build_study_plan_keyboard(plan: list, done_sessions: list) -> InlineKeyboardMarkup:
+def build_study_plan_keyboard(plan: list, done_sessions: list, plan_id: str) -> InlineKeyboardMarkup:
     keyboard = []
     done = set(done_sessions)
     for i, s in enumerate(plan):
@@ -1358,12 +1512,12 @@ def build_study_plan_keyboard(plan: list, done_sessions: list) -> InlineKeyboard
         courses = list(dict.fromkeys(p["course"] for p in s["pieces"]))
         course_label = courses[0] + (f" +{len(courses) - 1}" if len(courses) > 1 else "")
         label = f"{mark} {i + 1}. {s['day'][:3]} {s['start']} {course_label}"
-        keyboard.append([InlineKeyboardButton(label[:60], callback_data=f"sp_plan|{i}")])
+        keyboard.append([InlineKeyboardButton(label[:60], callback_data=f"sp_plan|{plan_id}|{i}")])
     keyboard.append([InlineKeyboardButton("📊 Progress", callback_data="sp_progress")])
     return InlineKeyboardMarkup(keyboard)
 
 
-async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None, user_id: Optional[int] = None) -> str:
+async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None, user_id: Optional[int] = None) -> Optional[str]:
     """End-to-end weekly study plan: gather inputs, schedule, render, send
     to every user_id. Returns the rendered message text. status_msg, if
     given, is edited through the stages (used by the manual /studyplan
@@ -1374,17 +1528,30 @@ async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None, use
     if user_id is None and user_ids and len(user_ids) == 1:
         user_id = user_ids[0]
     inputs = await gather_weekly_study_inputs(session, user_id=user_id)
+    if user_id is not None and not db.private_context_is_current(user_id):
+        return None
 
     if not inputs["gaps"]:
         text = "\n".join(
             ["📘 No free study gaps found in next week's schedule, fully booked! No study plan to suggest this week.", ""]
             + render_behind_lines(inputs["rows"])
         )
+        failed = []
         for uid in user_ids:
+            if user_id == uid and not db.private_context_is_current(uid):
+                return None
+            if not is_user_allowed(uid):
+                continue
             try:
-                await bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
+                for chunk in _split_message(text):
+                    if user_id == uid and not db.private_context_is_current(uid):
+                        return None
+                    await bot.send_message(chat_id=uid, text=chunk, parse_mode="HTML")
             except Exception as e:
                 logging.warning("run_weekly_study_plan_job: failed to send to %s: %s", uid, e)
+                failed.append(uid)
+        if failed:
+            raise RuntimeError(f"Weekly study plan failed to send to {len(failed)} user(s)")
         return text
 
     if status_msg:
@@ -1394,6 +1561,8 @@ async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None, use
     progress = load_study_progress(user_id=user_id)
     progress["last_plan"] = plan["sessions"]
     progress["last_plan_done"] = []
+    plan_id = secrets.token_hex(6)
+    progress["last_plan_id"] = plan_id
     save_study_progress(progress, user_id=user_id)
 
     text = render_weekly_study_plan_message(plan, inputs["gaps"], inputs["exams"], inputs["rows"])
@@ -1401,16 +1570,28 @@ async def run_weekly_study_plan_job(bot, user_ids, session, status_msg=None, use
         names = ", ".join(sorted(html.escape(c) for c in short_courses))
         text += (f"\n\n⏱️ <i>Shorter sessions (max {STUDY_PLAN_SHORT_SESSION_MINUTES} min) for {names}:"
                  " most of their recent blocks were skipped.</i>")
-    reply_markup = build_study_plan_keyboard(plan["sessions"], []) if plan["sessions"] else None
+    reply_markup = build_study_plan_keyboard(plan["sessions"], [], plan_id) if plan["sessions"] else None
     now = datetime.now(TZ_BERLIN)
+    if user_id is not None and not db.private_context_is_current(user_id):
+        return None
+    failed = []
     for uid in user_ids:
+        if user_id == uid and not db.private_context_is_current(uid):
+            return None
+        if not is_user_allowed(uid):
+            continue
         summary = study_block_summary_line(uid, now)
         chunks = _split_message(f"{text}\n\n{summary}" if summary else text)
         try:
             for i, chunk in enumerate(chunks):
+                if user_id == uid and not db.private_context_is_current(uid):
+                    return None
                 await bot.send_message(chat_id=uid, text=chunk, parse_mode="HTML", reply_markup=reply_markup if i == len(chunks) - 1 else None)
         except Exception as e:
             logging.warning("run_weekly_study_plan_job: failed to send to %s: %s", uid, e)
+            failed.append(uid)
+    if failed:
+        raise RuntimeError(f"Weekly study plan failed to send to {len(failed)} user(s)")
     return text
 
 
@@ -1435,10 +1616,19 @@ async def handle_study_plan_toggle(update: Update, context: ContextTypes.DEFAULT
     that session's minutes to its tasks and refresh the checkmarks."""
     query = update.callback_query
     user_id = update.effective_user.id if update.effective_user else None
+    if (user_id is None or not db.private_context_is_current(user_id)
+            or not is_user_allowed(user_id)):
+        await query.answer("This action is no longer available.", show_alert=True)
+        return
     progress = load_study_progress(user_id=user_id)
     plan = progress.get("last_plan", [])
     try:
-        idx = int(query.data.split("|", 1)[1])
+        _, callback_plan_id, raw_idx = query.data.split("|", 2)
+        if callback_plan_id != progress.get("last_plan_id"):
+            raise ValueError("stale plan")
+        idx = int(raw_idx)
+        if idx < 0 or idx >= len(plan):
+            raise IndexError("invalid session index")
         s = plan[idx]
         pieces = s["pieces"]
     except (ValueError, IndexError, KeyError):
@@ -1457,7 +1647,8 @@ async def handle_study_plan_toggle(update: Update, context: ContextTypes.DEFAULT
     save_study_progress(progress, user_id=user_id)
     await query.answer("Session done ✅" if now_done else "Session unmarked")
     try:
-        await query.edit_message_reply_markup(reply_markup=build_study_plan_keyboard(plan, done))
+        await query.edit_message_reply_markup(reply_markup=build_study_plan_keyboard(
+            plan, done, progress["last_plan_id"]))
     except Exception as e:
         logging.debug("handle_study_plan_toggle: keyboard refresh skipped: %s", e)
 
@@ -1586,7 +1777,10 @@ async def track_courses_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     status_msg = await update.message.reply_text("🎯 Loading your courses...", disable_notification=True)
     try:
-        text, markup = render_track_menu(await _load_track_menu_progress(user_id=user_id), user_id=user_id)
+        progress = await _load_track_menu_progress(user_id=user_id)
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
+        text, markup = render_track_menu(progress, user_id=user_id)
         await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
 
     except Exception as e:
@@ -1606,12 +1800,17 @@ async def handle_study_track_menu(update: Update, context: ContextTypes.DEFAULT_
     except RuntimeError as e:  # their session expired: say so instead of a silent button
         await query.message.reply_text(f"❌ {e}")
         return
+    if user_id is None or not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        return
     data = query.data
     if data == "sp_track_auto":
         progress.pop("tracked", None)
         save_study_progress(progress, user_id=user_id)
     elif data.startswith("sp_track|"):
         cid = data.split("|", 1)[1]
+        if cid not in student_courses(user_id):
+            await query.message.reply_text("This course is not in your course list. Reopen /trackcourses.")
+            return
         tracked = progress.get("tracked")
         if tracked is None:
             tracked = _auto_tracked_cids(progress, user_id=user_id)
@@ -1630,6 +1829,11 @@ def _course_view_units(row: dict) -> list:
     view: everything held so far, then the not-yet-held lectures."""
     covered_ids = {id(u) for u in row["covered"]}
     return row["covered"] + [u for u in row["lectures"] if id(u) not in covered_ids]
+
+
+def _unit_callback_key(unit: dict) -> str:
+    """Compact stable key so old progress buttons cannot toggle a new row at the same index."""
+    return hashlib.sha256(str(unit.get("file", "")).encode("utf-8")).hexdigest()[:12]
 
 
 def render_course_progress(row: dict) -> tuple:
@@ -1653,7 +1857,10 @@ def render_course_progress(row: dict) -> tuple:
         left = f" <i>({u['remaining']} of {total} min left)</i>" if 0 < u["remaining"] < total else (f" <i>(~{total} min)</i>" if not u["done"] else "")
         lines.append(f"{mark} {html.escape(_unit_label(u), quote=False)}{left}")
         if i < 40:
-            keyboard.append([InlineKeyboardButton(f"{mark} {_unit_label(u)}"[:60], callback_data=f"sp_unit|{row['cid']}|{i}")])
+            keyboard.append([InlineKeyboardButton(
+                f"{mark} {_unit_label(u)}"[:60],
+                callback_data=f"sp_unit|{row['cid']}|{_unit_callback_key(u)}",
+            )])
     lines.append("━━━━━━━━━━━━━━━━━━")
     lines.append("✅ done · ⚠️ held in class, work left · ⬜ not held yet")
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="sp_progress")])
@@ -1667,6 +1874,8 @@ async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = await update.message.reply_text("📊 Loading study progress...\n\n📚 Scanning course files...", disable_notification=True)
     try:
         rows, _ = await _load_progress_rows(refresh=True, user_id=user_id)
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
         text, markup = render_progress_overview(rows)
         await status_msg.edit_text(text, parse_mode="HTML", reply_markup=markup)
 
@@ -1676,7 +1885,7 @@ async def progress_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """sp_progress / sp_progress_refresh / sp_course|cid / sp_unit|cid|i."""
+    """sp_progress / sp_progress_refresh / sp_course|cid / sp_unit|cid|key."""
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id if update.effective_user else None
@@ -1685,6 +1894,8 @@ async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAU
         rows, progress = await _load_progress_rows(refresh=(data == "sp_progress_refresh"), user_id=user_id)
     except RuntimeError as e:  # their session expired: say so instead of a silent button
         await query.message.reply_text(f"❌ {e}")
+        return
+    if user_id is None or not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
         return
 
     if data in ("sp_progress", "sp_progress_refresh"):
@@ -1700,7 +1911,7 @@ async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAU
                 # 🔄 Refresh with nothing changed: Telegram rejects an identical edit.
                 if "not modified" not in str(e).lower():
                     raise
-            return
+        return
 
     parts = data.split("|")
     row = next((r for r in rows if r["cid"] == parts[1]), None)
@@ -1710,9 +1921,10 @@ async def handle_study_progress_menu(update: Update, context: ContextTypes.DEFAU
 
     if parts[0] == "sp_unit":
         units = _course_view_units(row)
-        try:
-            unit = units[int(parts[2])]
-        except (ValueError, IndexError):
+        unit = next((candidate for candidate in units
+                     if _unit_callback_key(candidate) == parts[2]), None)
+        if unit is None:
+            await query.message.reply_text("⚠️ This lecture list changed. Refresh the progress view.")
             return
         _toggle_studied(progress, unit, row["cid"])
         save_study_progress(progress, user_id=user_id)
@@ -1752,10 +1964,19 @@ async def study_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             disable_notification=True,
         )
         active_session = await _own_session(user_id)
-        await run_weekly_study_plan_job(context.bot, [user_id], active_session, status_msg=status_msg, user_id=user_id)
-        await status_msg.edit_text("✅ Study plan ready, see below 👇")
+        result = await run_weekly_study_plan_job(
+            context.bot, [user_id], active_session, status_msg=status_msg, user_id=user_id,
+        )
+        if result is None:
+            try:
+                await status_msg.delete()
+            except TelegramError:
+                pass
+        else:
+            await status_msg.edit_text("✅ Study plan ready, see below 👇")
     except Exception as e:
-        await update.message.reply_text(f"❌ Fatal error: {e}")
+        if db.private_context_is_current(user_id):
+            await update.message.reply_text(f"❌ Fatal error: {e}")
         logging.exception("study_plan_command failed")
     finally:
         study_plan_in_progress.discard(chat_id)
@@ -1903,8 +2124,8 @@ async def build_study_pack(window: dict, user_id: int, now: datetime) -> tuple[s
     if buttons:
         lines.append("📎 Ready for you:")
     start_ts = int(window["start_dt"].timestamp())
-    buttons.append([InlineKeyboardButton("✅ Studied", callback_data=f"sp_block|{start_ts}|done"),
-                    InlineKeyboardButton("⏭ Skipped", callback_data=f"sp_block|{start_ts}|skipped")])
+    buttons.append([InlineKeyboardButton("✅ Studied", callback_data=f"sp_block|{user_id}|{start_ts}|done"),
+                    InlineKeyboardButton("⏭ Skipped", callback_data=f"sp_block|{user_id}|{start_ts}|skipped")])
     lines.append("━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
@@ -1978,32 +2199,53 @@ def study_block_summary_line(user_id: int, now: datetime) -> str:
 
 
 async def handle_study_block_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """sp_block|<start ts>|done|skipped: the student's answer on a study pack."""
+    """Answer an owned study pack, including buttons sent before owner IDs."""
     query = update.callback_query
     parts = query.data.split("|")
-    if len(parts) != 3 or parts[2] not in ("done", "skipped") or not parts[1].isdigit():
+    user_id = query.from_user.id
+    if len(parts) == 3:
+        # Old cards omitted the owner. The private sent-block lookup below
+        # still requires this timestamp to belong to the tapping student.
+        parts.insert(1, str(user_id))
+    if (len(parts) != 4 or parts[3] not in ("done", "skipped")
+            or not parts[1].isdigit() or not parts[2].isdigit()):
         await query.answer()
         return
-    user_id = query.from_user.id
-    record_study_block(user_id, int(parts[1]), parts[2])
-    await query.answer("Nice work! 💪" if parts[2] == "done" else "Noted, let's find another time.")
+    if int(parts[1]) != user_id:
+        await query.answer("This study block belongs to another account.", show_alert=True)
+        return
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        await query.answer("This action is no longer available.", show_alert=True)
+        return
+    start_ts = int(parts[2])
+    sent_block = next((block for block in study_block_log(user_id, start_ts, start_ts + 1)
+                       if block["ts"] == start_ts), None)
+    if sent_block is None or sent_block.get("status") != "sent":
+        await query.answer("This study block was already answered or has expired.", show_alert=True)
+        return
+    record_study_block(user_id, start_ts, parts[3])
+    await query.answer("Nice work! 💪" if parts[3] == "done" else "Noted, let's find another time.")
     # keep the download buttons, swap the answer row for the answer
     rows = [row for row in (query.message.reply_markup.inline_keyboard if query.message.reply_markup else [])
             if not any((b.callback_data or "").startswith("sp_block|") for b in row)]
-    rows.append([InlineKeyboardButton("✅ Studied" if parts[2] == "done" else "⏭ Skipped", callback_data="sp_block|answered")])
+    rows.append([InlineKeyboardButton("✅ Studied" if parts[3] == "done" else "⏭ Skipped", callback_data="sp_block|answered")])
     makeup_line = None
-    if parts[2] == "skipped":
+    if parts[3] == "skipped":
         try:
             slot = await find_makeup_slot(user_id, datetime.now(TZ_BERLIN))
         except Exception as e:
             logging.warning("Study block feedback: no make-up slot (%s)", e)
             slot = None
+        if not db.private_context_is_current(user_id):
+            return
         if slot:
             spot = f" · 📍 {html.escape(slot['study_spot'])}" if slot.get("study_spot") else ""
             makeup_line = (f"↪️ <b>Make-up slot:</b> {slot['start_dt']:%a %H:%M}–{slot['end_dt']:%H:%M} "
                            f"({format_hours(slot['duration_minutes'])}){spot}")
         else:
             makeup_line = "↪️ <i>No free study window in the next few days; the weekly plan will make room.</i>"
+    if not db.private_context_is_current(user_id):
+        return
     try:
         if makeup_line and query.message.text_html:
             await query.edit_message_text(f"{query.message.text_html}\n{makeup_line}", parse_mode="HTML",

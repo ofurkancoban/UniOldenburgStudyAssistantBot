@@ -24,6 +24,7 @@ import contextlib
 import contextvars
 import email.utils
 import logging
+import math
 import os
 import random
 import time
@@ -59,8 +60,9 @@ def user_agent() -> str:
 
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(os.getenv(name, "").strip() or default)
-    except ValueError:
+        value = float(os.getenv(name, "").strip() or default)
+        return value if math.isfinite(value) else default
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -122,10 +124,14 @@ class HostThrottle:
     MAX_COOLDOWN = 15 * 60
 
     def __init__(self, max_concurrency: Optional[int] = None, min_interval: Optional[float] = None):
-        self.max_concurrency = max_concurrency or max(1, _env_int("UNI_MAX_CONCURRENCY", 4))
-        self.min_interval = (
-            min_interval if min_interval is not None else max(0.0, _env_float("UNI_MIN_REQUEST_INTERVAL", 0.35))
-        )
+        concurrency = max_concurrency if max_concurrency is not None else _env_int("UNI_MAX_CONCURRENCY", 4)
+        self.max_concurrency = max(1, concurrency)
+        interval = min_interval if min_interval is not None else _env_float("UNI_MIN_REQUEST_INTERVAL", 0.35)
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError, OverflowError):
+            interval = 0.35
+        self.min_interval = max(0.0, interval) if math.isfinite(interval) else 0.35
         self._semaphores: dict[str, asyncio.Semaphore] = {}
         self._loops: dict[str, object] = {}
         self._next_slot: dict[str, float] = {}
@@ -162,15 +168,39 @@ class HostThrottle:
             await asyncio.sleep(remaining)
         sem = self._semaphore(host)
         async with sem:
+            # Another in-flight request can receive 429/503 while this one
+            # waits for the semaphore. Recheck after acquiring it so queued
+            # requests honor the newer host-wide cooldown instead of
+            # immediately sending a burst into the upstream.
+            while True:
+                remaining = self.cooldown_remaining(host)
+                if remaining > self.MAX_INLINE_WAIT:
+                    raise UniHostCooldown(host, remaining)
+                if not remaining:
+                    break
+                await asyncio.sleep(remaining)
             interval = self.min_interval * _SPACING_FACTOR.get(_priority.get(), 1.0)
             if interval:
                 async with self._spacing_lock[host]:
-                    now = time.monotonic()
-                    wait = self._next_slot.get(host, 0.0) - now
-                    if wait > 0:
-                        await asyncio.sleep(wait)
-                    # small jitter so many users' jobs never line up exactly
-                    self._next_slot[host] = time.monotonic() + interval * random.uniform(0.8, 1.3)
+                    while True:
+                        # A request already in flight may receive 429/503
+                        # while this one waits for spacing. Recheck here too,
+                        # immediately before reserving a send slot.
+                        remaining = self.cooldown_remaining(host)
+                        if remaining > self.MAX_INLINE_WAIT:
+                            raise UniHostCooldown(host, remaining)
+                        if remaining:
+                            await asyncio.sleep(remaining)
+                            continue
+                        wait = self._next_slot.get(host, 0.0) - time.monotonic()
+                        if wait > 0:
+                            await asyncio.sleep(wait)
+                            continue
+                        # small jitter so many users' jobs never line up exactly
+                        self._next_slot[host] = (
+                            time.monotonic() + interval * random.uniform(0.8, 1.3)
+                        )
+                        break
             yield
 
     def _set_cooldown(self, host: str, seconds: float, reason: str) -> None:
@@ -202,7 +232,8 @@ class HostThrottle:
         if status in (429, 503):
             streak = self._failures.get(host, 0) + 1
             self._failures[host] = streak
-            self._set_cooldown(host, retry_after if retry_after else 30.0 * (2 ** min(streak - 1, 5)),
+            self._set_cooldown(host, retry_after if retry_after is not None
+                               else 30.0 * (2 ** min(streak - 1, 5)),
                                f"HTTP {status}")
             return
         if failed or (status is not None and status >= 500):
@@ -294,7 +325,7 @@ def rewrite_headers(headers: CIMultiDictProxy, location: Optional[str]) -> CIMul
         kl = k.lower()
         if kl == "location":
             continue
-        if kl == "x-upstream-set-cookie":
+        if kl in ("x-upstream-set-cookie", "x-upstream-set-cookie-json"):
             continue
         out.add(k, v)
     if location:

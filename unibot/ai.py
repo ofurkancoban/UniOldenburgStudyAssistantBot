@@ -13,7 +13,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Callable, Optional
 
 import aiohttp
 
@@ -30,13 +30,34 @@ from unibot.config import (
     OPENROUTER_TTS_MODEL,
     OPENROUTER_TTS_VOICE,
 )
-from unibot import state
-from unibot.auth import current_user_id, is_user_admin
-from unibot.storage import save_wardrobe_item_descriptions, shared_http, student_courses
+from unibot import db, state
+from unibot.auth import ACTIVE, current_user_id, is_user_admin, is_user_allowed, lifecycle_state
+from unibot.storage import (
+    get_ai_personal_enabled,
+    save_wardrobe_item_descriptions,
+    shared_http,
+    student_courses,
+)
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
+
+
+def personal_ai_allowed(user_id: Optional[int]) -> bool:
+    """Whether a user-scoped AI request may still send personal data.
+
+    Consent alone is not sufficient: the account may have been stopped,
+    access revoked, or its data deleted while a request was waiting on a
+    provider or its rate limiter.
+    """
+    return bool(
+        user_id is not None
+        and is_user_allowed(user_id)
+        and lifecycle_state(user_id) == ACTIVE
+        and db.private_context_is_current(user_id)
+        and get_ai_personal_enabled(user_id)
+    )
 
 
 # ── Voice-to-task (free-tier speech-to-text, no API key needed) ────────────────
@@ -62,17 +83,24 @@ async def _recognize_in_language(recognizer, audio, language: str):
 
 
 
-async def transcribe_with_whisper(ogg_path: str) -> Optional[str]:
+async def transcribe_with_whisper(ogg_path: str, user_id: Optional[int] = None) -> Optional[str]:
     """Transcribe a voice note with GWDG's Whisper (takes the OGG as is,
     detects the language itself). In a side-by-side test it kept English
     course names inside Turkish sentences ("Advanced Microeconomics
     dersinin..."), which Google's one-language-per-call endpoint dropped,
     and heard "Mensa" where Google heard "Manisa". The course names go in
     as a vocabulary hint. None if GWDG is unset or the call failed."""
-    if not GWDG_API_KEY or time.monotonic() < state._gwdg_blocked_until or not use_ai_budget():
+    if user_id is not None and not personal_ai_allowed(user_id):
+        return None
+    if (not GWDG_API_KEY or time.monotonic() < state._gwdg_blocked_until
+            or not use_ai_budget(user_id=user_id)):
         return None  # the free Google recognizer takes over
-    # the speaking student's own course names help the transcription
-    hint = ", ".join(["Stud.IP", "StuMS", "Mensa"] + sorted(set(student_courses(current_user_id()).values())))[:800]
+    # Course names are personal academic data. Only include them in the
+    # external transcription request when the student enabled personal AI use.
+    owner = user_id if user_id is not None else current_user_id()
+    course_names = sorted(set(student_courses(owner).values())) \
+        if owner is not None and get_ai_personal_enabled(owner) else []
+    hint = ", ".join(["Stud.IP", "StuMS", "Mensa"] + course_names)[:800]
     form = aiohttp.FormData()
     form.add_field("model", GWDG_WHISPER_MODEL)
     form.add_field("response_format", "json")
@@ -80,7 +108,11 @@ async def transcribe_with_whisper(ogg_path: str) -> Optional[str]:
     form.add_field("file", await aread_bytes(ogg_path), filename="voice.ogg", content_type="audio/ogg")
     try:
         await _gwdg_throttle()
+        if user_id is not None and not personal_ai_allowed(user_id):
+            return None
         async with shared_http() as session:
+            if user_id is not None and not personal_ai_allowed(user_id):
+                return None
             async with session.post(
                 f"{GWDG_API_URL}/audio/transcriptions",
                 headers={"Authorization": f"Bearer {GWDG_API_KEY}"},
@@ -92,13 +124,15 @@ async def transcribe_with_whisper(ogg_path: str) -> Optional[str]:
                     logging.warning("Whisper transcription failed: HTTP %s", resp.status)
                     return None
                 data = await resp.json(content_type=None)
+        if user_id is not None and not personal_ai_allowed(user_id):
+            return None
         return (data.get("text") or "").strip() or None
     except Exception as e:
         logging.warning("Whisper transcription failed: %s: %s", type(e).__name__, e)
         return None
 
 
-async def transcribe_voice_message(ogg_path: str) -> str:
+async def transcribe_voice_message(ogg_path: str, user_id: Optional[int] = None) -> str:
     """Convert a Telegram voice note (OGG/Opus) to text: GWDG's Whisper
     first (see transcribe_with_whisper), else SpeechRecognition's free
     Google Web Speech endpoint, trying Turkish and English concurrently.
@@ -106,9 +140,15 @@ async def transcribe_voice_message(ogg_path: str) -> str:
     RuntimeError with a user-facing message on any failure (missing ffmpeg,
     unclear audio in both languages, network issue, ...).
     """
-    text = await transcribe_with_whisper(ogg_path)
+    if user_id is not None and not personal_ai_allowed(user_id):
+        raise RuntimeError("Personal AI use is off. Enable it under /settings → Privacy to use voice messages.")
+    text = await transcribe_with_whisper(ogg_path, user_id=user_id)
     if text:
+        if user_id is not None and not personal_ai_allowed(user_id):
+            raise RuntimeError("Personal AI use was turned off. The voice message was not sent for recognition.")
         return text
+    if user_id is not None and not personal_ai_allowed(user_id):
+        raise RuntimeError("Personal AI use was turned off. The voice message was not sent for recognition.")
 
     import speech_recognition as sr
     from pydub import AudioSegment
@@ -132,9 +172,14 @@ async def transcribe_voice_message(ogg_path: str) -> str:
         recognizer = sr.Recognizer()
         audio = await asyncio.to_thread(_record, recognizer)
 
+        if user_id is not None and not personal_ai_allowed(user_id):
+            raise RuntimeError("Personal AI use was turned off. The voice message was not sent for recognition.")
+
         results = await asyncio.gather(
             *(_recognize_in_language(recognizer, audio, lang) for lang in VOICE_TASK_LANGUAGES)
         )
+        if user_id is not None and not personal_ai_allowed(user_id):
+            raise RuntimeError("Personal AI use was turned off. The voice message was not sent for recognition.")
         candidates = {}
         request_error = None
         for lang, (text, err) in zip(VOICE_TASK_LANGUAGES, results):
@@ -227,16 +272,21 @@ def _reset_seconds(value, default: int = 3600) -> int:
     text = str(value or "").strip().lower()
     if text.isdigit():
         return int(text)
-    parts = re.findall(r"(\d+(?:\.\d+)?)\s*(h|m|s|ms)", text)
+    # Match the longest suffix first: otherwise ``500ms`` is consumed as
+    # ``500m`` and delays fallback for over eight hours instead of 0.5 s.
+    parts = re.findall(r"(\d+(?:\.\d+)?)\s*(ms|h|m|s)", text)
     if not parts:
         return default
     factor = {"h": 3600, "m": 60, "s": 1, "ms": 0.001}
     return max(1, int(sum(float(n) * factor[u] for n, u in parts)))
 
 
-async def _post_gwdg_chat(session, body: dict, timeout: float) -> tuple:
+async def _post_gwdg_chat(session, body: dict, timeout: float,
+                          can_send: Optional[Callable[[], bool]] = None) -> tuple:
     """(status, json body or None, headers) of one GWDG chat request."""
     await _gwdg_throttle()
+    if can_send is not None and not can_send():
+        return 0, None, {}
     async with session.post(
         f"{GWDG_API_URL}/chat/completions",
         headers={"Authorization": f"Bearer {GWDG_API_KEY}"},
@@ -248,16 +298,21 @@ async def _post_gwdg_chat(session, body: dict, timeout: float) -> tuple:
         return resp.status, data, resp.headers
 
 
-async def _call_gwdg_chat(messages: list, model: str, temperature: float = 0, timeout: float = 15) -> Optional[str]:
+async def _call_gwdg_chat(messages: list, model: str, temperature: float = 0,
+                          timeout: float = 15,
+                          can_send: Optional[Callable[[], bool]] = None) -> Optional[str]:
     """One chat completion on GWDG's OpenAI-compatible API. Returns the
     assistant text, or None if unconfigured, rate limited or failed, so the
     caller can fall back to another provider."""
-    if not GWDG_API_KEY or time.monotonic() < state._gwdg_blocked_until:
+    if ((can_send is not None and not can_send()) or not GWDG_API_KEY
+            or time.monotonic() < state._gwdg_blocked_until):
         return None
     body = {"model": model, "temperature": temperature, "messages": messages}
     try:
         async with shared_http() as session:
-            status, data, headers = await _post_gwdg_chat(session, body, timeout)
+            status, data, headers = await _post_gwdg_chat(session, body, timeout, can_send)
+            if status == 0 and can_send is not None and not can_send():
+                return None
             if status == 429:
                 exhausted = next((w for w in ("month", "day", "hour") if headers.get(f"x-ratelimit-remaining-requests-{w}") == "0"), None)
                 if exhausted:
@@ -266,7 +321,9 @@ async def _call_gwdg_chat(messages: list, model: str, temperature: float = 0, ti
                     logging.warning("GWDG %s quota used up, using fallbacks for %ss", exhausted, wait)
                     return None
                 await asyncio.sleep(GWDG_BURST_WAIT_SECONDS)
-                status, data, headers = await _post_gwdg_chat(session, body, timeout)
+                status, data, headers = await _post_gwdg_chat(session, body, timeout, can_send)
+                if status == 0 and can_send is not None and not can_send():
+                    return None
             if status != 200:
                 logging.warning("GWDG call failed: HTTP %s", status)
                 return None
@@ -325,12 +382,15 @@ def use_ai_budget(user_id=None) -> bool:
     return True
 
 
-async def _call_openrouter(system_prompt: str, user_text: str, temperature: float = 0, timeout: Optional[float] = None, reasoning: bool = True, model: Optional[str] = None, gwdg_model: Optional[str] = None) -> Optional[str]:
+async def _call_openrouter(system_prompt: str, user_text: str, temperature: float = 0,
+                           timeout: Optional[float] = None, reasoning: bool = True,
+                           model: Optional[str] = None, gwdg_model: Optional[str] = None,
+                           can_send: Optional[Callable[[], bool]] = None) -> Optional[str]:
     """One text completion: GWDG (GWDG_TEXT_MODEL) first, OpenRouter if that
     fails. Retried and with a longer timeout while _ai_patience is set. An
     explicit timeout always wins. `gwdg_model` overrides GWDG_TEXT_MODEL;
     `reasoning` and `model` only apply to the OpenRouter call."""
-    if not use_ai_budget():
+    if (can_send is not None and not can_send()) or not use_ai_budget():
         return None
     patience = _ai_patience.get()
     timeout = timeout or (patience[0] if patience else 15)
@@ -340,10 +400,22 @@ async def _call_openrouter(system_prompt: str, user_text: str, temperature: floa
     # short interactive calls, give up on it early and let OpenRouter answer.
     gwdg_timeout = timeout if timeout > 15 else min(timeout, GWDG_SHORT_TIMEOUT_SECONDS)
     for attempt in range(attempts):
-        result = await _call_gwdg_chat(messages, gwdg_model or GWDG_TEXT_MODEL, temperature, gwdg_timeout)
+        if can_send is not None and not can_send():
+            return None
+        result = await _call_gwdg_chat(
+            messages, gwdg_model or GWDG_TEXT_MODEL, temperature, gwdg_timeout,
+            can_send=can_send,
+        )
         if result is None:
-            result = await _call_openrouter_once(system_prompt, user_text, temperature, timeout, reasoning, model)
+            if can_send is not None and not can_send():
+                return None
+            result = await _call_openrouter_once(
+                system_prompt, user_text, temperature, timeout, reasoning, model,
+                can_send=can_send,
+            )
         if result is not None:
+            if can_send is not None and not can_send():
+                return None
             return result
         if attempt + 1 < attempts:
             logging.info("OpenRouter call: retrying (%s/%s)", attempt + 2, attempts)
@@ -351,7 +423,10 @@ async def _call_openrouter(system_prompt: str, user_text: str, temperature: floa
     return None
 
 
-async def _call_openrouter_once(system_prompt: str, user_text: str, temperature: float = 0, timeout: float = 15, reasoning: bool = True, model: Optional[str] = None) -> Optional[str]:
+async def _call_openrouter_once(system_prompt: str, user_text: str, temperature: float = 0,
+                                timeout: float = 15, reasoning: bool = True,
+                                model: Optional[str] = None,
+                                can_send: Optional[Callable[[], bool]] = None) -> Optional[str]:
     """POST one chat completion to OpenRouter's free tier and return the raw
     assistant text, or None on any failure (missing key, network error,
     timeout, non-2xx response). Callers must treat None as "couldn't
@@ -369,10 +444,14 @@ async def _call_openrouter_once(system_prompt: str, user_text: str, temperature:
     model's thinking phase for prompts where it adds minutes but little
     quality (see pick_outfit_from_wardrobe). `model` overrides
     OPENROUTER_MODEL for one call."""
-    if not OPENROUTER_API_KEY:
+    if not OPENROUTER_API_KEY or (can_send is not None and not can_send()):
         return None
     try:
         async with shared_http() as session:
+            # shared_http may wait while another request creates or replaces
+            # the client. Recheck consent at the last point before sending.
+            if can_send is not None and not can_send():
+                return None
             async with session.post(
                 OPENROUTER_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
@@ -397,17 +476,21 @@ async def _call_openrouter_once(system_prompt: str, user_text: str, temperature:
         return None
 
 
-async def synthesize_speech(text: str) -> Optional[tuple]:
+async def synthesize_speech(text: str, can_send: Optional[Callable[[], bool]] = None) -> Optional[tuple]:
     """_synthesize_speech_once, retried and with a longer timeout while
     _ai_patience is set (see _call_openrouter)."""
-    if not use_ai_budget():
+    if (can_send is not None and not can_send()) or not use_ai_budget():
         return None
     patience = _ai_patience.get()
     timeout = max(30, patience[0]) if patience else 30
     attempts = patience[1] if patience else 1
     for attempt in range(attempts):
-        result = await _synthesize_speech_once(text, timeout)
+        if can_send is not None and not can_send():
+            return None
+        result = await _synthesize_speech_once(text, timeout, can_send=can_send)
         if result is not None:
+            if can_send is not None and not can_send():
+                return None
             return result
         if attempt + 1 < attempts:
             logging.info("TTS call: retrying (%s/%s)", attempt + 2, attempts)
@@ -415,7 +498,8 @@ async def synthesize_speech(text: str) -> Optional[tuple]:
     return None
 
 
-async def _synthesize_speech_once(text: str, timeout: float = 30) -> Optional[tuple]:
+async def _synthesize_speech_once(text: str, timeout: float = 30,
+                                  can_send: Optional[Callable[[], bool]] = None) -> Optional[tuple]:
     """Convert text to speech via OpenRouter's free-tier TTS endpoint
     (/api/v1/audio/speech - a separate API surface from chat/completions,
     so it isn't listed in /api/v1/models and doesn't go through
@@ -425,7 +509,7 @@ async def _synthesize_speech_once(text: str, timeout: float = 30) -> Optional[tu
     assumed, since it can differ by model. Returns None on any failure
     (missing key, network error, non-2xx) - callers must degrade
     gracefully (e.g. fall back to sending the plain text)."""
-    if not OPENROUTER_API_KEY:
+    if not OPENROUTER_API_KEY or (can_send is not None and not can_send()):
         return None
     payload = {"model": OPENROUTER_TTS_MODEL, "input": text}
     if OPENROUTER_TTS_VOICE:
@@ -435,6 +519,8 @@ async def _synthesize_speech_once(text: str, timeout: float = 30) -> Optional[tu
         payload["voice"] = OPENROUTER_TTS_VOICE
     try:
         async with shared_http() as session:
+            if can_send is not None and not can_send():
+                return None
             async with session.post(
                 OPENROUTER_TTS_URL,
                 headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"},
@@ -487,7 +573,8 @@ async def _pcm_to_ogg_voice(pcm_bytes: bytes, sample_rate: int) -> Optional[str]
             pass
 
 
-async def generate_outfit_tryon_gwdg(reference_bytes: bytes, garments: list) -> Optional[bytes]:
+async def generate_outfit_tryon_gwdg(reference_bytes: bytes, garments: list,
+                                    user_id: Optional[int] = None) -> Optional[bytes]:
     """Free fallback for generate_outfit_tryon_gemini on GWDG. Its image
     edit model (Qwen-Image-Edit-2511) swaps in a different person when it
     gets the garment photos too, so it only sees the reference photo plus
@@ -497,17 +584,19 @@ async def generate_outfit_tryon_gwdg(reference_bytes: bytes, garments: list) -> 
     description saved. Returns the PNG bytes, or None if unconfigured or a
     call failed."""
     from unibot.wardrobe import describe_wardrobe_item
-    if not GWDG_API_KEY or not garments:
+    if user_id is None or not personal_ai_allowed(user_id) or not GWDG_API_KEY or not garments:
         return None
     lines = []
     for item, data in garments:
+        if not personal_ai_allowed(user_id):
+            return None
         text = item.get("description")
         if not text:
-            text = await describe_wardrobe_item(item, data)
-            if not text:
+            text = await describe_wardrobe_item(item, data, user_id=user_id)
+            if not personal_ai_allowed(user_id) or not text:
                 return None
             item["description"] = text
-            save_wardrobe_item_descriptions({item["id"]: text})
+            save_wardrobe_item_descriptions({item["id"]: text}, user_id=user_id)
         lines.append(f"- {item.get('label', 'clothing item')} ({item.get('type', 'item')}): {text}")
     description = "\n".join(lines)
     prompt = (
@@ -524,7 +613,11 @@ async def generate_outfit_tryon_gwdg(reference_bytes: bytes, garments: list) -> 
     headers = {"Authorization": f"Bearer {GWDG_API_KEY}", "inference-service": GWDG_IMAGE_EDIT_SERVICE}
     try:
         await _gwdg_throttle()
+        if not personal_ai_allowed(user_id):
+            return None
         async with shared_http() as session:
+            if not personal_ai_allowed(user_id):
+                return None
             async with session.post(f"{GWDG_API_URL}/images/edits", headers=headers, data=form, timeout=aiohttp.ClientTimeout(total=180)) as resp:
                 _record_gwdg_quota(resp.headers)
                 body = await resp.read()

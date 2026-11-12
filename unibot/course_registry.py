@@ -21,8 +21,10 @@ import hashlib
 import html
 import json
 import logging
+import math
 import re
 import time
+import weakref
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable, Optional
 
@@ -33,9 +35,10 @@ from telegram.ext import ContextTypes
 from studip_utils import TZ_BERLIN
 from unibot import db, state
 from unibot.auth import ACTIVE, has_stored_login, is_user_allowed, lifecycle_state
-from unibot.formatting import TELEGRAM_HTML_LIMIT, truncate_html
+from unibot.formatting import TELEGRAM_HTML_LIMIT, _telegram_length, truncate_html
 from unibot.preferences import DIGEST_HOUR, get_pref, in_quiet_hours, morning_send_time
 from unibot.studip_api import BASE_URL
+from unibot.storage import has_course_access
 from unibot.telegram_ui import WA_FORWARD_CALLBACK_PREFIX, broadcast_targets, markup_for
 
 SCANNER_FAILURE_COOLDOWN = 3600
@@ -71,8 +74,17 @@ def _uid_of(session) -> Optional[int]:
     return getattr(session, "user_id", None)
 
 
+def _session_active(uid: Optional[int]) -> bool:
+    """Whether a scanner still belongs to an account allowed to do background work."""
+    return uid is None or (is_user_allowed(uid) and lifecycle_state(uid) == ACTIVE)
+
+
+def _candidate_uid(cid: str, session) -> Optional[int]:
+    return next((uid for uid, candidate in _candidates.get(cid, []) if candidate is session), _uid_of(session))
+
+
 def _healthy(uid: Optional[int], session, now: float) -> bool:
-    if not has_stored_login(session):
+    if not _session_active(uid) or not has_stored_login(session):
         return False
     failed = _failed_at.get(uid) if uid is not None else None
     return failed is None or now - failed > SCANNER_FAILURE_COOLDOWN
@@ -102,15 +114,30 @@ def set_candidates(cid: str, candidates: list) -> None:
     _candidates[cid] = unique
 
 
+def forget_user(user_id: int) -> None:
+    """Remove a deleted student's session from every in-memory scan plan."""
+    uid = int(user_id)
+    for cid, candidates in list(_candidates.items()):
+        remaining = [(candidate_uid, sess) for candidate_uid, sess in candidates
+                     if candidate_uid != uid]
+        if remaining:
+            _candidates[cid] = remaining
+        else:
+            _candidates.pop(cid, None)
+            _rotation.pop(cid, None)
+    _failed_at.pop(uid, None)
+
+
 def pick_scanner(cid: str, now: Optional[float] = None):
     """The next healthy member session for the course (round-robin), any
     member session when none is healthy, None when the course has none."""
     cands = _candidates.get(cid) or []
-    if not cands:
+    eligible = [c for c in cands if _session_active(c[0])]
+    if not eligible:
         return None
     now = now if now is not None else time.time()
-    healthy = [c for c in cands if _healthy(c[0], c[1], now)]
-    pool = healthy or cands
+    healthy = [c for c in eligible if _healthy(c[0], c[1], now)]
+    pool = healthy or eligible
     turn = _rotation.get(cid, 0)
     _rotation[cid] = turn + 1
     return pool[turn % len(pool)][1]
@@ -119,7 +146,7 @@ def pick_scanner(cid: str, now: Optional[float] = None):
 def failover_order(cid: str, primary, now: Optional[float] = None) -> list:
     """The primary session first, then the course's other healthy members."""
     now = now if now is not None else time.time()
-    order = [primary] if primary is not None else []
+    order = [primary] if primary is not None and _session_active(_candidate_uid(cid, primary)) else []
     for uid, sess in _candidates.get(cid) or []:
         if sess is not primary and _healthy(uid, sess, now):
             order.append(sess)
@@ -133,9 +160,15 @@ async def scan_with_failover(cid: str, primary, fetch: Callable[..., Awaitable])
     global failover_count
     last_error: Optional[BaseException] = None
     for sess in failover_order(cid, primary):
+        if not _session_active(_candidate_uid(cid, sess)):
+            continue
         try:
             result = await fetch(sess)
         except Exception as e:
+            if getattr(e, "quiet", False):
+                # A host-wide circuit breaker is unrelated to this student's
+                # credentials; another session would hit the same cooldown.
+                raise
             last_error = e
             report_failure(sess)
             logging.warning("Scanner %s failed for course %s (%s), trying the next member",
@@ -242,7 +275,7 @@ def files_link_markup(cid: Optional[str]) -> Optional[InlineKeyboardMarkup]:
         "🔗 Open in Stud.IP", url=f"{BASE_URL}/dispatch.php/course/files?cid={cid}")]])
 
 
-def _first_button(markup) -> Optional[dict]:
+def _first_button(markup, allow_wa: bool = False) -> Optional[dict]:
     """The alert's main button (download, link) kept for the digest."""
     try:
         button = markup.inline_keyboard[0][0]
@@ -251,7 +284,7 @@ def _first_button(markup) -> Optional[dict]:
     if getattr(button, "url", None):
         return {"text": button.text, "url": button.url}
     data = getattr(button, "callback_data", None)
-    if data and not str(data).startswith(WA_FORWARD_CALLBACK_PREFIX):
+    if data and (allow_wa or not str(data).startswith(WA_FORWARD_CALLBACK_PREFIX)):
         # "Forward to WA" would forward the whole digest, so it's not kept
         return {"text": button.text, "callback_data": data}
     return None
@@ -268,20 +301,66 @@ def _hold_reason(uid: int, now: datetime) -> Optional[str]:
 
 
 def queue_alert(uid: int, kind: str, cid: Optional[str], title_text: str, markup, reason: str,
-                now: Optional[datetime] = None) -> None:
+                now: Optional[datetime] = None, *, urgent: bool = False,
+                full_text: Optional[str] = None) -> None:
     scope = db.get_user_scope(uid)
     now = now or datetime.now(TZ_BERLIN)
-    queue = list(scope.private(ALERT_QUEUE_KIND) or [])
-    queue.append({"kind": kind, "cid": cid, "title": title_text, "button": _first_button(markup),
-                  "reason": reason, "ts": now.timestamp()})
+    stored = scope.private(ALERT_QUEUE_KIND)
+    queue = stored if isinstance(stored, list) else []
+    item = {"kind": kind, "cid": cid, "title": title_text,
+            "button": _first_button(markup, allow_wa=urgent),
+            "reason": reason, "ts": now.timestamp()}
+    if urgent and isinstance(full_text, str):
+        # Urgent timetable changes may wait through quiet hours, but must keep
+        # their full card and sound when they are eventually delivered.
+        item.update({"urgent": True, "full_text": truncate_html(full_text)})
+    queue.append(item)
     scope.save_private(ALERT_QUEUE_KIND, _prune_queue(queue, now))
 
 
 def _prune_queue(queue: list, now: datetime) -> list:
     """Drop held alerts older than QUEUE_MAX_AGE_SECONDS and keep at most
     QUEUE_MAX_ITEMS (the newest)."""
+    if not isinstance(queue, list):
+        return []
     cutoff = now.timestamp() - QUEUE_MAX_AGE_SECONDS
-    fresh = [item for item in queue if not isinstance(item.get("ts"), (int, float)) or item["ts"] >= cutoff]
+    fresh = []
+    for item in queue:
+        if not isinstance(item, dict) or not isinstance(item.get("title"), str):
+            continue
+        item = {**item, "title": truncate_html(item["title"], DIGEST_TEXT_LIMIT - 100)}
+        if item.get("urgent") is True:
+            if isinstance(item.get("full_text"), str):
+                item["full_text"] = truncate_html(item["full_text"])
+            else:
+                # Malformed/legacy urgent rows cannot be sent as full cards.
+                item.pop("urgent", None)
+                item.pop("full_text", None)
+        else:
+            item.pop("urgent", None)
+            item.pop("full_text", None)
+        button = item.get("button")
+        if button is not None:
+            if not isinstance(button, dict) or not isinstance(button.get("text"), str) or not button.get("text"):
+                item["button"] = None
+            elif isinstance(button.get("url"), str) and button["url"]:
+                item["button"] = {"text": button["text"], "url": button["url"]}
+            elif isinstance(button.get("callback_data"), str) and button["callback_data"] \
+                    and len(button["callback_data"].encode("utf-8")) <= 64:
+                item["button"] = {"text": button["text"], "callback_data": button["callback_data"]}
+            else:
+                item["button"] = None
+        stamp = item.get("ts")
+        if isinstance(stamp, bool):
+            continue
+        if isinstance(stamp, int):
+            if stamp >= cutoff:
+                fresh.append(item)
+        elif isinstance(stamp, float):
+            if math.isfinite(stamp) and stamp >= cutoff:
+                fresh.append(item)
+        else:
+            fresh.append(item)  # legacy records without a timestamp remain deliverable
     return fresh[-QUEUE_MAX_ITEMS:]
 
 
@@ -304,6 +383,9 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
     `recipients` (a set of students) replaces the course's usual audience.
     Returns {"full"|"title"|"silent"|"skipped"|"queued": count}."""
     counts = {"full": 0, "title": 0, "silent": 0, "skipped": 0, "queued": 0}
+    if kind in KIND_COLUMN and not cid:
+        logging.error("Refused %s alert without a course ID", kind)
+        return counts
     now = now or datetime.now(TZ_BERLIN)
     # last line of defence against "message is too long" for every alert kind
     if parse_mode == "HTML":
@@ -311,42 +393,83 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
     else:
         text, title_text = text[:TELEGRAM_HTML_LIMIT], title_text[:TELEGRAM_HTML_LIMIT]
     for uid in sorted(recipients if recipients is not None else broadcast_targets(cid, members)):
-        fmt = delivery_format(uid, cid, kind)
-        if fmt is None:
-            counts["skipped"] += 1
-            continue
-        if urgent:
-            fmt = "full"
-        files_mode = get_pref(uid, "file_delivery") if kind == "files" else "card"
-        markup = markup_for(uid, files_link_markup(cid) if files_mode == "link" else reply_markup)
-        try:
-            reason = _hold_reason(uid, now)
-            if urgent and reason == "digest":
-                reason = None
-            if reason is not None:
-                queue_alert(uid, kind, cid, title_text, markup, reason, now)
-                counts["queued"] += 1
+        with db.private_write_context(uid):
+            if not db.private_context_is_current(uid):
+                counts["skipped"] += 1
                 continue
-            # "title only" for this course means just a line, whatever the file delivery
-            if files_mode == "upload" and fmt != "title" and send_full is not None and await send_full(bot, uid):
-                counts[fmt] += 1
-                await asyncio.sleep(0.3)
+            if (not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE
+                    or (cid is not None and not has_course_access(uid, cid))):
+                counts["skipped"] += 1
                 continue
-            body = title_text if fmt == "title" else text
+            fmt = delivery_format(uid, cid, kind)
+            if fmt is None:
+                counts["skipped"] += 1
+                continue
+            if urgent:
+                fmt = "full"
+            files_mode = get_pref(uid, "file_delivery") if kind == "files" else "card"
+            markup = markup_for(uid, files_link_markup(cid) if files_mode == "link" else reply_markup)
             try:
-                await bot.send_message(chat_id=uid, text=body, parse_mode=parse_mode,
-                                       disable_notification=fmt == "silent", reply_markup=markup)
-            except BadRequest as e:
-                if parse_mode != "HTML" or "parse" not in str(e).lower():
-                    raise
-                # markup Telegram can't parse must not cost the student the alert
-                logging.warning("A %s alert for %s was rejected (%s); sending it as plain text", kind, uid, e)
-                await bot.send_message(chat_id=uid, text=_plain(body), disable_notification=fmt == "silent",
-                                       reply_markup=markup)
-            counts[fmt] += 1
-            await asyncio.sleep(0.3)  # Telegram rate limit safety
-        except Exception as e:
-            logging.warning("Failed to deliver a %s alert to %s: %s", kind, uid, e)
+                reason = _hold_reason(uid, now)
+                if urgent and reason == "digest":
+                    reason = None
+                if reason is not None:
+                    queue_alert(uid, kind, cid, title_text, markup, reason, now,
+                                urgent=urgent, full_text=text if urgent else None)
+                    counts["queued"] += 1
+                    continue
+                # "title only" for this course means just a line, whatever the file delivery
+                if files_mode == "upload" and fmt != "title" and send_full is not None:
+                    sent_full = await send_full(bot, uid)
+                    if not db.private_context_is_current(uid):
+                        counts["skipped"] += 1
+                        continue
+                    if sent_full:
+                        counts[fmt] += 1
+                        await asyncio.sleep(0.3)
+                        continue
+                    # The file may have taken long enough to download that the
+                    # recipient was blocked while it was in flight. Do not fall
+                    # back to a smaller alert after that access change.
+                    if (not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE
+                            or (cid is not None and not has_course_access(uid, cid))):
+                        counts["skipped"] += 1
+                        continue
+                body = title_text if fmt == "title" else text
+                try:
+                    await bot.send_message(chat_id=uid, text=body, parse_mode=parse_mode,
+                                           disable_notification=fmt == "silent", reply_markup=markup)
+                except BadRequest as e:
+                    if parse_mode != "HTML" or "parse" not in str(e).lower():
+                        raise
+                    # markup Telegram can't parse must not cost the student the alert
+                    logging.warning("A %s alert for %s was rejected (%s); sending it as plain text", kind, uid, e)
+                    if (not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE
+                            or (cid is not None and not has_course_access(uid, cid))):
+                        counts["skipped"] += 1
+                        continue
+                    if not db.private_context_is_current(uid):
+                        counts["skipped"] += 1
+                        continue
+                    await bot.send_message(chat_id=uid, text=_plain(body), disable_notification=fmt == "silent",
+                                           reply_markup=markup)
+                if not db.private_context_is_current(uid):
+                    counts["skipped"] += 1
+                    continue
+                counts[fmt] += 1
+                await asyncio.sleep(0.3)  # Telegram rate limit safety
+            except Exception as e:
+                logging.warning("Failed to deliver a %s alert to %s: %s", kind, uid, e)
+                if (not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE
+                        or not db.private_context_is_current(uid)):
+                    counts["skipped"] += 1
+                    continue
+                try:
+                    queue_alert(uid, kind, cid, title_text, markup, "retry", now,
+                                urgent=urgent, full_text=text if urgent else None)
+                    counts["queued"] += 1
+                except Exception:
+                    logging.error("Could not queue failed %s alert for %s", kind, uid, exc_info=True)
     return counts
 
 
@@ -358,6 +481,8 @@ def _queue_due(uid: int, item: dict, now: datetime, with_morning: bool = False) 
     quiet hours."""
     local = now.astimezone(TZ_BERLIN)
     is_digest = item.get("reason") == "digest" and get_pref(uid, "delivery_mode") == "digest"
+    if item.get("reason") == "retry":
+        return not in_quiet_hours(uid, now)
     if with_morning and not is_digest:
         return True
     if in_quiet_hours(uid, now):
@@ -390,7 +515,7 @@ def digest_batch(items: list) -> list:
     the message. The rest stays queued for the next digest."""
     batch: list = []
     for item in items:
-        if batch and len(digest_text(batch + [item])) > DIGEST_TEXT_LIMIT:
+        if batch and _telegram_length(digest_text(batch + [item])) > DIGEST_TEXT_LIMIT:
             break
         batch.append(item)
     return batch
@@ -414,7 +539,29 @@ def digest_markup(items: list) -> Optional[InlineKeyboardMarkup]:
     return InlineKeyboardMarkup(rows) if rows else None
 
 
+_alert_delivery_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+def _queued_course_allowed(uid: int, item: dict) -> bool:
+    return ((item.get("cid") is None and item.get("kind") not in KIND_COLUMN)
+            or has_course_access(uid, item.get("cid")))
+
+
 async def flush_alert_queues(bot, now: Optional[datetime] = None, user_ids=None,
+                             with_morning: bool = False) -> int:
+    """Serialize each student's queue delivery across watcher and morning jobs."""
+    locks = _alert_delivery_locks.setdefault(asyncio.get_running_loop(), {})
+    selected = None if user_ids is None else set(user_ids)
+    sent = 0
+    for uid in db.private_owner_ids(ALERT_QUEUE_KIND):
+        if selected is not None and uid not in selected:
+            continue
+        async with locks.setdefault(uid, asyncio.Lock()):
+            sent += await _flush_alert_queues_unlocked(bot, now, [uid], with_morning)
+    return sent
+
+
+async def _flush_alert_queues_unlocked(bot, now: Optional[datetime] = None, user_ids=None,
                              with_morning: bool = False) -> int:
     """Send each student's due held alerts as one digest message; returns
     how many students got one. `user_ids` limits it to those students and
@@ -423,36 +570,110 @@ async def flush_alert_queues(bot, now: Optional[datetime] = None, user_ids=None,
     now = now or datetime.now(TZ_BERLIN)
     sent = 0
     owners = db.private_owner_ids(ALERT_QUEUE_KIND)
-    for uid in owners if user_ids is None else [u for u in owners if u in set(user_ids)]:
-        if lifecycle_state(uid) != ACTIVE:
-            continue
-        scope = db.get_user_scope(uid)
-        stored = list(scope.private(ALERT_QUEUE_KIND) or [])
-        queue = _prune_queue(stored, now)
-        if queue != stored:
-            scope.save_private(ALERT_QUEUE_KIND, queue)
-        batch = digest_batch([item for item in queue if _queue_due(uid, item, now, with_morning)])
-        if not batch:
-            continue
-        text, markup = digest_text(batch), digest_markup(batch)
-        try:
-            try:
-                await bot.send_message(chat_id=uid, text=text, parse_mode="HTML",
-                                       disable_notification=False, reply_markup=markup)
-            except BadRequest as e:
-                # a title Telegram can't parse must not hold the queue forever
-                logging.warning("Course digest for %s rejected (%s); sending it as plain text", uid, e)
-                await bot.send_message(chat_id=uid, text=_plain(text), disable_notification=False,
-                                       reply_markup=markup)
-        except Exception as e:
-            logging.warning("Course digest for %s failed: %s", uid, e)
-            continue
-        # re-read: an alert queued while the digest was being sent (the
-        # awaits above) must not be overwritten by the list read before
-        current = list(scope.private(ALERT_QUEUE_KIND) or [])
-        scope.save_private(ALERT_QUEUE_KIND, [item for item in current if item not in batch])
-        sent += 1
-        await asyncio.sleep(0.3)  # Telegram rate limit safety between students
+    selected_uids = None if user_ids is None else set(user_ids)
+    for uid in owners if selected_uids is None else [u for u in owners if u in selected_uids]:
+        # Keep the queue snapshot, its delivery, and follow-up writes bound to
+        # one deletion generation. A user who restarts soon after deleting
+        # their data must not receive alerts from an older queue snapshot.
+        with db.private_write_context(uid):
+            if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                    or lifecycle_state(uid) != ACTIVE):
+                continue
+            scope = db.get_user_scope(uid)
+            raw = scope.private(ALERT_QUEUE_KIND)
+            stored = raw if isinstance(raw, list) else []
+            queue = [item for item in _prune_queue(stored, now)
+                     if _queued_course_allowed(uid, item)]
+            if queue != stored and db.private_context_is_current(uid):
+                scope.save_private(ALERT_QUEUE_KIND, queue)
+            due = [item for item in queue if _queue_due(uid, item, now, with_morning)]
+            urgent_items = [item for item in due if item.get("urgent") is True and item.get("full_text")]
+            batch = digest_batch([item for item in due if item not in urgent_items])
+            if not urgent_items and not batch:
+                continue
+            if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+                continue
+
+            def remove_sent(scope, sent_items: list, now: datetime) -> None:
+                # Re-read after sending so alerts appended during a Telegram await
+                # are not overwritten by this worker's stale queue snapshot.
+                current_raw = scope.private(ALERT_QUEUE_KIND)
+                current = _prune_queue(current_raw if isinstance(current_raw, list) else [], now)
+                remaining = list(current)
+                for sent_item in sent_items:
+                    try:
+                        remaining.remove(sent_item)
+                    except ValueError:
+                        pass  # another worker already removed this exact entry
+                scope.save_private(ALERT_QUEUE_KIND, remaining)
+
+            student_sent = False
+            # Urgent timetable changes are separate full cards with sound, rather
+            # than title lines folded into the ordinary digest.
+            for item in urgent_items:
+                if not _queued_course_allowed(uid, item):
+                    continue
+                if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                        or lifecycle_state(uid) != ACTIVE):
+                    break
+                try:
+                    await bot.send_message(chat_id=uid, text=item["full_text"], parse_mode="HTML",
+                                           disable_notification=False, reply_markup=digest_markup([item]))
+                    if not db.private_context_is_current(uid):
+                        break
+                    remove_sent(scope, [item], now)
+                except BadRequest as e:
+                    if "parse" not in str(e).lower():
+                        logging.warning("Urgent course alert for %s failed: %s", uid, e)
+                        continue
+                    logging.warning("Urgent course alert for %s rejected (%s); sending it as plain text", uid, e)
+                    if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                            or lifecycle_state(uid) != ACTIVE):
+                        break
+                    try:
+                        await bot.send_message(chat_id=uid, text=_plain(item["full_text"]),
+                                               disable_notification=False, reply_markup=digest_markup([item]))
+                        if not db.private_context_is_current(uid):
+                            break
+                        remove_sent(scope, [item], now)
+                    except Exception as fallback_error:
+                        logging.warning("Urgent course alert fallback for %s failed: %s", uid, fallback_error)
+                        continue
+                except Exception as e:
+                    logging.warning("Urgent course alert for %s failed: %s", uid, e)
+                    continue
+                student_sent = True
+                await asyncio.sleep(0.3)
+
+            batch = [item for item in batch if _queued_course_allowed(uid, item)]
+            if (batch and db.private_context_is_current(uid) and is_user_allowed(uid)
+                    and lifecycle_state(uid) == ACTIVE):
+                text, markup = digest_text(batch), digest_markup(batch)
+                try:
+                    try:
+                        await bot.send_message(chat_id=uid, text=text, parse_mode="HTML",
+                                               disable_notification=False, reply_markup=markup)
+                        if not db.private_context_is_current(uid):
+                            continue
+                        remove_sent(scope, batch, now)
+                    except BadRequest as e:
+                        # a title Telegram can't parse must not hold the queue forever
+                        logging.warning("Course digest for %s rejected (%s); sending it as plain text", uid, e)
+                        if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                                or lifecycle_state(uid) != ACTIVE):
+                            continue
+                        await bot.send_message(chat_id=uid, text=_plain(text), disable_notification=False,
+                                               reply_markup=markup)
+                        if not db.private_context_is_current(uid):
+                            continue
+                        remove_sent(scope, batch, now)
+                except Exception as e:
+                    logging.warning("Course digest for %s failed: %s", uid, e)
+                    continue
+                student_sent = True
+            if student_sent:
+                sent += 1
+                await asyncio.sleep(0.3)  # Telegram rate safety between students
     return sent
 
 
@@ -550,15 +771,22 @@ async def handle_course_alerts(update: Update, context: ContextTypes.DEFAULT_TYP
     parts = (query.data or "").split("|")
     action = parts[1] if len(parts) > 1 else ""
     cid = parts[-1] if action in ("c", "t", "fmt") else None
+    saved = True
     if action == "t" and len(parts) == 4 and parts[2] in _TOGGLES and cid:
         prefs = db.get_user_scope(user_id).course_prefs(cid)
         if prefs is not None:
             column = _TOGGLES[parts[2]][0]
-            db.get_user_scope(user_id).set_course_pref(cid, column, not prefs[column])
+            saved = db.get_user_scope(user_id).set_course_pref(cid, column, not prefs[column])
     elif action == "fmt" and cid:
         prefs = db.get_user_scope(user_id).course_prefs(cid)
         if prefs is not None:
-            db.get_user_scope(user_id).set_course_pref(cid, "format", _next_format(prefs["format"]))
+            saved = db.get_user_scope(user_id).set_course_pref(
+                cid, "format", _next_format(prefs["format"])
+            )
+    if not saved:
+        await query.answer("This course setting could not be saved. Please reopen the course list.",
+                           show_alert=True)
+        return
     await query.answer()
     text, markup = course_alerts_course_view(user_id, cid) if cid else course_alerts_list_view(user_id)
     if action:

@@ -34,7 +34,6 @@ from unibot.config import (
 from unibot.preferences import get_pref
 from unibot.storage import (
     get_user_name,
-    get_wardrobe_feature_enabled,
     link_cache,
     load_default_semester,
     load_general_cache,
@@ -73,6 +72,8 @@ async def _restart_process():
     # Give the reply above a moment to actually reach Telegram before we tear things down.
     await asyncio.sleep(0.5)
 
+    from unibot.schedule import stop_fastenroll_jobs
+    await stop_fastenroll_jobs()
     stop_whatsapp_microservice()
     link_cache.flush()
 
@@ -351,7 +352,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🔑 Logged in: {logged_in}\n"
         f"👀 Unified Watcher: {watcher_status}\n"
         f"🔁 Global Scans: {state.global_scan_count}\n"
-        f"📱 WA Group: {wa_group_label}\n"
+        f"📱 WA Group: {html.escape(str(wa_group_label))}\n"
         f"💬 WA Status: {wa_status}"
     )
 
@@ -403,7 +404,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               if weather_location else "Uni Oldenburg (default)")
     text += f"\n📍 Weather Location: {weather_location_label}"
 
-    wardrobe_enabled = bool(get_wardrobe_feature_enabled() and get_pref(user_id, "outfit"))
+    wardrobe_enabled = bool(get_pref(user_id, "outfit"))
     text += f"\n👔 Daily Outfit Suggestion: {'✅ On' if wardrobe_enabled else '🔲 Off'}"
 
     study_plan_enabled = get_pref(user_id, "weekly_study_plan")
@@ -517,8 +518,15 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━\n"
             "<i>Sent to all registered students.</i>"
         )
-        await broadcast(context.bot, announcement, parse_mode="HTML", disable_notification=False)
-        await update.message.reply_text("✅ Announcement broadcasted to all active students.", parse_mode="HTML")
+        result = await broadcast(context.bot, announcement, parse_mode="HTML", disable_notification=False)
+        sent_count = len(result["sent"])
+        failed_count = len(result["failed"])
+        if failed_count:
+            reply = (f"⚠️ Announcement delivered to {sent_count} student(s); "
+                     f"it failed for {failed_count} student(s). Check the bot logs for details.")
+        else:
+            reply = f"✅ Announcement delivered to {sent_count} active student(s)."
+        await update.message.reply_text(reply, parse_mode="HTML")
     else:
         user_data(context)["pending_step"] = "admin_broadcast_text"
         await update.message.reply_text(
@@ -712,6 +720,18 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             if target and action == "admin_toggle_user":
                 new_state = not target["is_active"]
                 db.set_user_active(target_id, new_state)
+                if not new_state:
+                    # Blocking an account must also stop already-running or
+                    # restart-persistent enrollment work and revoke its Mini
+                    # App cookies. Keep stored credentials for a later unblock.
+                    if state.login_server is not None:
+                        state.login_server.revoke_user(target_id)
+                    from fast_enroll import clear_pending_job
+                    from unibot.schedule import fastenroll_tasks
+
+                    clear_pending_job(target_id)
+                    for task in (fastenroll_tasks.pop(target_id, None) or {}).values():
+                        task.cancel()
                 notice = f"User {'activated' if new_state else 'blocked'}."
             elif target:
                 new_role = "user" if target["role"] == "admin" else "admin"
@@ -734,6 +754,8 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
 
     if data == "admin_menu":
+        # This is also the Cancel button on the pending broadcast prompt.
+        user_data(context).pop("pending_step", None)
         text, reply_markup = _build_admin_overview_view()
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=reply_markup)
         return
@@ -829,7 +851,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             f"💻 <b>CPU Usage:</b> <code>%{cpu}</code>\n"
             f"🧠 <b>RAM:</b> <code>{mem.used // (1024*1024)}MB / {mem.total // (1024*1024)}MB</code> (%{mem.percent})\n"
             f"💾 <b>Disk:</b> <code>{disk.used // (1024**3)}GB / {disk.total // (1024**3)}GB</code>\n"
-            f"🌐 <b>Cloudflare Tunnel:</b> <code>{'Online' if state.quick_tunnel else 'Direct / Off'}</code>\n"
+            f"🌐 <b>Cloudflare Tunnel:</b> <code>{'Online' if state.quick_tunnel and state.quick_tunnel.url else 'Connecting' if state.quick_tunnel else 'Direct / Off'}</code>\n"
             f"🔄 <b>Watcher Task:</b> <code>{'Running' if state.unified_watcher_task and not state.unified_watcher_task.done() else 'Stopped'}</code>\n"
             "━━━━━━━━━━━━━━━━━━"
         )

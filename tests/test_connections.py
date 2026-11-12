@@ -1158,7 +1158,7 @@ class CourseWatchPlanTests(unittest.TestCase):
         self.assertEqual(sorted(listed), [1, 2])  # course lists are cached between cycles
 
     def test_course_alerts_reach_participants_only(self):
-        from unibot import telegram_ui
+        from unibot import state, telegram_ui
         sent = []
 
         class Bot:
@@ -1168,12 +1168,19 @@ class CourseWatchPlanTests(unittest.TestCase):
         users = [{"telegram_id": 1}, {"telegram_id": 2}, {"telegram_id": 3}]
         with mock.patch.object(telegram_ui, "ALLOWED_USER_IDS", {1, 2}), \
                 mock.patch.object(telegram_ui.db, "get_all_users", lambda: users), \
+                mock.patch.object(state, "user_courses_map", {2: {"c3": "Course 3"}}), \
+                mock.patch.object(state, "global_session", None), \
+                mock.patch.object(telegram_ui.db, "get_user_scope", return_value=mock.Mock(course_ids=lambda: [])), \
                 mock.patch.object(telegram_ui.db, "exists", lambda key: False):
             asyncio.run(telegram_ui.broadcast(Bot(), "x", cid="c3", members={2}))
             self.assertEqual(sorted(sent), [2])  # admin 1 does not take c3
             sent.clear()
             asyncio.run(telegram_ui.broadcast(Bot(), "x", cid="c3"))
-            self.assertEqual(sent, [])  # unknown participants: nobody who doesn't take it, admins included
+            self.assertEqual(sent, [2])  # trusted membership also works without explicit recipients
+            sent.clear()
+            with mock.patch.object(state, "user_courses_map", {}):
+                asyncio.run(telegram_ui.broadcast(Bot(), "x", cid="c3", members={2}))
+            self.assertEqual(sent, [])  # an explicit recipient alone is not authorization
 
 
 class AccountRegistryTests(unittest.TestCase):

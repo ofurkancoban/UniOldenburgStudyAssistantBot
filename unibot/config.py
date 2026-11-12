@@ -142,7 +142,18 @@ logging.getLogger("pypdf").setLevel(logging.ERROR)
 # shared secret. When WA_SERVICE_TOKEN isn't set in .env, a random one is made
 # per run and handed to the service through the environment it inherits when
 # start_whatsapp_microservice() spawns it.
-WA_SERVICE_PORT = int(os.getenv("PORT", "3838"))
+def _parse_service_port(value: str) -> int:
+    """Parse the shared WhatsApp service port with a useful startup error."""
+    try:
+        port = int(value)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"PORT must be an integer between 1 and 65535 (got {value!r}).") from exc
+    if not 1 <= port <= 65535:
+        raise SystemExit(f"PORT must be between 1 and 65535 (got {value!r}).")
+    return port
+
+
+WA_SERVICE_PORT = _parse_service_port(os.getenv("PORT", "3838"))
 WA_SERVICE_URL = f"http://127.0.0.1:{WA_SERVICE_PORT}"
 WA_SERVICE_TOKEN = os.getenv("WA_SERVICE_TOKEN", "").strip() or secrets.token_urlsafe(32)
 os.environ["WA_SERVICE_TOKEN"] = WA_SERVICE_TOKEN

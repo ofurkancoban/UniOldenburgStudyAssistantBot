@@ -1,9 +1,12 @@
 import asyncio
 import base64
+import contextlib
+import contextvars
 import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import random
 import struct
@@ -11,7 +14,7 @@ import time
 from dataclasses import dataclass, field
 from http.cookies import CookieError, SimpleCookie
 from typing import Optional
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import unquote, urljoin, urlsplit
 
 import aiohttp
 from yarl import URL
@@ -51,6 +54,44 @@ def _report_login_state(user_id, ok: bool) -> None:
             logging.debug("Login state listener failed", exc_info=True)
 
 _REDIRECT_CODES = {301, 302, 303, 307, 308}
+_cookie_auth_only = contextvars.ContextVar("studip_cookie_auth_only", default=False)
+
+
+@contextlib.contextmanager
+def cookie_auth_only():
+    """Use the logged-in cookie session without attaching an OAuth bearer token.
+
+    A JSON:API request can fall back to cookies when the OAuth server has
+    issued a token the API still rejects. The override is task-local so it
+    cannot affect another user's concurrent request.
+    """
+    token = _cookie_auth_only.set(True)
+    try:
+        yield
+    finally:
+        _cookie_auth_only.reset(token)
+
+
+def _secure_university_url(url: str) -> str:
+    """Keep requests to university hosts on HTTPS, including every redirect."""
+    parsed = URL(url)
+    if parsed.scheme == "http" and (parsed.host or "").lower() in UNI_HOSTS:
+        if parsed.port == 80:
+            parsed = parsed.with_port(None)
+        return str(parsed.with_scheme("https"))
+    return str(parsed)
+
+
+def _url_origin(url: str) -> tuple[str, Optional[str], Optional[int]]:
+    parsed = urlsplit(url)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return scheme, host, port
+
+
+class SessionCheckUnavailable(RuntimeError):
+    """Stud.IP could not be checked, so authentication state is unknown."""
 
 
 
@@ -65,6 +106,8 @@ async def _worker_refusal(resp) -> str:
     """Why the worker itself (not the university) refused a request, or ""."""
     if resp.status not in (401, 403):
         return ""
+    if resp.headers.get("X-Proxy-Upstream"):
+        return ""  # this is the university's auth/permission response
     if resp.headers.get("X-Proxy-Error"):
         return resp.headers["X-Proxy-Error"]
     if "text/plain" not in resp.headers.get("Content-Type", "text/plain"):
@@ -164,8 +207,24 @@ class StumsState:
 
     @classmethod
     def from_dict(cls, data: dict) -> "StumsState":
-        return cls(verified_at=float(data.get("verified_at") or 0.0), referer=data.get("referer") or None,
-                   blocked_until=float(data.get("blocked_until") or 0.0))
+        if not isinstance(data, dict):
+            return cls()
+
+        def timestamp(key: str) -> float:
+            value = data.get(key, 0.0)
+            if isinstance(value, bool):
+                return 0.0
+            try:
+                parsed = float(value or 0.0)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            return parsed if math.isfinite(parsed) and parsed >= 0 else 0.0
+
+        referer = data.get("referer")
+        if not isinstance(referer, str) or not referer.startswith("https://stums.uni-oldenburg.de/"):
+            referer = None
+        return cls(verified_at=timestamp("verified_at"), referer=referer,
+                   blocked_until=timestamp("blocked_until"))
 
     def lock(self) -> asyncio.Lock:
         """One StuMS sign-in at a time for this account (bound to the running loop)."""
@@ -194,6 +253,8 @@ class StudIPSession(SsoFlowMixin):
         # Cookie-less twin of `session` for requests sent through the
         # Cloudflare Worker: their cookies are managed by hand (see request()).
         self._proxy_http: Optional[aiohttp.ClientSession] = None
+        self._ensure_lock: Optional[asyncio.Lock] = None
+        self._ensure_lock_loop = None
         self.headers = {
             'User-Agent': user_agent(),
             'Accept-Encoding': 'gzip, deflate',
@@ -242,21 +303,29 @@ class StudIPSession(SsoFlowMixin):
         return self.session
 
     async def ensure_session(self):
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(
-                headers=self.headers,
-                cookie_jar=aiohttp.CookieJar(unsafe=True),
-                connector=aiohttp.TCPConnector(limit=20, limit_per_host=6, ttl_dns_cache=300),
-                timeout=DEFAULT_TIMEOUT,
-            )
-            await self.load_cookies()
-        if self._proxy_http is None or self._proxy_http.closed:
-            self._proxy_http = aiohttp.ClientSession(
-                headers=self.headers,
-                cookie_jar=aiohttp.DummyCookieJar(),
-                connector=aiohttp.TCPConnector(limit=20, limit_per_host=8, ttl_dns_cache=300),
-                timeout=DEFAULT_TIMEOUT,
-            )
+        loop = asyncio.get_running_loop()
+        if self._ensure_lock is None or self._ensure_lock_loop is not loop:
+            self._ensure_lock = asyncio.Lock()
+            self._ensure_lock_loop = loop
+        async with self._ensure_lock:
+            # Requests can arrive together on the first use, or just after a
+            # session was closed. Recheck under the lock so only one pair of
+            # aiohttp sessions is created and cookie restoration runs once.
+            if self.session is None or self.session.closed:
+                self.session = aiohttp.ClientSession(
+                    headers=self.headers,
+                    cookie_jar=aiohttp.CookieJar(unsafe=True),
+                    connector=aiohttp.TCPConnector(limit=20, limit_per_host=6, ttl_dns_cache=300),
+                    timeout=DEFAULT_TIMEOUT,
+                )
+                await self.load_cookies()
+            if self._proxy_http is None or self._proxy_http.closed:
+                self._proxy_http = aiohttp.ClientSession(
+                    headers=self.headers,
+                    cookie_jar=aiohttp.DummyCookieJar(),
+                    connector=aiohttp.TCPConnector(limit=20, limit_per_host=8, ttl_dns_cache=300),
+                    timeout=DEFAULT_TIMEOUT,
+                )
 
     def _get_totp_token(self):
         if self.totp_code:
@@ -291,7 +360,20 @@ class StudIPSession(SsoFlowMixin):
 
     def _store_proxied_cookies(self, resp, real_url: str) -> None:
         """Store cookies a Worker-proxied response carried, under the real host."""
-        raw = resp.headers.getall("X-Upstream-Set-Cookie", [])
+        encoded = resp.headers.get("X-Upstream-Set-Cookie-Json")
+        raw = []
+        if encoded:
+            try:
+                decoded = json.loads(unquote(encoded))
+                if isinstance(decoded, list) and all(isinstance(item, str) for item in decoded):
+                    raw = decoded
+            except (TypeError, ValueError):
+                self.logger.warning("Could not decode proxied cookies from %s", redact_url(real_url))
+        if not raw:
+            # Older Worker deployments use repeated custom headers. Keep
+            # accepting them during rollout, then fall back to legacy rewritten
+            # Set-Cookie headers if talking to an older worker still in flight.
+            raw = resp.headers.getall("X-Upstream-Set-Cookie", [])
         if not raw:
             # Older worker deployments pass a rewritten Set-Cookie (Domain removed)
             raw = resp.headers.getall("Set-Cookie", [])
@@ -323,6 +405,7 @@ class StudIPSession(SsoFlowMixin):
         else:
             routed, http = url, self._client
         via_worker = http is self._proxy_http
+        worker_error = None
         async with THROTTLE.slot(host):
             try:
                 resp = await http.request(
@@ -333,12 +416,17 @@ class StudIPSession(SsoFlowMixin):
                 if not via_worker:
                     THROTTLE.report(host, failed=True)
                     raise
-                _mark_worker_down(self.logger, exc.__class__.__name__)
-                # A request that never reached the worker is safe to resend;
-                # after a timeout a POST may already have been delivered.
-                if method in ("GET", "HEAD") or isinstance(exc, aiohttp.ClientConnectorError):
-                    return await self._send_once(method, url, headers, body, timeout, extra)
-                raise
+                worker_error = exc
+        if worker_error is not None:
+            _mark_worker_down(self.logger, worker_error.__class__.__name__)
+            # Release the worker request's host slot before the direct retry.
+            # Otherwise a wave of failed worker requests can hold every slot
+            # while all of them wait to acquire another slot for failover.
+            # A request that never reached the worker is safe to resend; after
+            # a timeout a POST may already have been delivered.
+            if method in ("GET", "HEAD") or isinstance(worker_error, aiohttp.ClientConnectorError):
+                return await self._send_once(method, url, headers, body, timeout, extra)
+            raise worker_error
         if via_worker:
             failure = _worker_failure(resp)
             if failure:
@@ -370,7 +458,7 @@ class StudIPSession(SsoFlowMixin):
         """Send a request (following redirects manually) and return a UniResponse."""
         await self.ensure_session()
         method = method.upper()
-        url = unroute_proxy_url(str(url))
+        url = _secure_university_url(unroute_proxy_url(str(url)))
         if params:
             url = str(URL(url).extend_query(params))
         req_headers = dict(headers or {})
@@ -382,7 +470,7 @@ class StudIPSession(SsoFlowMixin):
         for _hop in range(max_redirects + 1):
             resp = await self._send_with_retry(method, current, req_headers, body, timeout, extra)
             location = resp.headers.get("Location")
-            real_location = unroute_proxy_url(urljoin(current, location)) if location else None
+            real_location = _secure_university_url(unroute_proxy_url(urljoin(current, location))) if location else None
             if not allow_redirects or resp.status not in _REDIRECT_CODES or not real_location:
                 headers_out = None
                 if location or self._via_worker((urlsplit(current).hostname or "").lower()):
@@ -396,8 +484,10 @@ class StudIPSession(SsoFlowMixin):
                 body = {}
                 for key in [k for k in req_headers if k.lower() in ("content-type", "content-length")]:
                     req_headers.pop(key, None)
-            if urlsplit(real_location).hostname != urlsplit(current).hostname:
-                for key in [k for k in req_headers if k.lower() == "authorization"]:
+            if _url_origin(real_location) != _url_origin(current):
+                # Browser-like credential boundary: don't carry explicit
+                # bearer or Cookie headers across scheme, host, or port.
+                for key in [k for k in req_headers if k.lower() in ("authorization", "cookie")]:
                     req_headers.pop(key, None)
             current = real_location
         raise RuntimeError(f"Too many redirects for {redact_url(url)}")
@@ -464,6 +554,11 @@ class StudIPSession(SsoFlowMixin):
             self.stums = StumsState.from_dict(data)
 
     async def save_cookies(self):
+        # Keep-alive and SSO work can finish around logout. Once logout has
+        # marked this session closed, no late save may recreate its deleted
+        # cookies or StuMS state in the credential store.
+        if self.explicitly_logged_out:
+            return
         self.save_stums_state()
         if not self.session:
             return
@@ -538,7 +633,10 @@ class StudIPSession(SsoFlowMixin):
                 data = db.get_user_scope(self.user_id).credential("cookies")
                 if data:
                     self.logger.info("Encrypted cookies loaded from DB for user %s", self.user_id)
-                    self._load_stums_state()
+                # StuMS retry/verification state is stored in its own
+                # credential and must be restored even when the cookie jar is
+                # empty (for example after an expired session).
+                self._load_stums_state()
             except Exception as exc:
                 self.logger.warning("Failed to load cookies from DB for user %s: %s", self.user_id, exc)
 
@@ -615,6 +713,16 @@ class StudIPSession(SsoFlowMixin):
             async with self._s_get("https://elearning.uni-oldenburg.de/dispatch.php/start", allow_redirects=True) as r:
                 text = await r.text()
                 url = str(r.url)
+                status = r.status
+
+                # An authorization response means the cookie is no longer
+                # accepted. Other non-success responses do not establish
+                # whether the user is signed in; do not turn outages into
+                # an SSO/password retry.
+                if status in (401, 403):
+                    return False
+                if status != 200:
+                    raise SessionCheckUnavailable(f"Stud.IP session check answered HTTP {status}")
 
                 is_guest = '"username":"nobody"' in text or '"me":{"username":"nobody"}' in text
                 is_login_page = "/dispatch.php/login" in url or "index.php?again=yes" in url
@@ -630,14 +738,17 @@ class StudIPSession(SsoFlowMixin):
 
                 self.logger.info("is_html_logged_in: False (markers missing or Guest state at %s)", redact_url(url))
                 return False
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            raise SessionCheckUnavailable(f"Stud.IP session check failed: {type(e).__name__}") from e
         except Exception as e:
-            self.logger.error("is_html_logged_in check failed: %s", e)
+            if getattr(e, "quiet", False) or isinstance(e, SessionCheckUnavailable):
+                raise
+            log = self.logger.debug if getattr(e, "quiet", False) else self.logger.error
+            log("is_html_logged_in check failed: %s", e)
             return False
 
     async def heal_session(self) -> bool:
         """Attempt self-healing silent SSO renewal using stored NetIQ SSO cookies."""
-        if self._lock.locked():
-            return await self._heal_session_unlocked()
         async with self._lock:
             return await self._heal_session_unlocked()
 
@@ -676,11 +787,16 @@ class StudIPSession(SsoFlowMixin):
                 _report_login_state(getattr(self, "user_id", None), False)
                 return False
         except Exception as exc:
+            if (isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError, SessionCheckUnavailable))
+                    or getattr(exc, "quiet", False)):
+                # A transient failure says nothing about whether the login
+                # expired. Leave the lifecycle state and retry backoff alone.
+                raise
             self.logger.warning("⚠️ [Self-Healing] Silent SSO flow failed: %s", exc)
             _report_login_state(getattr(self, "user_id", None), False)
             return False
 
-    async def is_logged_in(self, allow_oauth: bool = True) -> bool:
+    async def is_logged_in(self, allow_oauth: bool = True, _lock_held: bool = False) -> bool:
         """Check if authenticated (via HTML cookie, automatic self-healing, or OAuth2)."""
         if await self.is_html_logged_in():
             return True
@@ -688,7 +804,8 @@ class StudIPSession(SsoFlowMixin):
         # Automatic self-healing: if HTML session dropped, silently renew via warm NetIQ cookies
         has_file = bool(self.cookie_file and os.path.exists(self.cookie_file))
         if has_file or getattr(self, "user_id", None):
-            if await self.heal_session():
+            healed = await self._heal_session_unlocked() if _lock_held else await self.heal_session()
+            if healed:
                 return True
 
         use_oauth = studip_oauth.oauth_enabled()
@@ -708,7 +825,7 @@ class StudIPSession(SsoFlowMixin):
                 self.explicitly_logged_out
                 or (time.time() - self.last_interactive_activity < 180)
             ):
-                return await self.is_logged_in()
+                return await self.is_logged_in(_lock_held=True)
 
             if not force and await self.is_html_logged_in():
                 self.logger.info("Session already logged in.")
@@ -720,7 +837,10 @@ class StudIPSession(SsoFlowMixin):
             )
             use_oauth = studip_oauth.oauth_enabled()
             if not has_headless_creds:
-                if await self.heal_session():
+                # login() already owns the session lock. Call the internal
+                # method directly here; external heal_session() callers must
+                # always wait for that lock instead of racing this SSO flow.
+                if await self._heal_session_unlocked():
                     return True
                 if not force and use_oauth:
                     try:
@@ -758,7 +878,14 @@ class StudIPSession(SsoFlowMixin):
                 return True
             except Exception as e:
                 self.logger.warning("SSO login flow did not complete: %s", e)
-                self._record_login_failure()
+                transient = (
+                    isinstance(e, (aiohttp.ClientError, asyncio.TimeoutError, SessionCheckUnavailable))
+                    or getattr(e, "quiet", False)
+                )
+                if transient:
+                    self.logger.debug("Transient SSO failure did not increase the credential retry backoff")
+                else:
+                    self._record_login_failure()
                 if not force and use_oauth:
                     try:
                         if await studip_oauth.get_access_token(user_id=getattr(self, "user_id", None)):
@@ -866,10 +993,19 @@ class StudIPSession(SsoFlowMixin):
         Stud.IP's JSON:API accepts session cookies directly; OAuth tokens are only
         used when USE_STUDIP_OAUTH is explicitly enabled.
         """
+        if _cookie_auth_only.get():
+            return {}
+        try:
+            parsed = urlsplit(url)
+            port = parsed.port
+        except ValueError:
+            return {}
+        if (parsed.scheme.lower() != "https" or port not in (None, 443)
+                or (parsed.hostname or "").lower() != "elearning.uni-oldenburg.de"
+                or not parsed.path.startswith("/jsonapi.php/")):
+            return {}
         use_oauth = studip_oauth.oauth_enabled()
         if not use_oauth:
-            return {}
-        if "/jsonapi.php/" not in url:
             return {}
         try:
             token = await studip_oauth.get_access_token(user_id=getattr(self, "user_id", None))

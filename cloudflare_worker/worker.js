@@ -97,8 +97,11 @@ export default {
     const respHeaders = new Headers(response.headers);
     const rawCookies = typeof response.headers.getSetCookie === "function" ? response.headers.getSetCookie() : [];
     respHeaders.delete("Set-Cookie");
-    for (const c of rawCookies) {
-      respHeaders.append("X-Upstream-Set-Cookie", c);
+    if (rawCookies.length) {
+      // A custom repeated header may be comma-folded by an HTTP intermediary.
+      // Set-Cookie values themselves can contain commas in Expires attributes,
+      // so preserve the cookie boundaries explicitly for the Python client.
+      respHeaders.set("X-Upstream-Set-Cookie-Json", encodeURIComponent(JSON.stringify(rawCookies)));
     }
     // Marks a genuine university response, so the bot can tell it apart from
     // an error page of the Cloudflare platform itself (limits, crashes).

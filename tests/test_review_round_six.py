@@ -29,6 +29,7 @@ class FlushRaceTests(unittest.TestCase):
     def test_an_alert_queued_during_the_send_survives(self):
         db.upsert_user(telegram_id=self.UID)
         scope = db.get_user_scope(self.UID)
+        scope.sync_courses({"c1"})
         scope.delete_private(course_registry.ALERT_QUEUE_KIND)
         now = datetime(2026, 11, 10, 9, 0, tzinfo=TZ_BERLIN)
         course_registry.queue_alert(self.UID, "files", "c1", "📄 Old alert", None, "quiet",

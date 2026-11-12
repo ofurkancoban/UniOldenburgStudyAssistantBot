@@ -12,7 +12,9 @@ import contextlib
 import html
 import json
 import logging
+import math
 import os
+import random
 import tempfile
 import time
 from datetime import datetime
@@ -22,6 +24,7 @@ from bs4 import BeautifulSoup
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import ContextTypes
+from telegram.error import BadRequest, TelegramError
 
 import studip_oauth
 from studip_utils import TZ_BERLIN, berlin_now
@@ -47,6 +50,7 @@ from unibot.formatting import (
     clean_for_html,
     clean_html_text,
     parse_date_safe,
+    split_html,
     truncate_html,
 )
 from unibot.monitoring_alerts import (  # noqa: F401 - the notification layer, re-exported for callers
@@ -86,6 +90,8 @@ from unibot.monitoring_fetch import (  # noqa: F401 - the fetch layer, re-export
 from fast_enroll import current_semester_id, get_semester_options
 from unibot.preferences import get_pref
 from unibot.storage import (
+    PERSONAL_RECORD_PREFIX,
+    get_ai_personal_enabled,
     link_cache,
     load_default_semester,
     load_files_cache,
@@ -101,6 +107,7 @@ from unibot.studip_api import (
     StudipApiError,
     _api_names,
     _api_rel_id,
+    _normalize_url,
     _ensure_watched_courses_map,
     list_courses,
     _list_courses_api,
@@ -117,7 +124,16 @@ from unibot.telegram_ui import (
 
 global_message_watcher = None
 global_announcement_watcher = None
+
+# Manual /check runs and the background watcher share these global caches.
+# Serialize each cache-owning scan so two overlapping checks cannot both read
+# the same old snapshot, emit duplicate alerts, then overwrite each other's
+# cache updates.
+_announcement_check_lock = asyncio.Lock()
+_file_check_lock = asyncio.Lock()
+_forum_check_lock = asyncio.Lock()
 check_in_progress: set[int] = set()  # chat_id set to prevent concurrent checks
+_admin_check_in_progress = False
 
 _OLDEST = datetime.fromtimestamp(0, TZ_BERLIN)  # sorts files without a date first (no overflow when compared)
 
@@ -143,6 +159,30 @@ def _legacy_message_keys(user_id: int) -> list[str]:
     return keys
 
 
+def _validated_messages_cache(value) -> Optional[list[dict]]:
+    """Validate an inbox snapshot before code indexes its rows by id.
+
+    If any row is malformed, treating the snapshot as uninitialized makes
+    the next successful poll establish a fresh baseline instead of either
+    crashing or re-notifying the whole inbox.
+    """
+    if not isinstance(value, list):
+        logging.warning("Ignoring an inbox cache with an invalid top-level shape")
+        return None
+    result = []
+    for message in value:
+        if not isinstance(message, dict) or message.get("id") is None:
+            logging.warning("Ignoring an inbox cache with a malformed row")
+            return None
+        item = dict(message)
+        item["id"] = str(item["id"])
+        for key in ("title", "sender", "date", "url", "body"):
+            if key in item and item[key] is not None:
+                item[key] = str(item[key])
+        result.append(item)
+    return result
+
+
 def stored_messages(user_id: Optional[int] = None) -> Optional[list]:
     """The student's remembered inbox (None before their first check). An
     old plain document is moved into the encrypted record and deleted."""
@@ -151,14 +191,23 @@ def stored_messages(user_id: Optional[int] = None) -> Optional[list]:
         return None
     messages = personal_record(uid, MESSAGES_RECORD)
     if messages is not None:
-        return messages
+        return _validated_messages_cache(messages)
     for key in _legacy_message_keys(uid):
         try:
             if db.exists(key):
-                messages = db.load(key) or []
-                save_personal_record(uid, MESSAGES_RECORD, messages)
-                db.delete(key)
-                return messages
+                raw_messages = db.load(key)
+                messages = _validated_messages_cache(raw_messages)
+                if messages is not None:
+                    save_personal_record(uid, MESSAGES_RECORD, messages)
+                    if not db.get_user_scope(uid).has_private(PERSONAL_RECORD_PREFIX + MESSAGES_RECORD):
+                        logging.warning("Could not migrate the inbox for user %s; keeping its legacy copy", uid)
+                        return None
+                    db.delete(key)
+                    return messages
+                # The invalid old snapshot cannot be used for comparisons. It
+                # remains available for diagnosis; a successful inbox poll
+                # will replace it with a clean baseline in the private record.
+                return None
         except Exception as e:
             logging.warning("Could not move an old message cache: %s", e)
     return None
@@ -203,7 +252,7 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        cache = db.load(FILES_CACHE_PATH)
+        cache = load_files_cache()
     except Exception as e:
         logging.error("Failed to load files cache: %s", e)
         await query.edit_message_text("⚠️ Error reading file history.")
@@ -214,12 +263,18 @@ async def show_last_files(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for cid, files in cache.items():
         if not isinstance(files, dict) or cid not in allowed:
             continue
-        for name, info in files.items():
+        for identity, info in files.items():
             if not isinstance(info, dict):
                 continue
+            name = info.get("name") or identity
             course = info.get("course") or state.courses_map.get(cid) or cid
             ts = info.get("modified_ts")
-            dt = datetime.fromtimestamp(ts, TZ_BERLIN) if isinstance(ts, (int, float)) else _OLDEST
+            try:
+                dt = (datetime.fromtimestamp(ts, TZ_BERLIN)
+                      if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts)
+                      else _OLDEST)
+            except (OverflowError, OSError, ValueError):
+                dt = _OLDEST
             all_files.append({
                 "cid": cid,
                 "course": course,
@@ -288,24 +343,49 @@ _prev_semester_courses: dict[int, dict] = {}
 _prev_semester_fetched: dict[int, float] = {}
 
 
+def forget_user_runtime_state(user_id: int) -> None:
+    """Drop cached course lists and manual-check timing for a deleted user."""
+    uid = int(user_id)
+    _course_list_fetched.pop(uid, None)
+    _prev_semester_courses.pop(uid, None)
+    _prev_semester_fetched.pop(uid, None)
+    _manual_check_at.pop(uid, None)
+
+
 async def _previous_semester_courses(uid: int, sess) -> dict:
     """{cid: name} of the student's courses in the semester before their
     current one, fetched with their own session through the JSON:API (no
     my_courses filter switching) and cached for COURSE_LIST_REFRESH_SECONDS."""
-    if uid in _prev_semester_courses and \
-            time.time() - _prev_semester_fetched.get(uid, 0.0) < COURSE_LIST_REFRESH_SECONDS:
-        return _prev_semester_courses[uid]
-    options = await get_semester_options(sess)
-    anchor = load_default_semester(uid).get("id") or current_semester_id(options)
-    index = next((i for i, (sid, _label) in enumerate(options) if sid == anchor), None)
-    courses: dict = {}
-    if index is not None and index + 1 < len(options):
-        with acting_as(uid):
+    if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+        return {}
+    with acting_as(uid):
+        if not db.private_context_is_current(uid):
+            return {}
+        if uid in _prev_semester_courses and \
+                time.time() - _prev_semester_fetched.get(uid, 0.0) < COURSE_LIST_REFRESH_SECONDS:
+            return _prev_semester_courses[uid]
+        options = await get_semester_options(sess)
+        if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                or lifecycle_state(uid) != ACTIVE):
+            return {}
+        anchor = load_default_semester(uid).get("id") or current_semester_id(options)
+        if not anchor:
+            raise StudipApiError("could not identify the semester for the previous-course list")
+        index = next((i for i, (sid, _label) in enumerate(options) if sid == anchor), None)
+        if index is None:
+            raise StudipApiError(f"configured semester {anchor} is missing from Stud.IP's semester list")
+        courses: dict = {}
+        if index + 1 < len(options):
             listed = await _list_courses_api(options[index + 1][0], session=sess, user_id=uid)
-        courses = {cid: name for name, cid in listed}
-    _prev_semester_courses[uid] = courses
-    _prev_semester_fetched[uid] = time.time()
-    return courses
+            if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                    or lifecycle_state(uid) != ACTIVE):
+                return {}
+            courses = {cid: name for name, cid in listed}
+        if not db.private_context_is_current(uid):
+            return {}
+        _prev_semester_courses[uid] = courses
+        _prev_semester_fetched[uid] = time.time()
+        return courses
 
 
 async def watched_courses() -> list:
@@ -322,25 +402,44 @@ async def watched_courses() -> list:
     members: dict = {}
     candidates: dict = {}
     known_uids: set = set()
+    watch_plan_complete = True
+    state.course_watch_plan_complete = False
     watcher = state.global_session
     watcher_uid = getattr(watcher, "user_id", None) if watcher is not None else None
-    if watcher is not None and has_stored_login(watcher) and lifecycle_state(watcher_uid) == ACTIVE:
+    if (watcher is not None and has_stored_login(watcher) and lifecycle_state(watcher_uid) == ACTIVE
+            and (watcher_uid is None or is_user_allowed(watcher_uid))):
         await _ensure_watched_courses_map(watcher)
-        for cid, name in state.courses_map.items():
-            titles.setdefault(cid, name)
-            candidates.setdefault(cid, []).append((watcher_uid, watcher))
-            if watcher_uid:
-                members.setdefault(cid, set()).add(watcher_uid)
+        watch_plan_complete = watch_plan_complete and state.courses_map_complete
+        if lifecycle_state(watcher_uid) == ACTIVE and (watcher_uid is None or is_user_allowed(watcher_uid)):
+            for cid, name in state.courses_map.items():
+                titles.setdefault(cid, name)
+                candidates.setdefault(cid, []).append((watcher_uid, watcher))
+                if watcher_uid:
+                    members.setdefault(cid, set()).add(watcher_uid)
     for account in signed_in_accounts():
         uid, sess = account.user_id, account.session
+        if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+            state.user_courses_map.pop(uid, None)
+            continue
         if time.time() - _course_list_fetched.get(uid, 0.0) > COURSE_LIST_REFRESH_SECONDS \
                 or uid not in state.user_courses_map:
             try:
                 with acting_as(uid):
-                    await list_courses(session=sess, user_id=uid)
+                    listed = await list_courses(session=sess, user_id=uid)
+                    if (not db.private_context_is_current(uid) or not is_user_allowed(uid)
+                            or lifecycle_state(uid) != ACTIVE):
+                        continue
+                if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+                    state.user_courses_map.pop(uid, None)
+                    continue
+                state.user_courses_map[uid] = {cid: name for name, cid in listed}
                 _course_list_fetched[uid] = time.time()
             except Exception as e:
+                watch_plan_complete = False
                 logging.warning("Course list for user %s unavailable: %s", uid, e)
+        if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+            state.user_courses_map.pop(uid, None)
+            continue
         if uid in state.user_courses_map:
             known_uids.add(uid)
         previous: dict = {}
@@ -348,11 +447,40 @@ async def watched_courses() -> list:
             try:
                 previous = await _previous_semester_courses(uid, sess)
             except Exception as e:
+                watch_plan_complete = False
+                # The registry sync below is exact. If the opted-in previous
+                # semester list failed, syncing only the current courses would
+                # erase that user's previously stored semester memberships.
+                known_uids.discard(uid)
                 logging.warning("Previous semester courses for user %s unavailable: %s", uid, e)
+        if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+            state.user_courses_map.pop(uid, None)
+            continue
         for cid, name in {**previous, **(state.user_courses_map.get(uid) or {})}.items():
             titles.setdefault(cid, name)
             candidates.setdefault(cid, []).append((uid, sess))
             members.setdefault(cid, set()).add(uid)
+    # A deletion can happen while one of the account-specific requests above
+    # is in flight. Do not republish that student's courses after deletion.
+    for uid in list(state.user_courses_map):
+        if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+            state.user_courses_map.pop(uid, None)
+    active_uids = {uid for uid in known_uids if is_user_allowed(uid) and lifecycle_state(uid) == ACTIVE}
+    known_uids.intersection_update(active_uids)
+    for cid in list(members):
+        active_members = {uid for uid in members[cid]
+                          if uid is None or (is_user_allowed(uid) and lifecycle_state(uid) == ACTIVE)}
+        if active_members:
+            members[cid] = active_members
+        else:
+            members.pop(cid, None)
+    for cid in list(candidates):
+        active_candidates = [(uid, sess) for uid, sess in candidates[cid]
+                             if uid is None or (is_user_allowed(uid) and lifecycle_state(uid) == ACTIVE)]
+        if active_candidates:
+            candidates[cid] = active_candidates
+        else:
+            candidates.pop(cid, None)
     state.course_members = members
     try:
         course_registry.sync_registry(titles, members, known_uids)
@@ -364,10 +492,11 @@ async def watched_courses() -> list:
         scanner = course_registry.pick_scanner(cid)
         if scanner is not None:
             plan.append((name, cid, scanner))
+    state.course_watch_plan_complete = watch_plan_complete
     return plan
 
 
-async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, courses=None):
+async def _check_new_announcements_parallel_unlocked(bot, chat_id, silent: bool = False, courses=None):
     """Parallel announcement checking for new items; `courses` is a
     watched_courses() plan, the watcher session's courses otherwise."""
     session = state.global_session
@@ -388,6 +517,21 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                     pass
                 logging.error("%s was corrupted (%s); moved to %s and starting fresh.", CACHE_PATH, e, corrupt_path)
                 cache = {"seen": [], "history": []}
+        # JSON decoding alone does not guarantee the cache has the structure
+        # this watcher expects. A valid JSON list/string used to abort every
+        # announcement check at cache.get(), leaving the watcher stuck.
+        if not isinstance(cache, dict):
+            logging.error("%s has an invalid top-level shape; starting with an empty cache.", CACHE_PATH)
+            cache = {"seen": [], "history": []}
+        if not isinstance(cache.get("seen"), list):
+            logging.warning("%s has an invalid seen list; resetting it.", CACHE_PATH)
+            cache["seen"] = []
+        if not isinstance(cache.get("history"), list):
+            logging.warning("%s has an invalid history list; resetting it.", CACHE_PATH)
+            cache["history"] = []
+        cache["seen"] = [key for key in cache["seen"] if isinstance(key, str)]
+        cache["history"] = [entry for entry in cache["history"]
+                             if isinstance(entry, dict) and isinstance(entry.get("key"), str)]
         seen = set(cache.get("seen", []))
 
         if courses is None:
@@ -397,6 +541,7 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
         all_found = []
         semaphore = asyncio.Semaphore(3)
         read_ok: set = set()  # courses whose announcements were actually read
+        incomplete_courses: set = set()
         seeded = _seeded_courses(cache.get("seeded"), (key.split(":", 1)[0] for key in seen))
 
         async def check_single_course_announcements(course_name, cid, session):
@@ -408,14 +553,22 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                     read_ok.add(cid)
                     return course_name, cid, found
                 except Exception as e:
+                    if getattr(e, "quiet", False):
+                        incomplete_courses.add(cid)
+                        logging.debug("Announcements scan paused for %s during university host cooldown",
+                                      course_name)
+                        return course_name, cid, []
                     logging.warning("Announcements API failed for %s (%s), falling back to the overview page", course_name, e)
                 try:
                     url = f"{BASE_URL}/dispatch.php/course/overview?cid={cid}"
                     async with await session.get(url) as r:
-                         html_text = await r.text()
+                        if r.status != 200:
+                            raise RuntimeError(f"course overview answered HTTP {r.status}")
+                        html_text = await r.text()
 
                     if "loginform" in html_text:
                         logging.warning("🔐 Session expired while accessing %s.", course_name)
+                        incomplete_courses.add(cid)
                         await session.login()
                         return course_name, cid, []
 
@@ -465,15 +618,20 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                     read_ok.add(cid)
                     return course_name, cid, course_announcements
                 except Exception as e:
-                    logging.warning("Announcement parse error in %s: %s", course_name, e)
+                    incomplete_courses.add(cid)
+                    log = logging.debug if getattr(e, "quiet", False) else logging.warning
+                    log("Announcement parse error in %s: %s", course_name, e)
                     return course_name, cid, []
 
         tasks = [check_single_course_announcements(name, cid, sess) for name, cid, sess in courses]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for result in results:
+        for (_course_name, cid, _session), result in zip(courses, results):
             if isinstance(result, tuple) and len(result) == 3:
                 all_found.extend(result[2])
+            elif isinstance(result, BaseException):
+                incomplete_courses.add(cid)
+                logging.warning("Announcement scan task failed for course %s: %s", cid, result)
 
         if all_found:
             all_found.sort(key=lambda x: (x["dt"] or "", x["date"]))
@@ -497,7 +655,10 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                     "━━━━━━━━━━━━━━━━━"
                 )
                 sid = _short_id()
-                announcement_task_cache[sid] = {"course": ann['course'], "subject": ann['subject'], "body": ann['body']}
+                announcement_task_cache[sid] = {
+                    "cid": ann["cid"], "course": ann["course"],
+                    "subject": ann["subject"], "body": ann["body"],
+                }
                 buttons = [
                     [InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")],
                     [InlineKeyboardButton("📝 Add as Task", callback_data=f"ann_to_task|{sid}")],
@@ -506,8 +667,15 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
                 await course_registry.fan_out(bot, ann.get("cid"), "announcements", text,
                                               announcement_title_text(ann), reply_markup=markup,
                                               members=course_members(ann.get("cid")))
-        elif not silent:
+        elif not silent and not incomplete_courses:
             await bot.send_message(chat_id=chat_id, text="☑️ No new announcements found.", disable_notification=True)
+        if incomplete_courses and not silent:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(f"⚠️ Could not check {len(incomplete_courses)} course(s); "
+                      "results may be incomplete. Try again shortly."),
+                disable_notification=True,
+            )
 
         seen.update(a["key"] for a in all_found)
         cache["seen"] = list(seen)
@@ -519,8 +687,33 @@ async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, c
         cache["history"] = merged[-100:]
 
         db.save(CACHE_PATH, cache)
+        return None if incomplete_courses else bool(new_items)
     except Exception as e:
         logging.error("check_new_announcements_parallel fatal: %s", e)
+        return None
+
+
+async def check_new_announcements_parallel(bot, chat_id, silent: bool = False, courses=None):
+    """Serialize checks that read and update the shared announcement cache."""
+    async with _announcement_check_lock:
+        return await _check_new_announcements_parallel_unlocked(bot, chat_id, silent, courses)
+
+
+async def _send_history_entry(bot, chat_id: int, text: str) -> bool:
+    """Split HTML safely and isolate one entry's delivery from later entries."""
+    try:
+        for chunk in split_html(text):
+            try:
+                await bot.send_message(chat_id=chat_id, text=chunk, parse_mode="HTML")
+            except BadRequest as exc:
+                if "parse" not in str(exc).lower():
+                    raise
+                plain = BeautifulSoup(chunk, "html.parser").get_text()
+                await bot.send_message(chat_id=chat_id, text=plain)
+        return True
+    except TelegramError as exc:
+        logging.warning("History entry could not be delivered to %s: %s", chat_id, exc)
+        return False
 
 
 async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -541,6 +734,11 @@ async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("⚠️ Error reading announcement history.")
         return
 
+    if not isinstance(cache, dict):
+        logging.warning("Announcement cache has an invalid top-level shape.")
+        await query.edit_message_text("⚠️ No announcements found in history.")
+        return
+
     history = cache.get("history", [])
     allowed = set(student_courses(query.from_user.id))  # the shared cache holds every student's courses
     if isinstance(history, list):
@@ -550,11 +748,12 @@ async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text("⚠️ No announcements found in history.")
         return
 
-    history.sort(key=lambda x: x.get("dt", ""))
+    history.sort(key=lambda x: str(x.get("dt") or ""))
     last5 = history[-5:]
 
     await query.edit_message_text("📢 <b>Last 5 Announcements</b>\n━━━━━━━━━━━━━━━━━", parse_mode="HTML")
 
+    failed = 0
     for ann in last5:
         text = (
             "━━━━━━━━━━━━━━━━━\n"
@@ -567,12 +766,14 @@ async def show_last_announcements(update: Update, context: ContextTypes.DEFAULT_
             f"{html.escape(ann.get('body', ''))}\n"
             "━━━━━━━━━━━━━━━━━"
         )
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        if not await _send_history_entry(context.bot, chat_id, text):
+            failed += 1
         await asyncio.sleep(0.3)
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text="📌 <b>Quick Access</b>",
+        text=(f"⚠️ {failed} announcement(s) could not be fully delivered. Please retry.\n\n" if failed else "")
+             + "📌 <b>Quick Access</b>",
         parse_mode="HTML",
         reply_markup=get_show_last_keyboard()
     )
@@ -590,7 +791,7 @@ async def show_last_forum_posts(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     try:
-        cache = db.load(CACHE_PATH)
+        cache = _load_forum_cache()
     except Exception:
         logging.warning("Forum history unreadable", exc_info=True)
         await query.edit_message_text("⚠️ Error reading forum history.")
@@ -607,20 +808,33 @@ async def show_last_forum_posts(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text("⚠️ No forum posts found in history.")
         return
 
-    # Sort by date (text sort is not ideal but sufficient for now, or use 'key' if it has timestamp)
-    # The key format is cid:thread_id:post_id_or_date.
-    # Let's try to trust the order they were added or just reverse check
-    # We don't have a reliable timestamp in the dict unless we parsed it.
-    # But for "Show Last", usually showing the most recently added to cache is good.
-    # Python dicts preserve insertion order in recent versions.
-    # So taking the last 5 items might work if we append new ones.
-    # But let's just show them.
+    def _forum_post_datetime(post):
+        value = post.get("timestamp") or post.get("date")
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                parsed = parse_date_safe(value)
+        else:
+            parsed = parse_date_safe(value)
+        if parsed == datetime.min:
+            return float("-inf")
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=TZ_BERLIN)
+        try:
+            return parsed.timestamp()
+        except (OSError, OverflowError, ValueError):
+            return float("-inf")
 
-    last5 = list(all_posts)[-5:]
-    last5.reverse()  # Newest first
+    # Existing discussion keys keep their insertion position when a new reply
+    # updates the cache entry. Sort by posting time so active older threads
+    # appear in "Last 5" even when their cache key has existed for months.
+    all_posts.sort(key=_forum_post_datetime, reverse=True)
+    last5 = all_posts[:5]
 
     await query.edit_message_text("💬 <b>Last 5 Forum Posts</b>\n━━━━━━━━━━━━━━━━━", parse_mode="HTML")
 
+    failed = 0
     for post in last5:
         # Get post data with fallbacks
         course = post.get('course', 'Unknown Course')
@@ -628,9 +842,6 @@ async def show_last_forum_posts(update: Update, context: ContextTypes.DEFAULT_TY
         author = post.get('author', 'Unknown')
         date = post.get('date') or post.get('timestamp', '-')
         body = post.get('body', '')
-
-        # No blind truncation here because body contains HTML formatting.
-        # It's better to manage length dynamically within the scraper.
 
         text = (
             "━━━━━━━━━━━━━━━━━\n"
@@ -644,12 +855,14 @@ async def show_last_forum_posts(update: Update, context: ContextTypes.DEFAULT_TY
             f"{body}\n"
             "━━━━━━━━━━━━━━━━━"
         )
-        await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        if not await _send_history_entry(context.bot, chat_id, text):
+            failed += 1
         await asyncio.sleep(0.3)
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text="📌 <b>Quick Access</b>",
+        text=(f"⚠️ {failed} forum entry/entries could not be fully delivered. Please retry.\n\n" if failed else "")
+             + "📌 <b>Quick Access</b>",
         parse_mode="HTML",
         reply_markup=get_show_last_keyboard()
     )
@@ -660,7 +873,47 @@ async def check_new_files(bot, chat_id, silent: bool = False):
     return await check_new_files_parallel(bot, chat_id, silent)
 
 
-async def _scan_course_files(course_name: str, cid: str, cache: dict, session=None) -> tuple[list, bool]:
+async def _list_course_files_recursive(cid: str, session, list_folder) -> list[dict]:
+    """List every file in a course tree, using one session for the whole scan.
+
+    A folder that cannot be listed makes the course scan incomplete. Callers
+    then keep the previous cache snapshot instead of treating a partial tree
+    as deleted files.
+    """
+    visited_folders: set[str] = set()
+    files: list[dict] = []
+
+    async def visit(folder_url: Optional[str]) -> None:
+        normalized_url = _normalize_url(folder_url) if folder_url else None
+        if folder_url and normalized_url is None:
+            raise StudipApiError(f"invalid folder URL while scanning course {cid}")
+        folder_key = normalized_url or f"root:{cid}"
+        if folder_key in visited_folders:
+            return
+        visited_folders.add(folder_key)
+
+        items = await list_folder(cid, folder_url, session=session)
+        folders = []
+        for item in items:
+            if item.get("type") == "file":
+                files.append(item)
+            elif item.get("type") == "folder":
+                child_url = _normalize_url(item.get("url"))
+                if child_url is None:
+                    raise StudipApiError(
+                        f"folder {item.get('name')!r} has no trusted URL in course {cid}"
+                    )
+                folders.append(child_url)
+
+        for child_url in folders:
+            await visit(child_url)
+
+    await visit(None)
+    return files
+
+
+async def _scan_course_files(course_name: str, cid: str, cache: dict, session=None,
+                             incomplete_courses: Optional[set] = None) -> tuple[list, bool]:
     """(new/updated file events, cache changed) for one course.
 
     The cache always gets the fresh listing, even without a notification, so
@@ -670,15 +923,28 @@ async def _scan_course_files(course_name: str, cid: str, cache: dict, session=No
         api_ok = True
         try:
             files, used = await course_registry.scan_with_failover(
-                cid, session, lambda s: _list_files_api(cid, None, session=s))
+                cid, session,
+                lambda s: _list_course_files_recursive(cid, s, _list_files_api),
+            )
         except Exception as e:
+            if getattr(e, "quiet", False):
+                if incomplete_courses is not None:
+                    incomplete_courses.add(cid)
+                logging.debug("File API scan paused for %s during university host cooldown", course_name)
+                return [], False
             logging.warning("File API failed for %s with every member (%s), falling back to the HTML page",
                             course_name, e)
-            files, used = await _list_files_html(cid, None, session=session), session
+            files = await _list_course_files_recursive(cid, session, _list_files_html)
+            used = session
             api_ok = False
         if not files:
-            if api_ok and cid not in cache:
-                cache[cid] = {}  # read and empty: its first file is news
+            if api_ok:
+                course_registry.record_scan(cid, used, file_hash=course_registry.content_hash({}))
+            # A successfully read empty listing is meaningful: files may have
+            # been removed from the course. Keep the historical diff silent,
+            # but stop showing deleted files in the last-files view.
+            if cid not in cache or cache.get(cid) != {}:
+                cache[cid] = {}
                 return [], True
             return [], False
         current = _snapshot_course_files(files)
@@ -691,18 +957,23 @@ async def _scan_course_files(course_name: str, cid: str, cache: dict, session=No
             return [], True
         old = cache.get(cid, {})
         events = _file_events(course_name, cid, *_diff_course_files(current, old))
-        if current == old:
+        cache_current = {
+            name: {**info, "course": course_name, "modified_ts": info.get("modified_ts")}
+            for name, info in current.items()
+        }
+        if cache_current == old:
             return events, False
-        cache[cid] = {name: {**info, "course": course_name, "modified_ts": info.get("modified_ts")}
-                      for name, info in current.items()}
+        cache[cid] = cache_current
         return events, True
     except Exception as e:
+        if incomplete_courses is not None:
+            incomplete_courses.add(cid)
         logging.warning("Error while checking files for %s: %s", course_name, e)
         return [], False
 
 
 @single_flight
-async def check_new_files_parallel(bot, chat_id, silent: bool = False, courses=None):
+async def _check_new_files_parallel_unlocked(bot, chat_id, silent: bool = False, courses=None):
     """Parallel file checking; `courses` is a watched_courses() plan."""
     session = state.global_session
     if not silent:
@@ -714,13 +985,16 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False, courses=N
             await _ensure_watched_courses_map(session)
             courses = [(name, cid, session) for cid, name in state.courses_map.items()]
         if not courses:
-            return
+            return False
 
         semaphore = asyncio.Semaphore(1)
+        incomplete_courses: set = set()
 
         async def scan(course_name, cid, sess):
             async with semaphore:
-                res = await _scan_course_files(course_name, cid, cache, session=sess)
+                res = await _scan_course_files(
+                    course_name, cid, cache, session=sess, incomplete_courses=incomplete_courses,
+                )
                 await asyncio.sleep(0.5)  # Pace queries politely
                 return res
 
@@ -728,8 +1002,9 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False, courses=N
                                        return_exceptions=True)
         all_events = []
         updated = False
-        for result in results:
+        for (_course_name, cid, _session), result in zip(courses, results):
             if isinstance(result, BaseException):
+                incomplete_courses.add(cid)
                 logging.error("Course check failed: %s", result)
                 continue
             events, changed = result
@@ -739,6 +1014,21 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False, courses=N
         try:
             if all_events:
                 await _send_file_alerts(bot, all_events)
+                if incomplete_courses and not silent:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(f"⚠️ Could not check {len(incomplete_courses)} course(s); "
+                              "file results may be incomplete. Try again shortly."),
+                        disable_notification=True,
+                    )
+            elif incomplete_courses:
+                if not silent:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(f"⚠️ Could not check {len(incomplete_courses)} course(s); "
+                              "file results may be incomplete. Try again shortly."),
+                        disable_notification=True,
+                    )
             else:
                 if not silent:
                     await bot.send_message(chat_id=chat_id, text="☑️ No new or updated files found.", disable_notification=True)
@@ -748,9 +1038,18 @@ async def check_new_files_parallel(bot, chat_id, silent: bool = False, courses=N
             if updated:
                 save_files_cache(cache)
 
+        return None if incomplete_courses else bool(all_events)
+
     except Exception as e:
         await bot.send_message(chat_id=chat_id, text=f"❌ Error during file check:\n{e}")
         logging.error("check_new_files_parallel fatal: %s", e)
+        return None
+
+
+async def check_new_files_parallel(bot, chat_id, silent: bool = False, courses=None):
+    """Serialize checks that read and update the shared file cache."""
+    async with _file_check_lock:
+        return await _check_new_files_parallel_unlocked(bot, chat_id, silent, courses)
 
 
 # The inbox is one small API request, so it's polled on its own short loop
@@ -768,40 +1067,51 @@ async def message_poll_loop(app) -> None:
     message reaches Telegram within about a minute) and every other signed-in
     user's inbox every MESSAGE_POLL_USER_SECONDS, each with their own session
     and sent only to them. Skips while the watchers are paused."""
-    import random
-
     act_as_bot()
     last_user_poll: dict[int, float] = {}
     while True:
         await asyncio.sleep(MESSAGE_POLL_SECONDS)
-        if state.global_watcher_paused:
-            continue
-        # the fast poll reads the watcher session's inbox, so its messages go
-        # to that session's own student (the primary admin before it has one)
-        admin_id = getattr(state.global_session, "user_id", None) or PRIMARY_ADMIN_ID
-        with acting_as(None):
-            if state.global_session is not None and admin_id is not None and has_stored_login(state.global_session) \
-                    and lifecycle_state(admin_id) == ACTIVE:
-                try:
-                    await check_new_messages(app.bot, admin_id, silent=True)
-                except Exception as e:
-                    logging.error("❌ Message poll failed: %s", e)
+        try:
+            await _poll_messages_once(app, last_user_poll)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.error("❌ Message poll cycle failed; retrying next interval", exc_info=True)
 
-        now = time.time()
-        for uid, sess in list(state.user_sessions.items()):
-            if sess is state.global_session or uid == admin_id:
-                continue
-            if now - last_user_poll.get(uid, 0.0) < MESSAGE_POLL_USER_SECONDS:
-                continue
-            if time.time() - getattr(sess, "last_interactive_activity", 0.0) < 180 or not has_stored_login(sess):
-                continue
-            last_user_poll[uid] = now
-            await asyncio.sleep(random.uniform(1.0, 4.0))  # spread users out
-            with acting_as(uid):
-                try:
-                    await check_new_messages(app.bot, uid, silent=True)
-                except Exception as e:
-                    logging.warning("Message poll failed for user %s: %s", uid, e)
+
+async def _poll_messages_once(app, last_user_poll: dict[int, float]) -> None:
+    """Run one inbox cycle; the outer loop keeps polling after an unexpected
+    per-user lookup or session-state error."""
+    if state.global_watcher_paused:
+        return
+    # the fast poll reads the watcher session's inbox, so its messages go
+    # to that session's own student (the primary admin before it has one)
+    admin_id = getattr(state.global_session, "user_id", None) or PRIMARY_ADMIN_ID
+    with acting_as(admin_id):
+        if state.global_session is not None and admin_id is not None and has_stored_login(state.global_session) \
+                and is_user_allowed(admin_id) and lifecycle_state(admin_id) == ACTIVE:
+            try:
+                await check_new_messages(app.bot, admin_id, silent=True)
+            except Exception as e:
+                logging.error("❌ Message poll failed: %s", e)
+
+    now = time.time()
+    for uid, sess in list(state.user_sessions.items()):
+        if sess is state.global_session or uid == admin_id:
+            continue
+        if now - last_user_poll.get(uid, 0.0) < MESSAGE_POLL_USER_SECONDS:
+            continue
+        if time.time() - getattr(sess, "last_interactive_activity", 0.0) < 180 or not has_stored_login(sess):
+            continue
+        last_user_poll[uid] = now
+        await asyncio.sleep(random.uniform(1.0, 4.0))  # spread users out
+        if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE or not has_stored_login(sess):
+            continue
+        with acting_as(uid):
+            try:
+                await check_new_messages(app.bot, uid, silent=True)
+            except Exception as e:
+                logging.warning("Message poll failed for user %s: %s", uid, e)
 
 
 _message_check_lock = asyncio.Lock()
@@ -812,24 +1122,36 @@ async def check_new_messages(bot, chat_id, silent: bool = False):
     (newest last). Serialized, since the fast poll loop and the manual
     check can overlap and both rewrite the cache."""
     async with _message_check_lock:
-        return await _check_new_messages(bot, chat_id, silent)
+        with acting_as(chat_id):
+            if not db.private_context_is_current(chat_id):
+                return False
+            return await _check_new_messages(bot, chat_id, silent)
 
 
 async def _check_new_messages(bot, chat_id, silent: bool = False):
     # the acting user's own inbox (the admin's outside of any user context)
     session = get_user_session()
     owner = _message_owner()
+    if owner is not None and (not is_user_allowed(owner) or lifecycle_state(owner) != ACTIVE):
+        return False
     if not silent:
         await bot.send_message(chat_id=chat_id, text="📨 Checking messages...", disable_notification=True)
 
     try:
+        old_messages = stored_messages(owner)
+        known_ids = {str(m["id"]) for m in old_messages} if old_messages is not None else None
         try:
-            all_messages = await _fetch_messages_api(session=session)
+            all_messages = await _fetch_messages_api(session=session, known_ids=known_ids)
         except Exception as e:
+            if getattr(e, "quiet", False):
+                logging.debug("Inbox poll paused during university host cooldown")
+                return False
             logging.warning("check_new_messages: API failed (%s), falling back to the overview page", e)
             all_messages = await _fetch_messages_html(session)
 
-        old_messages = stored_messages(owner)
+        if (owner is not None and (not db.private_context_is_current(owner)
+                                   or not is_user_allowed(owner) or lifecycle_state(owner) != ACTIVE)):
+            return False
         if old_messages is None:
             # first check for this user: remember the inbox as it is instead
             # of sending every old message as "new"
@@ -850,14 +1172,15 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
         for msg in new_messages:
             if "body" not in msg:
                 msg["body"] = await fetch_message_body(session, msg["url"])
-
-        # Update cache with new messages prepended or appended
-        # Best to just store all recent ones
-        all_messages_combined = (new_messages + old_messages)[:100]
-        save_messages(owner, all_messages_combined)
+                if owner is not None and not db.private_context_is_current(owner):
+                    return False
 
         new_messages_sorted = sorted(new_messages, key=lambda m: parse_date_safe(m.get("date", "")))
+        delivered_ids = set()
         for msg in new_messages_sorted:
+            if (owner is not None and (not db.private_context_is_current(owner)
+                                       or not is_user_allowed(owner) or lifecycle_state(owner) != ACTIVE)):
+                break
             body_text = msg.get("body", "📭 Content error").strip()
             text = (
                 "🔥 📩 <b>NEW MESSAGE</b> 🔥\n"
@@ -889,14 +1212,29 @@ async def _check_new_messages(bot, chat_id, silent: bool = False):
                     btn_rows.append([InlineKeyboardButton("↩️ Reply on Stud.IP", callback_data=f"msg_reply|{msg['id']}")])
                 btn_rows.append([InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")])
                 markup = markup_for(chat_id, InlineKeyboardMarkup(btn_rows))
-            # a Stud.IP message is private: only its recipient gets it. One
-            # too long for Telegram (escaped markup grows) is cut, so the
-            # rest of the batch isn't lost with it: the cache is updated already
             try:
                 await bot.send_message(chat_id=chat_id, text=truncate_html(text), parse_mode="HTML", reply_markup=markup)
             except Exception as e:
                 logging.error("check_new_messages: could not send message %s: %s", msg.get("id"), e)
+                # Keep the acknowledged inbox a contiguous newest-first
+                # boundary. If a later message were delivered and cached after
+                # this failure, the next API scan could stop at that newer ID
+                # and never retry this one.
+                break
+            else:
+                if owner is not None and not db.private_context_is_current(owner):
+                    return False
+                delivered_ids.add(msg["id"])
             await asyncio.sleep(0.3)
+        # Only acknowledge messages Telegram accepted. Failed items remain
+        # unseen and are retried on the next inbox poll.
+        if (owner is not None and (not db.private_context_is_current(owner)
+                                   or not is_user_allowed(owner) or lifecycle_state(owner) != ACTIVE)):
+            return False
+        delivered = [m for m in new_messages if m["id"] in delivered_ids]
+        recent = sorted(delivered + old_messages,
+                        key=lambda m: parse_date_safe(m.get("date", "")), reverse=True)
+        save_messages(owner, recent[:100])
         return True
     except Exception as e:
         logging.error("check_new_messages failed: %s", e)
@@ -921,13 +1259,18 @@ def _load_forum_cache() -> dict:
     if not db.exists(FORUM_CACHE_PATH):
         return {}
     try:
-        return db.load(FORUM_CACHE_PATH)
+        cache = db.load(FORUM_CACHE_PATH)
+        if not isinstance(cache, dict):
+            logging.warning("⚠️ Forum cache has an invalid top-level shape, using empty.")
+            return {}
+        return {key: entry for key, entry in cache.items()
+                if isinstance(key, str) and isinstance(entry, dict)}
     except Exception:
         logging.warning("⚠️ Failed to load forum cache, using empty.")
         return {}
 
 
-async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, courses=None):
+async def _check_new_forum_posts_parallel_unlocked(bot, chat_id, silent: bool = False, courses=None):
     """Parallel forum checking; `courses` is a watched_courses() plan."""
     session = state.global_session
     if not silent:
@@ -948,7 +1291,8 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, cou
                     entries, used = await course_registry.scan_with_failover(
                         cid, sess, lambda s: _fetch_course_forum_strict(s, course_name, cid))
                 except Exception as e:
-                    logging.warning("Forum of %s unavailable with every member: %s", course_name, e)
+                    log = logging.debug if getattr(e, "quiet", False) else logging.warning
+                    log("Forum of %s unavailable with every member: %s", course_name, e)
                     return None
                 course_registry.record_scan(cid, used, forum_hash=course_registry.content_hash(
                     sorted((p.get("key"), p.get("date")) for p in entries)))
@@ -956,7 +1300,11 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, cou
 
         results = await asyncio.gather(*(fetch(name, cid, sess) for name, cid, sess in courses),
                                        return_exceptions=True)
-        stored_seeded = db.load(FORUM_SEEDED_PATH) if db.exists(FORUM_SEEDED_PATH) else None
+        try:
+            stored_seeded = db.load(FORUM_SEEDED_PATH) if db.exists(FORUM_SEEDED_PATH) else None
+        except Exception as e:
+            logging.warning("Forum seed cache is unreadable; rebuilding from current history: %s", e)
+            stored_seeded = None
         seeded = _seeded_courses(stored_seeded, (p.get("cid") for p in cache.values() if isinstance(p, dict)))
         new_posts_found = []
         for res in results:
@@ -964,16 +1312,40 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, cou
                 continue
             cid, entries = res
             for p in entries:
+                # Bind even legacy/parser-provided rows to the scanned course.
+                p["cid"] = cid
                 # Notify for threads not seen before that have unread postings;
                 # a newly followed course's existing threads are its starting point
-                if p["key"] not in cache and p.get("is_new") and cid in seeded:
-                    new_posts_found.append(p)
+                previous = cache.get(p["key"])
+                if cid in seeded:
+                    if previous is None:
+                        # A thread first appearing after the course was seeded
+                        # is new only when Stud.IP marks it unread for the
+                        # session that fetched it. Existing threads are checked
+                        # by stable post ID below because unread counts belong
+                        # to the individual scanning account.
+                        if p.get("is_new"):
+                            new_posts_found.append(p)
+                    else:
+                        previous_post_id = previous.get("last_post_id")
+                        current_post_id = p.get("last_post_id")
+                        if previous_post_id is not None and current_post_id is not None:
+                            has_new_post = previous_post_id != current_post_id
+                        else:
+                            # Existing cache entries predate last_post_id.
+                            # Their body/date still identify most new replies.
+                            has_new_post = (
+                                previous.get("timestamp") != p.get("timestamp")
+                                or previous.get("last_message_plain") != p.get("last_message_plain")
+                            )
+                        if has_new_post:
+                            new_posts_found.append(p)
                 # Always cache, so "Show Last 5" works immediately
                 cache[p["key"]] = p
             seeded.add(cid)
 
         for p in new_posts_found:
-            markup = await _forum_alert_markup(p)
+            markup = _forum_alert_markup(p)
             await course_registry.fan_out(bot, p.get("cid"), "forum", _forum_alert_text(p),
                                           forum_title_text(p), reply_markup=markup,
                                           members=course_members(p.get("cid")))
@@ -985,8 +1357,17 @@ async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, cou
         if not new_posts_found and not silent:
             await bot.send_message(chat_id=chat_id, text="☑️ No new forum posts found (cache updated).", disable_notification=True)
 
+        return None if any(res is None or isinstance(res, BaseException) for res in results) else bool(new_posts_found)
+
     except Exception as e:
         logging.error("check_new_forum_posts_parallel fatal: %s", e)
+        return None
+
+
+async def check_new_forum_posts_parallel(bot, chat_id, silent: bool = False, courses=None):
+    """Serialize checks that read and update the shared forum cache."""
+    async with _forum_check_lock:
+        return await _check_new_forum_posts_parallel_unlocked(bot, chat_id, silent, courses)
 
 
 async def check_new_forum_posts(bot, chat_id, silent: bool = False):
@@ -1136,13 +1517,17 @@ async def _run_check_now(update, context):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id if update.effective_user else None
     is_admin = user_id is not None and is_user_admin(user_id)
+    watcher_was_paused = state.global_watcher_paused
+    global _admin_check_in_progress
 
-    if chat_id in check_in_progress:
+    if chat_id in check_in_progress or (is_admin and _admin_check_in_progress):
         await update.message.reply_text("⚠️ Another check is already running.")
         return
 
     try:
         check_in_progress.add(chat_id)
+        if is_admin:
+            _admin_check_in_progress = True
         plan, refused = await _manual_check_plan(user_id)
         if refused:
             await update.message.reply_text(refused)
@@ -1198,7 +1583,14 @@ async def _run_check_now(update, context):
         # Summary with Last 5 buttons
         summary = "🔍 Full check completed:\n\n"
         for check, res in results:
-            icon = "✅" if res is True or (isinstance(res, list) and len(res) > 0) else ("❌" if "error" in str(res) else "☑️")
+            if res is True or (isinstance(res, list) and len(res) > 0):
+                icon = "✅"
+            elif res is None:
+                icon = "⚠️"  # the scan could not confirm a complete result
+            elif "error" in str(res):
+                icon = "❌"
+            else:
+                icon = "☑️"
             label = {"messages": "Messages", "announcements": "Announcements", "files": "Files", "forum": "Forum"}[check]
             summary += f"{icon} {label}\n"
 
@@ -1212,13 +1604,15 @@ async def _run_check_now(update, context):
     finally:
         check_in_progress.discard(chat_id)
         if is_admin:
-            state.global_watcher_paused = False
+            state.global_watcher_paused = watcher_was_paused
+            _admin_check_in_progress = False
 
 
 # ── Feature 3: Direct Stud.IP Message Reply (`POST /jsonapi.php/v1/messages`) ─
 
-async def send_studip_message(recipient_id: str, subject: str, message_body: str, _retry: bool = True,
-                              user_id: Optional[int] = None) -> dict:
+async def send_studip_message(recipient_id: str, subject: str, message_body: str,
+                              user_id: Optional[int] = None, _oauth_retry: bool = True,
+                              _session_retry: bool = True) -> dict:
     """Send a Stud.IP internal message via `POST /jsonapi.php/v1/messages`."""
     # the student sends from their own account, never from the watcher's
     if user_id is None:
@@ -1248,16 +1642,27 @@ async def send_studip_message(recipient_id: str, subject: str, message_body: str
     }
     async with await session.post(url, data=json.dumps(payload), headers=headers) as r:
         status, resp_text = r.status, await r.text()
-    if status == 401 and _retry:
+    if status == 401:
         use_oauth = studip_oauth.oauth_enabled()
-        if use_oauth and studip_oauth.load_tokens(user_id=user_id) and \
-                await studip_oauth.get_access_token(force_refresh=True, user_id=user_id):
-            return await send_studip_message(recipient_id, subject, message_body, _retry=False, user_id=user_id)
-        # Self-healing silent SSO renewal attempt
-        if await session.heal_session():
-            return await send_studip_message(recipient_id, subject, message_body, _retry=False, user_id=user_id)
-        await session.login()  # respects the failed-login backoff
-        return await send_studip_message(recipient_id, subject, message_body, _retry=False, user_id=user_id)
+        if _oauth_retry and use_oauth:
+            try:
+                has_tokens = studip_oauth.load_tokens(user_id=user_id) is not None
+                token = (await studip_oauth.get_access_token(force_refresh=True, user_id=user_id)
+                         if has_tokens else None)
+            except Exception as exc:
+                logging.warning("OAuth refresh failed for message send; trying the cookie session: %s",
+                                type(exc).__name__)
+                token = None
+            if token:
+                return await send_studip_message(recipient_id, subject, message_body, user_id=user_id,
+                                                 _oauth_retry=False, _session_retry=_session_retry)
+        if _session_retry:
+            from studip_session import cookie_auth_only
+            with cookie_auth_only():
+                if not await session.heal_session():
+                    await session.login()  # respects the failed-login backoff
+                return await send_studip_message(recipient_id, subject, message_body, user_id=user_id,
+                                                 _oauth_retry=False, _session_retry=False)
     if status not in (200, 201, 202, 204):
         raise StudipApiError(f"POST /messages failed: HTTP {status} ({resp_text[:180]})")
     try:
@@ -1404,6 +1809,20 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if message is None or message.voice is None or chat is None or user_data is None:
         return
 
+    def request_is_current() -> bool:
+        return (is_user_allowed(user_id) and db.private_context_is_current(user_id)
+                and lifecycle_state(user_id) == ACTIVE)
+
+    async def discard_status() -> None:
+        with contextlib.suppress(Exception):
+            await status_msg.delete()
+
+    if not get_ai_personal_enabled(user_id):
+        await message.reply_text(
+            "🔒 Voice messages use outside speech and AI services. Enable personal AI use under /settings → 🔒 Privacy first."
+        )
+        return
+
     if not ai_budget_left(user_id):
         # every voice note needs several AI calls (intent, answer, speech)
         await message.reply_text(AI_BUDGET_MESSAGE)
@@ -1411,19 +1830,39 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     status_msg = await message.reply_text("🎙️ Transcribing...", disable_notification=True)
     await context.bot.send_chat_action(chat_id=chat.id, action=ChatAction.TYPING)
 
-    ogg_path = os.path.join(tempfile.gettempdir(), f"voice_{message.voice.file_unique_id}.oga")
+    # file_unique_id is shared by identical voice uploads (including forwards).
+    # A deterministic path lets two simultaneous handlers overwrite or delete
+    # each other's recording, potentially transcribing the wrong student's audio.
+    fd, ogg_path = tempfile.mkstemp(prefix="unibot_voice_", suffix=".oga")
+    os.close(fd)
     try:
         file = await context.bot.get_file(message.voice.file_id)
+        if not request_is_current():
+            await discard_status()
+            return
         await file.download_to_drive(ogg_path)
-        transcript = await transcribe_voice_message(ogg_path)
+        if not request_is_current():
+            await discard_status()
+            return
+        transcript = await transcribe_voice_message(ogg_path, user_id=user_id)
     except Exception as e:
         logging.warning("Voice message transcription failed", exc_info=True)
-        await status_msg.edit_text(f"⚠️ {e}")
+        if request_is_current():
+            await status_msg.edit_text(f"⚠️ {e}")
+        else:
+            await discard_status()
         return
     finally:
         # the student's recording never stays on the server
         with contextlib.suppress(OSError):
             os.remove(ogg_path)
+
+    if not request_is_current():
+        await discard_status()
+        return
+    if not get_ai_personal_enabled(user_id):
+        await status_msg.edit_text("🔒 Personal AI use was turned off. The voice message was not processed further.")
+        return
 
     # Google's free STT can mishear things, so confirm before it's actually used
     # to answer the wizard step (or classified as a fresh command) - nothing is
@@ -1439,7 +1878,10 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
     # oddly to interrupt a direct answer with an extra confirm step.
     intent_result = None
     if step is None:
-        intent_result = await classify_voice_intent(transcript)
+        intent_result = await classify_voice_intent(transcript, user_id=user_id)
+        if not request_is_current():
+            await discard_status()
+            return
         if intent_result["intent"] == "recommend_meal":
             await status_msg.delete()
             await _route_voice_intent(update, context, intent_result, transcript)

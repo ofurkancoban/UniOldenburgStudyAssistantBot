@@ -36,7 +36,10 @@ const SERVICE_TOKEN = (process.env.WA_SERVICE_TOKEN || '').trim();
 function tokenMatches(received) {
     const a = Buffer.from(String(received || ''));
     const b = Buffer.from(SERVICE_TOKEN);
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
+    // timingSafeEqual compares bytes and throws when UTF-8 byte lengths
+    // differ. Compare the buffers, not JS string lengths, so malformed
+    // non-ASCII headers are rejected as unauthorized instead of becoming 500s.
+    return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
 }
 
 if (!SERVICE_TOKEN) {
@@ -62,23 +65,49 @@ const AUTH_DIR = 'baileys_auth';
 const LOCK_FILE = 'whatsapp_service.lock';
 
 function acquireProcessLock() {
+    let fd;
     try {
-        if (fs.existsSync(LOCK_FILE)) {
+        // Exclusive creation makes the check and claim one atomic operation.
+        fd = fs.openSync(LOCK_FILE, 'wx', 0o600);
+        fs.writeFileSync(fd, String(process.pid));
+        fs.closeSync(fd);
+        return true;
+    } catch (err) {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch { /* ignore */ }
+            try { fs.unlinkSync(LOCK_FILE); } catch { /* ignore */ }
+        }
+        if (err.code !== 'EEXIST') {
+            console.error('FATAL: Unable to acquire WhatsApp process lock:', err);
+            process.exit(1);
+            return false;
+        }
+
+        let oldPid;
+        try {
             const content = fs.readFileSync(LOCK_FILE, 'utf8').trim();
-            const oldPid = parseInt(content, 10);
-            if (!isNaN(oldPid) && oldPid !== process.pid) {
-                try {
-                    process.kill(oldPid, 0);
-                    console.error(`FATAL: Another WhatsApp service is already running (PID ${oldPid}). Exiting immediately.`);
-                    process.exit(1);
-                } catch (e) {
-                    console.log(`Cleaning up stale lock file from dead PID ${oldPid}`);
-                }
+            if (!/^\d+$/.test(content)) throw new Error('Lock file has no valid PID');
+            oldPid = Number(content);
+            if (!Number.isSafeInteger(oldPid) || oldPid < 1) throw new Error('Lock file has invalid PID');
+        } catch (checkError) {
+            console.error('FATAL: WhatsApp process lock is unreadable or malformed; refusing to start:', checkError);
+            process.exit(1);
+            return false;
+        }
+        try {
+            process.kill(oldPid, 0);
+            console.error(`FATAL: Another WhatsApp service is already running (PID ${oldPid}). Exiting immediately.`);
+        } catch (checkError) {
+            if (checkError.code === 'EPERM') {
+                console.error(`FATAL: WhatsApp lock owner PID ${oldPid} exists but cannot be inspected. Exiting.`);
+            } else if (checkError.code === 'ESRCH') {
+                console.error(`FATAL: Stale WhatsApp lock from PID ${oldPid}; the bot supervisor must clean it before restart.`);
+            } else {
+                console.error('FATAL: Unable to inspect WhatsApp process lock:', checkError);
             }
         }
-        fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'w' });
-    } catch (err) {
-        console.error('Warning: Error handling process lock:', err);
+        process.exit(1);
+        return false;
     }
 }
 
@@ -97,21 +126,22 @@ function releaseProcessLock() {
 
 acquireProcessLock();
 
-// Safety net: an error from an internal async path not awaited by our own
-// try/catch is an unhandled rejection/exception and would otherwise exit
-// Node, killing the whole service (and pm2 then restarts it from scratch,
-// dropping the session). Log and keep running instead; reconnectClient()'s
-// own guard (isReconnecting) prevents pile-ups if this fires mid-reconnect.
+// An unhandled rejection is logged because it may be an isolated failed
+// operation. An uncaught exception is different: process state can no longer
+// be trusted, so exit and let the Python parent restart us from saved auth.
 process.on('unhandledRejection', (err) => {
     console.error('Unhandled rejection (kept process alive):', err);
 });
 process.on('uncaughtException', (err) => {
-    if (err && err.code === 'EADDRINUSE') {
-        console.error('FATAL: Port in use (EADDRINUSE). Exiting immediately to prevent conflict loop.');
-        releaseProcessLock();
-        process.exit(1);
-    }
-    console.error('Uncaught exception (kept process alive):', err);
+    console.error('Fatal uncaught exception; exiting so the parent can restart the service:', err);
+    if (shutdownStarted) return;
+    shutdownStarted = true;
+    void flushAuthWrites()
+        .catch((flushError) => console.error('Could not flush WhatsApp auth writes after fatal error:', flushError))
+        .finally(() => {
+            releaseProcessLock();
+            process.exit(1);
+        });
 });
 
 async function sendQRToTelegram(qrString) {
@@ -137,8 +167,12 @@ async function sendQRToTelegram(qrString) {
             } else {
                 console.error('Failed to send QR to Telegram:', res.statusCode);
             }
+            // Consume the response even though its body is not needed, so the
+            // socket can close cleanly and the HTTP client does not retain it.
+            res.resume();
         });
 
+        req.on('error', (err) => console.error('Error sending QR to Telegram:', err));
         form.pipe(req);
     } catch (err) {
         console.error('Error sending QR to Telegram:', err);
@@ -177,6 +211,9 @@ const TEST_MESSAGE_KEYBOARD = { inline_keyboard: [[{ text: '🧪 Send WA Test Me
 let sock = null;
 let isAuthenticated = false;
 let isReconnecting = false;
+let socketSetupPromise = null;
+let flushAuthWrites = async () => {};
+let shutdownStarted = false;
 let reconnectFailures = 0; // consecutive closes since the last open, drives the reconnect backoff
 let sessionLoggedOut = false; // true after WhatsApp rejected the saved session (logged out), so /request_qr knows reusing it is pointless
 let hasEverConnected = false; // true once the connection has opened at least once this process - never reset, so /status can tell "waiting for the first-ever QR" apart from "was connected, session dropped"
@@ -197,8 +234,20 @@ let disconnectAlertPending = false;
 // just means discarding the old socket reference and building a fresh one,
 // reusing the same auth folder (see auth_state.js) so a still-valid session
 // restores silently with no new QR.
-async function connectToWhatsApp() {
-    const { state, saveCreds } = await useResilientAuthState(AUTH_DIR, { onAlert: (text) => sendTextToTelegram(text) });
+function connectToWhatsApp() {
+    if (socketSetupPromise) return socketSetupPromise;
+    let tracked;
+    tracked = _connectToWhatsApp().finally(() => {
+        if (socketSetupPromise === tracked) socketSetupPromise = null;
+    });
+    socketSetupPromise = tracked;
+    return tracked;
+}
+
+async function _connectToWhatsApp() {
+    const authState = await useResilientAuthState(AUTH_DIR, { onAlert: (text) => sendTextToTelegram(text) });
+    flushAuthWrites = authState.flushWrites;
+    const { state, saveCreds } = authState;
 
     sock = makeWASocket({
         auth: state,
@@ -371,6 +420,18 @@ async function reconnectClient(reason, { forceLogout = false } = {}) {
         console.log(`Reconnect already in progress, skipping duplicate trigger (${reason}).`);
         return;
     }
+    // The initial startup connect is not a reconnect and previously did not
+    // set isReconnecting. Wait for its socket/auth setup to finish before
+    // tearing down the socket or deleting auth files for a forced QR flow.
+    const pendingSetup = socketSetupPromise;
+    if (pendingSetup) {
+        try {
+            await pendingSetup;
+        } catch {
+            // The normal reconnect path below retries a failed setup.
+        }
+        if (isReconnecting) return;
+    }
     isReconnecting = true;
     isAuthenticated = false;
     console.log(`Re-initializing WhatsApp client (${reason})...`);
@@ -387,12 +448,21 @@ async function reconnectClient(reason, { forceLogout = false } = {}) {
         }
     }
 
+    // Event listeners are detached now, so this is the final batch of writes
+    // owned by the old auth state. Finish it before either reloading the same
+    // files into a new state instance or deleting them for a new QR code.
+    await flushAuthWrites();
+
     if (forceLogout) {
         try {
             if (sock) await sock.logout();
         } catch (err) {
             console.error('Error logging out client:', err);
         }
+        // logout() may trigger final Signal key removals or credential saves.
+        // Wait for those before deleting the directory so no stale write can
+        // recreate old session files after the reset.
+        await flushAuthWrites();
         try {
             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
         } catch (err) {
@@ -405,6 +475,7 @@ async function reconnectClient(reason, { forceLogout = false } = {}) {
             // ignore - socket may already be closed
         }
     }
+    await flushAuthWrites();
     sock = null;
 
     try {
@@ -412,7 +483,16 @@ async function reconnectClient(reason, { forceLogout = false } = {}) {
     } catch (err) {
         console.error('Error re-initializing client:', err);
         isReconnecting = false;
-        sendTextToTelegram(`🔴 WhatsApp reconnect attempt failed (${reason}): ${err && err.message ? err.message : String(err)}\n\nWon't retry automatically until another trigger (a send attempt, or tap "📲 Request WA QR" in /status).`);
+        const errorText = err && err.message ? err.message : String(err);
+        sendTextToTelegram(`🔴 WhatsApp reconnect attempt failed (${reason}): ${errorText}\n\nRetrying automatically with a backoff. You can also tap "📲 Request WA QR" in /status.`);
+        const delay = Math.min(5000 * 2 ** reconnectFailures, 5 * 60 * 1000);
+        reconnectFailures += 1;
+        console.log(`Scheduling another reconnect attempt in ${Math.round(delay / 1000)} seconds...`);
+        setTimeout(() => {
+            if (!isAuthenticated && !isReconnecting && !sessionLoggedOut && !isConflictPaused) {
+                reconnectClient(`retry after failed attempt: ${reason}`);
+            }
+        }, delay);
     }
 }
 
@@ -565,37 +645,33 @@ app.post('/send', async (req, res) => {
 
     const { text, groupName } = req.body;
 
-    if (!text || !groupName) {
+    if (typeof text !== 'string' || text.length === 0
+        || typeof groupName !== 'string' || groupName.length === 0) {
         return res.status(400).json({ error: 'Missing text or groupName in request body' });
     }
 
     try {
 
-        // Use hardcoded WA_GROUP_ID from .env if available to completely bypass group lookup
-        const hardcodedGroupId = process.env.WA_GROUP_ID;
+        // Prefer an explicit JID (group or individual chat) over the process
+        // environment. For older callers that send a display name, retain the
+        // configured group as the fallback target.
+        const requestedJid = typeof groupName === 'string'
+            && (groupName.endsWith('@g.us') || groupName.endsWith('@c.us'))
+            ? groupName
+            : null;
+        const targetId = requestedJid || process.env.WA_GROUP_ID;
 
-        if (hardcodedGroupId) {
+        if (targetId) {
             // jidNormalizedUser is a no-op for group JIDs (@g.us has no
-            // per-device suffix to strip) - this is purely defensive, in
-            // case WA_GROUP_ID ever ends up holding a device-specific JID.
-            const sent = await sock.sendMessage(jidNormalizedUser(hardcodedGroupId), { text });
+            // per-device suffix to strip) - this is purely defensive.
+            const sent = await sock.sendMessage(jidNormalizedUser(targetId), { text });
             if (!sent) {
-                noteSendFailureAndReconnect(hardcodedGroupId);
+                noteSendFailureAndReconnect(targetId);
                 return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (it may or may not have actually gone out - check the group before resending). Reconnecting in the background; try again in about 30 seconds.' });
             }
-            console.log(`Message sent directly to WA_GROUP_ID: ${hardcodedGroupId}`);
-            return res.json({ success: true, message: 'Message sent via Hardcoded ID' });
-        }
-
-        // If the python bot sent an ID instead of a name (ends with @g.us or @c.us), use it directly
-        if (groupName.endsWith('@g.us') || groupName.endsWith('@c.us')) {
-            const sent = await sock.sendMessage(jidNormalizedUser(groupName), { text });
-            if (!sent) {
-                noteSendFailureAndReconnect(groupName);
-                return res.status(502).json({ error: 'WhatsApp accepted the request but did not confirm the message was sent (it may or may not have actually gone out - check the group before resending). Reconnecting in the background; try again in about 30 seconds.' });
-            }
-            console.log(`Message sent directly to ID: ${groupName}`);
-            return res.json({ success: true, message: 'Message sent via direct ID' });
+            const destination = targetId.endsWith('@c.us') ? 'direct ID' : 'group ID';
+            console.log(`Message sent directly to ${destination}: ${targetId}`);
+            return res.json({ success: true, message: `Message sent via ${destination}` });
         }
 
         // Otherwise try searching by name
@@ -626,6 +702,8 @@ app.post('/send', async (req, res) => {
 
 // Graceful shutdown on exit (PM2 restart/stop)
 const cleanupAndExit = async () => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
     console.log('\nShutting down WhatsApp service...');
     if (stableConnectionTimer) {
         clearTimeout(stableConnectionTimer);
@@ -640,6 +718,7 @@ const cleanupAndExit = async () => {
     } catch (err) {
         // Ignore errors during shutdown
     }
+    await flushAuthWrites();
     releaseProcessLock();
     process.exit(0);
 };
@@ -651,7 +730,10 @@ process.on('SIGQUIT', cleanupAndExit);
 const server = app.listen(PORT, HOST, () => {
     console.log(`WhatsApp service listening on ${HOST}:${PORT}`);
     // Start WhatsApp connection ONLY after the HTTP port is bound
-    connectToWhatsApp();
+    connectToWhatsApp().catch((err) => {
+        console.error('Initial WhatsApp connection setup failed:', err);
+        reconnectClient('initial connection setup failed');
+    });
 });
 
 server.on('error', (err) => {

@@ -199,6 +199,8 @@ class BlockedStudentAlertTests(unittest.TestCase):
         from unibot import db, telegram_ui
         db.upsert_user(telegram_id=9951, role="user")
         db.upsert_user(telegram_id=9952, role="user")
+        db.get_user_scope(9951).sync_courses({"c1"})
+        db.get_user_scope(9952).sync_courses({"c1"})
         db.set_user_active(9952, False)
         targets = telegram_ui.broadcast_targets("c1", members={9951, 9952})
         self.assertIn(9951, targets)

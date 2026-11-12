@@ -8,7 +8,7 @@ import html
 import logging
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, cast
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -38,11 +38,12 @@ from unibot.storage import (
     user_tasks,
     set_wardrobe_reference_photo,
 )
+from unibot import db
 from unibot.formatting import _short_id, clean_course_title
 from unibot.telegram_ui import user_data, _download_telegram_file, get_main_keyboard, nav_names
 from unibot.auth import get_user_session, is_user_allowed, login_studip, personal_session
 from unibot.studip_api import BASE_URL, _normalize_url, list_courses, list_files
-from unibot.ai import _call_openrouter, _extract_json_object
+from unibot.ai import _call_openrouter, _extract_json_object, personal_ai_allowed
 from unibot.weather import get_weather_snapshot
 from unibot.mensa import (
     _deliver_food_recommendation,
@@ -66,6 +67,18 @@ from unibot.morning import send_daily_plan_voice, send_text_and_voice, send_week
 
 
 nav_stack: dict[int, list[Optional[str]]] = {}  # user_id -> [url1, url2, ...]
+
+
+def _exam_datetime(value: str) -> datetime:
+    """Parse a StuMS exam datetime as Berlin local time.
+
+    StuMS schedule strings have no timezone suffix; date-only curriculum
+    entries are naive too. Normalize both before comparing with berlin_now().
+    """
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=TZ_BERLIN)
+    return parsed.astimezone(TZ_BERLIN)
 
 
 # ── Voice intent routing (free-tier OpenRouter LLM) ─────────────────────────
@@ -239,7 +252,8 @@ async def build_qa_context(user_id=None) -> str:
 QA_SYSTEM_PROMPT = """You are a helpful university assistant answering a spoken question from a student, using ONLY the data provided below the question: never invent facts that aren't in it. Answer conversationally and concisely (2-4 sentences), in plain spoken sentences suitable both for reading as a text message and for being read aloud as a voice message: no markdown, no bullet points, no emojis, no headers. If the data doesn't contain enough to answer, say so honestly rather than guessing. If weather data is given and the question is about the weather or what to wear/bring, answer using the condition (dry/rainy/etc, that matters more than the exact temperature) with a practical suggestion. Course material excerpts, when given, are passages from the student's own course files picked by similarity to the question: use them for questions about lecture content, assignments or course organisation, mention which course or file the answer comes from, and ignore excerpts that don't actually answer the question."""
 
 
-async def answer_question_with_context(question: str, context_data: str, name: Optional[str] = None) -> Optional[str]:
+async def answer_question_with_context(question: str, context_data: str, name: Optional[str] = None,
+                                       user_id: Optional[int] = None) -> Optional[str]:
     """Ask the chat LLM (OpenRouter) to answer a free-form spoken question
     using the snapshot from build_qa_context. Returns None on any failure -
     callers should tell the user to try again rather than send a blank or
@@ -248,11 +262,14 @@ async def answer_question_with_context(question: str, context_data: str, name: O
     if name:
         system_prompt += f" The student's name is {name} - you may address them by it naturally, but don't force it into every sentence."
     user_prompt = f"Data:\n{context_data}\n\nQuestion: {question}"
-    answer = await _call_openrouter(system_prompt, user_prompt, temperature=0.7)
+    answer = await _call_openrouter(
+        system_prompt, user_prompt, temperature=0.7,
+        can_send=lambda: user_id is None or personal_ai_allowed(user_id),
+    )
     return answer.strip() if answer else None
 
 
-async def classify_voice_intent(transcript: str) -> dict:
+async def classify_voice_intent(transcript: str, user_id: Optional[int] = None) -> dict:
     """Classify a fresh (no wizard pending) voice transcript into one of
     VOICE_INTENTS. Always returns {"intent", "query", "alternatives"};
     falls back to {"intent": "unclear", "query": None, "alternatives": []}
@@ -265,11 +282,23 @@ async def classify_voice_intent(transcript: str) -> dict:
     can't parse (truncated, prose-wrapped, etc), and a single retry clears
     most of those without meaningfully hurting latency."""
     for attempt in range(2):
-        raw = await _call_openrouter(CLASSIFY_INTENT_SYSTEM_PROMPT, transcript)
+        if user_id is not None and not get_ai_personal_enabled(user_id):
+            return {"intent": "unclear", "query": None, "alternatives": []}
+        raw = await _call_openrouter(
+            CLASSIFY_INTENT_SYSTEM_PROMPT, transcript,
+            can_send=lambda: user_id is None or personal_ai_allowed(user_id),
+        )
         parsed = _extract_json_object(raw)
         if parsed and parsed.get("intent") in VOICE_INTENTS:
-            alternatives = [a for a in (parsed.get("alternatives") or []) if a in INTENT_LABELS]
-            return {"intent": parsed["intent"], "query": parsed.get("query"), "alternatives": alternatives[:2]}
+            raw_alternatives = parsed.get("alternatives")
+            alternatives = (
+                [a for a in raw_alternatives if isinstance(a, str) and a in INTENT_LABELS]
+                if isinstance(raw_alternatives, list) else []
+            )
+            query = parsed.get("query")
+            if not isinstance(query, str):
+                query = None
+            return {"intent": parsed["intent"], "query": query, "alternatives": alternatives[:2]}
         if attempt == 0:
             logging.warning("classify_voice_intent: unparseable response, retrying: %r", raw)
     return {"intent": "unclear", "query": None, "alternatives": []}
@@ -289,15 +318,15 @@ async def _upcoming_exams(session):
         logging.warning("_upcoming_exams: fetch failed: %s", e)
         return []
 
-    now = berlin_now()
+    now = datetime.now(TZ_BERLIN)
     upcoming = []
     for exam in registered:
         if not exam.get("date"):
             continue
         if exam.get("start_datetime"):
-            dt = datetime.fromisoformat(exam["start_datetime"])
+            dt = _exam_datetime(exam["start_datetime"])
         else:
-            dt = datetime.fromisoformat(exam["date"]).replace(hour=9, minute=0)
+            dt = _exam_datetime(exam["date"]).replace(hour=9, minute=0)
         if dt >= now:
             upcoming.append((exam["title"], dt))
 
@@ -340,12 +369,12 @@ async def _find_exam_datetime(session, query_text: Optional[str]):
         if not exam.get("date"):
             continue
         if exam.get("start_datetime"):
-            pool.append((exam["title"], datetime.fromisoformat(exam["start_datetime"]), True))
+            pool.append((exam["title"], _exam_datetime(exam["start_datetime"]), True))
         else:
-            pool.append((exam["title"], datetime.fromisoformat(exam["date"]).replace(hour=9, minute=0), False))
+            pool.append((exam["title"], _exam_datetime(exam["date"]).replace(hour=9, minute=0), False))
     for exam in all_exams:
         if exam.get("exam_date"):
-            pool.append((exam["title"], datetime.fromisoformat(exam["exam_date"]).replace(hour=9, minute=0), False))
+            pool.append((exam["title"], _exam_datetime(exam["exam_date"]).replace(hour=9, minute=0), False))
 
     if not pool:
         return None, None, False
@@ -368,10 +397,17 @@ async def _find_exam_datetime(session, query_text: Optional[str]):
     if best_score < 0.45:
         return None, None, False
 
-    today_start = berlin_now().replace(hour=0, minute=0, second=0, microsecond=0)
-    if best_dt < today_start:
+    now = datetime.now(TZ_BERLIN)
+
+    def exam_is_upcoming(dt: datetime, has_exact_time: bool) -> bool:
+        # An all-day/date-only exam remains relevant for the whole calendar
+        # day. For timed exams, compare instants so the repeated autumn hour
+        # does not make a past sitting appear to be in the future.
+        return dt.timestamp() >= now.timestamp() if has_exact_time else dt.date() >= now.date()
+
+    if not exam_is_upcoming(best_dt, best_has_time):
         for score, title, dt, has_time in scored[1:]:
-            if dt >= today_start and score >= best_score - 0.15:
+            if exam_is_upcoming(dt, has_time) and score >= best_score - 0.15:
                 return title, dt, has_time
 
     return best_title, best_dt, best_has_time
@@ -442,7 +478,7 @@ def _best_title_match(query: Optional[str], candidates: list, min_score: float =
     meant?" checkpoint before acting (e.g. Stud.IP course names vs. StuMS
     exam titles for the same module often share only a generic word like
     "Economics", which scores deceptively high at the default threshold)."""
-    if not query or not candidates:
+    if not isinstance(query, str) or not query.strip() or not candidates:
         return None
     query_lower = query.strip().lower()
     if not query_lower:
@@ -477,24 +513,67 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
     file_id = update.message.photo[-1].file_id
 
     if step == "wardrobe_add_item":
+        if not get_ai_personal_enabled(user_id):
+            context.user_data.pop("pending_step", None)
+            await update.message.reply_text(
+                "🔒 Personal AI use is off. Clothing photos are sent to an outside AI service for tagging. "
+                "Enable it under /settings → 🔒 Privacy, then start Add Clothing Item again."
+            )
+            return
         status_msg = await update.message.reply_text("📸 Tagging...", disable_notification=True)
         image_bytes = await _download_telegram_file(context.bot, file_id)
-        tags = await tag_wardrobe_item(image_bytes) if image_bytes else None
+        if not db.private_context_is_current(user_id):
+            return
+        if not get_ai_personal_enabled(user_id):
+            await status_msg.edit_text("🔒 Personal AI use was turned off. The clothing photo was not sent for tagging.")
+            context.user_data.pop("pending_step", None)
+            return
+        tags = await tag_wardrobe_item(image_bytes, user_id=user_id) if image_bytes else None
+        if not db.private_context_is_current(user_id):
+            return
+        if not get_ai_personal_enabled(user_id):
+            await status_msg.edit_text("🔒 Personal AI use was turned off. The item was not saved.")
+            context.user_data.pop("pending_step", None)
+            return
         if not tags:
             await status_msg.edit_text("⚠️ Couldn't recognize that item - try a clearer photo of just this one piece of clothing, or /status to cancel.")
             return  # pending_step stays set so a retry just works
         # Best effort: without it the GWDG try-on describes the item later.
-        tags["description"] = await describe_wardrobe_item(tags, image_bytes or b"")
-        item = add_wardrobe_item(user_id, tags, file_id=file_id)
+        tags["description"] = await describe_wardrobe_item(tags, image_bytes or b"", user_id=user_id)
+        if not db.private_context_is_current(user_id):
+            return
+        if not get_ai_personal_enabled(user_id):
+            await status_msg.edit_text("🔒 Personal AI use was turned off. The item was not saved.")
+            context.user_data.pop("pending_step", None)
+            return
+        try:
+            item = add_wardrobe_item(user_id, tags, file_id=file_id)
+        except Exception:
+            logging.error("Could not save wardrobe item for user %s", user_id, exc_info=True)
+            await status_msg.edit_text(
+                "⚠️ I couldn't save that clothing item. The photo wasn't added; please try again.",
+                reply_markup=get_main_keyboard(),
+            )
+            return
+        if not db.private_context_is_current(user_id):
+            return
         context.user_data.pop("pending_step", None)
         subtype_note = f"/{item['subtype']}" if item.get("subtype") else ""
         await status_msg.edit_text(f"👔 Added: {item['label']} ({item['type']}{subtype_note}, {item['warmth']} warmth)", reply_markup=get_main_keyboard())
         return
 
     if step == "wardrobe_set_reference":
+        if not db.private_context_is_current(user_id):
+            return
         set_wardrobe_reference_photo(user_id, file_id)
+        if not db.private_context_is_current(user_id):
+            return
         context.user_data.pop("pending_step", None)
-        await update.message.reply_text("🖼️ Reference photo updated - I'll reuse it every morning.", reply_markup=get_main_keyboard())
+        await update.message.reply_text(
+            "🖼️ Reference photo updated. It is stored for outfit suggestions and sent to outside AI services only "
+            "when personal AI use is enabled under /settings → 🔒 Privacy.",
+            reply_markup=get_main_keyboard(),
+        )
         return
 
     await update.message.reply_text("📸 Got a photo - if you want to add it to your wardrobe, go to /status → 👔 My Wardrobe → 📸 Add Clothing Item first.")
@@ -512,6 +591,11 @@ async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_user_allowed(user_id):
         return
 
+    if not get_ai_personal_enabled(user_id):
+        context.user_data.pop("pending_voice", None)
+        await query.edit_message_text("🔒 Personal AI use is off. Enable it under /settings → 🔒 Privacy before using voice messages.")
+        return
+
     pending = context.user_data.pop("pending_voice", None)
     if not pending:
         await query.edit_message_text("⚠️ This confirmation has expired - please send a new voice note.")
@@ -522,12 +606,21 @@ async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     if pending["step"]:
+        # The Telegram edits above yield control. Consent, access, or the
+        # user's private-data generation may have changed while they were
+        # pending, so do not feed the confirmed transcript into a wizard
+        # until the same request-level guard used by intent routing passes.
+        if not personal_ai_allowed(user_id):
+            await query.edit_message_text(
+                "🔒 Personal AI use was turned off. The voice command was not processed."
+            )
+            return
         user_data(context)["pending_step"] = pending["step"]
         await handle_pending_step(update, context, text_override=pending["text"])
         return
 
     await query.edit_message_text(f"🎙️ Heard: “{pending['text']}”\n\n🤔 Understanding...")
-    result = pending.get("intent_result") or await classify_voice_intent(pending["text"])
+    result = pending.get("intent_result") or await classify_voice_intent(pending["text"], user_id=user_id)
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     await _route_voice_intent(update, context, result, pending["text"])
 
@@ -593,7 +686,7 @@ async def _voice_intent_unclear(update, context, result, transcript, intent, que
 async def _voice_intent_create_exam_reminder_task(update, context, result, transcript, intent, query_text, alternatives, message):
     """Voice intent: create_exam_reminder_task."""
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
-    extracted = await extract_exam_reminder_task(transcript)
+    extracted = await extract_exam_reminder_task(transcript, user_id=update.effective_user.id)
     course_query = extracted["course_query"] or query_text
     offset_value = extracted["offset_value"]
     if not course_query or offset_value is None:
@@ -617,11 +710,22 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
         return True
 
     delta = timedelta(hours=offset_value) if extracted["offset_unit"] == "hours" else timedelta(days=offset_value)
-    due_dt = (exam_dt - delta).replace(tzinfo=TZ_BERLIN)
-    if due_dt <= datetime.now(TZ_BERLIN):
+    # Offsets mean elapsed time before the sitting. Subtract in UTC so an
+    # offset that crosses a DST boundary cannot create a nonexistent Berlin
+    # wall time or drift by an hour.
+    due_dt = (exam_dt.astimezone(timezone.utc) - delta).astimezone(TZ_BERLIN)
+    now = datetime.now(TZ_BERLIN)
+    if (not has_time and extracted["offset_unit"] == "days" and offset_value == 0
+            and exam_dt.date() == now.date()):
+        # A date-only sitting has no known 09:00 start. If the student asks
+        # for a reminder on its date after the default 09:00 placeholder,
+        # send it now instead of incorrectly calling the exam past.
+        due_dt = now
+    if due_dt.timestamp() <= now.timestamp():
         # a reminder in the past would fire at once
         exam_when = exam_dt.strftime("%d.%m.%Y %H:%M") if has_time else exam_dt.strftime("%d.%m.%Y")
-        if exam_dt.replace(tzinfo=TZ_BERLIN) <= datetime.now(TZ_BERLIN):
+        exam_has_passed = (exam_dt.timestamp() <= now.timestamp()) if has_time else exam_dt.date() < now.date()
+        if exam_has_passed:
             await message.reply_text(
                 f"⚠️ The {exam_title} exam I found was on {exam_when}, which has already passed, so no reminder "
                 "was set. If there is a later sitting, register for it first or add the reminder via ➕ Add Task."
@@ -633,7 +737,7 @@ async def _voice_intent_create_exam_reminder_task(update, context, result, trans
         )
         return True
     task = {
-        "id": str(uuid.uuid4())[:8],
+        "id": uuid.uuid4().hex,
         "user_id": update.effective_user.id,
         "text": f"{exam_title} exam",
         "due_time": due_dt.isoformat(),
@@ -861,8 +965,13 @@ async def _voice_intent_exam_register(update, context, result, transcript, inten
     matched_exam = _best_title_match(query_text, [(e["title"], e) for e in exams])
     if matched_exam:
         sid = str(uuid.uuid4())[:8]
-        exam_action_cache[sid] = {"unit_id": matched_exam["unit_id"], "action_type": action_type,
-                                  "title": matched_exam["title"], "user_id": update.effective_user.id}
+        try:
+            exam_action_cache[sid] = {"unit_id": matched_exam["unit_id"], "action_type": action_type,
+                                      "title": matched_exam["title"], "user_id": update.effective_user.id}
+        except RuntimeError:
+            logging.warning("Could not persist an exam button action for user %s", update.effective_user.id)
+            await message.reply_text("⚠️ I couldn't safely prepare that action just now. Open Exam Registration to try again.")
+            return True
         label = "📝 Register" if intent == "exam_register" else "🗑️ Deregister"
         keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(f"{label}: {matched_exam['title'][:40]}?", callback_data=f"exam_ask|{sid}")]])
         await message.reply_text(f"🎙️ Found a match: {matched_exam['title']}", reply_markup=keyboard)
@@ -936,23 +1045,49 @@ async def _voice_intent_ask_question(update, context, result, transcript, intent
     """Voice intent: ask_question."""
     await context.bot.send_chat_action(chat_id=message.chat_id, action=ChatAction.TYPING)
     qa_user_id = update.effective_user.id if update.effective_user else None
+
+    def request_is_current() -> bool:
+        return (qa_user_id is not None and is_user_allowed(qa_user_id)
+                and db.private_context_is_current(qa_user_id))
+
     try:
         context_data = await build_qa_context(user_id=qa_user_id)
-        passages = await search_course_material(transcript, user_id=qa_user_id)
+        if not request_is_current():
+            return True
+        # Course files are personal academic data too; do not retrieve and
+        # forward their contents to an AI provider when personal sharing is off.
+        passages = (await search_course_material(transcript, user_id=qa_user_id)
+                    if get_ai_personal_enabled(qa_user_id) else [])
+        if not request_is_current():
+            return True
         if passages:
             context_data += "\n\nCourse material excerpts (from the student's Stud.IP course files, closest to the question first):\n" + "\n\n".join(
                 f"[{p['course']} | {p['file']}]\n{p['text']}" for p in passages
             )
         name = get_user_name(qa_user_id) if get_ai_personal_enabled(qa_user_id) else None
-        answer = await answer_question_with_context(transcript, context_data, name=name)
+        if not get_ai_personal_enabled(qa_user_id):
+            await message.reply_text("🔒 Personal AI use was turned off. The spoken question was not sent for answering.")
+            return True
+        answer = await answer_question_with_context(
+            transcript, context_data, name=name, user_id=qa_user_id
+        )
     except Exception as e:
         logging.error("_route_voice_intent: ask_question failed: %s", e)
+        if not request_is_current():
+            return True
         await message.reply_text(f"❌ Error answering that: {str(e)[:200]}")
+        return True
+    if not request_is_current():
         return True
     if not answer:
         await message.reply_text("🤷 Couldn't come up with an answer right now - try again in a bit.")
         return True
-    await send_text_and_voice(message, answer)
+    if not request_is_current():
+        return True
+    if not get_ai_personal_enabled(qa_user_id):
+        await message.reply_text("🔒 Personal AI use was turned off. The answer was not sent.")
+        return True
+    await send_text_and_voice(message, answer, user_id=qa_user_id)
     return True
 
 
@@ -1017,6 +1152,20 @@ async def _route_voice_intent(update: Update, context: ContextTypes.DEFAULT_TYPE
     low-confidence or missing match falls back to showing the full list, the
     same one the button-driven flow would have shown.
     """
+    user_id = update.effective_user.id if update.effective_user else None
+    # Intent classification can finish after an administrator blocks the
+    # account or personal-data deletion invalidates the originating update.
+    # Do not let that stale result start a new private action.
+    if (user_id is None or not is_user_allowed(user_id)
+            or not db.private_context_is_current(user_id)):
+        return
+    if not get_ai_personal_enabled(user_id):
+        message = update.effective_message
+        if message is not None:
+            await message.reply_text(
+                "🔒 Personal AI use is off. Enable it under /settings → 🔒 Privacy before using voice messages."
+            )
+        return
     from unibot.menus import handle_pending_step
     intent = result.get("intent", "unclear")
     query_text = result.get("query")
@@ -1044,6 +1193,11 @@ async def handle_voice_clarify(update: Update, context: ContextTypes.DEFAULT_TYP
 
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
+        return
+
+    if not get_ai_personal_enabled(user_id):
+        context.user_data.pop("pending_voice_clarify", None)
+        await query.edit_message_text("🔒 Personal AI use is off. Enable it under /settings → 🔒 Privacy before using voice messages.")
         return
 
     pending = context.user_data.pop("pending_voice_clarify", None)

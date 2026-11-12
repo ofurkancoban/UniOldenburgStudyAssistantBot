@@ -4,6 +4,7 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import logging
+import math
 import time
 from datetime import datetime
 from typing import Optional
@@ -21,7 +22,7 @@ from unibot.config import (
     WEATHER_LATITUDE,
     WEATHER_LONGITUDE,
 )
-from unibot.storage import personal_record, save_personal_record, shared_http
+from unibot.storage import PERSONAL_RECORD_PREFIX, personal_record, save_personal_record, shared_http
 from unibot.auth import current_user_id, is_user_allowed
 
 
@@ -33,6 +34,33 @@ WEATHER_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 
 
 WEATHER_LOCATION_RECORD = "weather_location"  # each student's own place, encrypted
+
+
+def _normalize_location(value, fallback_name: str = "") -> Optional[dict]:
+    if not isinstance(value, dict):
+        return None
+    name = value.get("name") or fallback_name
+    country = value.get("country") or ""
+    latitude, longitude = value.get("latitude"), value.get("longitude")
+    if not isinstance(name, str) or not name.strip() or not isinstance(country, str):
+        return None
+    if (isinstance(latitude, bool) or isinstance(longitude, bool)
+            or not isinstance(latitude, (int, float, str))
+            or not isinstance(longitude, (int, float, str))):
+        return None
+    try:
+        latitude, longitude = float(latitude), float(longitude)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    if (not math.isfinite(latitude) or not math.isfinite(longitude)
+            or not -90 <= latitude <= 90 or not -180 <= longitude <= 180):
+        return None
+    return {
+        "name": name.strip(),
+        "country": country.strip(),
+        "latitude": latitude,
+        "longitude": longitude,
+    }
 
 
 def _weather_owner(user_id=None) -> Optional[int]:
@@ -52,30 +80,47 @@ def load_weather_location(user_id=None) -> Optional[dict]:
     try:
         own = personal_record(uid, WEATHER_LOCATION_RECORD)
         if own:
-            return own
+            location = _normalize_location(own)
+            if location is None:
+                logging.warning("Ignoring malformed weather location for user %s", uid)
+            return location
         if uid == PRIMARY_ADMIN_ID and db.exists(WEATHER_LOCATION_CACHE_PATH):
             # the one shared place from before belonged to the bot's owner
             legacy = db.load(WEATHER_LOCATION_CACHE_PATH)
-            if legacy:
-                save_personal_record(uid, WEATHER_LOCATION_RECORD, legacy)
+            location = _normalize_location(legacy)
+            if location:
+                save_personal_record(uid, WEATHER_LOCATION_RECORD, location)
+                if not db.get_user_scope(uid).has_private(PERSONAL_RECORD_PREFIX + WEATHER_LOCATION_RECORD):
+                    logging.warning("Could not migrate the weather location; keeping its legacy copy")
+                    return None
             db.delete(WEATHER_LOCATION_CACHE_PATH)
-            return legacy or None
+            return location
     except Exception as e:
         logging.warning("Could not load weather location: %s", e)
     return None
 
 
 def save_weather_location(name: str, country: str, latitude: float, longitude: float,
-                          user_id=None) -> None:
+                          user_id=None) -> bool:
     uid = _weather_owner(user_id)
     if uid is None:
         logging.error("Weather location not saved: no student")
-        return
+        return False
+    location = _normalize_location({
+        "name": name, "country": country, "latitude": latitude, "longitude": longitude,
+    })
+    if location is None:
+        logging.warning("Weather location not saved for user %s: invalid location data", uid)
+        return False
     try:
-        save_personal_record(uid, WEATHER_LOCATION_RECORD,
-                             {"name": name, "country": country, "latitude": latitude, "longitude": longitude})
+        save_personal_record(uid, WEATHER_LOCATION_RECORD, location)
+        # Private writes can be rejected silently when the account was deleted
+        # while an older update was waiting on geocoding. Confirm persistence
+        # before telling the user the new location is active.
+        return personal_record(uid, WEATHER_LOCATION_RECORD) == location
     except Exception as e:
         logging.error("Could not save weather location: %s", e)
+        return False
 
 
 async def geocode_location(query: str) -> Optional[dict]:
@@ -98,16 +143,15 @@ async def geocode_location(query: str) -> Optional[dict]:
         logging.warning("geocode_location: fetch failed: %s", e)
         return None
 
-    results = data.get("results") or []
-    if not results:
+    try:
+        results = data.get("results") or []
+        best = results[0] if isinstance(results, list) and results else None
+        location = _normalize_location(best, fallback_name=query) if isinstance(best, dict) else None
+    except (AttributeError, IndexError, TypeError, ValueError):
+        location = None
+    if not location:
         return None
-    best = results[0]
-    return {
-        "name": best.get("name", query),
-        "country": best.get("country", ""),
-        "latitude": best["latitude"],
-        "longitude": best["longitude"],
-    }
+    return location
 
 
 async def handle_set_weather_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -151,9 +195,22 @@ _FETCHED_AT: dict = {}
 SNAPSHOT_REUSE_SECONDS = 30 * 60  # students at the same place share a fetch
 
 
+def _prune_weather_snapshots(now_ts: Optional[float] = None) -> None:
+    """Discard expired places and dates so cache memory follows recent use."""
+    now_ts = now_ts if now_ts is not None else time.time()
+    expired = [key for key, fetched in _FETCHED_AT.items()
+               if now_ts - fetched >= SNAPSHOT_REUSE_SECONDS]
+    for key in expired:
+        _FETCHED_AT.pop(key, None)
+        _SNAPSHOTS.pop(key, None)
+
+
 def _coords(location: Optional[dict]) -> tuple[float, float]:
     if location:
-        return float(location["latitude"]), float(location["longitude"])
+        normalized = _normalize_location(location)
+        if normalized:
+            return normalized["latitude"], normalized["longitude"]
+        logging.warning("Ignoring malformed weather coordinates; using the configured default")
     return float(WEATHER_LATITUDE), float(WEATHER_LONGITUDE)
 
 
@@ -177,7 +234,11 @@ def forget_weather_place(user_id, place: Optional[dict]) -> None:
 def cached_weather_snapshot(day, user_id=None) -> Optional[dict]:
     """The last get_weather_snapshot result for `day` at the student's place,
     without a request (None when it wasn't fetched in this process)."""
-    return _SNAPSHOTS.get(snapshot_key(day, user_id))
+    location = load_weather_location(user_id)
+    snapshot = _SNAPSHOTS.get((day, *tuple(round(c, 3) for c in _coords(location))))
+    if snapshot is None:
+        return None
+    return {**snapshot, "location_name": location["name"] if location else "Oldenburg"}
 
 
 async def get_weather_snapshot(target_date=None, user_id=None) -> Optional[dict]:
@@ -206,8 +267,11 @@ async def get_weather_snapshot(target_date=None, user_id=None) -> Optional[dict]
     location = load_weather_location(user_id)
     latitude, longitude = _coords(location)
     key = (target_date, round(latitude, 3), round(longitude, 3))
-    if key in _SNAPSHOTS and time.time() - _FETCHED_AT.get(key, 0.0) < SNAPSHOT_REUSE_SECONDS:
-        return _SNAPSHOTS[key]
+    location_name = location["name"] if location else "Oldenburg"
+    now_ts = time.time()
+    _prune_weather_snapshots(now_ts)
+    if key in _SNAPSHOTS and now_ts - _FETCHED_AT.get(key, 0.0) < SNAPSHOT_REUSE_SECONDS:
+        return {**_SNAPSHOTS[key], "location_name": location_name}
 
     try:
         async with shared_http() as session:
@@ -262,11 +326,10 @@ async def get_weather_snapshot(target_date=None, user_id=None) -> Optional[dict]
             "precip_chance": max(morning_precip) if morning_precip else 0,
             "temp_min": temp_min,
             "temp_max": temp_max,
-            "location_name": location["name"] if location else "Oldenburg",
         }
         _SNAPSHOTS[key] = snapshot
         _FETCHED_AT[key] = time.time()
-        return snapshot
+        return {**snapshot, "location_name": location_name}
     except (KeyError, IndexError, ValueError, TypeError) as e:
         logging.warning("get_weather_snapshot: parse failed: %s", e)
         return None

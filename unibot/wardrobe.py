@@ -40,16 +40,15 @@ from unibot.config import (
     OUTFIT_OPENROUTER_MODEL,
 )
 from unibot.preferences import get_pref, set_pref
+from unibot import db
 from unibot.storage import (
     clear_wardrobe_items,
     get_cached_outfit_today,
     get_recently_worn_item_ids,
     get_wardrobe_entry,
-    get_wardrobe_feature_enabled,
     record_worn_items,
     remove_wardrobe_item,
     save_cached_outfit_today,
-    set_wardrobe_feature_enabled,
     shared_http,
 )
 from unibot.telegram_ui import (
@@ -63,6 +62,7 @@ from unibot.auth import is_user_admin
 from unibot.ai import (
     _call_gwdg_chat,
     _call_openrouter,
+    personal_ai_allowed,
     _extract_json_object,
     generate_outfit_tryon_gwdg,
 )
@@ -124,12 +124,80 @@ def _add_required_outerwear(items: list[dict], chosen: list[dict], weather: Opti
     """Models sometimes skip the jacket on a mild day with a cold morning
     despite the prompt; add one when the weather needs it and none was
     picked: a coat when it's cold, else a light jacket."""
-    if not _outerwear_required(weather) or any(it.get("type") == "outerwear" for it in chosen):
+    if not _outerwear_required(weather):
         return chosen
     pool = _prefer_unworn([it for it in items if it.get("type") == "outerwear"], recent_ids)
-    preferred = "coat" if _temperature_band((weather or {}).get("temp_max")) in ("very_cold", "cold") else "light_jacket"
+    band = _temperature_band((weather or {}).get("temp_max"))
+    if band == "very_cold":
+        # Full winter layering needs both a middle layer and an outer shell
+        # when the wardrobe has both, even if the model selected only one.
+        present = {it.get("subtype") for it in chosen if it.get("type") == "outerwear"}
+        additions: list[dict] = []
+        for subtype in ("light_jacket", "coat"):
+            if subtype in present:
+                continue
+            item = next((it for it in pool if it.get("subtype") == subtype), None)
+            if item and item["id"] not in {it["id"] for it in chosen + additions}:
+                additions.append(item)
+        if not present and not additions and pool:
+            additions.append(pool[0])
+        return chosen + additions
+    if any(it.get("type") == "outerwear" for it in chosen):
+        return chosen
+    preferred = "coat" if band == "cold" else "light_jacket"
     outer = next((it for it in pool if it.get("subtype") == preferred), None) or (pool[0] if pool else None)
     return chosen + [outer] if outer else chosen
+
+
+def _normalize_model_outfit(items: list[dict], chosen: list[dict], weather: Optional[dict], recent_ids: set) -> list[dict]:
+    """Enforce garment-count and weather rules on untrusted model output."""
+    unique = []
+    seen_ids = set()
+    for item in chosen:
+        if item["id"] not in seen_ids:
+            unique.append(item)
+            seen_ids.add(item["id"])
+
+    result = []
+    kept_types = set()
+    for item in unique:
+        kind = item.get("type")
+        if kind in ("top", "bottom", "shoes"):
+            if kind in kept_types:
+                continue
+            kept_types.add(kind)
+            result.append(item)
+        elif kind == "outerwear":
+            band = _temperature_band(weather.get("temp_max") if weather else None)
+            needed = _outerwear_required(weather)
+            if not needed:
+                continue
+            if band == "very_cold":
+                if item.get("subtype") not in ("light_jacket", "coat"):
+                    if any(it.get("type") == "outerwear" for it in result):
+                        continue
+                elif any(it.get("subtype") == item.get("subtype") for it in result if it.get("type") == "outerwear"):
+                    continue
+            elif any(it.get("type") == "outerwear" for it in result):
+                continue
+            result.append(item)
+        elif kind == "accessory" and any(word in item.get("label", "").lower() for word in _HEADWEAR_KEYWORDS):
+            if not any(it.get("type") == "accessory" and any(
+                word in it.get("label", "").lower() for word in _HEADWEAR_KEYWORDS
+            ) for it in result):
+                result.append(item)
+
+    # A partial but syntactically valid model answer should not omit the
+    # basic top/bottom when the wardrobe contains them.
+    fallback = _heuristic_outfit_pick(items, weather, recent_ids)
+    present_types = {it.get("type") for it in result}
+    for kind in ("top", "bottom"):
+        if kind not in present_types:
+            fill = next((it for it in fallback if it.get("type") == kind), None)
+            if fill and fill["id"] not in {it["id"] for it in result}:
+                result.append(fill)
+                present_types.add(kind)
+    return result
 
 
 def _temperature_band(temp_max: Optional[float]) -> str:
@@ -262,7 +330,8 @@ def _add_mandatory_shoes_and_headwear(items: list[dict], chosen: list[dict]) -> 
     return chosen
 
 
-async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], recent_ids: Optional[set] = None) -> Optional[dict]:
+async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], recent_ids: Optional[set] = None,
+                                   user_id: Optional[int] = None) -> Optional[dict]:
     """Ask the LLM to pick a coherent, temperature-banded outfit from the
     user's cataloged wardrobe items, considering the morning's weather
     snapshot (see get_weather_snapshot) - structural twin of
@@ -279,7 +348,7 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
     Returns {"chosen_items": [...item dicts...], "description": "<human
     readable, e.g. 'navy hoodie + black jeans'>"}, or None if there are no
     items to choose from at all."""
-    if not items:
+    if not items or user_id is None or not personal_ai_allowed(user_id):
         return None
 
     band = _temperature_band(weather.get("temp_max") if weather else None)
@@ -302,28 +371,36 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
     # Free models get rate-limited upstream now and then; the default
     # models are the backup.
     for model, gwdg_model in ((OUTFIT_OPENROUTER_MODEL, GWDG_OUTFIT_MODEL), (OPENROUTER_MODEL, GWDG_TEXT_MODEL)):
+        if user_id is not None and not personal_ai_allowed(user_id):
+            return None
         raw = await _call_openrouter(
             OUTFIT_RECOMMENDATION_SYSTEM_PROMPT, user_text,
             temperature=0.9, timeout=OUTFIT_AI_TIMEOUT_SECONDS, reasoning=False, model=model, gwdg_model=gwdg_model,
+            can_send=lambda: personal_ai_allowed(user_id),
         )
         if raw:
             break
     parsed = _extract_json_object(raw)
     chosen_items = []
-    if parsed and parsed.get("item_ids"):
+    raw_item_ids = parsed.get("item_ids") if parsed else None
+    if isinstance(raw_item_ids, list):
         by_id = {it["id"]: it for it in items}
-        chosen_items = [by_id[i] for i in parsed["item_ids"] if i in by_id]
+        chosen_items = [by_id[item_id] for item_id in raw_item_ids
+                        if isinstance(item_id, str) and item_id in by_id]
 
     if not chosen_items:
         chosen_items = _heuristic_outfit_pick(items, weather, recent_ids)
     if not chosen_items:
         return None
+    else:
+        chosen_items = _normalize_model_outfit(items, chosen_items, weather, recent_ids)
     pre_ids = {it["id"] for it in chosen_items}
     chosen_items = _add_required_outerwear(items, chosen_items, weather, recent_ids)
     chosen_items = _add_mandatory_shoes_and_headwear(items, chosen_items)
     forced_extras = [it["label"] for it in chosen_items if it["id"] not in pre_ids]
 
-    reasoning = ((parsed or {}).get("reasoning") or "").strip()
+    raw_reasoning = (parsed or {}).get("reasoning")
+    reasoning = raw_reasoning.strip()[:500] if isinstance(raw_reasoning, str) else ""
     description = reasoning or " + ".join(it["label"] for it in chosen_items)
     if reasoning and forced_extras:
         # The LLM/heuristic reasoning may not mention the mandatory
@@ -332,7 +409,8 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
         # make sure they're always named in what the user sees.
         description += " + " + " + ".join(forced_extras)
     # Only the LLM pick reasons about colors; the heuristic fallback has no tip.
-    color_tip = (parsed.get("color_tip") or "").strip() if parsed and parsed.get("item_ids") else ""
+    raw_color_tip = parsed.get("color_tip") if parsed and isinstance(raw_item_ids, list) and raw_item_ids else None
+    color_tip = raw_color_tip.strip()[:300] if isinstance(raw_color_tip, str) else ""
     return {"chosen_items": chosen_items, "description": description, "color_tip": color_tip}
 
 
@@ -362,6 +440,8 @@ async def handle_wardrobe_menu(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     await query.answer()
+    if not db.private_context_is_current(user_id):
+        return
     text, keyboard = _wardrobe_list_view(user_id)
     await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -373,8 +453,16 @@ async def handle_wardrobe_add_item(update: Update, context: ContextTypes.DEFAULT
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     await query.answer()
+    if not db.private_context_is_current(user_id):
+        return
+    if not personal_ai_allowed(user_id):
+        await query.message.reply_text(
+            "🔒 Clothing photos are sent to an outside AI service for tagging. "
+            "Allow personal data use under /settings → 🔒 Privacy before adding an item."
+        )
+        return
     user_data(context)["pending_step"] = "wardrobe_add_item"
-    await query.message.reply_text("📸 Send a photo of one clothing item.")
+    await query.message.reply_text("📸 Send a photo of one clothing item. It will be sent to an outside AI service for tagging.")
 
 
 async def handle_wardrobe_set_reference(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -384,8 +472,13 @@ async def handle_wardrobe_set_reference(update: Update, context: ContextTypes.DE
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     await query.answer()
+    if not db.private_context_is_current(user_id):
+        return
     user_data(context)["pending_step"] = "wardrobe_set_reference"
-    await query.message.reply_text("🖼️ Send one clear full-body photo of yourself - I'll reuse it every morning.")
+    await query.message.reply_text(
+        "🖼️ Send one clear full-body photo of yourself. It is stored for outfit suggestions and sent to outside AI services only "
+        "when personal AI use is enabled under /settings → 🔒 Privacy."
+    )
 
 
 async def handle_wardrobe_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -395,6 +488,8 @@ async def handle_wardrobe_remove(update: Update, context: ContextTypes.DEFAULT_T
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     await query.answer()
+    if not db.private_context_is_current(user_id):
+        return
     item_id = query.data.split("|", 1)[1]
     remove_wardrobe_item(user_id, item_id)
     text, keyboard = _wardrobe_list_view(user_id)
@@ -407,6 +502,8 @@ async def handle_wardrobe_clear_ask(update: Update, context: ContextTypes.DEFAUL
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     await query.answer()
+    if not db.private_context_is_current(query.from_user.id):
+        return
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Yes, clear all", callback_data="wardrobe_clear_confirm"),
         InlineKeyboardButton("❌ Cancel", callback_data="wardrobe_clear_cancel"),
@@ -421,6 +518,8 @@ async def handle_wardrobe_clear_confirm(update: Update, context: ContextTypes.DE
         return
     await query.answer("Cleared")
     user_id = query.from_user.id
+    if not db.private_context_is_current(user_id):
+        return
     clear_wardrobe_items(user_id)
     text, keyboard = _wardrobe_list_view(user_id)
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
@@ -428,8 +527,13 @@ async def handle_wardrobe_clear_confirm(update: Update, context: ContextTypes.DE
 
 async def handle_wardrobe_clear_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not is_user_admin(query.from_user.id):
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
+        return
     await query.answer("Cancelled")
     user_id = query.from_user.id
+    if not db.private_context_is_current(user_id):
+        return
     text, keyboard = _wardrobe_list_view(user_id)
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
@@ -448,6 +552,15 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     await query.answer()
+    if not db.private_context_is_current(user_id):
+        return
+
+    if not personal_ai_allowed(user_id):
+        await query.message.reply_text(
+            "🔒 Outfit suggestions use your wardrobe and reference photo with outside AI services. "
+            "Allow personal data use under /settings → 🔒 Privacy first."
+        )
+        return
 
     entry = get_wardrobe_entry(user_id)
     items = entry.get("items", [])
@@ -477,8 +590,18 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
     stop_evt, anim_task = _start_loading_animation(status_msg, "Picking an outfit for you...")
     try:
         weather = await get_weather_snapshot(datetime.now(TZ_BERLIN).date(), user_id=user_id)
+        if not db.private_context_is_current(user_id):
+            return
+        if not personal_ai_allowed(user_id):
+            await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
+            return
         recent_ids = get_recently_worn_item_ids(user_id)
-        outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids)
+        outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids, user_id=user_id)
+        if not db.private_context_is_current(user_id):
+            return
+        if not personal_ai_allowed(user_id):
+            await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
+            return
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
 
@@ -488,7 +611,19 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
 
     caption = outfit_caption(outfit)
     reference_bytes = await _download_telegram_file(context.bot, ref_file_id)
-    image_bytes = await generate_outfit_tryon_image(context.bot, reference_bytes, outfit["chosen_items"]) if reference_bytes else None
+    if not db.private_context_is_current(user_id):
+        return
+    if not personal_ai_allowed(user_id):
+        await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
+        return
+    image_bytes = await generate_outfit_tryon_image(
+        context.bot, reference_bytes, outfit["chosen_items"], user_id=user_id
+    ) if reference_bytes else None
+    if not db.private_context_is_current(user_id):
+        return
+    if not personal_ai_allowed(user_id):
+        await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
+        return
     photo_file_id = None
     if image_bytes:
         sent = await query.message.reply_photo(photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
@@ -508,10 +643,10 @@ async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.D
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     await query.answer()
-    new_state = not get_wardrobe_feature_enabled()
-    set_wardrobe_feature_enabled(new_state)
-    if isinstance(user_id, int):
-        set_pref(user_id, "outfit", new_state)
+    if not db.private_context_is_current(user_id):
+        return
+    new_state = not get_pref(user_id, "outfit")
+    set_pref(user_id, "outfit", new_state)
     await query.edit_message_text(
         f"👔 Daily Outfit Suggestion is now {'✅ On' if new_state else '🔲 Off'}.\nRun /status to see the full menu again."
     )
@@ -520,7 +655,7 @@ async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.D
 def _outfit_menu_view(user_id: Optional[int] = None) -> tuple:
     """/status's grouped outfit submenu: the daily suggestion toggle,
     the wardrobe list and the reference photo setup in one place."""
-    enabled = bool(get_wardrobe_feature_enabled() and (get_pref(user_id, "outfit") if isinstance(user_id, int) else True))
+    enabled = bool(get_pref(user_id, "outfit") if isinstance(user_id, int) else False)
     text = f"👔 <b>Outfit &amp; Wardrobe</b>\n\nDaily Outfit Suggestion: {'✅ On' if enabled else '🔲 Off'}"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{'✅' if enabled else '🔲'} Daily Outfit Suggestion", callback_data="outfit_menu_toggle")],
@@ -540,12 +675,12 @@ async def handle_outfit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
         return
     await query.answer()
+    if not db.private_context_is_current(user_id):
+        return
     if query.data == "outfit_menu_toggle":
-        current = bool(get_wardrobe_feature_enabled() and (get_pref(user_id, "outfit") if isinstance(user_id, int) else True))
+        current = bool(get_pref(user_id, "outfit"))
         new_state = not current
-        set_wardrobe_feature_enabled(new_state)
-        if isinstance(user_id, int):
-            set_pref(user_id, "outfit", new_state)
+        set_pref(user_id, "outfit", new_state)
         text, keyboard = _outfit_menu_view(user_id)
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
         return
@@ -576,12 +711,53 @@ async def _fetch_wardrobe_item_bytes(bot, item: dict) -> Optional[bytes]:
 TAG_WARDROBE_ITEM_PROMPT = """You're looking at a photo of a single clothing item. Respond with strict JSON only, no other text: {"type": "top|bottom|outerwear|shoes|accessory", "subtype": "<for type=top: t-shirt|shirt|sweater; for type=bottom: pants|shorts; for type=outerwear: light_jacket|coat; otherwise null>", "color": "<main color, 1-2 words>", "warmth": "light|medium|warm", "label": "<short description, e.g. 'navy blue hoodie'>"}."""
 
 
-async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
+def _validated_wardrobe_tags(value) -> Optional[dict]:
+    """Validate and bound vision-model output before storing it in the
+    wardrobe or using it to build Telegram buttons and prompts."""
+    if not isinstance(value, dict):
+        return None
+    item_type = value.get("type")
+    if not isinstance(item_type, str) or item_type not in {"top", "bottom", "outerwear", "shoes", "accessory"}:
+        return None
+    valid_subtypes = {
+        "top": {"t-shirt", "shirt", "sweater"},
+        "bottom": {"pants", "shorts"},
+        "outerwear": {"light_jacket", "coat"},
+        "shoes": set(),
+        "accessory": set(),
+    }
+    subtype = value.get("subtype")
+    if not isinstance(subtype, str) or subtype not in valid_subtypes[item_type]:
+        subtype = None
+    warmth = value.get("warmth")
+    if not isinstance(warmth, str) or warmth not in {"light", "medium", "warm"}:
+        warmth = "medium"
+
+    def short_text(key, limit, fallback=""):
+        raw = value.get(key)
+        if not isinstance(raw, str):
+            return fallback
+        return " ".join(raw.split())[:limit].strip() or fallback
+
+    return {
+        "type": item_type,
+        "subtype": subtype,
+        "color": short_text("color", 32),
+        "warmth": warmth,
+        # The wardrobe menu appends type and subtype to the label in a
+        # Telegram button (maximum 64 characters).
+        "label": short_text("label", 32, "clothing item"),
+    }
+
+
+async def tag_wardrobe_item(image_bytes: bytes, user_id: Optional[int] = None) -> Optional[dict]:
     """Auto-tag a newly uploaded clothing-item photo via GWDG's vision
     model (GWDG_VISION_MODEL), falling back to Cloudflare Workers AI's
     free-tier one. Returns {"type", "color", "warmth", "label"} or None on
     any failure (missing config, non-2xx, unparsable JSON); the caller must
     not catalog a garbage entry on None, and should let the user retry."""
+    if user_id is None or not personal_ai_allowed(user_id):
+        return None
     b64 = base64.b64encode(image_bytes).decode("ascii")
     raw = await _call_gwdg_chat(
         [{"role": "user", "content": [
@@ -589,15 +765,20 @@ async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
         ]}],
         GWDG_VISION_MODEL, timeout=30,
+        can_send=lambda: personal_ai_allowed(user_id),
     )
-    tags = _extract_json_object(raw) if raw else None
+    tags = _validated_wardrobe_tags(_extract_json_object(raw)) if raw else None
     if tags:
         return tags
+    if user_id is None or not personal_ai_allowed(user_id):
+        return None
     if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
         return None
     url = CLOUDFLARE_AI_URL.format(account_id=CLOUDFLARE_ACCOUNT_ID, model=CLOUDFLARE_VISION_MODEL)
     try:
         async with shared_http() as session:
+            if not personal_ai_allowed(user_id):
+                return None
             async with session.post(
                 url,
                 headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}", "Content-Type": "application/json"},
@@ -618,7 +799,8 @@ async def tag_wardrobe_item(image_bytes: bytes) -> Optional[dict]:
                 data = await resp.json()
                 raw = data.get("result", {}).get("response")
                 # Some Workers AI models return the JSON already parsed.
-                return raw if isinstance(raw, dict) else _extract_json_object(raw)
+                parsed = raw if isinstance(raw, dict) else _extract_json_object(raw)
+                return _validated_wardrobe_tags(parsed)
     except Exception as e:
         logging.warning("Cloudflare tagging call failed: %s", e)
         return None
@@ -676,26 +858,34 @@ GWDG_GARMENT_DESCRIBE_PROMPT = (
 )
 
 
-async def describe_wardrobe_item(item: dict, image_bytes: bytes) -> Optional[str]:
+async def describe_wardrobe_item(item: dict, image_bytes: bytes,
+                                user_id: Optional[int] = None) -> Optional[str]:
     """One-line visual description of a garment photo by GWDG's vision
     model, stored on the wardrobe item (see add_wardrobe_item) so the GWDG
     try-on can dress the reference photo from text without describing the
     garments again each time. None if GWDG is unset or the call failed."""
+    if user_id is None or not personal_ai_allowed(user_id):
+        return None
     content = [
         {"type": "text", "text": f"{GWDG_GARMENT_DESCRIBE_PROMPT}\nItem: {item.get('label', 'clothing item')} ({item.get('type', 'item')})"},
         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")}},
     ]
-    return await _call_gwdg_chat([{"role": "user", "content": content}], GWDG_VISION_MODEL, temperature=0.2, timeout=30)
+    return await _call_gwdg_chat(
+        [{"role": "user", "content": content}], GWDG_VISION_MODEL,
+        temperature=0.2, timeout=30,
+        can_send=lambda: personal_ai_allowed(user_id),
+    )
 
 
-async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -> Optional[bytes]:
+async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list,
+                                      user_id: Optional[int] = None) -> Optional[bytes]:
     """Dress the reference photo in every garment at once via a Gemini image
     model on fal.ai (FAL_GEMINI_TRYON_MODEL). garments is [(item, bytes)]
     in outer-to-inner order, shoes and headwear included; unlike the
     dedicated try-on models, this one sees the actual shoe/hat photos, so
     no separate text-described accessory pass is needed. Returns None if
     unconfigured or the call failed, so the caller falls back to FASHN."""
-    if not FAL_KEY or not FAL_GEMINI_TRYON_MODEL or not garments:
+    if user_id is None or not personal_ai_allowed(user_id) or not FAL_KEY or not FAL_GEMINI_TRYON_MODEL or not garments:
         return None
     try:
         import fal_client
@@ -707,11 +897,15 @@ async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -
     try:
         urls = []
         for data in [reference_bytes] + [g[1] for g in garments]:
+            if not personal_ai_allowed(user_id):
+                return None
             path = os.path.join(tempfile.gettempdir(), f"gemini_tryon_{uuid.uuid4().hex}.jpg")
             paths.append(path)
             await awrite_bytes(path, data)
             urls.append(await fal_client.upload_file_async(Path(path)))
 
+        if not personal_ai_allowed(user_id):
+            return None
         result = await fal_client.subscribe_async(
             FAL_GEMINI_TRYON_MODEL,
             arguments={"prompt": _tryon_prompt(garments, random.choice(TRYON_POSES)), "image_urls": urls, "num_images": 1, "output_format": "png"},
@@ -733,7 +927,9 @@ async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list) -
                 pass
 
 
-async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optional[bytes], lower_bytes: Optional[bytes]) -> Optional[bytes]:
+async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optional[bytes],
+                                      lower_bytes: Optional[bytes],
+                                      user_id: Optional[int] = None) -> Optional[bytes]:
     """Dress the reference photo via FASHN's try-on model (fal.ai-hosted,
     paid, ~$0.075/image) - the primary provider when FAL_KEY is set, since
     a live comparison against the free Spaces below showed it preserves
@@ -743,7 +939,7 @@ async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optio
     lower garment. Each step is independently best-effort. Returns None
     if FAL_KEY isn't configured, there's nothing to apply, or both steps
     failed - caller falls back to the free OOTDiffusion path."""
-    if not FAL_KEY or (not upper_bytes and not lower_bytes):
+    if user_id is None or not personal_ai_allowed(user_id) or not FAL_KEY or (not upper_bytes and not lower_bytes):
         return None
     try:
         import fal_client
@@ -755,10 +951,16 @@ async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optio
         person_path = os.path.join(tempfile.gettempdir(), f"fashn_person_{uuid.uuid4().hex}.jpg")
         garment_path = os.path.join(tempfile.gettempdir(), f"fashn_garment_{uuid.uuid4().hex}.jpg")
         try:
+            if not personal_ai_allowed(user_id):
+                return None
             await awrite_bytes(person_path, person_bytes)
             await awrite_bytes(garment_path, garment_bytes)
             person_url = await fal_client.upload_file_async(Path(person_path))
+            if not personal_ai_allowed(user_id):
+                return None
             garment_url = await fal_client.upload_file_async(Path(garment_path))
+            if not personal_ai_allowed(user_id):
+                return None
             result = await fal_client.subscribe_async(
                 FAL_TRYON_MODEL,
                 arguments={"model_image": person_url, "garment_image": garment_url},
@@ -781,12 +983,12 @@ async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optio
 
     current = reference_bytes
     applied_any = False
-    if upper_bytes:
+    if upper_bytes and personal_ai_allowed(user_id):
         result = await _apply_garment(current, upper_bytes)
         if result:
             current = result
             applied_any = True
-    if lower_bytes:
+    if lower_bytes and personal_ai_allowed(user_id):
         result = await _apply_garment(current, lower_bytes)
         if result:
             current = result
@@ -795,7 +997,9 @@ async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optio
     return current if applied_any else None
 
 
-async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Optional[bytes], lower_bytes: Optional[bytes]) -> Optional[bytes]:
+async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Optional[bytes],
+                                     lower_bytes: Optional[bytes],
+                                     user_id: Optional[int] = None) -> Optional[bytes]:
     """Dress the reference photo via levihsu/OOTDiffusion's dress-code
     endpoint (process_dc) - unlike yisol/IDM-VTON, this exposes a
     category selector (Upper-body/Lower-body/Dress), so it can be
@@ -808,6 +1012,8 @@ async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Option
     Quality depends heavily on the reference photo being a plain-
     background, front-facing, full-body shot - not guaranteed otherwise,
     this is a free shared-GPU community demo, not a production API."""
+    if user_id is None or not personal_ai_allowed(user_id):
+        return None
     try:
         from gradio_client import Client, handle_file
     except ImportError:
@@ -844,7 +1050,7 @@ async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Option
     person_path = _write_tmp(reference_bytes)
     applied_any = False
     try:
-        if upper_bytes:
+        if upper_bytes and personal_ai_allowed(user_id):
             garm_path = _write_tmp(upper_bytes)
             try:
                 result = await asyncio.to_thread(_call, person_path, garm_path, "Upper-body")
@@ -855,7 +1061,7 @@ async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Option
             except Exception as e:
                 logging.warning("OOTDiffusion upper-body step failed: %s", e)
 
-        if lower_bytes:
+        if lower_bytes and personal_ai_allowed(user_id):
             garm_path = _write_tmp(lower_bytes)
             try:
                 result = await asyncio.to_thread(_call, person_path, garm_path, "Lower-body")
@@ -877,12 +1083,15 @@ async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Option
                 pass
 
 
-async def generate_outfit_tryon_flux(reference_bytes: bytes, item_images: list[bytes]) -> Optional[bytes]:
+async def generate_outfit_tryon_flux(reference_bytes: bytes, item_images: list[bytes],
+                                     user_id: Optional[int] = None) -> Optional[bytes]:
     """Fallback try-on image via Cloudflare Workers AI's FLUX.2 [dev] -
     a general multi-reference image-editing model (not purpose-built for
     try-on like IDM-VTON, used only when that Space is unavailable). Takes
     the reference photo plus up to 3 item photos as reference images.
     Returns image bytes, or None on any failure."""
+    if user_id is None or not personal_ai_allowed(user_id):
+        return None
     if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
         return None
     url = CLOUDFLARE_AI_URL.format(account_id=CLOUDFLARE_ACCOUNT_ID, model=CLOUDFLARE_IMAGE_MODEL)
@@ -903,6 +1112,8 @@ async def generate_outfit_tryon_flux(reference_bytes: bytes, item_images: list[b
             form.add_field(f"image{i}", item_bytes, filename=f"item{i}.jpg", content_type="image/jpeg")
 
         async with shared_http() as session:
+            if not personal_ai_allowed(user_id):
+                return None
             async with session.post(
                 url,
                 headers={"Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}"},
@@ -927,7 +1138,9 @@ def _describe_item_for_prompt(item: dict) -> str:
     return f"{color} {label}".strip()
 
 
-async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: Optional[dict], headwear_item: Optional[dict]) -> Optional[bytes]:
+async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: Optional[dict],
+                                            headwear_item: Optional[dict],
+                                            user_id: Optional[int] = None) -> Optional[bytes]:
     """Add shoes/headwear via black-forest-labs/FLUX.1-Kontext-Dev - a
     general instruction-based image editor (not garment-category-locked
     like OOTDiffusion/IDM-VTON), so it can place accessories neither of
@@ -943,7 +1156,7 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
     instruction stays clean. Returns None if there's nothing to add or
     the call fails - caller keeps the un-accessorized image rather than
     nothing."""
-    if not shoes_item and not headwear_item:
+    if user_id is None or not personal_ai_allowed(user_id) or (not shoes_item and not headwear_item):
         return None
     try:
         from gradio_client import Client, handle_file
@@ -962,6 +1175,8 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
     ref_path = os.path.join(tempfile.gettempdir(), f"kontext_{uuid.uuid4().hex}.jpg")
     try:
         await awrite_bytes(ref_path, reference_bytes)
+        if not personal_ai_allowed(user_id):
+            return None
 
         def _call():
             client = Client(HF_SPACE_ACCESSORIES, token=HF_TOKEN or None)
@@ -987,7 +1202,8 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
             pass
 
 
-async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items: list[dict]) -> Optional[bytes]:
+async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items: list[dict],
+                                      user_id: Optional[int] = None) -> Optional[bytes]:
     """Dress the reference photo in the chosen outfit. First tries the
     Gemini model with every visible item in one call (see
     generate_outfit_tryon_gemini), then GWDG's free describe-and-edit
@@ -1007,6 +1223,8 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
     means the base outfit image goes out without them. Returns None only
     if the base top/bottom dressing itself produced nothing - caller must
     degrade to a text-only outfit message in that case."""
+    if user_id is None or not personal_ai_allowed(user_id):
+        return None
     shoes_item = next((it for it in chosen_items if it.get("type") == "shoes"), None)
     headwear_item = next(
         (it for it in chosen_items if it.get("type") == "accessory" and any(kw in it.get("label", "").lower() for kw in _HEADWEAR_KEYWORDS)),
@@ -1019,31 +1237,54 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
     visible += [it for it in (shoes_item, headwear_item) if it]
     garments = []
     for it in visible:
+        if not personal_ai_allowed(user_id):
+            return None
         data = await _fetch_wardrobe_item_bytes(bot, it)
         if data:
             garments.append((it, data))
-    for provider in (generate_outfit_tryon_gemini, generate_outfit_tryon_gwdg):
-        image_bytes = await provider(reference_bytes, garments)
+    for provider in (generate_outfit_tryon_gemini,):
+        if not personal_ai_allowed(user_id):
+            return None
+        image_bytes = await provider(reference_bytes, garments, user_id=user_id)
         if image_bytes:
             return image_bytes
+    if not personal_ai_allowed(user_id):
+        return None
+    image_bytes = await generate_outfit_tryon_gwdg(reference_bytes, garments, user_id=user_id)
+    if image_bytes:
+        return image_bytes
 
     upper_item = next((it for it in reversed(chosen_items) if it.get("type") == "outerwear"), None) \
         or next((it for it in chosen_items if it.get("type") == "top"), None)
     lower_item = next((it for it in chosen_items if it.get("type") == "bottom"), None)
 
     upper_bytes = await _fetch_wardrobe_item_bytes(bot, upper_item) if upper_item else None
+    if not personal_ai_allowed(user_id):
+        return None
     lower_bytes = await _fetch_wardrobe_item_bytes(bot, lower_item) if lower_item else None
 
-    image_bytes = await generate_outfit_tryon_fashn(reference_bytes, upper_bytes, lower_bytes)
+    if not personal_ai_allowed(user_id):
+        return None
+    image_bytes = await generate_outfit_tryon_fashn(reference_bytes, upper_bytes, lower_bytes, user_id=user_id)
     if not image_bytes:
-        image_bytes = await generate_outfit_tryon_ootd(reference_bytes, upper_bytes, lower_bytes)
+        if not personal_ai_allowed(user_id):
+            return None
+        image_bytes = await generate_outfit_tryon_ootd(reference_bytes, upper_bytes, lower_bytes, user_id=user_id)
     if not image_bytes:
-        image_bytes = await generate_outfit_tryon_flux(reference_bytes, [b for b in (upper_bytes, lower_bytes) if b])
+        if not personal_ai_allowed(user_id):
+            return None
+        image_bytes = await generate_outfit_tryon_flux(
+            reference_bytes, [b for b in (upper_bytes, lower_bytes) if b], user_id=user_id
+        )
     if not image_bytes:
         return None
 
     if shoes_item or headwear_item:
-        accessorized = await generate_outfit_tryon_accessories(image_bytes, shoes_item, headwear_item)
+        if not personal_ai_allowed(user_id):
+            return None
+        accessorized = await generate_outfit_tryon_accessories(
+            image_bytes, shoes_item, headwear_item, user_id=user_id
+        )
         if accessorized:
             return accessorized
     return image_bytes

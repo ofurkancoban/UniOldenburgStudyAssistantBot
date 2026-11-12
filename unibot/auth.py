@@ -6,17 +6,17 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 import atexit
 import contextlib
 import contextvars
-import errno
+import importlib
 import html
 import logging
+import math
 import os
 import re
-import sys
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
 
-import psutil
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -71,6 +71,7 @@ def act_as_bot() -> None:
     """Mark the current task as the bot's own (background jobs started from a
     user's update must not inherit that user or its request priority)."""
     _current_user.set(None)
+    db.clear_private_write_context()
     set_request_priority(BACKGROUND)
 
 
@@ -95,7 +96,8 @@ def acting_as(user_id: Optional[int]):
     """Run a block on behalf of `user_id` (None: the bot's admin session)."""
     token = _current_user.set(user_id)
     try:
-        yield
+        with db.private_write_context(user_id):
+            yield
     finally:
         _current_user.reset(token)
 
@@ -174,6 +176,15 @@ _renewal_failures: dict[int, int] = {}
 _reauth_prompted_at: dict[int, float] = {}
 
 
+def forget_user_runtime_state(user_id: int) -> None:
+    """Drop ephemeral authentication and rate-limit state for a deleted user."""
+    uid = int(user_id)
+    for table in (_rate_hits, _rate_cooldown_until, _renewal_failures, _reauth_prompted_at,
+                  _gate_replied):
+        table.pop(uid, None)
+    _invite_fail_closed.discard(uid)
+
+
 def lifecycle_state(user_id: Optional[int]) -> str:
     if user_id is None:
         return ACTIVE
@@ -181,7 +192,10 @@ def lifecycle_state(user_id: Optional[int]) -> str:
         return db.get_lifecycle(user_id)["state"]
     except Exception:
         logging.debug("Lifecycle lookup failed", exc_info=True)
-        return ACTIVE
+        # A failed lookup must not silently resume background access to a
+        # student's account. A later successful interaction or DB recovery
+        # can restore the real lifecycle state.
+        return INACTIVE
 
 
 def _on_login_state(user_id: int, ok: bool) -> None:
@@ -205,11 +219,13 @@ studip_session.LOGIN_STATE_LISTENERS.append(_on_login_state)
 
 
 def reauth_prompt_due(user_id: int, now: Optional[float] = None) -> bool:
+    """Whether an expired user may be prompted again.
+
+    The caller records the timestamp only after both Telegram messages have
+    been delivered, so a transient send failure remains retryable.
+    """
     now = now if now is not None else time.time()
-    if now - _reauth_prompted_at.get(user_id, 0.0) < REAUTH_PROMPT_INTERVAL_SECONDS:
-        return False
-    _reauth_prompted_at[user_id] = now
-    return True
+    return now - _reauth_prompted_at.get(user_id, 0.0) >= REAUTH_PROMPT_INTERVAL_SECONDS
 
 
 REAUTH_TEXT = ("🔐 <b>Your university session has expired</b> (password change, timeout or 2FA).\n"
@@ -228,9 +244,17 @@ class _ChatTarget:
 
 async def send_reauth_notice(bot, user_id: int) -> None:
     """Tell an expired student once, with the one-tap sign-in button."""
-    await bot.send_message(chat_id=user_id, text=REAUTH_TEXT, parse_mode="HTML")
-    await _send_login_prompt(_ChatTarget(bot, user_id), user_id)
-    _reauth_prompted_at[user_id] = time.time()
+    with acting_as(user_id):
+        if (not db.private_context_is_current(user_id) or not is_user_allowed(user_id)
+                or lifecycle_state(user_id) != NEEDS_REAUTH):
+            return
+        await bot.send_message(chat_id=user_id, text=REAUTH_TEXT, parse_mode="HTML")
+        if (not db.private_context_is_current(user_id) or not is_user_allowed(user_id)
+                or lifecycle_state(user_id) != NEEDS_REAUTH):
+            return
+        await _send_login_prompt(_ChatTarget(bot, user_id), user_id)
+        if db.private_context_is_current(user_id) and lifecycle_state(user_id) == NEEDS_REAUTH:
+            _reauth_prompted_at[user_id] = time.time()
 
 
 async def _lifecycle_on_interaction(update: Update, user_id: int) -> None:
@@ -238,13 +262,17 @@ async def _lifecycle_on_interaction(update: Update, user_id: int) -> None:
     state_now = lifecycle_state(user_id)
     message = update.effective_message
     text = (message.text or "").strip() if message is not None else ""
-    if state_now == INACTIVE and text.startswith("/start"):
+    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text else ""
+    if state_now == INACTIVE and command == "/start":
         db.set_lifecycle(user_id, ACTIVE, "resumed with /start")
         logging.info("User %s resumed with /start", user_id)
     elif state_now == NEEDS_REAUTH and message is not None and reauth_prompt_due(user_id):
         try:
             await message.reply_text(REAUTH_TEXT, parse_mode="HTML")
             await _send_login_prompt(message, user_id)
+            if (db.private_context_is_current(user_id) and is_user_allowed(user_id)
+                    and lifecycle_state(user_id) == NEEDS_REAUTH):
+                _reauth_prompted_at[user_id] = time.time()
         except TelegramError:
             logging.debug("Re-auth prompt failed", exc_info=True)
 
@@ -254,17 +282,52 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     lifecycle hooks); new users can redeem invite codes."""
     user = update.effective_user
     _current_user.set(None)
+    db.clear_private_write_context()
     set_request_priority(BACKGROUND)
     if user is not None and is_user_allowed(user.id):
+        if db.private_deletion_in_progress(user.id):
+            # Do not let a concurrent /start reactivate the account or let a
+            # stale callback start new user-scoped work before deletion ends.
+            raise ApplicationHandlerStop
         chat = update.effective_chat
-        if chat is not None and chat.type != "private":
+        if chat is None or chat.type != "private":
             # replies carry private data (grades, files, schedule): never answer in a group
             logging.info("Ignored an update from a non-private chat")
             raise ApplicationHandlerStop
-        if await _rate_limited(update, user.id):
-            raise ApplicationHandlerStop
-        await _lifecycle_on_interaction(update, user.id)
+        # Capture the account generation before the first await. If deletion
+        # starts and finishes while Telegram is answering a prompt, this
+        # update must remain stale after deletion has reopened the account.
         _current_user.set(user.id)
+        db.set_private_write_context(user.id)
+        if await _rate_limited(update, user.id):
+            _current_user.set(None)
+            db.clear_private_write_context()
+            raise ApplicationHandlerStop
+        if not is_user_allowed(user.id) or not db.private_context_is_current(user.id):
+            _current_user.set(None)
+            db.clear_private_write_context()
+            raise ApplicationHandlerStop
+        message = update.effective_message
+        command_text = (message.text or "").strip() if message is not None else ""
+        if command_text.startswith("/"):
+            command = command_text.split(maxsplit=1)[0].split("@", 1)[0].lower()
+            if command != "/cancel" and context is not None and context.user_data is not None:
+                # A slash command is a deliberate change of activity. Do not
+                # leave a text/photo wizard armed to consume an unrelated
+                # message sent after that command (notably admin broadcasts
+                # and wardrobe photos).
+                for key in (
+                    "pending_step", "task_wizard", "fastenroll_wizard",
+                    "studip_reply_target", "pending_voice", "pending_voice_clarify",
+                ):
+                    context.user_data.pop(key, None)
+        await _lifecycle_on_interaction(update, user.id)
+        # The lifecycle hook can await a re-auth prompt. Access can be revoked,
+        # or deletion can finish, while that reply is in flight.
+        if not is_user_allowed(user.id) or not db.private_context_is_current(user.id):
+            _current_user.set(None)
+            db.clear_private_write_context()
+            raise ApplicationHandlerStop
         set_request_priority(INTERACTIVE)
         action = None
         if update.callback_query and update.callback_query.data:
@@ -294,15 +357,16 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             code = invite_code_in(text)
 
-        if code and _invite_attempts_exhausted(user.id):
-            # Codes are short (24 bits), so guessing is capped per account.
-            # No reply: answering every guess would also burn the bot's
-            # send quota.
-            raise ApplicationHandlerStop
         if code:
-            ok, msg = redeem_invite_token(code, user.id, full_name=user.full_name, username=user.username)
-            if not ok:
-                _record_invite_failure(user.id)
+            result = _redeem_invite_with_limit(
+                code, user.id, full_name=user.full_name, username=user.username
+            )
+            if result is None:
+                # Codes are short (24 bits), so guessing is capped per account.
+                # No reply: answering every guess would also burn the bot's
+                # send quota.
+                raise ApplicationHandlerStop
+            ok, msg = result
             if ok:
                 welcome_text = (
                     "🎉 <b>Welcome to UniOldenburg Assistant!</b>\n"
@@ -362,17 +426,40 @@ INVITE_FAILURES_PATH = "invite_failures.json"
 # The "invite only" reply goes to an unknown account at most this often.
 GATE_REPLY_INTERVAL = 6 * 3600
 _gate_replied: dict[int, float] = {}
+_invite_failures_lock = threading.RLock()
+_invite_fail_closed: set[int] = set()
 
 
-def _load_invite_failures(now: float) -> dict:
+def _load_invite_failures(now: float) -> Optional[dict]:
     try:
         raw = db.load(INVITE_FAILURES_PATH) if db.exists(INVITE_FAILURES_PATH) else {}
     except Exception:
         logging.debug("Invite failure record unreadable", exc_info=True)
-        raw = {}
+        return None
+    if not isinstance(raw, dict):
+        logging.warning("Invite failure record has an invalid shape; denying invite attempts")
+        return None
     recent = {}
-    for uid, times in (raw or {}).items():
-        kept = [t for t in times if now - t < INVITE_FAILURE_WINDOW]
+    for uid, times in raw.items():
+        if not isinstance(uid, str) or not uid.isdecimal() or not isinstance(times, list):
+            logging.warning("Invite failure record has an invalid entry; denying invite attempts")
+            return None
+        kept = []
+        for value in times:
+            if isinstance(value, bool):
+                logging.warning("Invite failure record has an invalid timestamp; denying invite attempts")
+                return None
+            try:
+                stamp = float(value)
+            except (TypeError, ValueError, OverflowError):
+                logging.warning("Invite failure record has an invalid timestamp; denying invite attempts")
+                return None
+            age = now - stamp
+            if not math.isfinite(stamp) or age < 0:
+                logging.warning("Invite failure record has an invalid timestamp; denying invite attempts")
+                return None
+            if age < INVITE_FAILURE_WINDOW:
+                kept.append(stamp)
         if kept:
             recent[str(uid)] = kept
     return recent
@@ -392,19 +479,66 @@ def invite_code_in(text: str) -> Optional[str]:
 
 def _invite_attempts_exhausted(user_id: int) -> bool:
     now = time.time()
-    return len(_load_invite_failures(now).get(str(user_id), [])) >= INVITE_MAX_FAILURES
+    with _invite_failures_lock:
+        if user_id in _invite_fail_closed:
+            return True
+        failures = _load_invite_failures(now)
+        return failures is None or len(failures.get(str(user_id), [])) >= INVITE_MAX_FAILURES
 
 
 def _record_invite_failure(user_id: int) -> None:
     now = time.time()
-    failures = _load_invite_failures(now)
-    failures.setdefault(str(user_id), []).append(now)
-    try:
-        db.save(INVITE_FAILURES_PATH, failures)
-    except Exception:
-        logging.warning("Could not record a failed invite code", exc_info=True)
-    if len(failures[str(user_id)]) == INVITE_MAX_FAILURES:
-        logging.warning("Invite code guessing capped for a Telegram account for %ss", INVITE_FAILURE_WINDOW)
+    with _invite_failures_lock:
+        failures = _load_invite_failures(now)
+        if failures is None:
+            return  # Preserve unreadable state; the gate remains fail-closed.
+        failures.setdefault(str(user_id), []).append(now)
+        try:
+            db.save(INVITE_FAILURES_PATH, failures)
+        except Exception:
+            logging.warning("Could not record a failed invite code", exc_info=True)
+            _invite_fail_closed.add(user_id)
+        if len(failures[str(user_id)]) == INVITE_MAX_FAILURES:
+            logging.warning("Invite code guessing capped for a Telegram account for %ss", INVITE_FAILURE_WINDOW)
+
+
+def _redeem_invite_with_limit(code: str, user_id: int, full_name=None, username=None):
+    """Serialize failed-attempt checks with redemption so concurrent guesses
+    cannot all pass the limit check before any of them is recorded."""
+    with _invite_failures_lock:
+        if _invite_attempts_exhausted(user_id):
+            return None
+        result = redeem_invite_token(code, user_id, full_name=full_name, username=username)
+        if not result[0]:
+            _record_invite_failure(user_id)
+        return result
+
+
+def forget_user_invite_failures(user_id: int) -> None:
+    """Delete one account's persisted failed-invite history and stale backup."""
+    uid = int(user_id)
+    with _invite_failures_lock:
+        if db.exists(INVITE_FAILURES_PATH):
+            failures = _load_invite_failures(time.time())
+            if failures is None:
+                raise RuntimeError("Invite failure history is unreadable; cannot verify its deletion")
+            failures.pop(str(uid), None)
+            if failures:
+                db.save(INVITE_FAILURES_PATH, failures)
+            else:
+                db.delete(INVITE_FAILURES_PATH)
+        elif db.has_imported_backup(INVITE_FAILURES_PATH):
+            db.delete_imported_backup(INVITE_FAILURES_PATH)
+
+        if db.exists(INVITE_FAILURES_PATH):
+            remaining = _load_invite_failures(time.time())
+            if remaining is None or str(uid) in remaining:
+                raise RuntimeError("Invite failure history remains after deletion")
+        if db.has_imported_backup(INVITE_FAILURES_PATH):
+            db.delete_imported_backup(INVITE_FAILURES_PATH)
+        if db.has_imported_backup(INVITE_FAILURES_PATH):
+            raise RuntimeError("Imported invite failure history remains after deletion")
+        _invite_fail_closed.discard(uid)
 
 
 def _reset_invite_failures() -> None:
@@ -452,70 +586,79 @@ def is_user_admin(user_id: Optional[int]) -> bool:
 
 # ── single-instance lock ───────────────────────────────────────────────────────
 LOCK_FILE = ".bot_instance.lock"
-
-
-def _is_bot_process(pid: int) -> bool:
-    """Whether `pid` is another running copy of this bot. A PID alone is not
-    enough: after a reboot or a crash the number can belong to any process,
-    and a stale lock would then block every start."""
-    if pid == os.getpid():
-        return False  # our own lock, left behind by an os.execv restart
-    try:
-        proc = psutil.Process(pid)
-        if proc.status() == psutil.STATUS_ZOMBIE:
-            return False
-        cmdline = proc.cmdline()
-    except (psutil.NoSuchProcess, psutil.ZombieProcess):
-        return False
-    except psutil.AccessDenied:
-        return True  # can't tell: assume it is the bot rather than run twice
-    script = os.path.basename(sys.argv[0] or "")
-    if not script:
-        return True
-    return any(os.path.basename(arg) == script for arg in cmdline)
+_instance_lock_fd: Optional[int] = None
 
 
 def acquire_instance_lock():
-    """Ensure only one process instance runs (prevents getUpdates 409)."""
-    try:
-        # Check if lock exists and if its PID is still this bot
-        if os.path.exists(LOCK_FILE):
-            try:
-                with open(LOCK_FILE, "r") as f:
-                    pid = int(f.read().strip())
-                if _is_bot_process(pid):
-                    logging.error("❌ Another bot instance is actually running (PID %s). Exiting.", pid)
-                    return False
-                else:
-                    # normal after every restart (PM2 stops the old process first)
-                    logging.info("Stale lock file found (PID %s is not this bot). Removing it.", pid)
-                    os.remove(LOCK_FILE)
-            except Exception as e:
-                logging.warning("⚠️ Failed to read/validate lock file: %s. Attempting to overwrite.", e)
-                try: os.remove(LOCK_FILE)
-                except OSError: pass
+    """Atomically claim the process lock (prevents duplicate pollers/watchers).
 
-        fd = os.open(LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "w") as f:
-            f.write(str(os.getpid()))
-        atexit.register(release_instance_lock)  # also on an exit that skips main's cleanup
+    The lock file is intentionally persistent. The OS lock, not the PID text,
+    determines ownership, so a crash or reboot releases it automatically and
+    two starters cannot both remove a stale file and believe they own it.
+    """
+    global _instance_lock_fd
+    if _instance_lock_fd is not None:
         return True
-    except OSError as e:
-        if e.errno == errno.EEXIST:
-            logging.error("Another bot instance is already running (concurrency race).")
-            return False
+    fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+    except BaseException:
+        os.close(fd)
         raise
+    try:
+        if os.name == "nt":
+            msvcrt = importlib.import_module("msvcrt")
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+                os.fsync(fd)
+            os.lseek(fd, 0, os.SEEK_SET)
+            getattr(msvcrt, "locking")(fd, getattr(msvcrt, "LK_NBLCK"), 1)  # noqa: B009
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        logging.error("Another bot instance is already running.")
+        return False
+    except BaseException:
+        os.close(fd)
+        raise
+    _instance_lock_fd = fd
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        os.fsync(fd)
+    except BaseException:
+        release_instance_lock()
+        raise
+    atexit.register(release_instance_lock)
+    return True
 
 
 def release_instance_lock():
-    """Remove the lock, but only when it is ours (never another instance's)."""
+    """Release our OS lock; closing the descriptor also releases on crashes."""
+    global _instance_lock_fd
+    fd, _instance_lock_fd = _instance_lock_fd, None
+    if fd is None:
+        return
     try:
-        with open(LOCK_FILE, "r") as f:
-            owner = f.read().strip()
-        if owner == str(os.getpid()):
-            os.remove(LOCK_FILE)
-    except (OSError, ValueError):
-        pass
+        if os.name == "nt":
+            msvcrt = importlib.import_module("msvcrt")
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            getattr(msvcrt, "locking")(fd, getattr(msvcrt, "LK_UNLCK"), 1)  # noqa: B009
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        logging.debug("Could not explicitly release the instance lock", exc_info=True)
+    finally:
+        os.close(fd)
 
 
 # ── selectors (IdP flow) ─────────────────────────────────────────────────────────
@@ -549,7 +692,8 @@ def pick_watcher_session(exclude: Optional[int] = None) -> StudIPSession:
     Prefers an admin session already open in this process, then an admin with
     a stored login. Without any, an unbound session that stays logged out
     until an admin signs in (it adopts the first admin who does)."""
-    candidates = [uid for uid in _admin_candidates() if uid != exclude]
+    candidates = [uid for uid in _admin_candidates()
+                  if uid != exclude and is_user_allowed(uid) and lifecycle_state(uid) == ACTIVE]
     for uid in candidates:
         sess = state.user_sessions.get(uid)
         if sess is not None and not sess.explicitly_logged_out:
@@ -694,6 +838,16 @@ def _get_or_init_session() -> StudIPSession:
 
 
 async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None:
+    if user_id is None:
+        await _complete_proxy_session_authenticated(None)
+        return
+    with acting_as(user_id):
+        if not db.private_context_is_current(user_id):
+            return
+        await _complete_proxy_session_authenticated(user_id)
+
+
+async def _complete_proxy_session_authenticated(user_id: Optional[int] = None) -> None:
     """Called when the user completes login in the proxied Stud.IP Mini App."""
     from unibot.studip_api import forget_user_profile, get_studip_user_profile
 
@@ -705,6 +859,8 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
     session.reset_login_backoff()
     state._login_failure_notified = False
     await session.save_cookies()
+    if user_id is not None and not db.private_context_is_current(user_id):
+        return
     if user_id is not None:
         # a completed interactive sign-in ends a paused (expired) state even
         # when the Stud.IP check below can't confirm it yet: paused students
@@ -723,6 +879,8 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
                 logging.info("✅ Stud.IP session established during login for user %s", user_id)
     except Exception as exc:
         logging.info("Stud.IP SSO handoff after proxy login failed for user %s: %s", user_id, exc)
+    if user_id is not None and not db.private_context_is_current(user_id):
+        return
 
     studip_cookie = None
     if session.session:
@@ -745,11 +903,15 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
             profile = await get_studip_user_profile(user_id=user_id, session=session)
         except Exception as exc:
             logging.warning("⚠️ OAuth consent after proxy login failed for user %s: %s", user_id, exc)
+        if user_id is not None and not db.private_context_is_current(user_id):
+            return
     elif is_new_session or state._studip_user_profile is None:
         try:
             profile = await get_studip_user_profile(user_id=user_id, session=session)
         except Exception as exc:
             logging.debug("Profile sync after login for user %s: %s", user_id, exc)
+        if user_id is not None and not db.private_context_is_current(user_id):
+            return
 
     if profile and user_id is not None:
         studip_user = profile.get("username")
@@ -767,6 +929,8 @@ async def _on_proxy_session_authenticated(user_id: Optional[int] = None) -> None
         logging.info("🎓 StuMS session established during login for user %s", user_id)
     except Exception as exc:
         logging.info("StuMS SSO handoff after proxy login failed for user %s: %s", user_id, exc)
+    if user_id is not None and not db.private_context_is_current(user_id):
+        return
 
     if is_new_session and (user_id is None or is_user_admin(user_id)):
         state._last_notified_studip_cookie = studip_cookie
@@ -842,14 +1006,21 @@ async def _start_login_infra(app) -> None:
             await state.quick_tunnel.start()
         except Exception as exc:
             logging.error("❌ Named Cloudflare tunnel failed: %s", exc)
-            state.quick_tunnel = None
+            # start() can time out while its supervisor is still waiting for
+            # cloudflared to publish a URL. Keep that live supervisor attached
+            # to runtime state so it can recover and be stopped at shutdown.
+            if state.quick_tunnel._task is None:
+                state.quick_tunnel = None
     elif mode == "quick":
         state.quick_tunnel = QuickTunnel(server.port, on_url_change=_on_tunnel_url)
         try:
             await state.quick_tunnel.start()
         except Exception as exc:
             logging.error("❌ Cloudflare quick tunnel failed: %s", exc)
-            state.quick_tunnel = None
+            # A URL timeout does not stop QuickTunnel's supervisor. Retain the
+            # object when that task is alive so a late URL can still be used.
+            if state.quick_tunnel._task is None:
+                state.quick_tunnel = None
 
     await server.start()
     logging.info("🔐 Login page available at %s", server.base_url())
@@ -858,32 +1029,44 @@ async def _start_login_infra(app) -> None:
 
 async def _send_login_prompt(reply_target, user_id: int) -> None:
     """Send the Stud.IP Mini App login button to a message target."""
-    server = _get_login_server()
-    await server.start()
+    with acting_as(user_id):
+        if (not db.private_context_is_current(user_id) or not is_user_allowed(user_id)
+                or lifecycle_state(user_id) == INACTIVE):
+            return
+        server = _get_login_server()
+        await server.start()
+        # Starting the server may yield while the account is being deleted.
+        # Do not create a one-time login link or send it after that point.
+        if (not db.private_context_is_current(user_id) or not is_user_allowed(user_id)
+                or lifecycle_state(user_id) == INACTIVE):
+            return
 
-    public = _login_public_url()
-    if public.startswith("https://"):
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔐 Open Stud.IP (Mini App)", web_app=WebAppInfo(url=server.app_url()))],
-        ])
-        await reply_target.reply_text(
-            "Tap the button below to sign in once with your university account.\n"
-            "The same sign-in connects Stud.IP and StuMS (exams, grades), and both "
-            "sessions are kept alive automatically.",
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
-    else:
-        link = server.new_link(user_id)
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔐 Open login page", url=link)
-        ]])
-        await reply_target.reply_text(
-            "Tap the button to open the login page (valid for 10 minutes).\n"
-            f"Same Wi-Fi required - the page is served at {server.base_url()}.",
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
+        public = _login_public_url()
+        if public.startswith("https://"):
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔐 Open Stud.IP (Mini App)", web_app=WebAppInfo(url=server.app_url()))],
+            ])
+            await reply_target.reply_text(
+                "Tap the button below to sign in once with your university account.\n"
+                "The same sign-in connects Stud.IP and StuMS (exams, grades), and both "
+                "sessions are kept alive automatically.",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
+        else:
+            link = server.new_link(user_id)
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔐 Open login page", url=link)
+            ]])
+            if (not db.private_context_is_current(user_id) or not is_user_allowed(user_id)
+                    or lifecycle_state(user_id) == INACTIVE):
+                return
+            await reply_target.reply_text(
+                "Tap the button to open the login page (valid for 10 minutes).\n"
+                f"Same Wi-Fi required - the page is served at {server.base_url()}.",
+                reply_markup=keyboard,
+                disable_web_page_preview=True,
+            )
 
 
 # ── account registry ──────────────────────────────────────────────────────────
@@ -975,16 +1158,32 @@ async def _perform_logout(user_id: Optional[int] = None) -> None:
     forget_user_profile(user_id)
     if user_id is not None:
         sess = state.user_sessions.pop(user_id, None)
+        if state.login_server is not None:
+            # Stop pending post-login hooks before the logout's first await;
+            # otherwise a hook could restore credentials after deletion.
+            state.login_server.revoke_user(user_id)
         if sess is not None:
             await sess.logout()
+        # Older versions stored each student's cookies in this file. The
+        # session may never have been instantiated in this process, so
+        # StudIPSession.logout() cannot be relied on to remove it.
+        for path in (f"studip_cookies_{int(user_id)}.json",
+                     f"studip_cookies_{int(user_id)}.json.tmp"):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                if os.path.exists(path):
+                    raise OSError("file still exists after removal")
+            except OSError as exc:
+                logging.error("Could not remove legacy session file %s during logout: %s", path, exc)
+                raise RuntimeError(f"Could not clear the saved Stud.IP session ({path})") from exc
         db.get_user_scope(user_id).delete_credentials()
-        if studip_oauth.oauth_enabled():
-            studip_oauth.clear_tokens(user_id=user_id)
+        # Logout must also remove legacy OAuth token files when OAuth use is
+        # currently disabled or the user's session object was not in memory.
+        # clear_tokens invalidates in-flight refreshes even when no token is active.
+        studip_oauth.clear_tokens(user_id=user_id)
         db.update_user_studip(user_id, "")
         state.user_courses_map.pop(user_id, None)
-        if state.login_server is not None:
-            # an open Mini App must not keep proxying this account
-            state.login_server.revoke_user(user_id)
         if state.global_session is sess:
             # keep the watcher running on another signed-in admin, if any
             state.global_session = pick_watcher_session(exclude=user_id)
@@ -995,6 +1194,7 @@ async def _perform_logout(user_id: Optional[int] = None) -> None:
             # watcher builds its own instead of following theirs
             state.courses_map = {}
             state._courses_map_built_with_prev = None
+            state._courses_map_refreshed_at = 0.0
         if sess is not None and sess is not state.global_session:
             await sess.close()  # its HTTP connections would otherwise leak
         return
@@ -1002,13 +1202,11 @@ async def _perform_logout(user_id: Optional[int] = None) -> None:
     state._studip_api_user_id = None
     state._studip_user_profile = None
     state._last_notified_studip_cookie = None
-    if state.global_session is not None:
-        await state.global_session.logout()
-    if studip_oauth.oauth_enabled():
-        studip_oauth.clear_tokens()
-    # Any Mini App / link session still open must not keep proxying the account
     if state.login_server is not None:
         state.login_server.revoke_all()
+    if state.global_session is not None:
+        await state.global_session.logout()
+    studip_oauth.clear_tokens()
 
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):

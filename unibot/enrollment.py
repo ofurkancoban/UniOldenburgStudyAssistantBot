@@ -13,9 +13,18 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
-from fast_enroll import clear_pending_job, decline_course, enroll_now, get_semester_options, load_pending, semester_display
+from fast_enroll import (
+    clear_pending_job,
+    decline_course,
+    enroll_now,
+    get_semester_options,
+    load_pending,
+    resolve_target,
+    semester_display,
+)
 
 from unibot import state
+from unibot import db
 from unibot.preferences import get_pref, set_pref
 from unibot.storage import (
     clear_default_semester,
@@ -31,13 +40,14 @@ from unibot.telegram_ui import (
     _stop_loading_animation,
     get_main_keyboard,
 )
-from unibot.auth import INACTIVE, is_user_allowed, lifecycle_state, login_studip
+from unibot.auth import ACTIVE, is_user_allowed, lifecycle_state, login_studip
 from unibot.schedule import fastenroll_tasks, schedule_fastenroll_job
 from unibot.study_plan import _render_enrolled_courses_for_semester, _render_open_courses_for_semester
 from unibot.tasks import _run_fastenroll_task
 
 
 SEM_ID_RE = re.compile(r"(?:sem_id=|course_id=)?([a-f0-9]{32})")
+_pending_course_actions: set[tuple[int, str]] = set()
 
 
 def extract_sem_id(text: str) -> Optional[str]:
@@ -58,12 +68,21 @@ def normalize_enroll_time(text: Optional[str]) -> Optional[str]:
 
 def validate_fastenroll_args(sem_id: Optional[str], target_time_str: Optional[str], target_date_str: Optional[str]) -> Optional[str]:
     """Return an error message if invalid, else None."""
-    if not sem_id or not re.fullmatch(r"[a-f0-9]{32}", sem_id):
+    if not isinstance(sem_id, str) or not re.fullmatch(r"[a-f0-9]{32}", sem_id):
         return "Could not find a valid course id (expected a 32-char hex sem_id, or a course link containing one)."
-    if not target_time_str or not re.fullmatch(r"[0-9]{2}:[0-9]{2}:[0-9]{2}", target_time_str):
+    if not isinstance(target_time_str, str) or not re.fullmatch(r"[0-9]{2}:[0-9]{2}:[0-9]{2}", target_time_str):
         return "Time must be in HH:MM:SS format (Europe/Berlin)."
-    if target_date_str and not re.fullmatch(r"[0-9]{2}\.[0-9]{2}\.[0-9]{4}", target_date_str):
-        return "Date must be in DD.MM.YYYY format."
+    try:
+        datetime.strptime(target_time_str, "%H:%M:%S")
+    except ValueError:
+        return "Time must be a real time between 00:00:00 and 23:59:59."
+    if target_date_str not in (None, ""):
+        if not isinstance(target_date_str, str) or not re.fullmatch(r"[0-9]{2}\.[0-9]{2}\.[0-9]{4}", target_date_str):
+            return "Date must be in DD.MM.YYYY format."
+        try:
+            datetime.strptime(target_date_str, "%d.%m.%Y")
+        except ValueError:
+            return "Date must be a real calendar date in DD.MM.YYYY format."
     return None
 
 
@@ -267,25 +286,7 @@ async def handle_course_enroll_confirm(update: Update, context: ContextTypes.DEF
         return
 
     sem_id = query.data.split("|", 1)[1]
-    status_msg = await query.edit_message_text("⏳ Enrolling...")
-    await _show_typing(query)
-    stop_evt, anim_task = _start_loading_animation(status_msg, "Enrolling...")
-
-    try:
-        session = await login_studip()
-        success, message = await enroll_now(session, sem_id)
-    except Exception as e:
-        logging.error("handle_course_enroll_confirm: enroll failed: %s", e)
-        await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
-        return
-    finally:
-        await _stop_loading_animation(stop_evt, anim_task)
-        await _delete_status_message(status_msg)
-
-    if success:
-        await query.message.reply_text("✅ Enrolled successfully!")
-    else:
-        await query.message.reply_text(f"❌ {message}")
+    await _submit_course_action(query, user_id, sem_id, "enroll")
 
 
 async def handle_course_enroll_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,25 +360,60 @@ async def handle_course_deenroll_confirm(update: Update, context: ContextTypes.D
         return
 
     cid = query.data.split("|", 1)[1]
-    status_msg = await query.edit_message_text("⏳ Signing out...")
-    await _show_typing(query)
-    stop_evt, anim_task = _start_loading_animation(status_msg, "Signing out...")
+    await _submit_course_action(query, user_id, cid, "deenroll")
 
-    try:
-        session = await login_studip()
-        success, message = await decline_course(session, cid)
-    except Exception as e:
-        logging.error("handle_course_deenroll_confirm: decline failed: %s", e)
-        await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
+
+async def _submit_course_action(query, user_id: int, course_id: str, action: str) -> None:
+    """Run one confirmed course mutation, suppressing duplicate taps."""
+    if not isinstance(course_id, str) or not re.fullmatch(r"[a-f0-9]{32}", course_id):
+        await query.message.reply_text("⚠️ This course reference is invalid or expired. Open the course list again.")
         return
-    finally:
-        await _stop_loading_animation(stop_evt, anim_task)
-        await _delete_status_message(status_msg)
+    if action not in ("enroll", "deenroll"):
+        logging.error("Rejected unknown course action %r", action)
+        return
+    # Opposite stale confirmation buttons must not submit contradictory
+    # mutations for the same course concurrently either.
+    action_key = (user_id, course_id)
+    if action_key in _pending_course_actions:
+        await query.message.reply_text("⏳ This course action is already being submitted.")
+        return
+    _pending_course_actions.add(action_key)
+    status_msg = None
+    stop_evt = anim_task = None
+    label = "Enrolling..." if action == "enroll" else "Signing out..."
+    try:
+        status_msg = await query.edit_message_text(f"⏳ {label}")
+        await _show_typing(query)
+        stop_evt, anim_task = _start_loading_animation(status_msg, label)
+        try:
+            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+                return
+            session = await login_studip(user_id=user_id)
+            # Access can be revoked while login is waiting. Check immediately
+            # before the irreversible Stud.IP mutation.
+            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+                return
+            operation = enroll_now if action == "enroll" else decline_course
+            success, message = await operation(session, course_id, user_id=user_id)
+        except Exception as e:
+            logging.error("course %s action failed: %s", action, e)
+            await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")
+            return
+        finally:
+            if stop_evt is not None:
+                await _stop_loading_animation(stop_evt, anim_task)
+            if status_msg is not None:
+                await _delete_status_message(status_msg)
 
-    if success:
-        await query.message.reply_text("✅ Signed out of the course successfully!")
-    else:
-        await query.message.reply_text(f"❌ {message}")
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            return
+        if success:
+            text = "✅ Enrolled successfully!" if action == "enroll" else "✅ Signed out of the course successfully!"
+        else:
+            text = f"❌ {message}"
+        await query.message.reply_text(text)
+    finally:
+        _pending_course_actions.discard(action_key)
 
 
 async def handle_course_deenroll_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -462,8 +498,15 @@ async def handle_default_semester_pick(update: Update, context: ContextTypes.DEF
         await query.message.reply_text(f"❌ Error: {str(e)[:200]}")
         return
 
-    label = next((lbl for sid, lbl in semesters if sid == semester_id), semester_id)
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        return
+    label = next((lbl for sid, lbl in semesters if sid == semester_id), None)
+    if label is None:
+        await query.message.reply_text("⚠️ That semester is no longer available. Open the semester picker again.")
+        return
     save_default_semester(semester_id, label, user_id=user_id)
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        return
     rebuild_watched_courses(user_id)
     await query.edit_message_text(f"✅ Default semester set to: {semester_display(label)}\nFiles, Browse Courses, and Sign Out will now use it directly.")
 
@@ -512,6 +555,9 @@ FASTENROLL_ASK_LINK = "Please paste the course link (or its sem_id):"
 async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str, text: str) -> bool:
     """If `step` is one of the fast-enroll wizard steps, handle it and return True."""
     state = context.user_data.setdefault("fastenroll_wizard", {})
+    message = update.effective_message
+    if message is None:
+        return False
 
     if step == "fastenroll_date":
         today = datetime.now(ZoneInfo("Europe/Berlin")).date()
@@ -521,29 +567,69 @@ async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.
         elif lowered == "tomorrow":
             date_str = (today + timedelta(days=1)).strftime("%d.%m.%Y")
         elif re.fullmatch(r"[0-9]{2}\.[0-9]{2}\.[0-9]{4}", text):
+            try:
+                datetime.strptime(text, "%d.%m.%Y")
+            except ValueError:
+                await message.reply_text(
+                    "Please enter a real calendar date in DD.MM.YYYY format, 'today', or 'tomorrow'.",
+                    reply_markup=get_main_keyboard(),
+                )
+                return True
+            if datetime.strptime(text, "%d.%m.%Y").date() < today:
+                await message.reply_text(
+                    "That date has already passed. Please choose today or a future date.",
+                    reply_markup=get_main_keyboard(),
+                )
+                return True
             date_str = text
         else:
-            await update.message.reply_text(
+            await message.reply_text(
                 "Please use DD.MM.YYYY, 'today', or 'tomorrow'.",
                 reply_markup=get_main_keyboard(),
             )
             return True  # pending_step stays "fastenroll_date" - ask again
         state["target_date_str"] = date_str
         user_data(context)["pending_step"] = "fastenroll_time"
-        await update.message.reply_text(FASTENROLL_ASK_TIME, reply_markup=get_main_keyboard())
+        await message.reply_text(FASTENROLL_ASK_TIME, reply_markup=get_main_keyboard())
         return True
 
     if step == "fastenroll_time":
         text = normalize_enroll_time(text) or text
         if not re.fullmatch(r"[0-9]{2}:[0-9]{2}:[0-9]{2}", text):
-            await update.message.reply_text(
+            await message.reply_text(
                 "Please use HH:MM or HH:MM:SS (Europe/Berlin), e.g. 08:30 or 08:30:00.",
                 reply_markup=get_main_keyboard(),
             )
             return True  # pending_step stays "fastenroll_time" - ask again
+        try:
+            datetime.strptime(text, "%H:%M:%S")
+        except ValueError:
+            await message.reply_text(
+                "Please enter a real time between 00:00 and 23:59 (Europe/Berlin).",
+                reply_markup=get_main_keyboard(),
+            )
+            return True
+        try:
+            target = resolve_target(
+                text,
+                state.get("target_date_str"),
+                datetime.now(ZoneInfo("Europe/Berlin")),
+            )
+        except (TypeError, ValueError):
+            await message.reply_text(
+                "That time does not exist on the selected Berlin date. Please choose another time.",
+                reply_markup=get_main_keyboard(),
+            )
+            return True
+        if target.timestamp() <= datetime.now(ZoneInfo("Europe/Berlin")).timestamp():
+            await message.reply_text(
+                "That date and time has already passed. Please choose a future time.",
+                reply_markup=get_main_keyboard(),
+            )
+            return True
         state["target_time_str"] = text
         user_data(context)["pending_step"] = "fastenroll_link"
-        await update.message.reply_text(FASTENROLL_ASK_LINK, reply_markup=get_main_keyboard())
+        await message.reply_text(FASTENROLL_ASK_LINK, reply_markup=get_main_keyboard())
         return True
 
     if step == "fastenroll_link":
@@ -554,7 +640,7 @@ async def _handle_fastenroll_wizard_reply(update: Update, context: ContextTypes.
         )
         context.user_data.pop("fastenroll_wizard", None)
         context.user_data.pop("pending_step", None)
-        await update.message.reply_text(reply, reply_markup=get_main_keyboard())
+        await message.reply_text(reply, reply_markup=get_main_keyboard())
         return True
 
     return False
@@ -565,22 +651,66 @@ async def restore_pending_fastenroll_jobs(app):
     (e.g. VPS reboot or pm2 restart), so a job scheduled for later is not silently lost."""
     pending = load_pending()
     for chat_id_str, jobs in pending.items():
-        chat_id = int(chat_id_str)
-        if not is_user_allowed(chat_id) or lifecycle_state(chat_id) == INACTIVE:
-            # they left or stopped the bot: drop the jobs instead of keeping
-            # them for a later restart, when the target time may be long gone
+        try:
+            chat_id = int(chat_id_str)
+        except (TypeError, ValueError):
+            logging.warning("Dropping fast-enroll jobs with invalid chat id %r", chat_id_str)
+            clear_pending_job(chat_id_str)
+            continue
+        if not isinstance(jobs, dict):
+            logging.warning("Dropping malformed fast-enroll job list for chat %s", chat_id)
+            clear_pending_job(chat_id)
+            continue
+        if not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE:
+            # The account is not active, including when it needs sign-in:
+            # do not run an unattended enrollment after this restart.
             logging.info("Pending fastenroll jobs of %s dropped: no longer allowed or active", chat_id)
             clear_pending_job(chat_id)
             continue
         for sem_id, job in jobs.items():
             target_time_str = job.get("target_time_str")
             target_date_str = job.get("target_date_str")
+            error = validate_fastenroll_args(sem_id, target_time_str, target_date_str)
+            now = datetime.now(ZoneInfo("Europe/Berlin"))
+            try:
+                target = resolve_target(target_time_str, target_date_str, now)
+            except (TypeError, ValueError, AttributeError):
+                target = None
+            if error or target is None:
+                logging.warning("Dropping invalid or expired fast-enroll job for chat %s, course %s: %s",
+                                chat_id, sem_id, error or "could not resolve target time")
+                clear_pending_job(chat_id, sem_id)
+                continue
+            if target.timestamp() <= now.timestamp():
+                logging.info("Fast-enroll job for chat %s, course %s expired while the bot was offline",
+                             chat_id, sem_id)
+                try:
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=(f"⚠️ The scheduled fast enroll for course {sem_id} at "
+                              f"{target.strftime('%d.%m.%Y %H:%M:%S')} passed while the bot was offline. "
+                              "I removed it without submitting a late enrollment. Please check your course list."),
+                    )
+                except Exception:
+                    logging.warning("Could not notify chat %s about an expired fast-enroll job", chat_id,
+                                    exc_info=True)
+                clear_pending_job(chat_id, sem_id)
+                continue
             context = ContextTypes.DEFAULT_TYPE(application=app)
             logging.info("Restoring pending fastenroll job for chat %s: %s @ %s %s", chat_id, sem_id, target_date_str or '', target_time_str)
             try:
                 await app.bot.send_message(chat_id=chat_id, text=f"🔄 Resuming previously scheduled fast enroll for course {sem_id} at {target_time_str}.")
             except Exception:
                 logging.warning("Could not notify chat %s about resumed fastenroll job", chat_id, exc_info=True)
+            # The notification awaits Telegram. Data deletion or /stop may
+            # clear this job while it is in flight, so don't resurrect the
+            # stale in-memory snapshot after that await.
+            current_job = load_pending().get(str(chat_id), {}).get(sem_id)
+            if (not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE
+                    or not isinstance(current_job, dict)
+                    or current_job.get("target_time_str") != target_time_str
+                    or current_job.get("target_date_str") != target_date_str):
+                continue
             task = state.spawn(_run_fastenroll_task(chat_id, sem_id, target_time_str, target_date_str, context),
                                name=f"fastenroll:{chat_id}:{sem_id}")
             fastenroll_tasks.setdefault(chat_id, {})[sem_id] = task

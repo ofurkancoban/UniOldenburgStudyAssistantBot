@@ -10,6 +10,7 @@ import random
 import re
 from datetime import date, datetime, timedelta
 from typing import Optional
+from urllib.parse import urljoin
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -29,9 +30,10 @@ from unibot.telegram_ui import (
     get_main_keyboard,
 )
 from unibot.auth import current_user_id, is_user_allowed, login_studip
+from unibot.formatting import _prefix_by_telegram_length, _telegram_length, split_html, truncate_html
 from unibot.preferences import DIETS, diet_filter, food_filter, get_pref, get_prefs, set_pref
 from unibot.studip_api import BASE_URL
-from unibot.ai import _call_openrouter, _extract_json_object
+from unibot.ai import _call_openrouter, _extract_json_object, personal_ai_allowed
 
 
 FOOD_PREFERENCES_CACHE_PATH = "food_preferences.json"
@@ -52,10 +54,7 @@ def effective_food_filter(user_id: Optional[int] = None) -> dict:
     """Active food filter for menu display: the student's custom avoided
     codes/keywords from load_food_preferences() combined with their diet
     preset (vegetarian, vegan, halal, fish, budget)."""
-    try:
-        prefs = load_food_preferences(user_id) if isinstance(user_id, int) else load_food_preferences()
-    except TypeError:
-        prefs = load_food_preferences()
+    prefs = load_food_preferences(user_id) if isinstance(user_id, int) else load_food_preferences()
     uid = user_id if isinstance(user_id, int) else current_user_id()
     diet = get_pref(uid, "diet") if isinstance(uid, int) else "all"
     base = diet_filter(diet)
@@ -250,6 +249,8 @@ async def fetch_todays_menu_items(session, sub_path="2/") -> list:
         url = f"{BASE_URL}/plugins.php/mensawidget/menu/{sub_path}"
         async with await session.get(url) as r:
             html_content = await r.text()
+            if r.status != 200:
+                raise RuntimeError(f"Stud.IP menu answered HTTP {r.status}")
     except Exception as e:
         logging.warning("fetch_todays_menu_items: fetch failed: %s", e)
         return []
@@ -343,7 +344,7 @@ async def fetch_dish_photo_candidates(target_date=None, loc_id: str = "2") -> li
             title = str(title).strip()
             if not title:
                 continue
-            candidates.append((title, MENSA_PHOTO_BASE_URL + tag_attr(img, "src").lstrip("/")))
+            candidates.append((title, urljoin(MENSA_PHOTO_BASE_URL, tag_attr(img, "src"))))
         return candidates
     except Exception as e:
         logging.warning("fetch_dish_photo_candidates: parse failed: %s", e)
@@ -391,6 +392,8 @@ async def _fetch_speiseplan_html(loc_id: str, target_date=None) -> Optional[str]
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"Speiseplan widget answered HTTP {resp.status}")
                 return await resp.text()
     except Exception as e:
         logging.warning("Speiseplan widget request failed: %s", e)
@@ -458,7 +461,9 @@ async def _send_menu_items_individually(sender, dish_items: list, target_date=No
             photo_url = _best_title_match(item["name"], candidates, min_score=0.55)
         if not photo_url and skip_unmatched:
             continue
-        caption = _format_menu_item_html(item)
+        caption = truncate_html(
+            _format_menu_item_html(item), limit=1000 if photo_url else 3800,
+        )
         try:
             if photo_url:
                 await sender.reply_photo(photo=photo_url, caption=caption, parse_mode="HTML")
@@ -522,11 +527,12 @@ async def build_food_recommendation(loc_id: str = "2", user_id: Optional[int] = 
     just speak/show "reasoning" either way.
     """
     from unibot.voice import _best_title_match
+    owner = user_id if user_id is not None else current_user_id()
     try:
         if loc_id in SPEISEPLAN_LOCATIONS:
             items = await _speiseplan_main_items(loc_id)
         else:
-            session = await login_studip()
+            session = await login_studip(user_id=owner)
             items = await fetch_todays_menu_items(session)
     except Exception as e:
         logging.warning("build_food_recommendation: menu fetch failed: %s", e)
@@ -576,22 +582,25 @@ async def build_food_recommendation(loc_id: str = "2", user_id: Optional[int] = 
         MEAL_RECOMMENDATION_SYSTEM_PROMPT,
         "Today's candidates:\n" + "\n".join(lines),
         temperature=0.9,
+        can_send=lambda: owner is None or personal_ai_allowed(owner),
     )
     parsed = _extract_json_object(raw)
     chosen = None
-    if parsed and parsed.get("dish"):
-        chosen = _best_title_match(parsed["dish"], lookup, min_score=0.5)
+    model_dish = parsed.get("dish") if parsed else None
+    if isinstance(model_dish, str) and model_dish.strip():
+        chosen = _best_title_match(model_dish.strip(), lookup, min_score=0.5)
     if chosen is None:
         meat_candidates = [c for c in candidates if c["codes"] & MEAT_CODES]
         chosen = random.choice(meat_candidates or candidates)
 
-    reasoning = ((parsed or {}).get("reasoning") or "").strip() if chosen is not None else ""
+    raw_reasoning = (parsed or {}).get("reasoning")
+    reasoning = raw_reasoning.strip()[:500] if isinstance(raw_reasoning, str) and chosen is not None else ""
     reasoning = reasoning or f"I'd recommend the {chosen['name']} today."
 
     return {"dish": chosen["name"], "category": chosen["category"], "reasoning": reasoning, "loc_id": loc_id}
 
 
-async def _deliver_food_recommendation(sender, result: dict):
+async def _deliver_food_recommendation(sender, result: dict, user_id: Optional[int] = None):
     """Send a build_food_recommendation() result the way it's meant to be
     read: the Counter/Culinarium location + dish name as its own short text
     message (quick to glance at, no need to replay the audio for it), a
@@ -612,7 +621,7 @@ async def _deliver_food_recommendation(sender, result: dict):
 
     spoken_text = result["reasoning"]
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
-    if not await _try_send_voice(sender, spoken_text):
+    if not await _try_send_voice(sender, spoken_text, user_id=user_id):
         await sender.reply_text(f"🍽️ {spoken_text}")
 
 
@@ -690,7 +699,8 @@ def _menu_dish_rows(category_table) -> list:
 
 
 def _clean_menu_price(price: str) -> str:
-    clean_price = price.replace("&euro;", "€").strip().replace(".", ",")
+    clean_price = price.replace("&euro;", "€").strip()
+    clean_price = re.sub(r"(?<=\d)\.(?=\d)", ",", clean_price)
     if not clean_price or clean_price == "€":
         return ""
     if "€" not in clean_price:
@@ -743,7 +753,8 @@ def _is_dish_hidden(dish: dict, avoid_codes: set, avoid_keywords: list, max_pric
         return True
     if max_price is not None:
         price = _speiseplan_price(str(dish.get("price") or ""))
-        if price is not None and price > max_price:
+        # A budget filter cannot establish that an unpriced dish is affordable.
+        if price is None or price > max_price:
             return True
     return False
 
@@ -808,6 +819,8 @@ async def get_todays_menu_enhanced(session, sub_path="2/", avoid_codes=None, avo
         url = f"{BASE_URL}/plugins.php/mensawidget/menu/{sub_path}"
         async with await session.get(url) as r:
             html_content = await r.text()
+            if r.status != 200:
+                raise RuntimeError(f"Stud.IP menu answered HTTP {r.status}")
         soup = BeautifulSoup(html_content, "html.parser")
 
         effective_ts = _menu_effective_ts(sub_path)
@@ -980,10 +993,10 @@ async def handle_mensa_location_button(update: Update, context: ContextTypes.DEF
     text = await build_speiseplan_menu(loc_id, day, food["avoid_codes"], food["avoid_keywords"], max_price=food["max_price"])
     markup = speiseplan_menu_keyboard(loc_id, day)
     if len(parts) > 3 and parts[3] == "new":
-        await query.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+        await send_menu_content(query.message, text, markup)
         return
     try:
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        await send_menu_content(query.message, text, markup, editor=query)
     except TelegramError as e:
         if "not modified" not in str(e).lower():
             raise
@@ -1011,6 +1024,27 @@ def get_menu_navigation_keyboard(prev_path=None, next_path=None, current_path="2
     wechloy_row = [InlineKeyboardButton("🌲 Mensa Wechloy", callback_data="mensa_loc|3|today")]
 
     return InlineKeyboardMarkup([row, photos_row, prefs_row, recommend_row, wechloy_row])
+
+
+async def send_menu_content(message, text: str, reply_markup=None, *, editor=None) -> None:
+    """Send a menu across Telegram-sized messages, keeping navigation on the last part.
+
+    When an inline menu is being navigated, replace its current message with
+    the first part and reply with any remaining parts.
+    """
+    chunks = split_html(text, limit=3800) or ["ℹ️ No menu content is available."]
+    if editor is not None:
+        await editor.edit_message_text(
+            chunks[0], parse_mode="HTML",
+            reply_markup=reply_markup if len(chunks) == 1 else None,
+        )
+        chunks = chunks[1:]
+    for index, chunk in enumerate(chunks):
+        await message.reply_text(
+            chunk,
+            parse_mode="HTML",
+            reply_markup=reply_markup if index == len(chunks) - 1 else None,
+        )
 
 
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1046,10 +1080,8 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Dish photos are opt-in via the "📸 Show Dish Photos" button below,
         # not sent automatically - see handle_menu_photos_button.
-        await message.reply_text(
-            menu_text,
-            parse_mode="HTML",
-            reply_markup=get_menu_navigation_keyboard(prev, next_)
+        await send_menu_content(
+            message, menu_text, get_menu_navigation_keyboard(prev, next_),
         )
 
     except Exception as e:
@@ -1199,7 +1231,7 @@ def _food_preferences_management_view(category="main"):
         avoided_items.append(f"🚫 {code} ({code_name})")
 
     for kw in avoid_keywords:
-        avoided_items.append(f"🚫 \"{kw}\"")
+        avoided_items.append(f"🚫 \"{html.escape(str(kw))}\"")
 
     text = "🚫 <b>Mensa Food Preferences</b>\n\n"
     uid = current_user_id()
@@ -1234,7 +1266,12 @@ def _food_preferences_management_view(category="main"):
 
     # If there are custom keywords, add remove buttons for them
     for i, kw in enumerate(avoid_keywords):
-        keyboard.append([InlineKeyboardButton(f"❌ Remove \"{kw}\"", callback_data=foodpref_remove_data(i, kw))])
+        label = f'❌ Remove "{kw}"'
+        # Telegram limits inline-button labels to 64 characters. Custom
+        # keywords can be longer, while the callback itself uses a short hash.
+        if _telegram_length(label) > 64:
+            label = _prefix_by_telegram_length(label, 63) + "…"
+        keyboard.append([InlineKeyboardButton(label, callback_data=foodpref_remove_data(i, kw))])
 
     if avoided_items:
         keyboard.append([InlineKeyboardButton("🗑 Clear All Preferences", callback_data="foodpref_clear_ask")])
@@ -1306,7 +1343,7 @@ async def handle_menu_recommend_button(update: Update, context: ContextTypes.DEF
     status_msg = await query.message.reply_text("🍽️ Picking something for you...", disable_notification=True)
     stop_evt, anim_task = _start_loading_animation(status_msg, "Picking something for you...")
     try:
-        result = await build_food_recommendation(loc_id)
+        result = await build_food_recommendation(loc_id, user_id=user_id)
     finally:
         await _stop_loading_animation(stop_evt, anim_task)
         await _delete_status_message(status_msg)
@@ -1314,7 +1351,7 @@ async def handle_menu_recommend_button(update: Update, context: ContextTypes.DEF
     if not result:
         await query.message.reply_text("❌ Couldn't reach the Mensa menu right now - try again in a bit.")
         return
-    await _deliver_food_recommendation(query.message, result)
+    await _deliver_food_recommendation(query.message, result, user_id=user_id)
 
 
 async def handle_foodpref_category(update: Update, context: ContextTypes.DEFAULT_TYPE):

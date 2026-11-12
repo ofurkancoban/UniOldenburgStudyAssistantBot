@@ -5,6 +5,7 @@ state of every user session. Read-only: nothing here sends a request."""
 from __future__ import annotations
 
 import html
+import logging
 import os
 import re
 import time
@@ -142,7 +143,8 @@ def backup_line(backup_dir: Optional[str] = None, now: Optional[float] = None) -
     if not names:
         return "💾 Database backup: ⚠️ none yet"
     path = os.path.join(backup_dir, names[-1])
-    age_hours = ((now or time.time()) - os.path.getmtime(path)) / 3600
+    now_ts = time.time() if now is None else now
+    age_hours = (now_ts - os.path.getmtime(path)) / 3600
     size_mb = os.path.getsize(path) / (1024 * 1024)
     flag = "⚠️" if age_hours > 48 else "✅"
     return f"💾 Database backup: {flag} {names[-1]} ({size_mb:.1f} MB, {len(names)} kept)"
@@ -179,22 +181,33 @@ def current_commit(root: Optional[str] = None) -> Optional[str]:
 
 def _restart_log() -> list:
     try:
-        return db.load(RESTART_LOG) if db.exists(RESTART_LOG) else []
+        data = db.load(RESTART_LOG) if db.exists(RESTART_LOG) else []
     except (OSError, ValueError):
         return []
+    if not isinstance(data, list):
+        logging.warning("Ignoring malformed restart log: expected a list")
+        return []
+    valid = [entry for entry in data
+             if isinstance(entry, dict)
+             and isinstance(entry.get("ts"), (int, float))
+             and not isinstance(entry.get("ts"), bool)]
+    if len(valid) != len(data):
+        logging.warning("Ignored %s malformed restart-log entries", len(data) - len(valid))
+    return valid
 
 
 def record_start(now_ts: Optional[float] = None, commit: Optional[str] = None) -> None:
     """Log this process start with the commit it runs (see restart_line)."""
     log = _restart_log()
-    log.append({"ts": int(now_ts or time.time()), "commit": commit if commit is not None else current_commit()})
+    timestamp = time.time() if now_ts is None else now_ts
+    log.append({"ts": int(timestamp), "commit": commit if commit is not None else current_commit()})
     db.save(RESTART_LOG, log[-RESTART_LOG_KEEP:])
 
 
 def restart_line(now_ts: Optional[float] = None) -> str:
     """Starts in the last 24 h: a start on a new commit is a deploy, one on
     the same commit as the run before it a crash or a manual restart."""
-    now_ts = now_ts or time.time()
+    now_ts = time.time() if now_ts is None else now_ts
     log = _restart_log()
     recent = [(i, e) for i, e in enumerate(log) if e["ts"] >= now_ts - 86400]
     if not recent:

@@ -24,7 +24,8 @@ from fast_enroll import current_semester_id, get_semester_options, semester_disp
 
 from unibot import preferences as prefs
 from unibot import state
-from unibot.auth import get_user_session, is_user_admin, is_user_allowed, login_studip
+from unibot import db
+from unibot.auth import acting_as, get_user_session, is_user_admin, is_user_allowed, login_studip
 from unibot.settings_menu import QUIET_PRESETS
 from unibot.storage import (
     clear_default_semester,
@@ -58,9 +59,9 @@ ON_OFF = (("on", "On"), ("off", "Off"))
 QUESTIONS = (
     ("sem", "🗓️ Your semester",
      "📁 Files, Browse Courses and Sign Out open this semester directly. Change it later in /status.", True),
-    ("ai_personal", "🤖 AI may use timetable, tasks, exams",
-     "Needed for the spoken morning summary, 🔊 Listen and spoken questions. They are made by outside AI "
-     "services (GWDG, OpenRouter), which then see your timetable, tasks, exams, first name and weather place.", True),
+    ("ai_personal", "🤖 AI may use personal data",
+     "Needed for the spoken morning summary, 🔊 Listen, spoken questions, course-file summaries and study-plan topics, AI meal suggestions, and outfit suggestions. They are made by outside AI "
+     "services (including image services for wardrobe features). If you tap a task-suggestion button, the selected course announcement or forum post is also sent for that request.", True),
     ("ai_grades", "🤖 AI may use your grades",
      "Lets you ask the assistant about your grades. They are sent to the outside AI services (GWDG, OpenRouter) "
      "only for that question.", True),
@@ -212,6 +213,10 @@ def apply_answer(user_id: int, key: str, value: str, semesters: list) -> None:
         prefs.set_pref(user_id, key, value)
     if key in REQUIRED:
         _mark_answered(user_id, key)
+    if (not db.private_context_is_current(user_id)
+            or current_value(user_id, key) != value
+            or (key in REQUIRED and key not in _answered(user_id))):
+        raise RuntimeError(f"Setup answer {key!r} was not saved for this user")
 
 
 # ── the setup message ─────────────────────────────────────────────────────────
@@ -295,34 +300,68 @@ async def _semester_options(user_id: int, session=None) -> list:
 async def _semesters_for(user_id: int) -> tuple:
     """The semesters shown in the student's setup message, fetched again
     after a restart."""
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        return [], None
     cached = _setup_semesters.get(user_id)
     if cached:
         return cached
     options = await _semester_options(user_id)
     cached = (options, current_semester_id(options))
-    _setup_semesters[user_id] = cached
+    if is_user_allowed(user_id) and db.private_context_is_current(user_id):
+        _setup_semesters[user_id] = cached
     return cached
 
 
 async def offer_setup(bot, user_id: int, session=None) -> bool:
     """Send the setup message unless the student already finished it.
     Returns whether it was sent."""
+    # Login hooks and /start can run outside a Telegram update context. Bind
+    # the whole async flow to the user's current data generation so deletion
+    # can invalidate the in-flight semester lookup and prevent it from
+    # recreating onboarding state afterward.
+    with acting_as(user_id):
+        return await _offer_setup_for_user(bot, user_id, session)
+
+
+async def _offer_setup_for_user(bot, user_id: int, session=None) -> bool:
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        return False
     if setup_done(user_id):
         return False
-    if time.time() - _setup_offered.get(user_id, 0.0) < SETUP_REOFFER_SECONDS:
+    offered_at = time.time()
+    if offered_at - _setup_offered.get(user_id, 0.0) < SETUP_REOFFER_SECONDS:
         return False
-    _setup_offered[user_id] = time.time()  # before any await: a concurrent offer sees it
+    _setup_offered[user_id] = offered_at  # before any await: a concurrent offer sees it
+    semester_snapshot = None
+
+    def clear_stale_offer() -> None:
+        if _setup_offered.get(user_id) == offered_at:
+            _setup_offered.pop(user_id, None)
+        if semester_snapshot is not None and _setup_semesters.get(user_id) is semester_snapshot:
+            _setup_semesters.pop(user_id, None)
+
     try:
         options = await _semester_options(user_id, session)
+        if (not is_user_allowed(user_id) or not db.private_context_is_current(user_id)
+                or setup_done(user_id)):
+            clear_stale_offer()
+            return False
         if not options:
-            _setup_offered.pop(user_id, None)
+            clear_stale_offer()
             return False
         current = current_semester_id(options)
-        _setup_semesters[user_id] = (options, current)
+        semester_snapshot = (options, current)
+        _setup_semesters[user_id] = semester_snapshot
         text, markup = setup_view(user_id, options, current)
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            clear_stale_offer()
+            return False
         await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=markup)
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            clear_stale_offer()
+            return False
     except Exception:
-        _setup_offered.pop(user_id, None)  # not shown: the next sign-in or /start tries again
+        clear_stale_offer()  # not shown: the next sign-in or /start tries again
         logging.warning("Setup: could not ask %s", user_id, exc_info=True)
         return False
     return True
@@ -337,12 +376,20 @@ async def _redraw(query, text: str, markup=None) -> None:
 
 
 async def _finish(query, user_id: int) -> None:
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        await query.answer()
+        return
     missing = missing_answers(user_id)
     if missing:
         await query.answer("Please answer first: " + ", ".join(TITLES[k] for k in missing)[:180], show_alert=True)
         return
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        await query.answer()
+        return
+    if not mark_setup_done(user_id):
+        await query.answer("Couldn't save setup completion. Please try again.", show_alert=True)
+        return
     await query.answer("Saved")
-    mark_setup_done(user_id)
     _setup_offered.pop(user_id, None)
     _setup_semesters.pop(user_id, None)
     await _redraw(query, done_text(user_id))
@@ -351,6 +398,14 @@ async def _finish(query, user_id: int) -> None:
 async def handle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """setup|<question>|<value>, setup|info|<question>, setup|done, and the
     older setup_sem|<id>."""
+    query = update.callback_query
+    if query is None:
+        return
+    with acting_as(query.from_user.id):
+        await _handle_setup(update, context)
+
+
+async def _handle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = query.from_user.id
     if not is_user_allowed(user_id):
@@ -375,19 +430,36 @@ async def handle_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logging.warning("Setup: semesters unavailable for %s", user_id, exc_info=True)
         await query.answer("Couldn't reach Stud.IP, please try again.", show_alert=True)
         return
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        await query.answer()
+        return
     try:
         apply_answer(user_id, action, value, options)
     except ValueError:
         logging.info("Setup: answer refused for %s: %s", user_id, data)
         await query.answer("That option isn't offered any more, run /start again.", show_alert=True)
         return
+    except RuntimeError:
+        logging.warning("Setup: answer could not be saved for %s", user_id, exc_info=True)
+        await query.answer("Couldn't save that choice. Please try again.", show_alert=True)
+        return
     await query.answer("Saved")
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        return
     text, markup = setup_view(user_id, options, current)
     await _redraw(query, text, markup)
 
 
 async def handle_setup_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """setup_done from a setup message sent before the one-page setup."""
+    query = update.callback_query
+    if query is None:
+        return
+    with acting_as(query.from_user.id):
+        await _handle_setup_done(update, context)
+
+
+async def _handle_setup_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not is_user_allowed(query.from_user.id):
         await query.answer()

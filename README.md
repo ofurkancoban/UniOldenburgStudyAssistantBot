@@ -45,7 +45,7 @@ The bot runs a state-of-the-art background loop that tracks:
 *   **📢 Announcements**: Instant forwarding of course updates and news.
 *   **📁 File Manager**: Detects new uploads. Download files **directly** with one click.
 *   **💬 Forum Discussions**: Stay in the loop with new posts and full conversation history.
-*   **📨 Direct Messages**: Never miss an important message from lecturers or peers. The inbox is checked every 30 seconds on its own, so a new message reaches Telegram within about half a minute.
+*   **📨 Direct Messages**: Never miss an important message from lecturers or peers. The inbox is checked every 60 seconds on its own, so a new message usually reaches Telegram within about a minute.
 *   **🟢 WhatsApp Integration**: Forward any announcement or message directly to a target WhatsApp group with the tap of a button. The bot runs a local Node.js microservice to handle secure WhatsApp sessions.
 *   **👀 Watch Previous Semester Too**: `/status` has a toggle (off by default) that extends Announcements, File Manager, and Forum Discussions above to also watch the semester right before your current one, not just your active courses (Direct Messages aren't course-scoped, so this doesn't change those). Useful if a retake course or a module you're still following doesn't show up in the new term. Flip it anytime from `/status`; takes effect on the next check cycle, no restart needed.
 
@@ -156,8 +156,29 @@ chmod +x setup.sh
 
 **What the script does for you:**
 1.  **Environment Isolation**: Creates and activates a Python `.venv`.
-2.  **Dependency Resolution**: Installs all required libraries (`aiohttp`, `python-telegram-bot`, `cryptography`, etc.).
+2.  **Dependency Resolution**: Installs Python requirements and the WhatsApp service's locked Node.js dependencies. Node.js 20.9+ and npm are required.
 3.  **Configuration**: Creates `.env` from `.env.example` if it is missing, then starts the bot.
+
+### Deploy updates to the VPS
+
+The production VPS is updated from the `main` branch with `scripts/deploy.sh`. Configure the ignored local file `.deploy.env` once; it must contain the SSH target and can override the defaults:
+
+```bash
+DEPLOY_HOST=root@your-vps-host
+DEPLOY_DIR=/root/UniAssistant
+PM2_APP=UniAssistant
+NODE_BIN=/root/.nvm/versions/node/v22.16.0/bin
+```
+
+After committing the changes you want to release, run:
+
+```bash
+scripts/deploy.sh
+```
+
+The script requires a clean working tree, runs Ruff and mypy plus the project's unit tests, pushes the current commit to `main`, updates the VPS, and waits for Telegram polling and completed healthy controller and deadline-reminder cycles from the new process. Health and rollback checks each allow 900 seconds by default (`HEALTH_TIMEOUT` and `ROLLBACK_TIMEOUT`). Only log bytes written after the restart count. If verification fails, the previous commit is restored. Use `scripts/deploy.sh --worker` when the same release also changes `cloudflare_worker/worker.js`: the script records the active Worker versions and traffic percentages first, then restores that deployment if the release fails. This requires Wrangler's `deployments status --json` and `versions deploy` commands ([Wrangler reference](https://developers.cloudflare.com/workers/wrangler/commands/workers/)). The server must have no tracked local changes. Rollback to older bot code requires a completed controller cycle from that process, since older versions have no separate deadline loop.
+
+Time-sensitive task and calendar reminders run in their own loop. AI study plans and course indexing run separately, with bounded job durations, so slow material processing does not hold up reminder polling.
 
 ---
 

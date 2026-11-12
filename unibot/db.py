@@ -16,11 +16,14 @@ the old file name and serves as the document key.
 Migration is automatic and lazy: the first load of a document that is not in
 the database yet reads the old JSON file and imports it. The file itself is
 left in place as a backup; it is never read again once imported (delete()
-removes both, so a cleared setting cannot come back from the old file).
+or a later save removes the backup, so a cleared setting cannot come back
+from the old file).
 
 Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
+import contextlib
+import contextvars
 import gzip
 import json
 import logging
@@ -129,10 +132,101 @@ DB_BUSY_TIMEOUT = 30.0
 _lock = threading.RLock()
 _conn = None
 _conn_path = None
+_private_write_generation: dict[int, int] = {}
+_private_deletions_in_progress: set[int] = set()
+_private_write_context: contextvars.ContextVar[Optional[tuple[int, int]]] = contextvars.ContextVar(
+    "private_write_context", default=None,
+)
+
+
+def set_private_write_context(user_id: Optional[int]) -> None:
+    """Bind private writes in this task to the user's current data generation."""
+    if user_id is None:
+        _private_write_context.set(None)
+        return
+    uid = _require_uid(user_id)
+    with _lock:
+        generation = _private_write_generation.get(uid, 0)
+    _private_write_context.set((uid, generation))
+
+
+def clear_private_write_context() -> None:
+    _private_write_context.set(None)
+
+
+@contextlib.contextmanager
+def private_write_context(user_id: Optional[int]):
+    """Bind a task to one student's data generation for the duration of work."""
+    current = _private_write_context.get()
+    if user_id is None:
+        value = None
+    else:
+        uid = _require_uid(user_id)
+        if current is not None and current[0] == uid:
+            value = current  # nested scopes must not refresh a stale generation
+        else:
+            with _lock:
+                value = (uid, _private_write_generation.get(uid, 0))
+    token = _private_write_context.set(value)
+    try:
+        yield
+    finally:
+        _private_write_context.reset(token)
+
+
+def begin_private_deletion(user_id: int) -> None:
+    """Block new user work and invalidate existing work for the delete window."""
+    uid = _require_uid(user_id)
+    with _lock:
+        _private_write_generation[uid] = _private_write_generation.get(uid, 0) + 1
+        _private_deletions_in_progress.add(uid)
+
+
+def finish_private_deletion(user_id: int) -> None:
+    """Invalidate work started during deletion before reopening the account."""
+    uid = _require_uid(user_id)
+    with _lock:
+        _private_write_generation[uid] = _private_write_generation.get(uid, 0) + 1
+        _private_deletions_in_progress.discard(uid)
+
+
+def private_deletion_in_progress(user_id: int) -> bool:
+    uid = _require_uid(user_id)
+    with _lock:
+        return uid in _private_deletions_in_progress
+
+
+def private_context_is_current(user_id: int) -> bool:
+    """Whether this task still belongs to the user's current data generation.
+
+    Personal-data deletion invalidates the context synchronously. Long-running
+    handlers use this before sending or forwarding content so a request that
+    began before deletion cannot deliver its result afterward.
+    """
+    uid = _require_uid(user_id)
+    context = _private_write_context.get()
+    if context is None or context[0] != uid:
+        return False
+    with _lock:
+        return (uid not in _private_deletions_in_progress
+                and context[1] == _private_write_generation.get(uid, 0))
 
 
 def _db_path() -> str:
     return DB_FILE if os.path.isabs(DB_FILE) else os.path.join(PROJECT_ROOT, DB_FILE)
+
+
+def _secure_sqlite_files(path: str) -> None:
+    """Restrict the database and SQLite sidecars to the bot's OS account.
+
+    The database includes user identities and activity records, even though
+    credentials and private records have their own encryption layer.
+    """
+    for candidate in (path, f"{path}-wal", f"{path}-shm"):
+        try:
+            os.chmod(candidate, 0o600)
+        except FileNotFoundError:
+            continue
 
 
 def _connection() -> sqlite3.Connection:
@@ -144,6 +238,16 @@ def _connection() -> sqlite3.Connection:
         if _conn is None or _conn_path != path:
             if _conn is not None:
                 _conn.close()
+            # Pre-create with a restrictive mode: sqlite3.connect() otherwise
+            # follows the process umask, commonly leaving a 0644 database on
+            # a VPS. O_EXCL avoids truncating a database another process made.
+            try:
+                fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            except FileExistsError:
+                pass
+            else:
+                os.close(fd)
+            _secure_sqlite_files(path)
             # 30 s instead of the 5 s default, so a backup or a slow disk
             # makes writers wait rather than fail with "database is locked"
             _conn = sqlite3.connect(path, timeout=DB_BUSY_TIMEOUT, check_same_thread=False,
@@ -153,8 +257,27 @@ def _connection() -> sqlite3.Connection:
             _conn.execute("PRAGMA synchronous=FULL")
             _conn.executescript(_SCHEMA)
             _migrate_columns(_conn)
+            _secure_sqlite_files(path)
             _conn_path = path
         return _conn
+
+
+@contextlib.contextmanager
+def _transaction():
+    """Run a group of database writes atomically on the shared connection."""
+    with _lock:
+        conn = _connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            # Commit itself can fail (for example, a full disk). Roll back in
+            # that case too so the shared connection is not left inside a
+            # transaction and subsequent invite redemptions can still run.
+            if conn.in_transaction:
+                conn.rollback()
+            raise
 
 
 # Columns added after a table first shipped: (table, column, definition).
@@ -203,6 +326,19 @@ def exists(path: str) -> bool:
         return _row(_key(path)) is not None or os.path.exists(path)
 
 
+def has_imported_backup(path: str) -> bool:
+    """Whether a migrated JSON backup still exists beside its source path."""
+    with _lock:
+        return os.path.exists(path + ".imported")
+
+
+def delete_imported_backup(path: str) -> None:
+    with _lock:
+        backup_path = path + ".imported"
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+
+
 def load(path: str):
     """Parsed document. Raises FileNotFoundError when it does not exist and
     ValueError when a legacy file holds invalid JSON, like json.load(open())."""
@@ -216,8 +352,8 @@ def load(path: str):
             text = fh.read()
         data = json.loads(text)
         _write(key, json.dumps(data, ensure_ascii=False))
-        # the database is the only copy from now on; the renamed file stays as
-        # a backup but can never be read (or edited) by mistake again
+        # the database is the only live copy from now on; the renamed file is
+        # a temporary backup and can never be read (or edited) by mistake
         try:
             os.replace(path, path + ".imported")
         except OSError:
@@ -228,19 +364,30 @@ def load(path: str):
 
 def save(path: str, data, indent=None) -> None:
     """Store the document. Raises TypeError for data JSON can't encode, and
-    then leaves the stored version unchanged. indent is accepted for
-    compatibility with atomic_write_json and ignored."""
+    then leaves the stored version unchanged. A migrated JSON backup is
+    discarded after the new canonical value is committed. indent is accepted
+    for compatibility with atomic_write_json and ignored."""
     text = json.dumps(data, ensure_ascii=False)
     with _lock:
         _write(_key(path), text)
+        try:
+            delete_imported_backup(path)
+        except OSError:
+            # The SQLite row is canonical. Keep the stale backup visible so
+            # deletion paths can report and retry if it contains old data.
+            logging.warning("Could not remove stale imported backup %s", path + ".imported", exc_info=True)
 
 
 def delete(path: str) -> None:
     """Remove the document and its legacy file, if any."""
     with _lock:
-        _connection().execute("DELETE FROM documents WHERE key = ?", (_key(path),))
+        # Remove both an unimported source and the backup left after migration.
+        # If unlinking either fails, keep the DB row so callers can retry and
+        # a later load cannot treat a leftover legacy file as deleted data.
         if os.path.exists(path):
             os.remove(path)
+        delete_imported_backup(path)
+        _connection().execute("DELETE FROM documents WHERE key = ?", (_key(path),))
 
 
 def keys() -> list[str]:
@@ -281,9 +428,17 @@ def close() -> None:
 
 BACKUP_DIR = "backups"
 BACKUP_KEEP = 7
+_BACKUP_LOCK = threading.Lock()
 
 
 def backup(dest_dir: Optional[str] = None, keep: int = BACKUP_KEEP, stamp: Optional[str] = None) -> str:
+    """Serialize snapshot creation so a pre-deletion backup cannot finish last."""
+    with _BACKUP_LOCK:
+        return _backup_unlocked(dest_dir=dest_dir, keep=keep, stamp=stamp)
+
+
+def _backup_unlocked(dest_dir: Optional[str] = None, keep: int = BACKUP_KEEP,
+                     stamp: Optional[str] = None) -> str:
     """Write a consistent, gzipped copy of the database to
     <dest_dir>/bot_data_<stamp>.sqlite3.gz and keep only the newest `keep`.
 
@@ -300,16 +455,36 @@ def backup(dest_dir: Optional[str] = None, keep: int = BACKUP_KEEP, stamp: Optio
         with _lock:
             _connection()  # make sure the file and schema exist
         # its own read connection: with WAL the bot keeps reading and writing
-        source = sqlite3.connect(_db_path())
-        target = sqlite3.connect(raw)
+        source = target = None
         try:
+            source = sqlite3.connect(_db_path())
+            # sqlite3.connect() creates a new file with the process umask
+            # (often 0644). This plaintext SQLite container includes account
+            # identities and activity metadata, so lock down the temporary
+            # copy before the backup API writes any pages to it.
+            fd = os.open(raw, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+            target = sqlite3.connect(raw)
             source.backup(target)
         finally:
-            target.close()
-            source.close()
-        with open(raw, "rb") as src, gzip.open(final + ".tmp", "wb", compresslevel=6) as dst:
+            if target is not None:
+                target.close()
+            if source is not None:
+                source.close()
+        compressed_tmp = final + ".tmp"
+        # gzip.open() creates files with the process umask (often 0644 on the
+        # VPS). Pre-create and restrict the temporary archive before writing
+        # any database contents, just like the raw SQLite backup above.
+        fd = os.open(compressed_tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
+        with open(raw, "rb") as src, gzip.open(compressed_tmp, "wb", compresslevel=6) as dst:
             shutil.copyfileobj(src, dst, 1024 * 1024)
-        os.chmod(final + ".tmp", 0o600)
         os.replace(final + ".tmp", final)
     finally:
         for leftover in (raw, final + ".tmp"):
@@ -430,20 +605,41 @@ def prune_activity(keep_days: float = ACTIVITY_KEEP_DAYS, now: Optional[float] =
 
 def forget_user_identity(telegram_id: int) -> None:
     """A student's own data deletion: their activity log and the Telegram
-    name and username kept with their account row (the row itself stays, it
-    holds their access and role)."""
-    with _lock:
-        _connection().execute("DELETE FROM user_activity WHERE telegram_id = ?", (telegram_id,))
-        _connection().execute("UPDATE users SET username = NULL, full_name = NULL WHERE telegram_id = ?",
+    and Stud.IP names kept with their account row (the row itself stays, it
+    holds their access and role). Clear course scanner and invite token
+    attribution as well, since they link the account to bot activity."""
+    with _transaction() as conn:
+        conn.execute("DELETE FROM user_activity WHERE telegram_id = ?", (telegram_id,))
+        conn.execute(
+            "UPDATE users SET username = NULL, full_name = NULL, studip_username = NULL WHERE telegram_id = ?",
                               (telegram_id,))
+        conn.execute(
+            "UPDATE global_courses SET scanner_uid = NULL WHERE scanner_uid = ?",
+            (telegram_id,),
+        )
+        conn.execute("DELETE FROM invite_redemptions WHERE telegram_id = ?", (telegram_id,))
+        conn.execute("UPDATE invite_tokens SET used_by = NULL WHERE used_by = ?", (telegram_id,))
+        # Keep the token and its quota, but remove the deleted account's
+        # creator attribution. Zero is the anonymized system/unknown owner.
+        conn.execute("UPDATE invite_tokens SET created_by = 0 WHERE created_by = ?", (telegram_id,))
 
 
 def set_user_active(telegram_id: int, is_active: bool) -> None:
+    uid = _require_uid(telegram_id)
     with _lock:
-        _connection().execute(
+        conn = _connection()
+        row = conn.execute("SELECT is_active FROM users WHERE telegram_id = ?", (uid,)).fetchone()
+        if row is None or bool(row[0]) == bool(is_active):
+            return
+        cur = conn.execute(
             "UPDATE users SET is_active = ? WHERE telegram_id = ?",
-            (1 if is_active else 0, telegram_id),
+            (1 if is_active else 0, uid),
         )
+        if cur.rowcount:
+            # Admin block/unblock is an authorization boundary. In-flight
+            # private tasks carry this generation and must not deliver or
+            # write personal data using the status they observed earlier.
+            _private_write_generation[uid] = _private_write_generation.get(uid, 0) + 1
 
 
 def set_user_role(telegram_id: int, role: str) -> None:
@@ -504,8 +700,8 @@ def create_invite_token(created_by: int, label: Optional[str] = None, expires_da
 def redeem_invite_token(code: str, telegram_id: int, full_name: Optional[str] = None, username: Optional[str] = None) -> tuple[bool, str]:
     clean_code = normalize_invite_code(code)
     now = time.time()
-    with _lock:
-        row = _connection().execute(
+    with _transaction() as conn:
+        row = conn.execute(
             "SELECT code, created_by, label, expires_at, is_used, max_uses, use_count FROM invite_tokens WHERE code = ?",
             (clean_code,),
         ).fetchone()
@@ -523,11 +719,11 @@ def redeem_invite_token(code: str, telegram_id: int, full_name: Optional[str] = 
             return True, "You already have access."  # no quota used
 
         uses = row[6] + 1
-        _connection().execute(
+        conn.execute(
             "UPDATE invite_tokens SET use_count = ?, is_used = ?, used_by = ?, used_at = ? WHERE code = ?",
             (uses, 1 if uses >= row[5] else 0, telegram_id, now, clean_code),
         )
-        _connection().execute(
+        conn.execute(
             "INSERT OR IGNORE INTO invite_redemptions (code, telegram_id, used_at) VALUES (?, ?, ?)",
             (clean_code, telegram_id, now),
         )
@@ -603,6 +799,12 @@ def _save_user_credential(user_id: int, credential_type: str, data: Any) -> None
     encrypted_blob = encrypt_user_payload(uid, data)
     now = time.time()
     with _lock:
+        context = _private_write_context.get()
+        if (uid in _private_deletions_in_progress
+                or (context is not None and context[0] == uid
+                    and context[1] != _private_write_generation.get(uid, 0))):
+            logging.debug("Skipped stale credential write for user %s (%s)", uid, credential_type)
+            return
         _connection().execute(
             "INSERT INTO user_credentials (user_id, credential_type, encrypted_blob, updated_at) "
             "VALUES (?, ?, ?, ?) "
@@ -639,6 +841,12 @@ def _save_private(user_id: int, kind: str, data: Any) -> None:
     from studip_vault import encrypt_user_payload
     uid = _require_uid(user_id)
     with _lock:
+        context = _private_write_context.get()
+        if (uid in _private_deletions_in_progress
+                or (context is not None and context[0] == uid
+                    and context[1] != _private_write_generation.get(uid, 0))):
+            logging.debug("Skipped stale private write for user %s (%s)", uid, kind)
+            return
         _connection().execute(
             "INSERT INTO user_private_data (user_id, kind, encrypted_blob, updated_at) VALUES (?, ?, ?, ?) "
             "ON CONFLICT(user_id, kind) DO UPDATE SET "
@@ -807,6 +1015,12 @@ def _sync_user_courses(user_id: int, course_ids, now: Optional[float] = None) ->
     default preferences, existing ones keep theirs, dropped ones go."""
     wanted = set(course_ids)
     with _lock:
+        context = _private_write_context.get()
+        if (user_id in _private_deletions_in_progress
+                or (context is not None and context[0] == user_id
+                    and context[1] != _private_write_generation.get(user_id, 0))):
+            logging.debug("Skipped stale course sync for user %s", user_id)
+            return
         conn = _connection()
         have = {r[0] for r in conn.execute("SELECT course_id FROM user_courses WHERE user_id = ?", (user_id,))}
         stamp = now if now is not None else time.time()
@@ -815,6 +1029,13 @@ def _sync_user_courses(user_id: int, course_ids, now: Optional[float] = None) ->
                          (user_id, cid, stamp))
         for cid in have - wanted:
             conn.execute("DELETE FROM user_courses WHERE user_id = ? AND course_id = ?", (user_id, cid))
+
+
+def forget_user_courses(user_id: int) -> None:
+    """Remove course associations as part of personal-data deletion."""
+    uid = _require_uid(user_id)
+    with _lock:
+        _connection().execute("DELETE FROM user_courses WHERE user_id = ?", (uid,))
 
 
 def course_followers(course_id: str) -> list[int]:
@@ -854,6 +1075,12 @@ def _set_course_pref(user_id: int, course_id: str, column: str, value) -> bool:
     else:
         value = 1 if value else 0
     with _lock:
+        context = _private_write_context.get()
+        if (user_id in _private_deletions_in_progress
+                or (context is not None and context[0] == user_id
+                    and context[1] != _private_write_generation.get(user_id, 0))):
+            logging.debug("Skipped stale course preference write for user %s", user_id)
+            return False
         cur = _connection().execute(
             f"UPDATE user_courses SET {column} = ? WHERE user_id = ? AND course_id = ?",
             (value, user_id, course_id),
@@ -893,6 +1120,14 @@ def privacy_counts() -> dict:
 
 LEGACY_TASKS_DOC = "tasks_cache.json"
 TASKS_KIND = "tasks"
+
+
+def _valid_task_rows(raw: Any) -> list[dict]:
+    """Keep usable task entries when a saved list contains corrupt rows."""
+    if not isinstance(raw, list):
+        return []
+    return [task for task in raw
+            if isinstance(task, dict) and task.get("id") and isinstance(task.get("text"), str)]
 
 
 class UserScope:
@@ -941,26 +1176,57 @@ class UserScope:
     # tasks
     def tasks(self) -> list:
         _migrate_shared_tasks()
-        return list(self.private(TASKS_KIND) or [])
+        raw = self.private(TASKS_KIND)
+        if not isinstance(raw, list):
+            logging.warning("Ignored a malformed task list for user %s", self.user_id)
+            return []
+        tasks = _valid_task_rows(raw)
+        if len(tasks) != len(raw):
+            logging.warning("Ignored %s malformed task(s) for user %s", len(raw) - len(tasks), self.user_id)
+        return tasks
 
     def save_tasks(self, tasks: list) -> None:
+        if not isinstance(tasks, list) or any(
+                not isinstance(task, dict) or not task.get("id") or not isinstance(task.get("text"), str)
+                for task in tasks):
+            raise ValueError("tasks must be a list of entries with an id and text")
         for task in tasks:
             owner = task.get("user_id")
             if owner is not None and owner != self.user_id:
                 raise ValueError("a task of another student cannot be saved in this scope")
         self.save_private(TASKS_KIND, [{**t, "user_id": self.user_id} for t in tasks])
 
-    def add_task(self, task: dict) -> None:
-        self.save_tasks(self.tasks() + [task])
+    def add_task(self, task: dict) -> bool:
+        _migrate_shared_tasks()
+        if not isinstance(task, dict) or not task.get("id") or not isinstance(task.get("text"), str):
+            raise ValueError("a task needs an id and text")
+        with _lock:
+            raw = _load_private(self.user_id, TASKS_KIND)
+            tasks = _valid_task_rows(raw)
+            source_key = task.get("source_key")
+            if isinstance(source_key, str) and source_key and any(
+                    existing.get("source_key") == source_key for existing in tasks):
+                return False
+            task_id = task.get("id")
+            if task_id:
+                # Snoozing restores a fired task with the same ID. Replace an
+                # existing copy if a reminder job and its button handler
+                # overlap, rather than creating two rows for one task.
+                tasks = [existing for existing in tasks if existing.get("id") != task_id]
+            self.save_tasks(tasks + [task])
+            return True
 
     def remove_tasks(self, ids) -> list:
         """Drop the student's tasks with these ids; returns the removed ones."""
+        _migrate_shared_tasks()
         ids = set(ids)
-        tasks = self.tasks()
-        removed = [t for t in tasks if t.get("id") in ids]
-        if removed:
-            self.save_tasks([t for t in tasks if t.get("id") not in ids])
-        return removed
+        with _lock:
+            raw = _load_private(self.user_id, TASKS_KIND)
+            tasks = _valid_task_rows(raw)
+            removed = [task for task in tasks if task.get("id") in ids]
+            if removed or (isinstance(raw, list) and len(tasks) != len(raw)) or (raw is not None and not isinstance(raw, list)):
+                self.save_tasks([task for task in tasks if task.get("id") not in ids])
+            return removed
 
     # course registry rows of this student
     def course_ids(self) -> list[str]:
@@ -1011,16 +1277,48 @@ def _migrate_shared_tasks() -> None:
         from unibot.config import PRIMARY_ADMIN_ID
         fallback = PRIMARY_ADMIN_ID
         by_owner: dict[int, list] = {}
+        migration_complete = isinstance(shared, list)
         for task in shared if isinstance(shared, list) else []:
-            owner = task.get("user_id") if isinstance(task.get("user_id"), int) else fallback
+            if not isinstance(task, dict):
+                logging.warning("Skipped a malformed entry in the legacy task list")
+                migration_complete = False
+                continue
+            task_owner = task.get("user_id")
+            owner = task_owner if isinstance(task_owner, int) and not isinstance(task_owner, bool) else fallback
             if owner is not None:
                 by_owner.setdefault(owner, []).append({**task, "user_id": owner})
+            else:
+                # There is no account to which an ownerless task can safely be
+                # assigned. Keep the source document until an admin is configured.
+                migration_complete = False
         for owner, tasks in by_owner.items():
-            have = list(_load_private(owner, TASKS_KIND) or [])
+            # This migration runs while holding _lock, so deletion cannot
+            # start midway through the loop. If it started before we got the
+            # lock, however, keep the shared source until the user's retained
+            # task list can be written after deletion finishes.
+            if owner in _private_deletions_in_progress:
+                migration_complete = False
+                continue
+            context = _private_write_context.get()
+            if (context is not None and context[0] == owner
+                    and context[1] != _private_write_generation.get(owner, 0)):
+                # A deletion began after this task started. Leave the legacy
+                # source intact so the retained tasks can be migrated after
+                # the stale user context has ended.
+                migration_complete = False
+                continue
+            raw_have = _load_private(owner, TASKS_KIND)
+            have = (
+                [t for t in raw_have if isinstance(t, dict) and t.get("id") and isinstance(t.get("text"), str)]
+                if isinstance(raw_have, list) else []
+            )
             known = {t.get("id") for t in have}
             _save_private(owner, TASKS_KIND, have + [t for t in tasks if t.get("id") not in known])
-        _connection().execute("DELETE FROM documents WHERE key = ?", (_key(LEGACY_TASKS_DOC),))
-        logging.info("Moved the shared task list into %s private task records", len(by_owner))
+        if migration_complete:
+            _connection().execute("DELETE FROM documents WHERE key = ?", (_key(LEGACY_TASKS_DOC),))
+            logging.info("Moved the shared task list into %s private task records", len(by_owner))
+        else:
+            logging.warning("Legacy task list was retained because some entries could not be migrated")
 
 
 # ── user lifecycle: active, needs_reauth, inactive ───────────────────────────

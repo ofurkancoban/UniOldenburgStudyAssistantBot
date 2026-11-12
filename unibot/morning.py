@@ -17,7 +17,7 @@ from telegram.ext import ContextTypes
 
 from studip_utils import TZ_BERLIN, aread_bytes, berlin_now, format_hours as _format_hours, html_escape as _h
 
-from unibot import course_registry, state
+from unibot import course_registry, db, state
 from unibot.preferences import campus_anchor, food_filter, get_pref
 from unibot.storage import (
     AI_PERSONAL_OFF_NOTE,
@@ -26,7 +26,6 @@ from unibot.storage import (
     get_recently_worn_item_ids,
     get_user_name,
     get_wardrobe_entry,
-    get_wardrobe_feature_enabled,
     personal_record,
     save_personal_record,
     load_general_cache,
@@ -37,10 +36,32 @@ from unibot.storage import (
     save_cached_outfit_today,
     save_general_cache,
 )
-from unibot.formatting import _get_course_icon, _get_location_emoji, _safe_loc, clean_course_title
+from unibot.formatting import (
+    TELEGRAM_HTML_LIMIT,
+    _get_course_icon,
+    _get_location_emoji,
+    _safe_loc,
+    clean_course_title,
+    truncate_html,
+)
 from unibot.telegram_ui import _download_telegram_file, _show_typing
-from unibot.auth import acting_as, current_user_id, get_user_session, has_stored_login, is_user_admin, is_user_allowed
-from unibot.ai import _ai_patience, _call_openrouter, _pcm_to_ogg_voice, synthesize_speech
+from unibot.auth import (
+    ACTIVE,
+    acting_as,
+    current_user_id,
+    get_user_session,
+    has_stored_login,
+    is_user_admin,
+    is_user_allowed,
+    lifecycle_state,
+)
+from unibot.ai import (
+    _ai_patience,
+    _call_openrouter,
+    _pcm_to_ogg_voice,
+    personal_ai_allowed,
+    synthesize_speech,
+)
 from unibot.weather import build_weather_text_line, get_weather_snapshot
 from unibot.mensa import _friendly_menu_category_label, build_food_recommendation, fetch_dish_photo_url
 from unibot.wardrobe import generate_outfit_tryon_image, outfit_caption, pick_outfit_from_wardrobe
@@ -56,6 +77,46 @@ from unibot.schedule import (
 
 MORNING_AI_TIMEOUT_SECONDS = 60
 MORNING_AI_ATTEMPTS = 3
+
+
+def _private_context_current(user_id: int) -> bool:
+    """Check lifecycle generation for work initiated outside a user scope."""
+    with acting_as(user_id):
+        return db.private_context_is_current(user_id)
+
+
+def forget_prepared_morning_user(user_id: int) -> None:
+    """Remove a student's data from prepared and waiting morning summaries."""
+    pending = list(state._prepared_morning.items()) + list(state._morning_delivery_data.items())
+    for key, prepared in pending:
+        discard_prepared_morning_user(prepared, user_id)
+        if not prepared.get("texts"):
+            for voice_path in (prepared.get("voice_paths") or {}).values():
+                try:
+                    os.remove(voice_path)
+                except OSError:
+                    logging.debug("Could not remove prepared voice", exc_info=True)
+            task = state._morning_delivery_tasks.pop(key, None)
+            if task is not None and not task.done():
+                task.cancel()
+            state._prepared_morning.pop(key, None)
+            state._morning_delivery_data.pop(key, None)
+            prepared.clear()
+
+
+def discard_prepared_morning_user(prepared: dict, user_id: int) -> None:
+    """Remove one student's content from a prepared summary and its temp audio."""
+    for field in ("texts", "photos", "outfits", "voice_paths", "menu_buttons"):
+        values = prepared.get(field)
+        if not isinstance(values, dict):
+            continue
+        removed = values.pop(user_id, None)
+        values.pop(str(user_id), None)
+        if field == "voice_paths" and removed:
+            try:
+                os.remove(removed)
+            except OSError:
+                logging.debug("Could not remove deleted user's prepared voice", exc_info=True)
 
 
 async def prepare_morning_summary(bot, user_ids) -> Optional[dict]:
@@ -172,18 +233,18 @@ def _compose_morning_text(today_date, sections: list) -> str:
         f"🗓️ <b>Today:</b> {today_date:%d %B %Y, %A}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
     )
-    return f"{header}{''.join(sections)}\n\n━━━━━━━━━━━━━━━━━━"
+    return truncate_html(f"{header}{''.join(sections)}\n\n━━━━━━━━━━━━━━━━━━", TELEGRAM_HTML_LIMIT)
 
 
-async def _fetch_today_events(session, today_date, user_id: Optional[int] = None) -> tuple[list, list]:
-    """(this week's events, today's events); both empty if the calendar fails."""
+async def _fetch_today_events(session, today_date, user_id: Optional[int] = None) -> tuple[list, list, bool]:
+    """(this week's events, today's events, fetch succeeded)."""
     try:
         week_start = today_date - timedelta(days=today_date.weekday())
         events = await get_calendar_events(session=session, week_start=week_start, user_id=user_id)
     except Exception as e:
         logging.error("Summary schedule fetch error: %s", e)
-        return [], []
-    return events, [ev for ev in events if ev["date_key"] == today_date]
+        return [], [], False
+    return events, [ev for ev in events if ev["date_key"] == today_date], True
 
 
 async def _fetch_lunch_pick(loc_id: str = "2", user_id: Optional[int] = None) -> Optional[dict]:
@@ -225,45 +286,63 @@ async def _prepare_outfits(bot, user_ids, weather_of: dict) -> dict:
     (toggle in /status) and skipped for users with an empty wardrobe or no
     reference photo. Every step is best-effort."""
     outfits: dict = {}
-    if not get_wardrobe_feature_enabled():
-        return outfits
     for uid in user_ids:
-        if not is_user_admin(uid) or not get_pref(uid, "outfit"):
+        if not is_user_admin(uid) or not get_pref(uid, "outfit") or not get_ai_personal_enabled(uid):
             continue
-        try:
-            # A manual "Suggest Outfit Now" tap may have already run
-            # today; deliver_morning_summary resends that one instead.
-            if get_cached_outfit_today(uid):
+        with acting_as(uid):
+            if not db.private_context_is_current(uid):
                 continue
-            wardrobe_entry = get_wardrobe_entry(uid)
-            items = wardrobe_entry.get("items", [])
-            ref_file_id = wardrobe_entry.get("reference_photo_file_id")
-            if not items or not ref_file_id:
-                continue
-            recent_ids = get_recently_worn_item_ids(uid)
-            outfit = await pick_outfit_from_wardrobe(items, weather_of.get(uid), recent_ids)
-            if not outfit:
-                continue
-            reference_bytes = await _download_telegram_file(bot, ref_file_id)
-            image_bytes = await generate_outfit_tryon_image(bot, reference_bytes, outfit["chosen_items"]) if reference_bytes else None
-            outfits[uid] = {"outfit": outfit, "image_bytes": image_bytes}
-        except Exception as e:
-            logging.warning("Outfit suggestion failed for %s: %s", uid, e)
+            try:
+                # A manual "Suggest Outfit Now" tap may have already run
+                # today; deliver_morning_summary resends that one instead.
+                if get_cached_outfit_today(uid):
+                    continue
+                wardrobe_entry = get_wardrobe_entry(uid)
+                items = wardrobe_entry.get("items", [])
+                ref_file_id = wardrobe_entry.get("reference_photo_file_id")
+                if not items or not ref_file_id:
+                    continue
+                recent_ids = get_recently_worn_item_ids(uid)
+                outfit = await pick_outfit_from_wardrobe(items, weather_of.get(uid), recent_ids, user_id=uid)
+                if not db.private_context_is_current(uid) or not get_ai_personal_enabled(uid) or not outfit:
+                    continue
+                reference_bytes = await _download_telegram_file(bot, ref_file_id)
+                if not db.private_context_is_current(uid) or not get_ai_personal_enabled(uid):
+                    continue
+                image_bytes = await generate_outfit_tryon_image(
+                    bot, reference_bytes, outfit["chosen_items"], user_id=uid
+                ) if reference_bytes else None
+                if db.private_context_is_current(uid) and get_ai_personal_enabled(uid):
+                    outfits[uid] = {"outfit": outfit, "image_bytes": image_bytes}
+            except Exception as e:
+                logging.warning("Outfit suggestion failed for %s: %s", uid, e)
     return outfits
 
 
 async def _prepare_morning_voice(today_events, today_date, today_tasks, weather, food,
-                                 name: Optional[str] = None) -> Optional[str]:
+                                 name: Optional[str] = None,
+                                 include_schedule: bool = True,
+                                 user_id: Optional[int] = None) -> Optional[str]:
     """AI-narrated voice message, improvised fresh every morning (see
     build_ai_daily_plan_narration) and converted to OGG now, so delivery is
     just an upload. A TTS/ffmpeg hiccup just skips it."""
     try:
+        if user_id is not None and not get_ai_personal_enabled(user_id):
+            return None
         narration = await build_ai_daily_plan_narration(
-            today_events, today_date, name=name,
+            today_events if include_schedule else [], today_date, name=name,
             today_tasks=today_tasks, weather=weather, food=food,
-        ) or build_daily_plan_speech_text(today_events, today_date)
+            include_schedule=include_schedule, user_id=user_id,
+        ) or build_daily_plan_speech_text(today_events, today_date, include_schedule=include_schedule)
+        if user_id is not None and not get_ai_personal_enabled(user_id):
+            return None
         voice_path = None
-        result = await synthesize_speech(narration)
+        result = await synthesize_speech(
+            narration,
+            can_send=lambda: user_id is None or personal_ai_allowed(user_id),
+        )
+        if user_id is not None and not get_ai_personal_enabled(user_id):
+            return None
         if result:
             voice_path = await _pcm_to_ogg_voice(*result)
         if not voice_path:
@@ -297,7 +376,8 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     async def lunch_at(loc_id: str, uid: Optional[int] = None) -> tuple:
         food_rules = food_filter(uid)
         key = (loc_id, food_rules["diet"], tuple(sorted(food_rules["avoid_codes"])),
-               tuple(sorted(food_rules["avoid_keywords"])), food_rules["max_price"])
+               tuple(sorted(food_rules["avoid_keywords"])), food_rules["max_price"],
+               bool(uid is not None and get_ai_personal_enabled(uid)))
         if key not in picks:
             food = await _fetch_lunch_pick(loc_id, user_id=uid)
             picks[key] = (food, *await _prepare_lunch_photo(food))
@@ -312,9 +392,22 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
         # one student's failure leaves only their own summary out, never the slot's
         try:
             with acting_as(uid):
+                if not db.private_context_is_current(uid):
+                    continue
                 weather_of[uid] = await get_weather_snapshot(today_date, user_id=uid)
+                if not db.private_context_is_current(uid):
+                    continue
                 texts[uid], voice, menu_buttons[uid], photos[uid] = await _prepare_user_summary(
                     uid, today_date, weather_of[uid], lunch_at)
+                if not db.private_context_is_current(uid):
+                    if voice:
+                        try:
+                            os.remove(voice)
+                        except OSError:
+                            logging.debug("Could not remove stale prepared voice", exc_info=True)
+                    for part in (texts, menu_buttons, photos):
+                        part.pop(uid, None)
+                    continue
         except Exception:
             logging.error("Morning summary for %s could not be prepared", uid, exc_info=True)
             for part in (texts, menu_buttons, photos):
@@ -353,32 +446,39 @@ async def _prepare_user_summary(uid: int, today_date, weather, lunch_at) -> tupl
     # session must not sign in on anyone else's behalf)
     own = get_user_session(uid)
     session = own if has_stored_login(own) else None
-    events, today_events = (await _fetch_today_events(session, today_date, user_id=uid)) if session else ([], [])
+    events, today_events, calendar_available = (
+        await _fetch_today_events(session, today_date, user_id=uid)
+        if session else ([], [], False)
+    )
     today_tasks = _load_today_tasks(today_date, user_id=uid)
-    plan = plan_study_day(events, today_date)
+    plan = plan_study_day(events, today_date) if calendar_available else {"lunch": None}
     menu_button = _menu_button_for(plan, today_events)
     # the student picks what the summary contains (preferences.morning_sections)
     show = get_pref(uid, "morning_sections")
     food, photo_url, photo_caption = (await lunch_at("3" if menu_button.startswith("mensa_loc|3") else "2", uid)
                                       if show["mensa"] else (None, None, None))
-    menu = await _lunch_menu_highlight(plan["lunch"], session) if show["mensa"] else None
+    menu = await _lunch_menu_highlight(plan["lunch"], session) if show["mensa"] and calendar_available else None
     weather_shown = weather if show["weather"] else None
     text = _compose_morning_text(today_date, [
-        _format_schedule_section(today_events) if show["classes"] else "",
-        _format_study_windows_section(events, today_date, menu=menu) if show["study"] else "",
+        (_format_schedule_section(today_events) if calendar_available else
+         "📅 <b>Today's schedule couldn't be loaded.</b> Sign in or try again later.") if show["classes"] else "",
+        (_format_study_windows_section(events, today_date, menu=menu) if calendar_available else
+         "\n\n📚 <b>Study windows couldn't be calculated because the schedule is unavailable.</b>")
+        if show["study"] else "",
         f"\n\n{build_weather_text_line(weather_shown)}" if weather_shown else "",
         _format_tasks_section(today_tasks),
         _format_lunch_section(food) if show["mensa"] else "",
         await _fetch_exam_countdown(session, today_date) if session and show["exams"] else "",
     ])
     # the spoken version is written and voiced by the AI service: only with the student's permission
-    voice = await _prepare_morning_voice(today_events if show["classes"] else [], today_date, today_tasks,
-                                         weather_shown, food, name=get_user_name(uid)) \
-        if get_ai_personal_enabled(uid) else None
+    voice = await _prepare_morning_voice(today_events, today_date, today_tasks,
+                                         weather_shown, food, name=get_user_name(uid),
+                                         include_schedule=show["classes"], user_id=uid) \
+        if get_ai_personal_enabled(uid) and calendar_available else None
     return text, voice, menu_button, (photo_url, photo_caption)
 
 
-async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
+async def deliver_morning_summary(bot, user_ids, prepared: dict, on_delivered=None) -> list[int]:
     """Send a prepare_morning_summary result: text (pinned), lunch photo,
     outfit, voice message, back to back."""
     menu_buttons = prepared.get("menu_buttons") or {}
@@ -393,47 +493,73 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
 
     texts = prepared.get("texts") or {}
     for uid in user_ids:
+        if (not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE
+                or not _private_context_current(uid)):
+            continue
         if uid not in texts:
             continue  # joined after the summary was prepared
-        try:
-            sent_msg = await bot.send_message(
-                chat_id=uid,
-                text=texts[uid],
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
-                    "🍴 Today's Menu", callback_data=menu_buttons.get(uid, "menu_nav|2/|new"))]])
-            )
-        except Exception as e:
-            logging.error("Failed to send summary to %s: %s", uid, e)
-            continue
-        delivered.append(uid)
-
-        prev_msg_id = personal_record(uid, "pinned_morning_summary")
-        if prev_msg_id:
+        with acting_as(uid):
+            if not db.private_context_is_current(uid):
+                continue
             try:
-                await bot.unpin_chat_message(chat_id=uid, message_id=prev_msg_id)
+                sent_msg = await bot.send_message(
+                    chat_id=uid,
+                    text=texts[uid],
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                        "🍴 Today's Menu", callback_data=menu_buttons.get(uid, "menu_nav|2/|new"))]])
+                )
             except Exception as e:
-                logging.warning("Failed to unpin previous morning summary for %s: %s", uid, e)
-        try:
-            await bot.pin_chat_message(chat_id=uid, message_id=sent_msg.message_id, disable_notification=True)
-            save_personal_record(uid, "pinned_morning_summary", sent_msg.message_id)
-        except Exception as e:
-            logging.warning("Failed to pin morning summary for %s: %s", uid, e)
+                logging.error("Failed to send summary to %s: %s", uid, e)
+                continue
+            if not db.private_context_is_current(uid):
+                continue
+            delivered.append(uid)
+            if on_delivered is not None:
+                try:
+                    on_delivered(uid)
+                except Exception:
+                    logging.error("Failed to record morning summary delivery for %s", uid, exc_info=True)
 
-    for uid in user_ids:
+            prev_msg_id = personal_record(uid, "pinned_morning_summary")
+            if not db.private_context_is_current(uid):
+                continue
+            if prev_msg_id:
+                try:
+                    await bot.unpin_chat_message(chat_id=uid, message_id=prev_msg_id)
+                except Exception as e:
+                    logging.warning("Failed to unpin previous morning summary for %s: %s", uid, e)
+            try:
+                await bot.pin_chat_message(chat_id=uid, message_id=sent_msg.message_id, disable_notification=True)
+                save_personal_record(uid, "pinned_morning_summary", sent_msg.message_id)
+            except Exception as e:
+                logging.warning("Failed to pin morning summary for %s: %s", uid, e)
+
+    for uid in delivered:
+        if (not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE
+                or not _private_context_current(uid)):
+            continue
         photo_url, caption = (prepared.get("photos") or {}).get(uid) or (None, None)
         if not photo_url:
             continue
-        try:
-            await bot.send_photo(chat_id=uid, photo=photo_url, caption=caption, parse_mode="HTML")
-        except Exception as e:
-            logging.error("Failed to send lunch photo to %s: %s", uid, e)
-
-    if get_wardrobe_feature_enabled():
-        for uid in user_ids:
-            if not is_user_admin(uid) or not get_pref(uid, "outfit"):
+        with acting_as(uid):
+            if not db.private_context_is_current(uid):
                 continue
             try:
+                await bot.send_photo(chat_id=uid, photo=photo_url, caption=caption, parse_mode="HTML")
+            except Exception as e:
+                logging.error("Failed to send lunch photo to %s: %s", uid, e)
+
+    for uid in delivered:
+        if (not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE
+                or not _private_context_current(uid)):
+            continue
+        if not is_user_admin(uid) or not get_pref(uid, "outfit") or not get_ai_personal_enabled(uid):
+            continue
+        with acting_as(uid):
+            try:
+                if not db.private_context_is_current(uid):
+                    continue
                 # Checked again at delivery: a manual "Suggest Outfit Now"
                 # between preparation and now wins, so the user never gets
                 # two different outfits for the same day.
@@ -444,6 +570,8 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
                         await bot.send_photo(chat_id=uid, photo=cached["photo_file_id"], caption=caption, parse_mode="HTML")
                     else:
                         await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
+                    if not db.private_context_is_current(uid):
+                        continue
                     continue
                 entry = prepared["outfits"].get(uid)
                 if not entry:
@@ -453,12 +581,16 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
                 photo_file_id = None
                 if entry["image_bytes"]:
                     sent = await bot.send_photo(chat_id=uid, photo=io.BytesIO(entry["image_bytes"]), caption=caption, parse_mode="HTML")
+                    if not db.private_context_is_current(uid):
+                        continue
                     photo_file_id = sent.photo[-1].file_id if sent.photo else None
                 else:
                     # Every image provider failed/unavailable - still
                     # deliver the text-only pick rather than nothing, since
                     # the weather-aware reasoning is useful on its own.
                     await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
+                    if not db.private_context_is_current(uid):
+                        continue
                 record_worn_items(uid, [it["id"] for it in outfit["chosen_items"]])
                 save_cached_outfit_today(uid, outfit["description"], photo_file_id, outfit.get("color_tip", ""), [it["label"] for it in outfit["chosen_items"]])
             except Exception as e:
@@ -466,9 +598,14 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
 
     for uid, voice_path in (prepared.get("voice_paths") or {}).items():
         try:
-            if uid in user_ids:
-                voice_bytes = await aread_bytes(voice_path)
-                await bot.send_voice(chat_id=uid, voice=voice_bytes)
+            if uid in delivered and is_user_allowed(uid) and lifecycle_state(uid) == ACTIVE:
+                with acting_as(uid):
+                    if not db.private_context_is_current(uid):
+                        continue
+                    voice_bytes = await aread_bytes(voice_path)
+                    if (is_user_allowed(uid) and lifecycle_state(uid) == ACTIVE
+                            and db.private_context_is_current(uid) and get_ai_personal_enabled(uid)):
+                        await bot.send_voice(chat_id=uid, voice=voice_bytes)
         except Exception as e:
             logging.error("Morning voice: failed to send to %s: %s", uid, e)
         finally:
@@ -483,18 +620,36 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict) -> None:
             await course_registry.flush_alert_queues(bot, user_ids=delivered, with_morning=True)
         except Exception:
             logging.warning("Held course alerts after the morning summary failed", exc_info=True)
+    return delivered
 
 
-def morning_summary_sent(today_str: str, slot: str) -> bool:
+def morning_summary_sent(today_str: str, slot: str, user_ids=None) -> bool:
+    # Delivery state is per student: a legacy process-wide marker only meant
+    # that the old batch attempted the send, not that every student received it.
+    if user_ids is not None:
+        return all(
+            (record := personal_record(uid, "morning_summary_sent") or {}).get("date") == today_str
+            and slot in (record.get("slots") or [])
+            for uid in user_ids
+        )
     cache = load_general_cache()
     sent = cache.get("morning_summary_sent") or {}
     if sent.get("date") == today_str:
-        return slot in (sent.get("slots") or [])
+        if slot in (sent.get("slots") or []):
+            return True
     # before per-student times there was one 07:00 summary, marked by date only
     return slot == "07:00" and cache.get("last_morning_summary") == today_str
 
 
-def _mark_morning_summary_sent(today_str: str, slot: str) -> None:
+def _mark_morning_summary_sent(today_str: str, slot: str, user_ids=None) -> None:
+    if user_ids is not None:
+        for uid in user_ids:
+            previous = personal_record(uid, "morning_summary_sent") or {}
+            slots = list(previous.get("slots") or []) if previous.get("date") == today_str else []
+            if slot not in slots:
+                slots.append(slot)
+            save_personal_record(uid, "morning_summary_sent", {"date": today_str, "slots": slots})
+        return
     # Re-load rather than reusing a cache loaded earlier - deliver_morning_summary
     # does its own separate load/save of general_cache.json (to track which
     # message is currently pinned), and saving a stale copy would silently
@@ -517,13 +672,12 @@ async def _deliver_morning_summary_at(bot, user_ids, prepared: dict, send_at: da
         if delay > 0:
             await asyncio.sleep(delay)
         logging.info("🌞 Delivering the %s morning summary...", slot)
-        await deliver_morning_summary(bot, user_ids, prepared)
+        await deliver_morning_summary(
+            bot, user_ids, prepared,
+            on_delivered=lambda uid: _mark_morning_summary_sent(today_str, slot, [uid]),
+        )
     except Exception as e:
         logging.error("❌ Morning summary delivery failed: %s", e)
-    finally:
-        # Marked even on failure, like the old inline send: a broken
-        # delivery shouldn't repeat on every watcher cycle all day.
-        _mark_morning_summary_sent(today_str, slot)
 
 
 async def handle_calendar_today_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -573,10 +727,12 @@ async def handle_calendar_weekly_voice(update: Update, context: ContextTypes.DEF
         await query.message.reply_text(f"❌ Error generating voice schedule: {str(e)[:200]}")
 
 
-def build_daily_plan_speech_text(events: list, target_date) -> str:
+def build_daily_plan_speech_text(events: list, target_date, include_schedule: bool = True) -> str:
     """Build a plain-English (no Markdown/HTML) description of one day's
     schedule, suitable as TTS input - reuses the same event dicts
     send_daily_calendar renders (title, time, location, status)."""
+    if not include_schedule:
+        return f"Here's your personal briefing for {target_date:%A, %B %d}."
     day_events = [ev for ev in events if ev["date_key"] == target_date]
     today_events = [ev for ev in day_events if not ev.get("is_cancelled")]
     cancelled = _cancelled_sentence(day_events)
@@ -607,7 +763,7 @@ DAILY_PLAN_NARRATION_SYSTEM_PROMPT = """You are recording a short, warm, upbeat 
 Structure:
 1. Open with a genuine, encouraging line about the day ahead - invent fresh wording every time, never reuse a stock phrase, make it feel spontaneous rather than a template.
 2. If weather data is given, mention what it'll actually be like stepping outside (dry/rainy/sunny etc - the precise temperature matters far less than that) and suggest what to bring or wear, naturally, as part of the flow - not a separate weather-report segment.
-3. Naturally weave in today's schedule: what's on, roughly when, and where - like a friend casually telling them their day, not reading a bureaucratic agenda.
+3. If a schedule is provided, naturally weave in what's on, roughly when, and where - like a friend casually telling them their day, not reading a bureaucratic agenda. If the prompt says the schedule is hidden, do not mention classes or imply there are none.
 4. If any tasks are due today, mention them too, woven into the same conversational flow - not as a separate announcement.
 5. If a lunch pick is given, mention it naturally too - what it is and roughly where to get it - as part of the same flow, not a separate food-review segment.
 6. Close with one short, warm line wishing them well.
@@ -615,7 +771,10 @@ Structure:
 Rules: plain spoken sentences only - no markdown, no emojis, no bullet points, no headers. Keep it under 130 words (a bit more if there's weather, tasks, and/or a lunch pick to mention too). Vary your phrasing and structure every time you're asked this, even for an identical schedule, since this repeats every single morning and must never sound canned or repetitive."""
 
 
-async def build_ai_daily_plan_narration(today_events: list, target_date, name: Optional[str] = None, today_tasks: Optional[list] = None, weather: Optional[dict] = None, food: Optional[dict] = None) -> Optional[str]:
+async def build_ai_daily_plan_narration(today_events: list, target_date, name: Optional[str] = None,
+                                       today_tasks: Optional[list] = None, weather: Optional[dict] = None,
+                                       food: Optional[dict] = None, include_schedule: bool = True,
+                                       user_id: Optional[int] = None) -> Optional[str]:
     """Ask the chat LLM (OpenRouter) to write a warm, freshly-improvised
     spoken narration of the day's schedule, weather, any tasks due today,
     and a lunch pick - deliberately not a fixed template, so the opening
@@ -628,17 +787,20 @@ async def build_ai_daily_plan_narration(today_events: list, target_date, name: O
     callers should fall back to build_daily_plan_speech_text so the voice
     message always has content."""
     held = [ev for ev in today_events if not ev.get("is_cancelled")]
-    if held:
-        schedule_summary = "\n".join(
-            f"- {clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')} in {_safe_loc(ev.get('location', ''))}"
-            for ev in held
-        )
+    user_prompt = f"Today is {target_date:%A, %B %d}."
+    if include_schedule:
+        if held:
+            schedule_summary = "\n".join(
+                f"- {clean_course_title(ev.get('title', '')) or 'an event'} at {ev.get('time', '')} in {_safe_loc(ev.get('location', ''))}"
+                for ev in held
+            )
+        else:
+            schedule_summary = "No events scheduled - a free day."
+        if len(held) < len(today_events):
+            schedule_summary += f"\nCancelled today (mention briefly, they don't take place):{_cancelled_sentence(today_events)}"
+        user_prompt += f"\nSchedule:\n{schedule_summary}"
     else:
-        schedule_summary = "No events scheduled - a free day."
-    if len(held) < len(today_events):
-        schedule_summary += f"\nCancelled today (mention briefly, they don't take place):{_cancelled_sentence(today_events)}"
-
-    user_prompt = f"Today is {target_date:%A, %B %d}.\nSchedule:\n{schedule_summary}"
+        user_prompt += "\nThe student chose to hide classes. Do not mention their schedule or imply that they have no events."
 
     if weather:
         wet_note = "expect it to be wet (rain/drizzle/snow)" if weather["is_wet"] else "it should stay dry"
@@ -663,7 +825,12 @@ async def build_ai_daily_plan_narration(today_events: list, target_date, name: O
 
     if name:
         user_prompt += f"\nAddress the listener by name at least once, naturally (their name is {name})."
-    narration = await _call_openrouter(DAILY_PLAN_NARRATION_SYSTEM_PROMPT, user_prompt, temperature=1.15)
+    if user_id is not None and not get_ai_personal_enabled(user_id):
+        return None
+    narration = await _call_openrouter(
+        DAILY_PLAN_NARRATION_SYSTEM_PROMPT, user_prompt, temperature=1.15,
+        can_send=lambda: user_id is None or personal_ai_allowed(user_id),
+    )
     return narration.strip() if narration else None
 
 
@@ -702,7 +869,9 @@ Structure:
 Rules: plain spoken sentences only - no markdown, no emojis, no bullet points, no headers. Keep it under 160 words. Vary your phrasing and structure every time you're asked this, even for an identical week, since this must never sound canned or repetitive."""
 
 
-async def build_ai_weekly_plan_narration(events: list, week_start, week_end, name: Optional[str] = None, week_tasks: Optional[list] = None) -> Optional[str]:
+async def build_ai_weekly_plan_narration(events: list, week_start, week_end, name: Optional[str] = None,
+                                         week_tasks: Optional[list] = None,
+                                         user_id: Optional[int] = None) -> Optional[str]:
     """Ask the chat LLM (OpenRouter) to write a warm, freshly-improvised
     spoken narration of the week's schedule and any tasks due that week -
     the weekly counterpart of build_ai_daily_plan_narration. Returns None
@@ -746,7 +915,12 @@ async def build_ai_weekly_plan_narration(events: list, week_start, week_end, nam
 
     if name:
         user_prompt += f"\nAddress the listener by name at least once, naturally (their name is {name})."
-    narration = await _call_openrouter(WEEKLY_PLAN_NARRATION_SYSTEM_PROMPT, user_prompt, temperature=1.15)
+    if user_id is not None and not get_ai_personal_enabled(user_id):
+        return None
+    narration = await _call_openrouter(
+        WEEKLY_PLAN_NARRATION_SYSTEM_PROMPT, user_prompt, temperature=1.15,
+        can_send=lambda: user_id is None or personal_ai_allowed(user_id),
+    )
     return narration.strip() if narration else None
 
 
@@ -781,14 +955,21 @@ async def _send_voice_to_users(bot, user_ids, text: str):
             pass
 
 
-async def _try_send_voice(sender, text: str) -> bool:
+async def _try_send_voice(sender, text: str, user_id=None) -> bool:
     """Best-effort: synthesize `text` via OpenRouter TTS, convert to
     OGG/Opus, and send it as a voice message on `sender`. Returns True on
     success, False on any failure (TTS unavailable, ffmpeg missing/failed,
     or the send itself raising) - callers decide what, if anything, to do
     about a False result (e.g. fall back to sending the text)."""
-    result = await synthesize_speech(text)
+    if user_id is not None and not get_ai_personal_enabled(user_id):
+        return False
+    result = await synthesize_speech(
+        text,
+        can_send=lambda: user_id is None or personal_ai_allowed(user_id),
+    )
     if not result:
+        return False
+    if user_id is not None and not get_ai_personal_enabled(user_id):
         return False
     pcm_bytes, sample_rate = result
 
@@ -797,6 +978,8 @@ async def _try_send_voice(sender, text: str) -> bool:
         return False
 
     try:
+        if user_id is not None and not get_ai_personal_enabled(user_id):
+            return False
         await sender.reply_voice(voice=await aread_bytes(ogg_path))
         return True
     except Exception as e:
@@ -832,10 +1015,12 @@ async def send_daily_plan_voice(sender, events: list, target_date, user_id=None)
         logging.warning("send_daily_plan_voice: tasks fetch failed: %s", e)
         today_tasks = []
     weather = await get_weather_snapshot(target_date, user_id=owner)
-    text = await build_ai_daily_plan_narration(today_events, target_date, name=name, today_tasks=today_tasks, weather=weather) or build_daily_plan_speech_text(events, target_date)
+    text = await build_ai_daily_plan_narration(
+        today_events, target_date, name=name, today_tasks=today_tasks, weather=weather, user_id=owner
+    ) or build_daily_plan_speech_text(events, target_date)
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
 
-    if not await _try_send_voice(sender, text):
+    if not await _try_send_voice(sender, text, owner):
         await sender.reply_text("⚠️ Couldn't generate voice right now - here's the schedule as text instead:\n\n" + text)
 
 
@@ -852,19 +1037,25 @@ async def send_weekly_plan_voice(sender, events: list, week_start, user_id=None)
         return
     name = get_user_name(owner)
     week_tasks = _week_tasks_for_range(week_start, week_end, user_id=owner)
-    text = await build_ai_weekly_plan_narration(events, week_start, week_end, name=name, week_tasks=week_tasks) or build_weekly_plan_speech_text(events, week_start, week_end)
+    text = await build_ai_weekly_plan_narration(
+        events, week_start, week_end, name=name, week_tasks=week_tasks, user_id=owner
+    ) or build_weekly_plan_speech_text(events, week_start, week_end)
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
 
-    if not await _try_send_voice(sender, text):
+    if not await _try_send_voice(sender, text, owner):
         await sender.reply_text("⚠️ Couldn't generate voice right now - here's the week as text instead:\n\n" + text)
 
 
-async def send_text_and_voice(sender, text: str):
+async def send_text_and_voice(sender, text: str, user_id=None):
     """Send `text` as a normal message, then also synthesize and send it as
     a voice message via the same free OpenRouter TTS pipeline as 🔊 Listen.
     Best-effort for the voice half - a TTS/ffmpeg failure just means no
     voice note follows, since the text has already gone out and callers
     shouldn't have to handle a second failure mode on top of their own."""
+    if user_id is not None and not get_ai_personal_enabled(user_id):
+        return
     await sender.reply_text(text)
+    if user_id is not None and not get_ai_personal_enabled(user_id):
+        return
     await _show_typing(sender, action=ChatAction.RECORD_VOICE)
-    await _try_send_voice(sender, text)
+    await _try_send_voice(sender, text, user_id)

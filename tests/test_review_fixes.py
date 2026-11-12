@@ -187,6 +187,7 @@ class AlertQueueTests(unittest.TestCase):
 
     def _flush(self, uid, queue, send, **kw):
         scope = db.get_user_scope(uid)
+        scope.sync_courses({"c"})
         scope.save_private(course_registry.ALERT_QUEUE_KIND, queue)
         bot = mock.MagicMock()
         bot.send_message = send

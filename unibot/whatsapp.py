@@ -27,6 +27,15 @@ WA_FORWARD_CONFIRM_MARKUP = InlineKeyboardMarkup([[
     InlineKeyboardButton("❌ Cancel", callback_data="forward_wa_cancel"),
 ]])
 
+# Telegram can deliver multiple confirmation callbacks when an administrator
+# taps twice before the first WhatsApp request finishes. Keep one send in
+# flight per source message to avoid duplicate posts to the group.
+_wa_forwards_in_flight: set[tuple[int, int]] = set()
+
+
+def whatsapp_forward_in_flight(key: tuple[int, int]) -> bool:
+    return key in _wa_forwards_in_flight
+
 
 async def handle_forward_wa_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """First tap on any 'Forward to WA' button - swap it for a Yes/No confirmation
@@ -66,7 +75,8 @@ async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     text = query.message.text or query.message.caption or "No text found"
     text = text.replace(EXAM_DATES_FOOTER, "").rstrip()
-    success, message = await _send_text_to_whatsapp(text)
+    key = (query.message.chat_id, query.message.message_id)
+    success, message = await _send_text_to_whatsapp(text, dedupe_key=key)
     if success:
         await query.edit_message_reply_markup(reply_markup=None)  # Remove button after sending
     await context.bot.send_message(chat_id=query.message.chat_id, text=f"✅ {message}" if success else f"❌ {message}")
@@ -82,14 +92,38 @@ async def set_wa_group_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     set_wa_group_id(group_id)
 
+    service_synced = False
+    sync_error = None
     try:
         async with shared_http() as session:
-            await session.post(f"{WA_SERVICE_URL}/set_group_id", headers=WA_HEADERS, json={"groupId": group_id}, timeout=10)
+            async with session.post(
+                f"{WA_SERVICE_URL}/set_group_id",
+                headers=WA_HEADERS,
+                json={"groupId": group_id},
+                timeout=10,
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    service_synced = data.get("success") is True
+                    if not service_synced:
+                        sync_error = data.get("error", "service did not confirm the update")
+                else:
+                    sync_error = f"service returned HTTP {response.status}"
     except Exception as e:
         logging.error("Failed to notify WhatsApp service of new group ID: %s", e)
+        sync_error = str(e)
 
-    await query.answer("Group ID saved!")
-    await query.edit_message_text(f"✅ WA_GROUP_ID saved and active:\n{group_id}")
+    if service_synced:
+        await query.answer("Group ID saved and activated!")
+        await query.edit_message_text(f"✅ WA_GROUP_ID saved and active:\n{group_id}")
+    else:
+        await query.answer("Saved locally, but WhatsApp service was not updated.", show_alert=True)
+        await query.edit_message_text(
+            f"⚠️ WA_GROUP_ID saved locally, but the running WhatsApp service may still use its previous group.\n"
+            f"Selected group: {group_id}\n"
+            f"Service update error: {sync_error or 'no confirmation received'}\n\n"
+            "Retry selecting this group after the WhatsApp service is reachable."
+        )
 
 
 def _html_to_whatsapp_text(text: str) -> str:
@@ -108,7 +142,7 @@ def _html_to_whatsapp_text(text: str) -> str:
     return html.unescape(text)
 
 
-async def _send_text_to_whatsapp(text: str) -> tuple[bool, str]:
+async def _send_text_to_whatsapp(text: str, *, dedupe_key: tuple[int, int] | None = None) -> tuple[bool, str]:
     """POST plain text to the local WhatsApp microservice's target group.
     Returns (success, message) - mirrors forward_to_whatsapp's own request,
     factored out so the "EXAM REGISTRATION OPEN"-style notifications (which
@@ -124,6 +158,10 @@ async def _send_text_to_whatsapp(text: str) -> tuple[bool, str]:
     group_id = get_wa_group_id()
     if not group_id:
         return False, "No WhatsApp group is set yet. Use /status → \"📱 WhatsApp\" → \"🔍 Detect WA Groups\" and pick one first."
+    if dedupe_key is not None:
+        if dedupe_key in _wa_forwards_in_flight:
+            return False, "This message is already being sent."
+        _wa_forwards_in_flight.add(dedupe_key)
     text = _html_to_whatsapp_text(text)
     try:
         async with shared_http() as session:
@@ -136,6 +174,9 @@ async def _send_text_to_whatsapp(text: str) -> tuple[bool, str]:
     except Exception as e:
         logging.error("WhatsApp forward error: %s", e)
         return False, f"Error connecting to WhatsApp service: {e}"
+    finally:
+        if dedupe_key is not None:
+            _wa_forwards_in_flight.discard(dedupe_key)
 
 
 # Bot-only hint under the new exam dates; forward_to_whatsapp leaves it out.

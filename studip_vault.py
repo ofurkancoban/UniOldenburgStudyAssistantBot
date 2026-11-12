@@ -29,6 +29,8 @@ import json
 import logging
 import os
 import stat
+import tempfile
+import threading
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -42,6 +44,7 @@ ENCRYPTED_MAGIC = "VAULT:v1:"
 
 
 KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".vault_key")
+_KEY_FILE_LOCK = threading.Lock()
 
 
 def _key_from_secret(secret: str) -> bytes:
@@ -53,19 +56,67 @@ def _key_from_secret(secret: str) -> bytes:
 def _load_or_create_key_file() -> bytes:
     from cryptography.fernet import Fernet
 
-    try:
-        with open(KEY_FILE, "rb") as fh:
-            key = fh.read().strip()
-        if key:
+    # Credential writes can start in worker threads at the same time on a
+    # fresh install. Serialize the read/create sequence so one thread cannot
+    # observe another thread's newly-created but not-yet-written file.
+    with _KEY_FILE_LOCK:
+        try:
+            with open(KEY_FILE, "rb") as fh:
+                key = fh.read().strip()
+        except FileNotFoundError:
+            key = None
+        if key is not None:
+            if not key:
+                # An existing empty key file is evidence of an interrupted or
+                # damaged key, not a fresh install. Replacing it could make
+                # every encrypted credential and private record unreadable.
+                raise RuntimeError(f"Vault key file {KEY_FILE} is empty; refusing to replace it")
+            # Refuse to overwrite a non-empty but malformed key: doing so
+            # would make every existing encrypted record permanently unreadable.
+            try:
+                Fernet(key)
+            except Exception as exc:
+                raise RuntimeError(f"Vault key file {KEY_FILE} is invalid; refusing to replace it") from exc
+            # A key created by an older build or copied from a backup may
+            # have inherited permissive umask permissions. Tighten it before
+            # returning the secret to any caller.
+            os.chmod(KEY_FILE, 0o600)
             return key
-    except OSError:
-        pass
-    key = Fernet.generate_key()
-    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with open(fd, "wb") as fh:
-        fh.write(key)
-    logger.info("Generated a new vault key in %s", KEY_FILE)
-    return key
+
+        # Use a fully written temporary file and atomic rename. A crash during
+        # key creation must not leave an empty .vault_key that bricks startup.
+        key = Fernet.generate_key()
+        directory = os.path.dirname(KEY_FILE)
+        fd, tmp_path = tempfile.mkstemp(prefix=".vault_key.", dir=directory)
+        try:
+            if hasattr(os, "fchmod"):
+                os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fd = -1
+                fh.write(key)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp_path, KEY_FILE)
+            try:
+                dir_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                # Directory fsync is not supported on every platform; the
+                # key file itself has already been flushed before the rename.
+                pass
+        except Exception:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+        logger.info("Generated a new vault key in %s", KEY_FILE)
+        return key
 
 
 def _primary_key() -> bytes:

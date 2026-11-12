@@ -12,7 +12,7 @@ if ! command -v python3 &> /dev/null; then
 fi
 
 PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-if (( $(echo "$PY_VER < 3.10" | bc -l) )); then
+if ! python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 10))'; then
   echo "❌ Python version $PY_VER detected. Please use Python 3.10+."
   exit 1
 fi
@@ -36,6 +36,20 @@ pip install --upgrade pip setuptools wheel >/dev/null
 
 echo "📦 Installing Python dependencies..."
 pip install -r requirements.txt
+
+# Baileys and its current transitive packages require Node.js 20.9 or newer.
+# Use the committed lockfile so a fresh setup matches the WhatsApp service
+# version used by the bot and by scripts/deploy.sh.
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+  echo "❌ Node.js 20.9+ and npm are required for the WhatsApp service. Install Node.js, then rerun setup.sh."
+  exit 1
+fi
+if ! node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 20 || (major === 20 && minor >= 9) ? 0 : 1)'; then
+  echo "❌ Node.js $(node --version) detected. Please install Node.js 20.9 or higher."
+  exit 1
+fi
+echo "📦 Installing WhatsApp service dependencies from its lockfile..."
+(cd whatsapp_service && npm ci --omit=dev --no-audit --no-fund)
 
 # ── 4️⃣ .env Check ──────────────────────────────────────────────────
 if [ ! -f ".env" ]; then
