@@ -11,12 +11,13 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from telegram.ext import ApplicationBuilder, ApplicationHandlerStop, CallbackQueryHandler  # noqa: E402
@@ -49,7 +50,9 @@ def _callback_samples() -> list[tuple[str, int, str]]:
             if isinstance(value, ast.Constant) and isinstance(value.value, str):
                 samples.append((rel, value.lineno, value.value))
             elif isinstance(value, ast.JoinedStr):
-                text = "".join(part.value if isinstance(part, ast.Constant) else PLACEHOLDER for part in value.values)
+                text = "".join(part.value if isinstance(part, ast.Constant) else
+                               "a" * 12 if isinstance(part.value, ast.Name) and part.value.id == "plan_id"
+                               else PLACEHOLDER for part in value.values)
                 samples.append((rel, value.lineno, text))
     return samples
 
@@ -110,7 +113,7 @@ class MainMenuButtonTests(unittest.TestCase):
         from unibot import menus
         update, query = _query("show_menu", 7)
         with mock.patch.object(menus, "is_user_allowed", lambda uid: True):
-            asyncio.run(menus.handle_selection(update, mock.MagicMock()))
+            run_handler(menus.handle_selection, update, mock.MagicMock())
         self.assertEqual(query.message.reply_text.await_args.args[0], "🏠 Main menu")
         self.assertIsNotNone(query.message.reply_text.await_args.kwargs["reply_markup"].keyboard)
 
@@ -178,7 +181,7 @@ class ExamButtonTests(unittest.TestCase):
 
     def tap(self, data, user_id):
         update, query = _query(data, user_id)
-        asyncio.run(exams.handle_exam_buttons(update, mock.MagicMock()))
+        run_handler(exams.handle_exam_buttons, update, mock.MagicMock())
         return query
 
     def test_ask_shows_a_confirmation_first(self):
@@ -217,7 +220,7 @@ class ExamButtonTests(unittest.TestCase):
         update, query = _query("examopen_mute_confirm|s1", self.OWNER)
         with mock.patch.object(exams, "load_exam_cache", lambda user_id=None: {"muted_codes": []}), \
                 mock.patch.object(exams, "save_exam_cache", lambda data, user_id=None: saved.update({user_id: data})):
-            asyncio.run(exams.handle_examopen_mute_confirm(update, mock.MagicMock()))
+            run_handler(exams.handle_examopen_mute_confirm, update, mock.MagicMock())
         self.assertEqual(saved, {self.OWNER: {"muted_codes": ["stat101"]}})
 
 
@@ -226,12 +229,14 @@ class FastEnrollWizardTests(unittest.TestCase):
         update = mock.MagicMock()
         update.effective_chat.id = 555
         update.message.reply_text = mock.AsyncMock()
+        update.effective_message = update.message
         handled = asyncio.run(enrollment._handle_fastenroll_wizard_reply(update, context, step, text))
         return handled, update.message.reply_text.await_args.args[0]
 
     def test_time_then_link_schedules_the_job(self):
         context = mock.MagicMock()
-        context.user_data = {"pending_step": "fastenroll_time", "fastenroll_wizard": {"target_date_str": "10.11.2026"}}
+        tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
+        context.user_data = {"pending_step": "fastenroll_time", "fastenroll_wizard": {"target_date_str": tomorrow}}
         schedule = mock.AsyncMock(return_value="⏰ scheduled")
         with mock.patch.object(enrollment, "schedule_fastenroll_job", schedule), \
                 mock.patch.object(enrollment, "get_main_keyboard", lambda: None):
@@ -239,7 +244,7 @@ class FastEnrollWizardTests(unittest.TestCase):
             self.assertTrue(handled)
             self.assertEqual(context.user_data["pending_step"], "fastenroll_link")
             _, answer = self._reply(context, "fastenroll_link", "https://elearning.uni-oldenburg.de/x?cid=" + "a" * 32)
-        schedule.assert_awaited_once_with(555, "a" * 32, "08:30:00", "10.11.2026", context)
+        schedule.assert_awaited_once_with(555, "a" * 32, "08:30:00", tomorrow, context)
         self.assertEqual(answer, "⏰ scheduled")
         self.assertNotIn("pending_step", context.user_data)  # wizard finished
         self.assertNotIn("fastenroll_wizard", context.user_data)

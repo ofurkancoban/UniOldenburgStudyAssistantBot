@@ -25,7 +25,7 @@ sys.path.insert(0, ROOT)
 # attaches its file handler to the root logger).
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
 # Tests must never touch the real bot database
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, use_temp_db  # noqa: E402
 use_temp_db()
 
 import studip_login_server  # noqa: E402
@@ -127,6 +127,7 @@ class BotModuleTests(unittest.TestCase):
         self.assertEqual(sorted(set(w["date_key"] for w in windows)), [date(2026, 11, d) for d in range(2, 7)])
 
     def test_study_session_reminder_triggered(self):
+        activate_student(999)
         from unittest.mock import AsyncMock, patch
 
         mock_bot = mock.MagicMock()
@@ -247,9 +248,9 @@ class OAuthTests(unittest.TestCase):
 
     def test_rejected_refresh_token_is_cleared(self):
         studip_oauth.save_tokens({"access_token": "a", "refresh_token": "r", "expires_in": 3600,
-                                  "expires_at": time.time() - 10}, fresh=False)
+                                  "expires_at": time.time() - 10, "refreshed_at": time.time() - 7200}, fresh=False)
 
-        async def rejected(_tokens=None):
+        async def rejected(_tokens=None, user_id=None):
             raise studip_oauth.RefreshRejected("invalid_grant")
 
         with mock.patch.object(studip_oauth, "refresh", rejected):
@@ -258,10 +259,10 @@ class OAuthTests(unittest.TestCase):
 
     def test_transient_refresh_failure_backs_off(self):
         studip_oauth.save_tokens({"access_token": "a", "refresh_token": "r", "expires_in": 3600,
-                                  "expires_at": time.time() - 10}, fresh=False)
+                                  "expires_at": time.time() - 10, "refreshed_at": time.time() - 7200}, fresh=False)
         calls = []
 
-        async def failing(_tokens=None):
+        async def failing(_tokens=None, user_id=None):
             calls.append(1)
             raise RuntimeError("network down")
 

@@ -17,7 +17,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_as, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from telegram.error import RetryAfter  # noqa: E402
@@ -102,7 +102,7 @@ class WatchedListRebuildTests(_StateGuard):
                                   mock.AsyncMock(return_value=[("w26", "Wintersemester 2026/2027")])):
             handler = enrollment.handle_default_semester_clear if data == "default_sem_clear" \
                 else enrollment.handle_default_semester_pick
-            asyncio.run(handler(_query(data, uid), None))
+            run_handler(handler, _query(data, uid), None)
 
     def test_watcher_student_default_change_rebuilds(self):
         self._pick(WATCHER)
@@ -120,7 +120,7 @@ class WatchedListRebuildTests(_StateGuard):
 
     def test_previous_semester_toggles(self):
         with mock.patch.object(enrollment, "is_user_allowed", return_value=True):
-            asyncio.run(enrollment.handle_toggle_watch_prev_sem(_query("toggle_watch_prev_sem", STUDENT), None))
+            run_handler(enrollment.handle_toggle_watch_prev_sem, _query("toggle_watch_prev_sem", STUDENT), None)
         self.assertEqual(state.courses_map, {"w1": "Watched"})
         self.assertIs(state._courses_map_built_with_prev, False)
         settings_menu.apply_action(WATCHER, ["settings", "flip", "watch_previous_semester"])
@@ -181,6 +181,7 @@ class SetupOfferOnceTests(unittest.TestCase):
     UID = 9404
 
     def setUp(self):
+        activate_student(self.UID)
         onboarding._setup_offered.pop(self.UID, None)
         self.addCleanup(onboarding._setup_offered.pop, self.UID, None)
         for p in (mock.patch.object(onboarding, "setup_done", return_value=False),
@@ -191,15 +192,15 @@ class SetupOfferOnceTests(unittest.TestCase):
 
     def test_not_sent_twice_in_a_row(self):
         bot = mock.AsyncMock()
-        self.assertTrue(asyncio.run(onboarding.offer_setup(bot, self.UID)))
-        self.assertFalse(asyncio.run(onboarding.offer_setup(bot, self.UID)))
+        self.assertTrue(run_as(self.UID, onboarding.offer_setup(bot, self.UID)))
+        self.assertFalse(run_as(self.UID, onboarding.offer_setup(bot, self.UID)))
         self.assertEqual(bot.send_message.await_count, 1)
 
     def test_offered_again_later(self):
         bot = mock.AsyncMock()
-        asyncio.run(onboarding.offer_setup(bot, self.UID))
+        run_as(self.UID, onboarding.offer_setup(bot, self.UID))
         onboarding._setup_offered[self.UID] = time.time() - onboarding.SETUP_REOFFER_SECONDS - 1
-        self.assertTrue(asyncio.run(onboarding.offer_setup(bot, self.UID)))
+        self.assertTrue(run_as(self.UID, onboarding.offer_setup(bot, self.UID)))
 
     def test_concurrent_offers_send_one(self):
         bot = mock.AsyncMock()
@@ -207,14 +208,14 @@ class SetupOfferOnceTests(unittest.TestCase):
         async def both():
             return await asyncio.gather(onboarding.offer_setup(bot, self.UID), onboarding.offer_setup(bot, self.UID))
 
-        self.assertEqual(sorted(asyncio.run(both())), [False, True])
+        self.assertEqual(sorted(run_as(self.UID, both())), [False, True])
         self.assertEqual(bot.send_message.await_count, 1)
 
     def test_failed_send_can_be_retried_at_once(self):
         bot = mock.AsyncMock()
         bot.send_message.side_effect = [Exception("blocked"), None]
-        self.assertFalse(asyncio.run(onboarding.offer_setup(bot, self.UID)))
-        self.assertTrue(asyncio.run(onboarding.offer_setup(bot, self.UID)))
+        self.assertFalse(run_as(self.UID, onboarding.offer_setup(bot, self.UID)))
+        self.assertTrue(run_as(self.UID, onboarding.offer_setup(bot, self.UID)))
 
 
 if __name__ == "__main__":

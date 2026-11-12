@@ -15,7 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_as, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup  # noqa: E402
@@ -39,11 +39,13 @@ class AdminOnlyTests(unittest.TestCase):
 
         async def broadcast(bot, text, **kwargs):
             calls.append(kwargs.get("members"))
+            return {"sent": 1, "failed": 0}
 
         cache = {"health_state": {"studip": True}}
         with mock.patch.object(watcher, "run_health_checks", mock.AsyncMock(return_value={"studip": (False, "x")})), \
                 mock.patch.object(watcher, "broadcast", broadcast), \
                 mock.patch.object(watcher, "ADMIN_USER_IDS", {1}), \
+                mock.patch.object(watcher.db, "get_all_users", lambda: []), \
                 mock.patch.object(watcher, "load_general_cache", lambda: cache), \
                 mock.patch.object(watcher, "update_general_cache", cache.update):
             asyncio.run(watcher._report_health_changes(mock.MagicMock()))
@@ -85,12 +87,15 @@ class AdminOnlyTests(unittest.TestCase):
         bot = mock.MagicMock()
         bot.send_document = mock.AsyncMock(return_value=mock.MagicMock(document=None))
         keyboard = InlineKeyboardMarkup([WA_ROW])
-        send = monitoring_alerts._full_file_sender({"url": "https://x/f.pdf", "name": "f.pdf"}, "text", keyboard, 1)
-        with mock.patch.object(monitoring_alerts, "get_user_session", lambda uid: session), \
+        for uid in (1, 2):
+            activate_student(uid, {"c1": "Course"})
+        send = monitoring_alerts._full_file_sender({"cid": "c1", "url": "https://elearning.uni-oldenburg.de/f.pdf", "name": "f.pdf"}, "text", keyboard, 1)
+        with mock.patch.object(monitoring_alerts, "read_response_limited", mock.AsyncMock(return_value=b"pdf")), \
+                mock.patch.object(monitoring_alerts, "get_user_session", lambda uid: session), \
                 mock.patch.object(telegram_ui, "ADMIN_USER_IDS", {1}), \
                 mock.patch.object(telegram_ui.db, "is_user_admin_db", lambda uid: False):
-            self.assertTrue(asyncio.run(send(bot, 2)))
-            self.assertTrue(asyncio.run(send(bot, 1)))
+            self.assertTrue(run_as(2, send(bot, 2)))
+            self.assertTrue(run_as(1, send(bot, 1)))
         student, admin = (c.kwargs["reply_markup"] for c in bot.send_document.await_args_list)
         self.assertIsNone(student)
         self.assertIs(admin, keyboard)
@@ -180,6 +185,10 @@ class DeleteMyDataTests(unittest.TestCase):
 
 
 class SchedulingTests(unittest.TestCase):
+    def setUp(self):
+        for uid in range(920, 927):
+            activate_student(uid)
+
     def test_timetables_are_read_a_few_per_cycle_and_retried_sooner(self):
         from unibot import schedule
         accounts = [mock.MagicMock(user_id=920 + i, session=f"s{i}") for i in range(7)]
@@ -228,7 +237,7 @@ class SchedulingTests(unittest.TestCase):
                 mock.patch.object(menus, "_status_group_view", lambda g, uid: ("t", None)), \
                 mock.patch.object(state, "global_session", mock.MagicMock(user_id=1)), \
                 mock.patch.object(state, "courses_map", watcher_map):
-            asyncio.run(menus.handle_status_group(mock.MagicMock(callback_query=query), mock.MagicMock()))
+            run_handler(menus.handle_status_group, mock.MagicMock(callback_query=query), mock.MagicMock())
             self.assertEqual(state.courses_map, {"c1": "Course"})
         self.assertNotIn("931", json.dumps(watcher_map))
 

@@ -15,7 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_as, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
@@ -41,10 +41,11 @@ class ConsentStorageTests(unittest.TestCase):
         query.data = "privacy|ai_personal"
         query.from_user = types.SimpleNamespace(id=OFF)
         with mock.patch.object(privacy, "is_user_allowed", return_value=True):
-            asyncio.run(privacy.handle_privacy(types.SimpleNamespace(callback_query=query), None))
+            run_handler(privacy.handle_privacy, types.SimpleNamespace(callback_query=query), None)
         self.assertTrue(storage.get_ai_personal_enabled(OFF))
         text = query.edit_message_text.call_args.args[0]
-        self.assertIn("timetable, tasks and exams: ✅ Yes", text)
+        self.assertIn("Assistant may use personal data for AI", text)
+        self.assertIn("✅ Yes", text)
 
 
 class ListenTests(unittest.TestCase):
@@ -90,12 +91,17 @@ class MorningVoiceTests(unittest.TestCase):
             return None, None, None
 
         for uid, expected in ((ON, "/tmp/voice.ogg"), (OFF, None)):
+            activate_student(uid)
+            storage.set_ai_personal_enabled(uid, uid == ON)
+            self.addCleanup(storage.set_ai_personal_enabled, uid, False)
             with mock.patch.object(morning, "get_user_session", return_value=object()), \
-                    mock.patch.object(morning, "has_stored_login", return_value=False), \
+                    mock.patch.object(morning, "has_stored_login", return_value=True), \
+                    mock.patch.object(morning, "_fetch_today_events", mock.AsyncMock(return_value=([], [], True))), \
+                    mock.patch.object(morning, "_fetch_exam_countdown", mock.AsyncMock(return_value="")), \
                     mock.patch.object(morning, "_lunch_menu_highlight", mock.AsyncMock(return_value=None)), \
                     mock.patch.object(morning, "_prepare_morning_voice", speak), \
                     mock.patch.object(morning, "get_ai_personal_enabled", lambda u: u == ON):
-                _text, voice_path, _menu, _photo = asyncio.run(morning._prepare_user_summary(uid, DAY, None, lunch_at))
+                _text, voice_path, _menu, _photo = run_as(uid, morning._prepare_user_summary(uid, DAY, None, lunch_at))
             self.assertEqual(voice_path, expected)
         self.assertEqual(len(made), 1)
 
@@ -128,6 +134,7 @@ class SpokenQuestionTests(unittest.TestCase):
             self.assertIn(shared, context)
 
     def test_name_only_with_permission(self):
+        activate_student(OFF)
         for allowed, expected in ((False, None), (True, "Ada")):
             answer = mock.AsyncMock(return_value="ok")
             update = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=OFF))
@@ -138,9 +145,13 @@ class SpokenQuestionTests(unittest.TestCase):
                     mock.patch.object(voice, "get_ai_personal_enabled", lambda u, allowed=allowed: allowed), \
                     mock.patch.object(voice, "answer_question_with_context", answer), \
                     mock.patch.object(voice, "send_text_and_voice", mock.AsyncMock()):
-                asyncio.run(voice._voice_intent_ask_question(
-                    update, types.SimpleNamespace(bot=mock.AsyncMock()), {}, "q?", "ask_question", None, [], message))
-            self.assertEqual(answer.call_args.kwargs["name"], expected)
+                run_handler(voice._voice_intent_ask_question,
+                    update, types.SimpleNamespace(bot=mock.AsyncMock()), {}, "q?", "ask_question", None, [], message)
+            if allowed:
+                self.assertEqual(answer.call_args.kwargs["name"], expected)
+            else:
+                answer.assert_not_awaited()
+                message.reply_text.assert_awaited()
 
 
 if __name__ == "__main__":

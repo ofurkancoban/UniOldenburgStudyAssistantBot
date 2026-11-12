@@ -12,7 +12,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from unibot import db, menus, state, storage, studip_api  # noqa: E402
@@ -73,7 +73,7 @@ class ProfileViewTests(unittest.TestCase):
                 mock.patch.object(menus, "has_stored_login", return_value=signed_in), \
                 mock.patch.object(menus, "get_user_session", return_value=mock.MagicMock()), \
                 mock.patch.object(menus, "get_studip_user_profile", mock.AsyncMock(return_value=profile)):
-            asyncio.run(menus.handle_status_group(mock.MagicMock(callback_query=query), mock.MagicMock()))
+            run_handler(menus.handle_status_group, mock.MagicMock(callback_query=query), mock.MagicMock())
         return query.message.reply_text.await_args.args[0]
 
     def test_a_missing_name_is_fetched_and_kept(self):

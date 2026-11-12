@@ -59,6 +59,10 @@ TZ=UTC "$PY" -m unittest discover -s tests >/dev/null 2>&1 || {
   exit 1
 }
 echo "ruff, mypy and tests passed"
+if [ "$DEPLOY_WORKER" = 1 ]; then
+  step "Worker dependencies"
+  (cd cloudflare_worker && npm ci --no-audit --no-fund)
+fi
 
 step "Push"
 git push -q origin HEAD:main

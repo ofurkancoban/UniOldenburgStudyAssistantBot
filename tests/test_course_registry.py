@@ -11,7 +11,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_as, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from unibot import course_registry as cr  # noqa: E402
@@ -74,6 +74,8 @@ class RegistryTableTests(unittest.TestCase):
 
 class ScannerTests(unittest.TestCase):
     def setUp(self):
+        for uid in (1, 2, 3):
+            activate_student(uid)
         cr._rotation.clear()
         cr._failed_at.clear()
         cr._candidates.clear()
@@ -137,8 +139,8 @@ class ScannerTests(unittest.TestCase):
 class FanOutTests(unittest.TestCase):
     def setUp(self):
         _clear_tables()
-        for uid in (1, 2, 3, 4, 5):
-            db.get_user_scope(uid).sync_courses({"c1"})
+        for uid in (1, 2, 3, 4, 5, 6):
+            activate_student(uid, {"c1"})
         db.get_user_scope(1).set_course_pref("c1", "format", "full")
         db.get_user_scope(2).set_course_pref("c1", "format", "title")
         db.get_user_scope(4).set_course_pref("c1", "is_muted", True)
@@ -203,6 +205,7 @@ class QuietHoursAndDigestTests(unittest.TestCase):
         self.prefs = preferences
         _clear_tables()
         for uid in (21, 22, 23):
+            activate_student(uid, {"c1"})
             db.get_user_scope(uid).sync_courses({"c1"})
             db.get_user_scope(uid).delete_private("alert_queue")
         preferences.set_pref(21, "quiet_hours", {"start": "23:00", "end": "08:00"})
@@ -269,7 +272,7 @@ class CourseAlertsUiTests(unittest.TestCase):
         query.message.reply_text = mock.AsyncMock()
         update = mock.MagicMock(callback_query=query)
         with mock.patch.object(cr, "is_user_allowed", lambda uid: True):
-            asyncio.run(cr.handle_course_alerts(update, mock.MagicMock()))
+            run_handler(cr.handle_course_alerts, update, mock.MagicMock())
         return query
 
     def test_toggles_and_format_cycle(self):
@@ -293,6 +296,8 @@ class CourseAlertsUiTests(unittest.TestCase):
 class FullFileSenderTests(unittest.TestCase):
     def test_file_is_downloaded_once_then_sent_by_file_id(self):
         from unibot import monitoring_alerts as ma
+        for uid in (1, 2):
+            activate_student(uid, {"c1"})
         gets = []
 
         class Resp:
@@ -319,12 +324,13 @@ class FullFileSenderTests(unittest.TestCase):
                 docs.append((chat_id, document if isinstance(document, str) else "bytes"))
                 return mock.MagicMock(document=mock.MagicMock(file_id="FILEID"))
 
-        it = {"url": "https://x/file", "name": "Sheet 1.pdf"}
-        with mock.patch.object(ma, "get_user_session", lambda uid: Session()):
+        it = {"cid": "c1", "url": "https://elearning.uni-oldenburg.de/file", "name": "Sheet 1.pdf"}
+        with mock.patch.object(ma, "get_user_session", lambda uid: Session()), \
+                mock.patch.object(ma, "read_response_limited", mock.AsyncMock(return_value=b"%PDF-1.4")):
             send = ma._full_file_sender(it, "card", None, 1)
-            self.assertTrue(asyncio.run(send(Bot(), 1)))
-            self.assertTrue(asyncio.run(send(Bot(), 2)))
-        self.assertEqual(gets, ["https://x/file"])
+            self.assertTrue(run_as(1, send(Bot(), 1)))
+            self.assertTrue(run_as(2, send(Bot(), 2)))
+        self.assertEqual(gets, ["https://elearning.uni-oldenburg.de/file"])
         self.assertEqual(docs, [(1, "bytes"), (2, "FILEID")])
 
     def test_missing_url_falls_back_to_the_card(self):

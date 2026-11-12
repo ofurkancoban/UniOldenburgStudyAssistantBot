@@ -323,6 +323,12 @@ def save_exam_cache(data: dict, user_id=None) -> None:
 OPEN_CLOSED_GRACE_SECONDS = 6 * 3600
 
 
+def _reminder_now() -> datetime:
+    """One aware Berlin clock for reminder comparisons and persisted state."""
+    now = berlin_now()
+    return now.replace(tzinfo=TZ_BERLIN) if now.tzinfo is None else now.astimezone(TZ_BERLIN)
+
+
 @_background_job
 async def check_exam_date_reminders(session, bot, broadcast_fn) -> bool:
     """Remind about upcoming exam dates the student is registered for: at 3/1/0 days
@@ -343,7 +349,7 @@ async def check_exam_date_reminders(session, bot, broadcast_fn) -> bool:
 
     # This function compares parsed Berlin-local exam start times (made
     # timezone-aware below) with the current instant, so keep `now` aware too.
-    now = datetime.now(TZ_BERLIN)
+    now = _reminder_now()
     today = now.date()
     still_upcoming_keys = set()
     threshold_days, hours_before = _exam_thresholds()
@@ -460,7 +466,7 @@ async def check_exam_reminders(session, bot, broadcast_fn, exam_action_cache: di
     notified_deadline = cache.get("notified_deadline", {})
     muted_codes = set(cache.get("muted_codes", []))
 
-    now = berlin_now()
+    now = _reminder_now()
     delivery_ok = not failed_codes
     still_open_keys = set()
     # Keys from before the window dates were parsed read "code:None:None" and

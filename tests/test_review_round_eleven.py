@@ -16,7 +16,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup  # noqa: E402
@@ -121,8 +121,8 @@ class VoiceExamReminderTests(unittest.TestCase):
                 mock.patch.object(voice, "login_studip", mock.AsyncMock()), \
                 mock.patch.object(voice, "_find_exam_datetime", mock.AsyncMock(return_value=("Algorithms", exam_dt, True))), \
                 mock.patch.object(voice, "add_user_task", lambda uid, task: added.append(task)):
-            asyncio.run(voice._voice_intent_create_exam_reminder_task(
-                update, context, {}, "remind me", "create_exam_reminder_task", None, [], message))
+            run_handler(voice._voice_intent_create_exam_reminder_task,
+                update, context, {}, "remind me", "create_exam_reminder_task", None, [], message)
         return added, message.reply_text.call_args.args[0]
 
     def test_reminder_in_the_past_is_refused(self):

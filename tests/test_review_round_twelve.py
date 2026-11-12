@@ -17,7 +17,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import run_as, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 import exam_reminder  # noqa: E402
@@ -54,7 +54,7 @@ class SnoozeButtonTests(unittest.TestCase):
             query.data = data
             query.from_user = types.SimpleNamespace(id=UID)
             with mock.patch.object(tasks, "is_user_allowed", return_value=True):
-                asyncio.run(tasks.handle_task_reminder_action(types.SimpleNamespace(callback_query=query), None))
+                run_handler(tasks.handle_task_reminder_action, types.SimpleNamespace(callback_query=query), None)
         self.assertTrue(storage.recall_user_callback(UID, "task:t1", forget=False))
 
     def test_bad_course_index_saves_without_course(self):
@@ -64,20 +64,21 @@ class SnoozeButtonTests(unittest.TestCase):
         context = types.SimpleNamespace(user_data={"task_wizard": {"text": "Read", "course_options": [("A", "a")]}})
         self.addCleanup(storage.save_user_tasks, UID, [])
         with mock.patch.object(tasks, "is_user_allowed", return_value=True):
-            asyncio.run(tasks.handle_task_course_pick(types.SimpleNamespace(callback_query=query), context))
+            run_handler(tasks.handle_task_course_pick, types.SimpleNamespace(callback_query=query), context)
         self.assertEqual([t["course"] for t in storage.user_tasks(UID)], [None])
 
 
 class TaskListTests(unittest.TestCase):
-    def test_unreadable_time_is_skipped(self):
+    def test_unreadable_time_is_kept_as_an_undated_task(self):
         self.addCleanup(storage.save_user_tasks, UID, [])
         storage.save_user_tasks(UID, [{"id": "a", "text": "Broken", "due_time": "not a date"},
                                       {"id": "b", "text": "Fine", "due_time": "2030-01-01T10:00:00+01:00"}])
         message = mock.AsyncMock()
-        asyncio.run(tasks.send_task_list(message, UID))
+        run_as(UID, tasks.send_task_list(message, UID))
         texts = [c.args[0] for c in message.reply_text.call_args_list]
-        self.assertEqual(len(texts), 1)
+        self.assertEqual(len(texts), 2)
         self.assertIn("Fine", texts[0])
+        self.assertIn("Broken", texts[1])
 
 
 def _class(title, hour, cancelled=False):
@@ -107,7 +108,7 @@ class CancelledClassTests(unittest.TestCase):
     def test_ai_is_told_it_is_cancelled(self):
         prompts = []
 
-        async def call(system, user, temperature=None):
+        async def call(system, user, temperature=None, can_send=None):
             prompts.append(user)
             return "ok"
 
@@ -145,9 +146,9 @@ class VoiceExamReminderTests(unittest.TestCase):
                 mock.patch.object(voice, "login_studip", mock.AsyncMock()), \
                 mock.patch.object(voice, "_find_exam_datetime", mock.AsyncMock(return_value=("Algorithms", exam_dt, True))), \
                 mock.patch.object(voice, "add_user_task", lambda uid, task: added.append(task)):
-            asyncio.run(voice._voice_intent_create_exam_reminder_task(
+            run_handler(voice._voice_intent_create_exam_reminder_task,
                 update, types.SimpleNamespace(bot=mock.AsyncMock()), {}, "remind me", "create_exam_reminder_task",
-                None, [], message))
+                None, [], message)
         self.assertEqual(added, [])
         self.assertIn("already passed", message.reply_text.call_args.args[0])
 
@@ -227,7 +228,7 @@ class CourseAlertRedrawTests(unittest.TestCase):
         query.from_user = types.SimpleNamespace(id=UID)
         query.edit_message_text.side_effect = BadRequest("Message is not modified")
         with mock.patch.object(course_registry, "is_user_allowed", return_value=True):
-            asyncio.run(course_registry.handle_course_alerts(types.SimpleNamespace(callback_query=query), None))
+            run_handler(course_registry.handle_course_alerts, types.SimpleNamespace(callback_query=query), None)
         query.answer.assert_awaited_once()
 
 
@@ -255,8 +256,8 @@ class FirstScanBaselineTests(unittest.TestCase):
             events, changed = asyncio.run(monitoring._scan_course_files("Stats", "c1", cache, session=object()))
         self.assertEqual(events, [])
         self.assertTrue(changed)
-        self.assertIn("slides.pdf", cache["c1"])
-        listing.append({**listing[0], "name": "sheet1.pdf"})
+        self.assertEqual([entry["name"] for entry in cache["c1"].values()], ["slides.pdf"])
+        listing.append({**listing[0], "name": "sheet1.pdf", "url": "sheet1"})
         with mock.patch.object(monitoring, "_list_files_api", mock.AsyncMock(return_value=listing)):
             events, _ = asyncio.run(monitoring._scan_course_files("Stats", "c1", cache, session=object()))
         self.assertEqual([e["name"] for e in events], ["sheet1.pdf"])
@@ -380,7 +381,7 @@ class MenuButtonLeavesWizardTests(unittest.TestCase):
         update = types.SimpleNamespace(message=types.SimpleNamespace(text=text), effective_message=mock.AsyncMock(),
                                        effective_user=types.SimpleNamespace(id=UID))
         context = types.SimpleNamespace(user_data=user_data)
-        return asyncio.run(menus.handle_pending_step(update, context))
+        return run_handler(menus.handle_pending_step, update, context)
 
     def test_menu_button_is_never_sent_as_a_reply(self):
         user_data = {"pending_step": "studip_msg_reply", "studip_reply_target": {"recipient_id": "r1"}}

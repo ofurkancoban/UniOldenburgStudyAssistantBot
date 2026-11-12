@@ -12,7 +12,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
@@ -317,7 +317,7 @@ class StudyPackTests(unittest.TestCase):
         buttons = [row[0] for row in file_rows]
         self.assertEqual([b.text for b in buttons], ["📝 Problem_Set_2.pdf", "📊 Lecture_4.pdf"])
         start_ts = int(window["start_dt"].timestamp())
-        self.assertEqual([b.callback_data for b in feedback], [f"sp_block|{start_ts}|done", f"sp_block|{start_ts}|skipped"])
+        self.assertEqual([b.callback_data for b in feedback], [f"sp_block|4242|{start_ts}|done", f"sp_block|4242|{start_ts}|skipped"])
         sid = buttons[0].callback_data.split("|", 1)[1]
         self.assertTrue(buttons[0].callback_data.startswith("file|"))
         self.assertEqual((cache[sid]["cid"], cache[sid]["url"], cache[sid]["user_id"]), ("c1", "p2", self.UID))
@@ -341,6 +341,7 @@ class _FrozenDateTime(datetime):
 
 class StudyReminderTests(unittest.TestCase):
     def _run_at(self, moment, events):
+        activate_student(4242)
         sent = []
         bot = mock.MagicMock()
 
@@ -391,8 +392,8 @@ class StudyReminderTests(unittest.TestCase):
 
 class TaskPrivacyTests(unittest.TestCase):
     def test_weekly_view_lists_only_the_users_own_tasks(self):
-        tasks = [{"user_id": 1, "text": "mine", "due_time": "2026-11-04T10:00:00+01:00"},
-                 {"user_id": 2, "text": "theirs", "due_time": "2026-11-04T11:00:00+01:00"}]
+        tasks = [{"id": "mine", "user_id": 1, "text": "mine", "due_time": "2026-11-04T10:00:00+01:00"},
+                 {"id": "theirs", "user_id": 2, "text": "theirs", "due_time": "2026-11-04T11:00:00+01:00"}]
         # real per-student scopes: each list is stored and read under its own id
         for uid in (1, 2):
             storage.save_user_tasks(uid, [t for t in tasks if t["user_id"] == uid])
@@ -412,6 +413,8 @@ if __name__ == "__main__":
 
 class PerUserMorningSummaryTests(unittest.TestCase):
     def test_each_student_gets_their_own_summary_and_voice(self):
+        for uid in (1, 2, 3):
+            activate_student(uid)
         from unibot import morning
         sessions = {1: mock.MagicMock(name="s1"), 2: mock.MagicMock(name="s2"), 3: mock.MagicMock(name="s3")}
         logged_in = {1: True, 2: True, 3: False}
@@ -425,7 +428,7 @@ class PerUserMorningSummaryTests(unittest.TestCase):
             fetched.append(user_id)
             return timetable[user_id]
 
-        async def voice(today_events, today_date, today_tasks, weather, food, name=None):
+        async def voice(today_events, today_date, today_tasks, weather, food, name=None, include_schedule=True, user_id=None):
             return f"/tmp/voice-{[t['text'] for t in today_tasks]}"
 
         _FrozenDateTime.frozen = _at(WED, "06:30")
@@ -455,7 +458,7 @@ class PerUserMorningSummaryTests(unittest.TestCase):
         self.assertIn("Biology", texts[2])
         self.assertIn("PS 1", texts[1])
         self.assertNotIn("Lab report", texts[1])
-        self.assertIn("No classes today", texts[3])
+        self.assertIn("schedule couldn't be loaded", texts[3])
         self.assertEqual(prepared["voice_paths"][2], "/tmp/voice-['Lab report']")
         self.assertNotIn(1, prepared["voice_paths"])  # no permission for the AI service: no spoken version
         self.assertIn("Lunch at", texts[1])  # the study day plan is part of it
@@ -565,7 +568,7 @@ class TravelModeTests(unittest.TestCase):
         query.edit_message_text = mock.AsyncMock()
         update = mock.MagicMock(callback_query=query)
         with mock.patch.object(menus, "is_user_allowed", lambda uid: True):
-            asyncio.run(menus.handle_status_group(update, None))
+            run_handler(menus.handle_status_group, update, None)
         self.assertEqual(storage.get_travel_mode(self.UID), "bus")
         self.assertIn("Bus (20 min)", query.edit_message_text.await_args.args[0])
         with self.assertRaises(ValueError):
@@ -573,6 +576,9 @@ class TravelModeTests(unittest.TestCase):
 
 
 class CatchUpTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(4242, {"c1": "Econometrics"})
+
     def test_lecture_reminder_after_a_tight_switch_offers_recording_and_slides(self):
         files = mock.AsyncMock(return_value=[
             ("Recordings", {"name": "Lecture_5.webm", "url": "v5", "modified_iso": "2026-11-03T10:00:00+01:00"}),
@@ -624,11 +630,15 @@ class StudyBlockFeedbackTests(unittest.TestCase):
 
     def setUp(self):
         from unibot import storage
-        cache = storage.load_general_cache()
-        (cache.get("study_blocks") or {}).pop(str(self.UID), None)
-        storage.save_general_cache(cache)
+        activate_student(self.UID)
+        storage.save_personal_record(self.UID, "study_blocks", {})
 
     def _press(self, data, markup=None, slot=None):
+        parts = data.split("|")
+        if len(parts) == 3 and int(parts[1]) in (1, 2, 3):
+            parts[1] = str(int(_at(WED, f"{8 + int(parts[1]):02d}:00").timestamp()))
+            data = "|".join(parts)
+            storage.record_study_block(self.UID, int(parts[1]), "sent", "Econometrics")
         query = mock.MagicMock()
         query.data = data
         query.from_user.id = self.UID
@@ -638,7 +648,7 @@ class StudyBlockFeedbackTests(unittest.TestCase):
         query.message.reply_markup = markup
         query.message.text_html = "📚 <b>STUDY BLOCK STARTED</b>"
         with mock.patch.object(study_plan, "find_makeup_slot", mock.AsyncMock(return_value=slot)):
-            asyncio.run(study_plan.handle_study_block_feedback(mock.MagicMock(callback_query=query), None))
+            run_handler(study_plan.handle_study_block_feedback, mock.MagicMock(callback_query=query), None)
         return query
 
     def test_answers_are_logged_and_summarised(self):
@@ -777,7 +787,7 @@ class CampusLunchPickTests(unittest.TestCase):
         from unibot import mensa
         prompts = []
 
-        async def llm(system, user, temperature=0.9):
+        async def llm(system, user, temperature=0.9, can_send=None):
             prompts.append(user)
             return '{"dish": "Chili sin carne", "reasoning": "Hearty and cheap."}'
         with mock.patch.object(mensa, "_fetch_speiseplan_html", mock.AsyncMock(return_value=WECHLOY_DAY_HTML)), \
@@ -838,6 +848,7 @@ class CampusLunchPickTests(unittest.TestCase):
     def test_recommend_button_reads_the_mensa(self):
         from unibot import mensa
         query = mock.MagicMock()
+        query.from_user.id = 9901
         query.data = "menu_recommend|3"
         query.answer = mock.AsyncMock()
         query.message.reply_text = mock.AsyncMock()
@@ -847,22 +858,23 @@ class CampusLunchPickTests(unittest.TestCase):
                 mock.patch.object(mensa, "_show_typing", mock.AsyncMock()), \
                 mock.patch.object(mensa, "_start_loading_animation", lambda *a: (None, None)), \
                 mock.patch.object(mensa, "_stop_loading_animation", mock.AsyncMock()):
-            asyncio.run(mensa.handle_menu_recommend_button(mock.MagicMock(callback_query=query), None))
+            run_handler(mensa.handle_menu_recommend_button, mock.MagicMock(callback_query=query), None)
             query.data = "menu_recommend"
-            asyncio.run(mensa.handle_menu_recommend_button(mock.MagicMock(callback_query=query), None))
+            run_handler(mensa.handle_menu_recommend_button, mock.MagicMock(callback_query=query), None)
         self.assertEqual([c.args for c in build.await_args_list], [("3",), ("2",)])
 
     def test_wechloy_photos_button(self):
         from unibot import mensa
         query = mock.MagicMock()
+        query.from_user.id = 9901
         query.data = "mensa_loc|3|2026-11-04|photos"
         query.answer = mock.AsyncMock()
         send = mock.AsyncMock()
         with mock.patch.object(mensa, "is_user_allowed", lambda uid: True), \
-                mock.patch.object(mensa, "load_food_preferences", lambda: {"avoid_codes": ["S"], "avoid_keywords": []}), \
+                mock.patch.object(mensa, "load_food_preferences", lambda uid=None: {"avoid_codes": ["S"], "avoid_keywords": []}), \
                 mock.patch.object(mensa, "_fetch_speiseplan_html", mock.AsyncMock(return_value=SPEISEPLAN_HTML)), \
                 mock.patch.object(mensa, "_send_menu_items_individually", send):
-            asyncio.run(mensa.handle_mensa_location_button(mock.MagicMock(callback_query=query), None))
+            run_handler(mensa.handle_mensa_location_button, mock.MagicMock(callback_query=query), None)
         items = send.await_args.args[1]
         self.assertEqual([i["name"] for i in items], ["Chili sin carne"])  # the pork dish stays hidden
         self.assertEqual(send.await_args.kwargs, {"skip_unmatched": True, "loc_id": "3"})

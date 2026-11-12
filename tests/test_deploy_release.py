@@ -30,6 +30,7 @@ class DeploymentReleaseTests(unittest.TestCase):
                     "PYTHON": str(self.root / ".venv/bin/python"), "PATH": f"{self.root / 'bin'}:{os.environ['PATH']}"}
         self.stub(".venv/bin/ruff", "pass")
         self.stub(".venv/bin/mypy", "pass")
+        self.stub("bin/npm", "sys.exit(1 if os.environ.get('FAIL_NPM') == '1' else 0)")
         self.stub(".venv/bin/python", """
             if sys.argv[1:3] == ['-m', 'unittest']: sys.exit(0)
             os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
@@ -98,6 +99,12 @@ class DeploymentReleaseTests(unittest.TestCase):
 
     def worker_calls(self):
         return [json.loads(line) for line in (self.root / "worker_calls").read_text().splitlines()]
+
+    def test_worker_dependency_failure_stops_before_external_deploy(self):
+        result = self.run_release(FAIL_NPM="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.root / "worker_calls").exists())
+        self.assertEqual((self.root / "head").read_text(), "oldcommit")
 
     def assert_worker_restored(self):
         call = self.worker_calls()[-1]

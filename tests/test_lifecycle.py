@@ -118,7 +118,7 @@ class TelegramSafetyTests(unittest.TestCase):
 class InviteTests(unittest.TestCase):
     def test_quota_code_lets_that_many_students_in(self):
         code = db.create_invite_token(created_by=1, label="Group A", expires_days=1, max_uses=3)
-        results = [db.redeem_invite_token(code, uid)[0] for uid in (701, 702, 703, 704)]
+        results = [db.redeem_invite_token(code, uid)[0] for uid in (1701, 1702, 1703, 1704)]
         self.assertEqual(results, [True, True, True, False])
         token = next(t for t in db.list_invite_tokens() if t["code"] == code)
         self.assertEqual((token["use_count"], token["max_uses"], token["is_used"]), (3, 3, True))

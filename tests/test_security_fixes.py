@@ -16,7 +16,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 import studip_login_server  # noqa: E402
@@ -168,6 +168,12 @@ class MoreEscapingTests(unittest.TestCase):
 
 
 class VoiceRecordingTests(unittest.TestCase):
+    def setUp(self):
+        from unibot import storage
+        activate_student(5)
+        storage.set_ai_personal_enabled(5, True)
+        self.addCleanup(storage.set_ai_personal_enabled, 5, False)
+
     def test_recording_is_deleted_after_a_whisper_transcript(self):
         created = []
 
@@ -188,7 +194,7 @@ class VoiceRecordingTests(unittest.TestCase):
                 mock.patch.object(monitoring, "transcribe_voice_message", mock.AsyncMock(return_value="hello")), \
                 mock.patch("unibot.voice.classify_voice_intent", mock.AsyncMock(side_effect=RuntimeError("stop"))):
             with contextlib.suppress(RuntimeError):
-                asyncio.run(monitoring.handle_voice_message(update, context))
+                run_handler(monitoring.handle_voice_message, update, context)
         self.assertTrue(created)
         self.assertFalse(os.path.exists(created[0]))
 
@@ -259,7 +265,7 @@ class AdminPanelTests(unittest.TestCase):
         broadcast = mock.AsyncMock()
         with mock.patch.object(menus, "is_user_admin", return_value=False), \
                 mock.patch.object(menus, "broadcast", broadcast):
-            self.assertTrue(asyncio.run(menus.handle_pending_step(update, context, text_override="hi all")))
+            self.assertTrue(run_handler(menus.handle_pending_step, update, context, text_override="hi all"))
         broadcast.assert_not_called()
 
 
@@ -363,6 +369,10 @@ class StoppedStudentFeedTests(unittest.TestCase):
 
 class AiBudgetTests(unittest.TestCase):
     def setUp(self):
+        from unibot import storage
+        activate_student(9606)
+        storage.set_ai_personal_enabled(9606, True)
+        self.addCleanup(storage.set_ai_personal_enabled, 9606, False)
         from unibot import ai
         self.ai = ai
         ai._ai_calls.clear()
@@ -413,7 +423,7 @@ class AiBudgetTests(unittest.TestCase):
         context.bot.get_file = mock.AsyncMock()
         with mock.patch.object(monitoring, "is_user_allowed", return_value=True), \
                 mock.patch.object(monitoring, "ai_budget_left", return_value=False):
-            asyncio.run(monitoring.handle_voice_message(update, context))
+            run_handler(monitoring.handle_voice_message, update, context)
         update.message.reply_text.assert_awaited_once_with(monitoring.AI_BUDGET_MESSAGE)
         context.bot.get_file.assert_not_called()
 

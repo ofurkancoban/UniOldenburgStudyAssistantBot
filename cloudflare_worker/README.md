@@ -51,11 +51,15 @@ If `CLOUDFLARE_WORKER_URL` is omitted or empty, the bot automatically makes dire
 
 ## Alternative: Deployment via Wrangler CLI
 
-If you have Node.js and Wrangler installed locally:
+With Node.js installed, use the project's pinned Wrangler version:
 
 ```bash
 cd cloudflare_worker
-npm install -g wrangler
-wrangler secret put PROXY_SECRET
-wrangler deploy
+npm ci
+npx --no-install wrangler secret put PROXY_SECRET
+npm run deploy
 ```
+
+For a coordinated Worker and VPS release, run `scripts/deploy.sh --worker`
+from the repository root. It installs the locked Worker dependencies and
+restores the previous Worker deployment if the VPS release fails.

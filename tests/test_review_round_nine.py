@@ -16,7 +16,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from telegram.error import BadRequest, Forbidden, NetworkError  # noqa: E402
@@ -56,7 +56,7 @@ class StrictQuery:
 
 
 def _run(handler, query):
-    asyncio.run(handler(types.SimpleNamespace(callback_query=query, effective_user=query.from_user), mock.MagicMock()))
+    run_handler(handler, types.SimpleNamespace(callback_query=query, effective_user=query.from_user), mock.MagicMock())
 
 
 class AdminCallbackTests(unittest.TestCase):
@@ -163,6 +163,7 @@ class TaskDueTimeTests(unittest.TestCase):
 
 class ReminderDeliveryTests(unittest.TestCase):
     def setUp(self):
+        activate_student(6102)
         self.past = (datetime.now(TZ_BERLIN) - timedelta(minutes=1)).isoformat()
         self.addCleanup(storage.save_user_tasks, 6102, [])
 
@@ -178,12 +179,13 @@ class ReminderDeliveryTests(unittest.TestCase):
         storage.save_user_tasks(6102, [{"id": "n1", "user_id": 6102, "text": "x", "due_time": self.past}])
         self._fire(NetworkError("down"))
         self.assertEqual([t["id"] for t in storage.user_tasks(6102)], ["n1"])
-        self.assertIsNone(storage.recall_user_callback(6102, "task:n1"))
+        self.assertIsNotNone(storage.recall_user_callback(6102, "task:n1"))
 
-    def test_blocked_chat_drops_the_task(self):
+    def test_blocked_chat_preserves_the_task(self):
         storage.save_user_tasks(6102, [{"id": "b1", "user_id": 6102, "text": "x", "due_time": self.past}])
         self._fire(Forbidden("bot was blocked by the user"))
-        self.assertEqual(storage.user_tasks(6102), [])
+        self.assertEqual([t["id"] for t in storage.user_tasks(6102)], ["b1"])
+        self.assertIsNone(storage.recall_user_callback(6102, "task:b1"))
 
     def test_sent_reminder_keeps_its_buttons_working(self):
         storage.save_user_tasks(6102, [{"id": "s1", "user_id": 6102, "text": "x", "due_time": self.past}])

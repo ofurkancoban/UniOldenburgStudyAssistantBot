@@ -14,7 +14,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, use_temp_db  # noqa: E402
 use_temp_db()
 
 import fast_enroll  # noqa: E402
@@ -69,6 +69,7 @@ class CurrentSemesterTests(unittest.TestCase):
         self.assertEqual(listed, ["w26"])
 
     def test_previous_semester_is_the_one_before_today(self):
+        activate_student(78)
         listed = []
 
         async def list_api(semester_id, session=None, user_id=None):

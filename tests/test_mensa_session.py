@@ -23,6 +23,7 @@ LOGIN_HTML = '<form action="/dispatch.php/login"><input name="loginname"></form>
 class _Page:
     def __init__(self, text):
         self._text = text
+        self.status = 200
 
     async def text(self):
         return self._text

@@ -24,7 +24,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
@@ -63,8 +63,8 @@ class ScheduledIndexingTests(unittest.TestCase):
 
         self.assertEqual(len(recorded), 1)
         job, args = recorded[0]
-        self.assertIs(job, watcher.index_course_files)
-        self.assertEqual(args, (fake_session,))  # index_course_files(session)
+        self.assertIs(job, watcher._index_course_files_for_users)
+        self.assertEqual(args, (fake_session,))
 
 
 class LinkCachePersistenceTests(unittest.TestCase):
@@ -97,7 +97,7 @@ class LinkCachePersistenceTests(unittest.TestCase):
                 mock.patch.object(monitoring.db, "load", return_value=cache_data), \
                 mock.patch.object(monitoring, "student_courses", lambda u: {"cid1": "Algorithms"}), \
                 mock.patch.object(monitoring.asyncio, "sleep", mock.AsyncMock()):
-            asyncio.run(monitoring.show_last_files(mock.MagicMock(callback_query=query), context))
+            run_handler(monitoring.show_last_files, mock.MagicMock(callback_query=query), context)
 
         self.assertEqual(len(storage.link_cache), 1)
         entry = next(iter(storage.link_cache.values()))
@@ -116,7 +116,7 @@ class LinkCachePersistenceTests(unittest.TestCase):
         file_item = {"name": "slides.pdf", "url": "https://example.com/slides.pdf", "modified": "today", "size": "2 MB"}
 
         with mock.patch.object(voice, "_find_latest_file", mock.AsyncMock(return_value=("Algorithms", "cid1", file_item))):
-            asyncio.run(voice._voice_intent_show_last_file(update, context, {}, "", "show_last_file", "algo", [], message))
+            run_handler(voice._voice_intent_show_last_file, update, context, {}, "", "show_last_file", "algo", [], message)
 
         entry = next(iter(storage.link_cache.values()))
         self.assertEqual(entry["user_id"], uid)
@@ -139,9 +139,9 @@ class OutfitSyncAndVisibilityTests(unittest.TestCase):
         query.answer = mock.AsyncMock()
         query.edit_message_text = mock.AsyncMock()
         with mock.patch.object(wardrobe, "is_user_admin", return_value=True):
-            asyncio.run(wardrobe.handle_outfit_menu(mock.MagicMock(callback_query=query), mock.MagicMock()))
+            run_handler(wardrobe.handle_outfit_menu, mock.MagicMock(callback_query=query), mock.MagicMock())
 
-        self.assertFalse(storage.get_wardrobe_feature_enabled())
+        self.assertTrue(storage.get_wardrobe_feature_enabled())  # one user cannot disable the shared feature
         self.assertFalse(preferences.get_pref(uid, "outfit"))
 
     def test_life_view_hides_outfit_for_non_admins(self):
@@ -211,7 +211,7 @@ class TaskDueParsingAndStatusCleanupTests(unittest.TestCase):
                 mock.patch.object(menus, "get_all_exam_dates", mock.AsyncMock(return_value=[])), \
                 mock.patch.object(menus, "_show_typing", mock.AsyncMock()), \
                 mock.patch.object(menus, "_start_loading_animation", lambda *a: (mock.MagicMock(), asyncio.sleep(0))):
-            asyncio.run(menus.handle_course_view(mock.MagicMock(callback_query=query), context))
+            run_handler(menus.handle_course_view, mock.MagicMock(callback_query=query), context)
 
         status_msg.delete.assert_awaited_once()
         sent_text = query.message.reply_text.await_args_list[-1].args[0]
@@ -226,7 +226,7 @@ class AdminRoleAndPrivacyTests(unittest.TestCase):
         query.from_user = types.SimpleNamespace(id=9999)
         with mock.patch.object(system, "is_user_admin", return_value=True), \
                 mock.patch.object(system, "_is_protected_admin", return_value=False):
-            asyncio.run(system.handle_admin_callbacks(types.SimpleNamespace(callback_query=query), None))
+            run_handler(system.handle_admin_callbacks, types.SimpleNamespace(callback_query=query), None)
         self.assertEqual(db.get_user(9950)["role"], "user")
 
     def test_privacy_view_shows_the_grades_permission_as_it_is(self):

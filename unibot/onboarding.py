@@ -60,8 +60,7 @@ QUESTIONS = (
     ("sem", "🗓️ Your semester",
      "📁 Files, Browse Courses and Sign Out open this semester directly. Change it later in /status.", True),
     ("ai_personal", "🤖 AI may use personal data",
-     "Needed for the spoken morning summary, 🔊 Listen, spoken questions, course-file summaries and study-plan topics, AI meal suggestions, and outfit suggestions. They are made by outside AI "
-     "services (including image services for wardrobe features). If you tap a task-suggestion button, the selected course announcement or forum post is also sent for that request.", True),
+     "Uses outside AI services (GWDG, OpenRouter, Google speech and image services) for voice, summaries, study topics, meal and outfit suggestions. Task buttons send the selected announcement or forum post.", True),
     ("ai_grades", "🤖 AI may use your grades",
      "Lets you ask the assistant about your grades. They are sent to the outside AI services (GWDG, OpenRouter) "
      "only for that question.", True),

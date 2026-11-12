@@ -15,7 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 import fast_enroll  # noqa: E402
@@ -218,7 +218,10 @@ class SetupFlowTests(unittest.TestCase):
         with mock.patch.object(menus, "_render_files_courses_for_semester", render), \
                 mock.patch.object(menus, "_show_semester_picker", picker), \
                 mock.patch("unibot.auth.current_user_id", return_value=self.UID):
-            asyncio.run(menus.handle_files_browse(mock.MagicMock()))
+            update = mock.MagicMock()
+            update.effective_user.id = self.UID
+            update.callback_query = None
+            run_handler(menus.handle_files_browse, update)
         render.assert_awaited_once()
         self.assertEqual(render.call_args.args[1], "w26")
         picker.assert_not_awaited()

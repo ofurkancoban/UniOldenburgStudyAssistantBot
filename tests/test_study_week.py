@@ -11,7 +11,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
@@ -150,7 +150,7 @@ class CalendarFeedTests(unittest.TestCase):
         query.message.reply_document = mock.AsyncMock(side_effect=lambda **kw: seen.append(kw["document"].getvalue()))
         with mock.patch.object(study_week, "is_user_allowed", lambda uid: True), \
                 mock.patch.object(study_week, "calendar_for", mock.AsyncMock(return_value="BEGIN:VCALENDAR\r\n")):
-            asyncio.run(study_week.handle_calendar_sync(mock.MagicMock(callback_query=query), None))
+            run_handler(study_week.handle_calendar_sync, mock.MagicMock(callback_query=query), None)
         kwargs = query.message.reply_document.await_args.kwargs
         self.assertEqual(kwargs["filename"], "study-blocks.ics")
         self.assertEqual(seen, [b"BEGIN:VCALENDAR\r\n"])
@@ -214,7 +214,7 @@ class StudyBuddyTests(unittest.TestCase):
         storage.set_study_buddy_enabled(self.A, False)
         query = _query("buddy|toggle", self.A)
         with mock.patch.object(study_week, "plan_entries", mock.AsyncMock(return_value=[])):
-            asyncio.run(study_week.handle_study_buddy(mock.MagicMock(callback_query=query), None))
+            run_handler(study_week.handle_study_buddy, mock.MagicMock(callback_query=query), None)
         self.assertTrue(storage.get_study_buddy_enabled(self.A))
         text = query.edit_message_text.await_args.args[0]
         self.assertIn("never your timetable", text)
@@ -255,9 +255,9 @@ class StreakTests(unittest.TestCase):
                 mock.patch.object(tasks, "save_user_tasks", lambda u, t: saved.append(t)), \
                 mock.patch.object(tasks, "is_user_allowed", lambda uid: True):
             stranger = _query("task_done|t-1", 9999)
-            asyncio.run(tasks.handle_task_buttons(mock.MagicMock(callback_query=stranger), None))
+            run_handler(tasks.handle_task_buttons, mock.MagicMock(callback_query=stranger), None)
             self.assertEqual((saved, storage.task_outcomes(uid)), ([], []))  # not their task
-            asyncio.run(tasks.handle_task_buttons(mock.MagicMock(callback_query=query), None))
+            run_handler(tasks.handle_task_buttons, mock.MagicMock(callback_query=query), None)
         self.assertEqual(saved, [[]])
         (outcome,) = storage.task_outcomes(uid)
         self.assertEqual((outcome["due"], outcome["text"]), (task["due_time"], "Problem Set 3"))

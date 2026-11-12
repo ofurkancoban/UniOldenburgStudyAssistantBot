@@ -15,7 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from unibot import auth, course_registry, formatting, monitoring_alerts, system  # noqa: E402
@@ -83,6 +83,9 @@ class ForumAlertTests(unittest.TestCase):
 
 
 class PlainFallbackTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(5, {"c1": "Course"})
+
     def test_an_unparseable_alert_still_arrives_as_plain_text(self):
         from telegram.error import BadRequest
         sent = []
@@ -115,7 +118,7 @@ class InviteLabelTests(unittest.TestCase):
                     "expires_at": 9e12}]
         with mock.patch.object(system, "is_user_admin", return_value=True), \
                 mock.patch.object(system.db, "list_invite_tokens", return_value=invites):
-            asyncio.run(system.handle_admin_callbacks(mock.MagicMock(callback_query=query), mock.MagicMock()))
+            run_handler(system.handle_admin_callbacks, mock.MagicMock(callback_query=query), mock.MagicMock())
         text = query.edit_message_text.call_args.args[0]
         self.assertIn("CS &lt;Group A&gt; &amp; Math", text)
         self.assertNotIn("<Group A>", text)

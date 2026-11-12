@@ -20,7 +20,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from telegram.error import BadRequest, Forbidden  # noqa: E402
@@ -250,6 +250,11 @@ class FolderZipTests(unittest.TestCase):
         class Resp:
             def __init__(self, length, body):
                 self.status, self.content_length, self._body = 200, length, body
+                self.content = self
+                self.headers = {}
+
+            async def iter_chunked(self, size):
+                yield self._body
 
             async def read(self):
                 return self._body
@@ -267,7 +272,7 @@ class FolderZipTests(unittest.TestCase):
         files = [{"type": "file", "name": "small.txt", "url": "https://elearning.uni-oldenburg.de/small"},
                  {"type": "file", "name": "huge.mp4", "url": "https://elearning.uni-oldenburg.de/big"}]
         with mock.patch.object(studip_api, "list_files", mock.AsyncMock(return_value=files)):
-            buf, total, _, ok, size = asyncio.run(studip_api.create_recursive_zip("c", None, "root", session=Sess()))
+            buf, total, _, ok, size = asyncio.run(studip_api.create_recursive_zip("c", "https://elearning.uni-oldenburg.de/folder", "root", session=Sess()))
         self.assertEqual((total, ok), (2, 1))
         self.assertGreater(size, studip_api.ZIP_RAW_LIMIT_BYTES)  # the caller says "too large"
         self.assertEqual(zipfile.ZipFile(io.BytesIO(buf.getvalue())).namelist(), ["root/small.txt"])
@@ -306,23 +311,27 @@ class RestartSafeButtonTests(unittest.TestCase):
         update = mock.MagicMock(callback_query=query)
         with mock.patch.object(tasks, "is_user_allowed", lambda uid: True), \
                 mock.patch.object(tasks, "record_task_outcome", lambda *a: None):
-            asyncio.run(tasks.handle_task_reminder_action(update, None))
+            run_handler(tasks.handle_task_reminder_action, update, None)
         query.message.reply_text.assert_awaited_with("✔️ Done: Essay")
         self.assertIsNone(storage.recall_user_callback(9701, "task:t1"))  # one use
 
     def test_a_suggestion_works_for_every_follower(self):
         from unibot import tasks
-        tasks.task_suggestion_cache["sg1"] = {"text": "Hand in PS3", "due_time": None, "course": "Stats"}
+        tasks.task_suggestion_cache["sg1"] = {"body": "Hand in PS3", "course": "Stats", "cid": "c1"}
         saved = []
         for uid in (9801, 9802):
+            activate_student(uid, {"c1": "Stats"})
+            storage.set_ai_personal_enabled(uid, True)
+            self.addCleanup(storage.set_ai_personal_enabled, uid, False)
             query = mock.MagicMock()
             query.from_user.id, query.data = uid, "tasksug_add|sg1"
             query.answer, query.edit_message_reply_markup = mock.AsyncMock(), mock.AsyncMock()
             query.message.reply_text = mock.AsyncMock()
             with mock.patch.object(tasks, "is_user_allowed", lambda u: True), \
+                    mock.patch.object(tasks, "extract_task_suggestion", mock.AsyncMock(return_value={"text": "Hand in PS3", "due_time": None})), \
                     mock.patch.object(tasks, "_save_task_and_confirmation_text",
-                                      lambda u, *a: saved.append(u) or "ok"):
-                asyncio.run(tasks.handle_task_suggestion_add(mock.MagicMock(callback_query=query), None))
+                                      lambda u, *a, **kw: saved.append(u) or "ok"):
+                run_handler(tasks.handle_task_suggestion_add, mock.MagicMock(callback_query=query), None)
         self.assertEqual(saved, [9801, 9802])
 
 

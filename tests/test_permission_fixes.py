@@ -15,7 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from unibot import db, state  # noqa: E402
@@ -170,7 +170,7 @@ class AdminPanelTests(unittest.TestCase):
                 mock.patch.object(system, "ALLOWED_USER_IDS", set()), \
                 mock.patch.object(system, "PRIMARY_ADMIN_ID", 1), \
                 mock.patch.object(system, "_perform_logout", mock.AsyncMock()) as logout:
-            asyncio.run(system.handle_admin_callbacks(update, mock.MagicMock()))
+            run_handler(system.handle_admin_callbacks, update, mock.MagicMock())
         return query, logout
 
     def test_a_promoted_admin_cannot_touch_an_environment_admin(self):

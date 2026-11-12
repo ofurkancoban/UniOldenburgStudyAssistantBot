@@ -14,7 +14,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from telegram.error import BadRequest  # noqa: E402
@@ -82,7 +82,7 @@ class PrivacyRepeatTapTests(unittest.TestCase):
         with mock.patch.object(privacy, "is_user_allowed", return_value=True), \
                 mock.patch.object(privacy, "run_manual_check", mock.AsyncMock(return_value="⏳ wait")), \
                 mock.patch.object(privacy, "privacy_view", return_value=("same", None)):
-            asyncio.run(privacy.handle_privacy(mock.MagicMock(callback_query=query), mock.MagicMock()))
+            run_handler(privacy.handle_privacy, mock.MagicMock(callback_query=query), mock.MagicMock())
 
     def test_unchanged_view_is_ignored(self):
         self._tap(BadRequest("Message is not modified: specified new message content and reply "
@@ -119,6 +119,9 @@ class BusyTimeoutTests(unittest.TestCase):
 
 
 class FanOutLengthTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(5, {"c1": "Course"})
+
     def test_an_oversized_alert_is_cut_to_fit(self):
         from unibot import course_registry, formatting
         sent = []

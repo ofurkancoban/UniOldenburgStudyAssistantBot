@@ -13,7 +13,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_as, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 import studip_vault  # noqa: E402
@@ -127,7 +127,7 @@ class ScopedSessionTests(unittest.TestCase):
                 mock.patch.object(exams, "download_stums_document", download), \
                 mock.patch.object(exams, "_start_loading_animation", lambda *a: (None, None)), \
                 mock.patch.object(exams, "_stop_loading_animation", mock.AsyncMock()):
-            asyncio.run(exams.handle_stums_doc_download(update, mock.MagicMock()))
+            run_handler(exams.handle_stums_doc_download, update, mock.MagicMock())
         self.assertEqual(used, [own])
         sent = query.message.reply_document.call_args.kwargs["document"]
         self.assertEqual(seen, [b"%PDF"])  # streamed from memory, no file on disk
@@ -135,6 +135,9 @@ class ScopedSessionTests(unittest.TestCase):
 
 
 class PersonalSenderTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(9)
+
     def test_single_account_alerts_reach_only_that_student(self):
         from unibot import watcher
         sent = []
@@ -145,7 +148,7 @@ class PersonalSenderTests(unittest.TestCase):
 
         sess = mock.MagicMock(user_id=9)
         self.assertEqual(watcher._single_account_owner(sess), 9)
-        asyncio.run(watcher._user_sender(9)(Bot(), "🎓 Grade: 1.3"))
+        run_as(9, watcher._user_sender(9)(Bot(), "🎓 Grade: 1.3"))
         self.assertEqual(sent, [9])
 
     def test_grade_notifications_are_not_logged(self):
@@ -157,6 +160,8 @@ class PersonalSenderTests(unittest.TestCase):
 
 class PrivacyScreenTests(unittest.TestCase):
     def setUp(self):
+        for uid in (502, 503):
+            activate_student(uid)
         from unibot import privacy, storage
         self.privacy, self.storage = privacy, storage
         self.cache = {}
@@ -183,20 +188,21 @@ class PrivacyScreenTests(unittest.TestCase):
 
         async def checks(bot, session, send):
             runs.append(session)
+            return True
 
         own = mock.MagicMock()
         with mock.patch.object(self.privacy, "personal_session", lambda uid: own), \
                 mock.patch.object(self.privacy, "has_stored_login", lambda s: True), \
                 mock.patch.object(self.privacy, "_run_stums_checks", checks), \
                 mock.patch.object(self.privacy, "mark_personal_check", lambda uid: None):
-            first = asyncio.run(self.privacy.run_manual_check(None, 502))
-            second = asyncio.run(self.privacy.run_manual_check(None, 502))
+            first = run_as(502, self.privacy.run_manual_check(None, 502))
+            second = run_as(502, self.privacy.run_manual_check(None, 502))
         self.assertTrue(first.startswith("✅"))
         self.assertTrue(second.startswith("⏳"))
         self.assertEqual(runs, [own])
         with mock.patch.object(self.privacy, "personal_session", lambda uid: own), \
                 mock.patch.object(self.privacy, "has_stored_login", lambda s: False):
-            self.assertIn("Sign in", asyncio.run(self.privacy.run_manual_check(None, 503)))
+            self.assertIn("Sign in", run_as(503, self.privacy.run_manual_check(None, 503)))
 
     def test_ai_grades_are_opt_in(self):
         self.assertFalse(self.storage.get_ai_grades_enabled(504))
@@ -236,6 +242,7 @@ class PrivacyScreenTests(unittest.TestCase):
         er.save_exam_cache({"known_grades": {"M": "1.0"}}, user_id=uid)
         db.get_user_scope(uid).sync_courses({"c1"})
         self.cache.update({"study_blocks": {str(uid): {"1": {}}, "9": {"1": {}}}, "ai_grades": {str(uid): True}})
+        db.save(self.storage.GENERAL_CACHE_PATH, self.cache)
         self.storage.set_travel_mode(uid, "bus")  # a personal record
         exams.exam_action_cache["s1"] = {"user_id": uid}
         exams.exam_action_cache["s2"] = {"user_id": 9}
@@ -246,6 +253,7 @@ class PrivacyScreenTests(unittest.TestCase):
 
         with mock.patch.object(self.privacy, "_perform_logout", logout):
             asyncio.run(self.privacy.delete_personal_data(uid))
+        self.cache = db.load(self.storage.GENERAL_CACHE_PATH)
         self.assertEqual(logged_out, [uid])
         self.assertFalse(db.get_user_scope(uid).has_private(er.PRIVATE_EXAM_KIND))
         self.assertEqual(db.get_user_scope(uid).course_ids(), [])
@@ -270,11 +278,11 @@ class PrivacyScreenTests(unittest.TestCase):
 
         with mock.patch.object(self.privacy, "is_user_allowed", lambda uid: True), \
                 mock.patch.object(self.privacy, "delete_personal_data", delete):
-            asyncio.run(self.privacy.handle_privacy(update, mock.MagicMock()))
+            run_handler(self.privacy.handle_privacy, update, mock.MagicMock())
             self.assertEqual(deleted, [])
             self.assertIn("cannot be undone", query.edit_message_text.call_args.args[0])
             query.data = "privacy|delete_yes"
-            asyncio.run(self.privacy.handle_privacy(update, mock.MagicMock()))
+            run_handler(self.privacy.handle_privacy, update, mock.MagicMock())
         self.assertEqual(deleted, [507])
 
 

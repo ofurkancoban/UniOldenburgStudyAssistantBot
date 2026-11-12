@@ -20,7 +20,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from telegram.ext import ApplicationHandlerStop  # noqa: E402
@@ -55,6 +55,10 @@ class SharedCacheMixin:
 
 
 class FastEnrollTests(unittest.TestCase):
+    def setUp(self):
+        for uid in (701, 702):
+            activate_student(uid)
+
     def test_a_job_runs_with_the_students_own_login(self):
         from unibot import tasks
         seen = []
@@ -86,20 +90,23 @@ class FastEnrollTests(unittest.TestCase):
 
         app = mock.MagicMock()
         app.bot.send_message = mock.AsyncMock()
-        pending = {"702": {"s1": {"target_time_str": "10:00"}}, "703": {"s2": {"target_time_str": "10:00"}},
-                   "704": {"s3": {"target_time_str": "10:00"}}}
+        pending = {str(uid): {"a" * 32: {"target_time_str": "10:00:00", "target_date_str": "01.01.2030"}}
+                   for uid in (702, 703, 704)}
         states = {702: auth.ACTIVE, 703: auth.INACTIVE, 704: auth.ACTIVE}
         with mock.patch.object(enrollment, "load_pending", lambda: pending), \
                 mock.patch.object(enrollment, "is_user_allowed", lambda uid: uid != 704), \
                 mock.patch.object(enrollment, "lifecycle_state", lambda uid: states[uid]), \
                 mock.patch.object(state, "spawn", spawn):
             asyncio.run(enrollment.restore_pending_fastenroll_jobs(app))
-        self.assertEqual(spawned, ["fastenroll:702:s1"])
+        self.assertEqual(spawned, ["fastenroll:702:" + "a" * 32])
         enrollment.fastenroll_tasks.pop(702, None)
 
 
 class CourseSearchTests(unittest.TestCase):
     def setUp(self):
+        activate_student(705, {"mine": "Mine"})
+        storage.set_ai_personal_enabled(705, True)
+        self.addCleanup(storage.set_ai_personal_enabled, 705, False)
         from unibot import study_plan
         self.sp = study_plan
         vec = study_plan._pack_vector([1.0, 0.0])
@@ -110,7 +117,7 @@ class CourseSearchTests(unittest.TestCase):
         self.addCleanup(study_plan.save_course_index, {"files": {}})
 
     def _search(self, user_id, courses):
-        async def embed(texts):
+        async def embed(texts, user_id=None):
             return [[1.0, 0.0]]
 
         with mock.patch.object(self.sp, "embed_texts", embed), \
@@ -167,7 +174,7 @@ class PerStudentSwitchTests(unittest.TestCase):
         update, query = _callback(712, "status_group_toggle|semester|study_plan")
         with mock.patch.object(menus, "is_user_allowed", lambda uid: True), \
                 mock.patch.object(menus, "_status_group_view", lambda group, uid: ("t", None)):
-            asyncio.run(menus.handle_status_group(update, mock.MagicMock()))
+            run_handler(menus.handle_status_group, update, mock.MagicMock())
         self.assertTrue(preferences.get_pref(712, "weekly_study_plan"))
         self.assertFalse(preferences.get_pref(713, "weekly_study_plan"))
 
@@ -175,7 +182,7 @@ class PerStudentSwitchTests(unittest.TestCase):
         from unibot import watcher
         ran = []
 
-        async def once(key, period, label, start, job, bot, uids, session):
+        async def once(key, period, label, start, job, bot, uids, session, delivery_period):
             ran.append(list(uids))
 
         sunday = datetime(2026, 11, 8, 19, 0, tzinfo=TZ_BERLIN)
@@ -192,7 +199,7 @@ class PerStudentSwitchTests(unittest.TestCase):
         update, query = _callback(716, "toggle_wardrobe_feature")
         before = storage.get_wardrobe_feature_enabled()
         with mock.patch.object(wardrobe, "is_user_admin", lambda uid: False):
-            asyncio.run(wardrobe.handle_toggle_wardrobe_feature(update, mock.MagicMock()))
+            run_handler(wardrobe.handle_toggle_wardrobe_feature, update, mock.MagicMock())
         self.assertEqual(storage.get_wardrobe_feature_enabled(), before)
         self.assertTrue(query.answer.call_args.kwargs.get("show_alert"))
 
@@ -205,7 +212,7 @@ class AdminControlTests(unittest.TestCase):
             update, query = _callback(717, data)
             with mock.patch.object(menus, "is_user_admin", lambda uid: False), \
                     mock.patch.dict(menus._STATUS_BUTTON_HANDLERS, {data: handler}):
-                asyncio.run(menus.handle_status_buttons(update, mock.MagicMock()))
+                run_handler(menus.handle_status_buttons, update, mock.MagicMock())
             handler.assert_not_called()
             self.assertTrue(query.answer.call_args.kwargs.get("show_alert"), data)
 
@@ -215,7 +222,7 @@ class AdminControlTests(unittest.TestCase):
         update, query = _callback(718, "stop_watchers")
         with mock.patch.object(menus, "is_user_admin", lambda uid: True), \
                 mock.patch.dict(menus._STATUS_BUTTON_HANDLERS, {"stop_watchers": handler}):
-            asyncio.run(menus.handle_status_buttons(update, mock.MagicMock()))
+            run_handler(menus.handle_status_buttons, update, mock.MagicMock())
         handler.assert_awaited_once()
 
     def test_whatsapp_group_is_set_by_admins_only(self):
@@ -302,6 +309,11 @@ class FoodButtonTests(unittest.TestCase):
 
 
 class PersonalRecordTests(SharedCacheMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        for uid in (811, 812):
+            activate_student(uid)
+
     def _raw(self, user_id: int, kind: str) -> str:
         row = db._connection().execute(
             "SELECT encrypted_blob FROM user_private_data WHERE user_id = ? AND kind = ?", (user_id, kind),
@@ -432,6 +444,7 @@ class PersonalRecordTests(SharedCacheMixin, unittest.TestCase):
 
 class UrgentDeliveryTests(unittest.TestCase):
     def _deliver(self, fmt, reason, urgent):
+        activate_student(830, {"c1": "Course"})
         from unibot import course_registry
         bot = mock.MagicMock()
         bot.send_message = mock.AsyncMock()
@@ -440,7 +453,7 @@ class UrgentDeliveryTests(unittest.TestCase):
                 mock.patch.object(course_registry, "delivery_format", lambda uid, cid, kind: fmt), \
                 mock.patch.object(course_registry, "_hold_reason", lambda uid, now: reason), \
                 mock.patch.object(course_registry, "get_pref", lambda uid, key: "card"), \
-                mock.patch.object(course_registry, "queue_alert", lambda *a: queued.append(a)), \
+                mock.patch.object(course_registry, "queue_alert", lambda *a, **kw: queued.append(a)), \
                 mock.patch.object(course_registry.asyncio, "sleep", mock.AsyncMock()):
             counts = asyncio.run(course_registry.fan_out(bot, "c1", "schedule", "text", "title", urgent=urgent))
         return counts, bot.send_message.await_args_list
@@ -473,7 +486,9 @@ class InstanceLockTests(unittest.TestCase):
         lock_dir = tempfile.mkdtemp(prefix="unibot-lock-")
         self.addCleanup(shutil.rmtree, lock_dir, True)
         self.lock = os.path.join(lock_dir, ".bot_instance.lock")
-        for target, name, value in ((auth, "LOCK_FILE", self.lock), (auth.sys, "argv", ["studip_bot.py"])):
+        auth.release_instance_lock()
+        self.addCleanup(auth.release_instance_lock)
+        for target, name, value in ((auth, "LOCK_FILE", self.lock),):
             patcher = mock.patch.object(target, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -498,20 +513,24 @@ class InstanceLockTests(unittest.TestCase):
             self.assertEqual(f.read(), str(os.getpid()))
 
     def test_a_running_bot_still_blocks_the_start(self):
-        self._write(self._process("studip_bot.py").pid)
+        proc = subprocess.Popen([sys.executable, "-c",
+            "import fcntl,sys,time; f=open(sys.argv[1],'a+'); fcntl.flock(f,fcntl.LOCK_EX); "
+            "print('locked',flush=True); time.sleep(30)", self.lock], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.addCleanup(proc.stdout.close)
+        self.assertEqual(proc.stdout.readline().strip(), "locked")
         self.assertFalse(auth.acquire_instance_lock())
 
     def test_our_own_pid_after_a_restart_is_stale(self):
         self._write(os.getpid())
         self.assertTrue(auth.acquire_instance_lock())
 
-    def test_release_leaves_another_instances_lock_alone(self):
-        self._write(os.getpid() + 1)
+    def test_release_keeps_the_file_but_releases_the_os_lock(self):
+        self.assertTrue(auth.acquire_instance_lock())
         auth.release_instance_lock()
         self.assertTrue(os.path.exists(self.lock))
-        self._write(os.getpid())
-        auth.release_instance_lock()
-        self.assertFalse(os.path.exists(self.lock))
+        self.assertTrue(auth.acquire_instance_lock())
 
 
 if __name__ == "__main__":

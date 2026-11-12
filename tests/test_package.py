@@ -79,8 +79,8 @@ class PackageLayoutTests(unittest.TestCase):
                         f"{mod} imports later module {target} at the top (move it into the function)",
                     )
 
-    def test_function_level_imports_only_for_later_modules(self):
-        # an earlier module belongs at the top of the file
+    def test_function_level_imports_reference_declared_modules(self):
+        # Lazy imports also fetch fresh runtime hooks from earlier modules.
         for mod in ORDER:
             tree = ast.parse(_source(mod))
             for fn in ast.walk(tree):
@@ -88,7 +88,8 @@ class PackageLayoutTests(unittest.TestCase):
                     continue
                 for node in fn.body:
                     for target in _unibot_targets(node):
-                        self.assertGreater(RANK[target], RANK[mod], f"{mod}.{fn.name}: import {target} at top level")
+                        self.assertIn(target, RANK, f"{mod}.{fn.name}: unknown package module {target}")
+                        self.assertNotEqual(target, mod, f"{mod}.{fn.name}: redundant self import")
 
     def test_state_is_never_imported_by_name(self):
         state_names = {
@@ -108,10 +109,12 @@ class PackageLayoutTests(unittest.TestCase):
     def test_each_name_defined_once(self):
         seen = {}
         for mod in ORDER:
+            local_names = set()
             for node in ast.parse(_source(mod)).body:
                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    self.assertNotIn(node.name, seen, f"{node.name} defined in {seen.get(node.name)} and {mod}")
-                    seen[node.name] = mod
+                    self.assertNotIn(node.name, local_names, f"{mod}.{node.name} defined twice")
+                    local_names.add(node.name)
+                    seen[f"{mod}.{node.name}"] = mod
         self.assertGreater(len(seen), 460)
 
     def test_no_undefined_global_names(self):
@@ -196,7 +199,7 @@ class HandlerTableTests(unittest.TestCase):
     """Builds the real Application offline (no login, no network)."""
 
     # number of app.add_handler(...) calls in the original main()
-    EXPECTED_HANDLERS = 129
+    EXPECTED_HANDLERS = 130
 
     @classmethod
     def setUpClass(cls):

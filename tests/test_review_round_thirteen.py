@@ -17,7 +17,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_as, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
@@ -50,6 +50,9 @@ class _Frozen(datetime):
 
 
 class CancelledClassReminderTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID)
+
     def _run(self, events, at):
         sent = []
 
@@ -83,6 +86,9 @@ class CancelledClassReminderTests(unittest.TestCase):
 
 
 class FastEnrollPerStudentTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(2)
+
     def test_two_students_may_schedule_the_same_course(self):
         sem = "a" * 32
         saved = []
@@ -94,7 +100,7 @@ class FastEnrollPerStudentTests(unittest.TestCase):
                 mock.patch.object(schedule, "save_pending_job", lambda *a: saved.append(a[0])), \
                 mock.patch("unibot.tasks._run_fastenroll_task", run), \
                 mock.patch.dict(schedule.fastenroll_tasks, {}, clear=True):
-            reply = asyncio.run(schedule.schedule_fastenroll_job(2, sem, "08:00:00", None, None))
+            reply = run_as(2, schedule.schedule_fastenroll_job(2, sem, "08:00:00", None, None))
         self.assertIn("scheduled", reply)
         self.assertEqual(saved, [2])
 
@@ -118,6 +124,12 @@ class UpcomingDashboardTests(unittest.TestCase):
 
 
 class CourseIndexKeptOnFailureTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID, {"c1": "A", "c2": "B"})
+        from unibot import storage
+        storage.set_ai_personal_enabled(UID, True)
+        self.addCleanup(storage.set_ai_personal_enabled, UID, False)
+
     def test_failed_listing_keeps_the_courses_index(self):
         index = {"files": {"c1|old.pdf": {"course": "A", "file": "old.pdf", "size": "1", "modified_ts": 1, "chunks": []},
                            "c2|gone.pdf": {"course": "B", "file": "gone.pdf", "size": "1", "modified_ts": 1, "chunks": []}}}
@@ -133,7 +145,7 @@ class CourseIndexKeptOnFailureTests(unittest.TestCase):
                 mock.patch.object(study_plan, "_list_course_files", listing), \
                 mock.patch.object(study_plan, "_load_course_index_async", mock.AsyncMock(return_value=index)), \
                 mock.patch.object(study_plan, "save_course_index", lambda data: saved.update(data)):
-            stats = asyncio.run(study_plan.index_course_files(None))
+            stats = asyncio.run(study_plan.index_course_files(None, user_id=UID))
         self.assertIn("c1|old.pdf", saved["files"])  # not read this run: kept, not re-embedded tomorrow
         self.assertNotIn("c2|gone.pdf", saved["files"])  # read and really gone
         self.assertEqual(stats["removed"], 1)
@@ -165,6 +177,9 @@ class OutfitIsForAdminsTests(unittest.TestCase):
 
 
 class FilesBrowserTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID, {"c1": "Course"})
+
     def test_course_button_shows_an_ampersand_as_it_is(self):
         query = mock.AsyncMock()
         asyncio.run(menus._send_courses_menu(query, [("Research & Methods", "c1")]))
@@ -177,13 +192,13 @@ class FilesBrowserTests(unittest.TestCase):
         query = mock.AsyncMock()
         query.message.text_html = "<b>📁 File</b>"
         query.message.reply_markup = card_markup
-        with mock.patch.dict(menus.link_cache, {"s1": {"cid": "c1", "name": "slides.pdf"}}), \
+        with mock.patch.dict(menus.link_cache, {"s1": {"cid": "c1", "name": "slides.pdf", "user_id": UID}}), \
                 mock.patch.object(menus, "get_user_session", lambda uid=None: object()), \
                 mock.patch.object(menus, "get_fresh_file_url", mock.AsyncMock(return_value=None)), \
                 mock.patch.object(menus, "_show_typing", mock.AsyncMock()), \
                 mock.patch.object(menus, "_start_loading_animation", lambda *a: (None, None)), \
                 mock.patch.object(menus, "_stop_loading_animation", mock.AsyncMock()):
-            asyncio.run(menus._selection_file(None, None, query, ["file", "s1"], UID))
+            run_as(UID, menus._selection_file(None, None, query, ["file", "s1"], UID))
         last = query.edit_message_text.call_args
         self.assertEqual(last.args[0], "<b>📁 File</b>")
         self.assertIs(last.kwargs["reply_markup"], card_markup)
@@ -193,6 +208,7 @@ class FilesBrowserTests(unittest.TestCase):
 class _Page:
     def __init__(self, html_text):
         self._html = html_text
+        self.status = 200
 
     async def text(self):
         return self._html
@@ -303,6 +319,9 @@ class ExamReminderEscapingTests(unittest.TestCase):
 
 
 class MessageAlertTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID)
+
     def test_an_over_long_message_is_cut_and_the_next_one_still_goes_out(self):
         from unibot import monitoring
         messages = [{"id": "m1", "title": "Long", "sender": "Ada", "date": "01/11/26 10:00", "url": "u1", "body": "&" * 3300},
@@ -341,6 +360,9 @@ class StatusCommandTests(unittest.TestCase):
 
 
 class FastEnrollShutdownTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID)
+
     def test_a_cancelled_job_keeps_its_stored_entry_but_a_finished_one_clears_it(self):
         from unibot import tasks
 
@@ -425,6 +447,12 @@ class SignInResumesTests(unittest.TestCase):
 
 
 class AudioSummaryTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID, {"c1": "A", "c2": "B"})
+        from unibot import storage
+        storage.set_ai_personal_enabled(UID, True)
+        self.addCleanup(storage.set_ai_personal_enabled, UID, False)
+
     def test_an_expired_session_is_reported_on_the_status_message(self):
         from unibot import documents
         query = mock.AsyncMock()
@@ -432,12 +460,12 @@ class AudioSummaryTests(unittest.TestCase):
         query.from_user = types.SimpleNamespace(id=UID)
         status = mock.AsyncMock()
         query.message.reply_text = mock.AsyncMock(return_value=status)
-        with mock.patch.dict(documents.link_cache, {"s9": {"cid": "c1", "name": "slides.pdf"}}), \
+        with mock.patch.dict(documents.link_cache, {"s9": {"cid": "c1", "name": "slides.pdf", "user_id": UID}}), \
                 mock.patch.object(documents, "is_user_allowed", return_value=True), \
                 mock.patch.object(documents, "login_studip", mock.AsyncMock(side_effect=RuntimeError("Failed to log in to Stud.IP."))), \
                 mock.patch.object(documents, "_start_loading_animation", lambda *a: (None, None)), \
                 mock.patch.object(documents, "_stop_loading_animation", mock.AsyncMock()):
-            asyncio.run(documents.handle_file_audio_summary(types.SimpleNamespace(callback_query=query), None))
+            run_handler(documents.handle_file_audio_summary, types.SimpleNamespace(callback_query=query), None)
         self.assertIn("Failed to log in", status.edit_text.call_args.args[0])
 
 

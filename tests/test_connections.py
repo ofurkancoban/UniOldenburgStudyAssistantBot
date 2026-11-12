@@ -11,7 +11,7 @@ from unittest import mock
 
 # never touch the live log or database (set before unibot is imported)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_as, use_temp_db  # noqa: E402
 use_temp_db()
 
 from aiohttp import web
@@ -452,7 +452,8 @@ class PerUserStumsTests(unittest.TestCase):
         watcher = _import("watcher")
         bot = mock.MagicMock()
         bot.send_message = mock.AsyncMock()
-        asyncio.run(watcher._user_sender(42)(bot, "grade", parse_mode="HTML"))
+        activate_student(42)
+        run_as(42, watcher._user_sender(42)(bot, "grade", parse_mode="HTML"))
         bot.send_message.assert_awaited_once()
         self.assertEqual(bot.send_message.await_args.kwargs["chat_id"], 42)
 
@@ -718,6 +719,7 @@ class DailyDigestTests(unittest.TestCase):
 
         async def fake_broadcast(bot, text, **kwargs):
             sent.append(kwargs.get("members"))
+            return {"sent": set(kwargs.get("members") or []), "failed": set()}
 
         cache: dict = {}
         with mock.patch.object(watcher, "broadcast", fake_broadcast), \
@@ -831,7 +833,7 @@ class SqliteStoreTests(unittest.TestCase):
         with mock.patch.object(er, "exam_cache_path", lambda uid=None: legacy):
             self.assertEqual(er.load_exam_cache(42)["notified_open"], {"x:None:None": "t"})
             self.assertFalse(os.path.exists(legacy))  # imported once, then renamed
-            self.assertTrue(os.path.exists(legacy + ".imported"))
+            self.assertFalse(os.path.exists(legacy + ".imported"))  # plaintext removed after encrypted import
             er.save_exam_cache({"notified_open": {}, "known_grades": {"a": 1}}, 42)
             self.assertEqual(er.load_exam_cache(42)["known_grades"], {"a": 1})
             self.assertFalse(os.path.exists(legacy))  # saves never write a file
@@ -883,7 +885,7 @@ class CookieStorageTests(unittest.TestCase):
         async def first_run():
             sess = studip_session.StudIPSession("", "", "", cookie_file=None, user_id=4343)
             await sess.ensure_session()
-            sess.stums.verified_at, sess.stums.referer, sess.stums.blocked_until = 123.0, "https://stums/x", paused
+            sess.stums.verified_at, sess.stums.referer, sess.stums.blocked_until = 123.0, "https://stums.uni-oldenburg.de/qisserver/pages/cs/sys/portal/hisinoneStartPage.faces", paused
             await sess.close()  # a graceful shutdown
 
         async def second_run():
@@ -898,7 +900,7 @@ class CookieStorageTests(unittest.TestCase):
             asyncio.run(first_run())
             restored = asyncio.run(second_run())
             self.assertEqual((restored.verified_at, restored.referer, restored.blocked_until),
-                             (123.0, "https://stums/x", paused))
+                             (123.0, "https://stums.uni-oldenburg.de/qisserver/pages/cs/sys/portal/hisinoneStartPage.faces", paused))
             # after a logout the state is neither kept nor written again
             db.get_user_scope(4343).delete_credentials()
             sess = studip_session.StudIPSession("", "", "", cookie_file=None, user_id=4343)
@@ -1081,6 +1083,7 @@ class StumsFixtureTests(unittest.TestCase):
         class Resp:
             def __init__(self, text):
                 self._text = text
+                self.status = 200
 
             async def text(self):
                 return self._text
@@ -1113,6 +1116,8 @@ class CourseWatchPlanTests(unittest.TestCase):
     """Every user's courses are watched, each once, and alerts reach participants only."""
 
     def setUp(self):
+        for uid in (1, 2):
+            activate_student(uid)
         from unibot import monitoring, state
         self.monitoring, self.state = monitoring, state
         self.saved = (dict(state.user_sessions), state.global_session, dict(state.user_courses_map))
@@ -1138,6 +1143,7 @@ class CourseWatchPlanTests(unittest.TestCase):
         async def fake_list(session=None, user_id=None, semester_id=None):
             listed.append(user_id)
             state.user_courses_map[user_id] = {1: {"c1": "Math", "c2": "Stats"}, 2: {"c2": "Stats", "c3": "AI"}}[user_id]
+            return [(name, cid) for cid, name in state.user_courses_map[user_id].items()]
 
         from unibot import auth, course_registry
         course_registry._rotation.clear()
@@ -1145,7 +1151,7 @@ class CourseWatchPlanTests(unittest.TestCase):
                 mock.patch.object(auth, "has_stored_login", lambda s: True), \
                 mock.patch.object(course_registry, "has_stored_login", lambda s: True), \
                 mock.patch.object(auth.db, "get_all_users", lambda: [{"telegram_id": 1}, {"telegram_id": 2}]), \
-                mock.patch.object(auth, "ALLOWED_USER_IDS", {1}):
+                mock.patch.object(auth, "ALLOWED_USER_IDS", {1, 2}):
             plan = asyncio.run(m.watched_courses())
             again = asyncio.run(m.watched_courses())
         self.assertEqual(sorted((cid, sess is s1) for _n, cid, sess in plan),
@@ -1195,7 +1201,7 @@ class AccountRegistryTests(unittest.TestCase):
             self.assertEqual(auth.all_sessions(), [a, b])  # each session once, watcher first
             with mock.patch.object(auth, "has_stored_login", lambda s: s is b), \
                     mock.patch.object(auth.db, "get_all_users", lambda: [{"telegram_id": 2}, {"telegram_id": 3, "is_active": 0}]), \
-                    mock.patch.object(auth, "ALLOWED_USER_IDS", {1}):
+                    mock.patch.object(auth, "ALLOWED_USER_IDS", {1, 2}):
                 (account,) = auth.signed_in_accounts()
                 self.assertEqual((account.user_id, account.session), (2, b))
                 self.assertFalse(account.is_watcher)
@@ -1249,7 +1255,7 @@ class LayeringTests(unittest.TestCase):
 
     def test_monitoring_layers(self):
         # change detection is pure; neither lower layer reaches up to the watchers
-        self.assertEqual(self._imports("unibot/monitoring_diff.py"), {"datetime", "unibot.studip_api"})
+        self.assertEqual(self._imports("unibot/monitoring_diff.py"), {"urllib.parse", "unibot.studip_api"})
         for rel in ("unibot/monitoring_fetch.py", "unibot/monitoring_diff.py", "unibot/monitoring_alerts.py"):
             self.assertNotIn("unibot.monitoring", self._imports(rel), rel)
         self.assertNotIn("telegram", {m.split(".")[0] for m in self._imports("unibot/monitoring_fetch.py")})

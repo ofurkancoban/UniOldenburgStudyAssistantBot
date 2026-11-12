@@ -14,7 +14,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_as, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from unibot import formatting, menus, privacy, state, weather  # noqa: E402
@@ -106,6 +106,7 @@ class FastEnrollSpinTests(unittest.TestCase):
                 with mock.patch.object(fast_enroll, "resolve_target", lambda *a: target), \
                         mock.patch.object(fast_enroll, "_site_clock_offset", mock.AsyncMock(return_value=0.0)), \
                         mock.patch.object(fast_enroll, "_fetch_security_token", mock.AsyncMock(return_value="t")), \
+                        mock.patch.object(fast_enroll, "_is_enrollment_open", mock.AsyncMock(return_value=False)), \
                         mock.patch.object(fast_enroll, "_submit_enrollment", mock.AsyncMock(return_value=(200, "<title>ok</title>"))):
                     started = _time.time()
                     ok, _message = await fast_enroll.run_fast_enroll(object(), "s", "00:00:00")
@@ -142,6 +143,9 @@ class ZipConcurrencyTests(unittest.TestCase):
 
 
 class TaskReminderRetryTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID)
+
     def _run(self, error):
         from unibot import tasks
         removed = []
@@ -151,7 +155,7 @@ class TaskReminderRetryTests(unittest.TestCase):
         with mock.patch.object(tasks, "students_with_tasks", lambda: [UID]), \
                 mock.patch.object(tasks, "user_tasks", lambda uid: [task]), \
                 mock.patch.object(tasks, "remove_user_tasks", lambda uid, ids: removed.append(set(ids))), \
-                mock.patch.object(tasks, "remember_user_callback", lambda *a: None), \
+                mock.patch.object(tasks, "remember_user_callback", lambda *a: True), \
                 mock.patch.object(tasks, "record_task_outcome", lambda *a: None):
             asyncio.run(tasks.check_task_reminders(bot))
         return removed
@@ -159,9 +163,9 @@ class TaskReminderRetryTests(unittest.TestCase):
     def test_an_unexpected_error_keeps_the_task_for_the_next_minute(self):
         self.assertEqual(self._run(RuntimeError("boom")), [])
 
-    def test_a_blocked_chat_drops_the_task(self):
+    def test_a_blocked_chat_preserves_the_task(self):
         from telegram.error import Forbidden
-        self.assertEqual(self._run(Forbidden("bot was blocked by the user")), [{"t1"}])
+        self.assertEqual(self._run(Forbidden("bot was blocked by the user")), [])
 
 
 class WeeklyPlanCatchUpTests(unittest.TestCase):
@@ -208,6 +212,9 @@ class BlockedStudentAlertTests(unittest.TestCase):
 
 
 class UploadRespectsTitleOnlyTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID, {"c1": "Course"})
+
     def _fan(self, fmt):
         from unibot import course_registry as cr
         bot = mock.AsyncMock()
@@ -258,7 +265,7 @@ class ButtonTextTests(unittest.TestCase):
                 mock.patch.object(menus, "handle_pending_step", mock.AsyncMock(return_value=False)), \
                 mock.patch.object(menus, "status_command", mock.AsyncMock()) as status, \
                 mock.patch.object(menus, "exams_command", mock.AsyncMock()) as exams:
-            asyncio.run(menus.handle_reply_buttons(update, types.SimpleNamespace(user_data={})))
+            run_handler(menus.handle_reply_buttons, update, types.SimpleNamespace(user_data={}))
         status.assert_not_awaited()
         exams.assert_not_awaited()
         self.assertIn("buttons", message.reply_text.call_args.args[0])
@@ -272,7 +279,7 @@ class CourseViewCallbackTests(unittest.TestCase):
         update = types.SimpleNamespace(callback_query=query)
         context = types.SimpleNamespace(user_data={"course_view_options": [("A", "c1")]})
         with mock.patch.object(menus, "is_user_allowed", return_value=True):
-            asyncio.run(menus.handle_course_view(update, context))
+            run_handler(menus.handle_course_view, update, context)
         self.assertIn("expired", query.message.reply_text.call_args.args[0])
 
 
@@ -369,6 +376,12 @@ class RegistrySemesterTests(unittest.TestCase):
 
 
 class AudioSummarySessionTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID, {"c1": "A", "c2": "B"})
+        from unibot import storage
+        storage.set_ai_personal_enabled(UID, True)
+        self.addCleanup(storage.set_ai_personal_enabled, UID, False)
+
     def test_the_fresh_link_is_fetched_with_the_students_own_session(self):
         from unibot import documents
         query = mock.AsyncMock()
@@ -377,13 +390,13 @@ class AudioSummarySessionTests(unittest.TestCase):
         query.message.reply_text = mock.AsyncMock(return_value=mock.AsyncMock())
         own = object()
         fresh = mock.AsyncMock(return_value=None)
-        with mock.patch.dict(documents.link_cache, {"s7": {"cid": "c1", "name": "slides.pdf"}}), \
+        with mock.patch.dict(documents.link_cache, {"s7": {"cid": "c1", "name": "slides.pdf", "user_id": UID}}), \
                 mock.patch.object(documents, "is_user_allowed", return_value=True), \
                 mock.patch.object(documents, "login_studip", mock.AsyncMock(return_value=own)), \
                 mock.patch.object(documents, "get_fresh_file_url", fresh), \
                 mock.patch.object(documents, "_start_loading_animation", lambda *a: (None, None)), \
                 mock.patch.object(documents, "_stop_loading_animation", mock.AsyncMock()):
-            asyncio.run(documents.handle_file_audio_summary(types.SimpleNamespace(callback_query=query), None))
+            run_handler(documents.handle_file_audio_summary, types.SimpleNamespace(callback_query=query), None)
         self.assertIs(fresh.call_args.kwargs["session"], own)
         self.assertEqual(fresh.call_args.kwargs["user_id"], UID)
 
@@ -399,6 +412,9 @@ class FolderViewCleanupTests(unittest.TestCase):
 
 
 class EnrollTimeFormatTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID)
+
     def test_short_times_are_accepted(self):
         from unibot.enrollment import normalize_enroll_time, validate_fastenroll_args
         self.assertEqual(normalize_enroll_time("8:30"), "08:30:00")
@@ -418,7 +434,7 @@ class EnrollTimeFormatTests(unittest.TestCase):
         with mock.patch.object(schedule, "save_pending_job", lambda *a: saved.append(a)), \
                 mock.patch("unibot.tasks._run_fastenroll_task", run), \
                 mock.patch.dict(schedule.fastenroll_tasks, {}, clear=True):
-            reply = asyncio.run(schedule.schedule_fastenroll_job(UID, "a" * 32, "8:30", None, None))
+            reply = run_as(UID, schedule.schedule_fastenroll_job(UID, "a" * 32, "8:30", None, None))
         self.assertIn("scheduled", reply)
         self.assertEqual(saved[0][2], "08:30:00")
 
@@ -717,6 +733,9 @@ class CourseDatesOutsideTheTimetableTests(unittest.TestCase):
 
 
 class ReminderHeadingTests(unittest.TestCase):
+    def setUp(self):
+        activate_student(UID)
+
     def _reminder(self, **extra):
         """The reminder texts sent 45 minutes before a 10:00 event."""
         from tests.test_review_round_thirteen import _Frozen, _at, _class

@@ -21,7 +21,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
 # Tests must never touch the real bot database
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, use_temp_db  # noqa: E402
 use_temp_db()
 
 FIXTURES = os.path.join(ROOT, "tests", "fixtures")
@@ -258,7 +258,8 @@ class StudipFilesHtmlTests(unittest.TestCase):
         from unibot import state
         url = f"{api.BASE_URL}/dispatch.php/course/files?cid=c1"
         with mock.patch.object(state, "global_session", FakeSession({url: RuntimeError("down")})):
-            self.assertEqual(asyncio.run(api._list_files_html("c1")), [])
+            with self.assertRaisesRegex(RuntimeError, "down"):
+                asyncio.run(api._list_files_html("c1"))
 
 
 # ── course schedule change alerts ────────────────────────────────────────────
@@ -390,8 +391,9 @@ class MorningSummaryTests(unittest.TestCase):
     def test_calendar_failure_does_not_break_the_summary(self):
         # It used to leave `events` undefined and crash with NameError.
         with mock.patch.object(self.morning, "get_calendar_events", side_effect=RuntimeError("down")):
-            events, today_events = asyncio.run(self.morning._fetch_today_events(object(), date(2026, 11, 4)))
+            events, today_events, available = asyncio.run(self.morning._fetch_today_events(object(), date(2026, 11, 4)))
         self.assertEqual((events, today_events), ([], []))
+        self.assertFalse(available)
         self.assertEqual(self.morning._format_study_windows_section(events, date(2026, 11, 4)).count("Study"), 1)
 
     def test_tasks_are_sorted(self):
@@ -415,6 +417,13 @@ class _StopWatcher(BaseException):
 
 
 class WatcherCycleTests(unittest.TestCase):
+    def setUp(self):
+        from unibot import storage
+        for uid in (1, 5):
+            activate_student(uid)
+            storage.save_personal_record(uid, "personal_check_slots", None)
+            storage.save_personal_record(uid, "personal_check_retry_after", 0)
+
     def test_one_cycle_runs_every_check_and_survives_failures(self):
         watcher = _import("watcher")
         calls = []
@@ -436,6 +445,7 @@ class WatcherCycleTests(unittest.TestCase):
 
         async def broadcast(bot, text, **kwargs):
             sent.append(text)
+            return {"sent": set(kwargs.get("members") or []), "failed": set()}
 
         patches = {
             "ALLOWED_USER_IDS": {1},
@@ -459,7 +469,7 @@ class WatcherCycleTests(unittest.TestCase):
             "check_exam_reminders": job("exam_registrations", fails=True),
             "check_grade_reminders": job("grades"),
             "check_tuition_reminders": job("tuition"),
-            "check_exam_date_reminders": job("exam_dates"),
+            "check_exam_date_reminders": job("exam_dates", result=True),
             "index_course_files": job("index"),
             "run_health_checks": job("health", result={"studip": (False, "down <now>")}),
             "check_new_announcements_parallel": job("announcements"),
@@ -482,7 +492,7 @@ class WatcherCycleTests(unittest.TestCase):
             with self.assertRaises(_StopWatcher):
                 asyncio.run(watcher.unified_watcher_controller(app))
 
-        for expected in ("morning", "calendar", "schedule_changes", "timetable", "tasks", "exam_registrations", "grades",
+        for expected in ("schedule_changes", "timetable", "exam_registrations", "grades",
                          "tuition", "exam_dates", "health", "announcements", "forum"):
             self.assertIn(expected, calls)
         self.assertIn("files", calls)  # throttled to every 30 min, so due on the first cycle
@@ -501,6 +511,7 @@ class WatcherCycleTests(unittest.TestCase):
                 if name in ("registrations", "grades", "tuition"):
                     session, bot, send = args[:3]
                     await send(bot, "personal")
+                return True
             return run
 
         class Bot:
@@ -537,7 +548,7 @@ class WatcherCycleTests(unittest.TestCase):
             exam_cache["notified_open"] = {"MOD1:sitting": "2026-11-05"}
             late = stagger.personal_slots(5, day, season=True)[-1]
             self.assertEqual(cycle(late + timedelta(minutes=1)), everything)
-        self.assertIn("tasks", calls)  # local checks still run every cycle
+        self.assertNotIn("tasks", calls)  # the independent deadline loop owns local reminders
         self.assertEqual(set(sent_to), {5})  # personal alerts reach only that student
 
     def test_staggered_slots_differ_between_students(self):
@@ -561,12 +572,18 @@ class WatcherCycleTests(unittest.TestCase):
 
         async def work():
             runs.append(1)
-            raise RuntimeError("still recorded")
+            if len(runs) == 1:
+                raise RuntimeError("retry after cooldown")
 
         with mock.patch.multiple(watcher, load_general_cache=lambda: dict(cache),
                                  save_general_cache=lambda d: cache.update(d)):
             for _ in range(3):
                 asyncio.run(watcher._run_once_per_period("k", "2026-11-04", "Job", "start", work))
+            self.assertEqual(len(runs), 1)
+            self.assertNotIn("k", cache)
+            self.assertIn("k_retry_after", cache)
+            cache.pop("k_retry_after")
+            asyncio.run(watcher._run_once_per_period("k", "2026-11-05", "Job", "start", work))
             asyncio.run(watcher._run_once_per_period("k", "2026-11-05", "Job", "start", work))
         self.assertEqual(len(runs), 2)
         self.assertEqual(cache["k"], "2026-11-05")
@@ -622,10 +639,60 @@ class DispatchTableTests(unittest.TestCase):
             self.assertIn("handle_selection", self.routes(f"{key}|x"), key)
 
     def test_background_jobs_stay_single_flight(self):
-        mon, schedule, study_plan = (_import(m) for m in ("monitoring", "schedule", "study_plan"))
-        for fn in (mon.check_new_files_parallel, schedule.check_calendar_reminders,
-                   study_plan.index_course_files, study_plan.collect_course_topics, study_plan.collect_course_workload):
+        study_plan = _import("study_plan")
+        for fn in (study_plan.index_course_files, study_plan.collect_course_topics, study_plan.collect_course_workload):
             self.assertTrue(hasattr(fn, "__wrapped__"), fn.__name__)
+
+    def test_file_scans_wait_for_the_previous_snapshot(self):
+        mon = _import("monitoring")
+
+        async def scenario():
+            entered, release = asyncio.Event(), asyncio.Event()
+
+            async def scan(*args):
+                entered.set()
+                await release.wait()
+
+            scan_job = mock.AsyncMock(side_effect=scan)
+            with mock.patch.object(mon, "_file_check_lock", asyncio.Lock()), \
+                    mock.patch.object(mon, "_check_new_files_parallel_unlocked", scan_job):
+                first = asyncio.create_task(mon.check_new_files_parallel(None, 1))
+                await asyncio.wait_for(entered.wait(), 1)
+                second = asyncio.create_task(mon.check_new_files_parallel(None, 2))
+                await asyncio.sleep(0)
+                self.assertEqual(scan_job.await_count, 1)
+                release.set()
+                await asyncio.wait_for(asyncio.gather(first, second), 1)
+                self.assertEqual(scan_job.await_count, 2)
+
+        asyncio.run(scenario())
+
+    def test_calendar_reminders_serialize_each_owner_independently(self):
+        schedule = _import("schedule")
+        for uid in (61001, 61002):
+            activate_student(uid)
+
+        async def scenario():
+            first_entered, other_entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            calls = []
+
+            async def check(bot, uid, silent=False):
+                calls.append(uid)
+                (first_entered if uid == 61001 else other_entered).set()
+                await release.wait()
+
+            with mock.patch.object(schedule, "_check_calendar_reminders", side_effect=check):
+                first = asyncio.create_task(schedule.check_calendar_reminders(None, 61001))
+                await asyncio.wait_for(first_entered.wait(), 1)
+                same = asyncio.create_task(schedule.check_calendar_reminders(None, 61001))
+                other = asyncio.create_task(schedule.check_calendar_reminders(None, 61002))
+                await asyncio.wait_for(other_entered.wait(), 1)
+                self.assertEqual(calls, [61001, 61002])
+                release.set()
+                await asyncio.wait_for(asyncio.gather(first, same, other), 1)
+                self.assertEqual(calls, [61001, 61002, 61001])
+
+        asyncio.run(scenario())
 
 
 # ── StuMS login handoff ──────────────────────────────────────────────────────

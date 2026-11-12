@@ -13,7 +13,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
@@ -142,7 +142,7 @@ class DailyLifeTests(unittest.TestCase):
         from unibot import mensa
         prompts = []
 
-        async def llm(system, user, temperature=0.9):
+        async def llm(system, user, temperature=0.9, can_send=None):
             prompts.append(user)
             return '{"dish": "Pasta", "reasoning": "Cheap."}'
 
@@ -176,6 +176,9 @@ class DailyLifeTests(unittest.TestCase):
 
 class MorningTests(unittest.TestCase):
     def setUp(self):
+        for uid in (8050, 8051, 8052):
+            activate_student(uid)
+            storage.save_personal_record(uid, "morning_summary_sent", {})
         from unibot import schedule, state
         self.schedule, self.state = schedule, state
         state._prepared_morning.clear()
@@ -201,7 +204,7 @@ class MorningTests(unittest.TestCase):
         async def deliver(bot, uids, data, send_at, today_str, slot):
             from unibot import morning
             delivered.append((slot, sorted(uids)))
-            morning._mark_morning_summary_sent(today_str, slot)  # as the real delivery does
+            morning._mark_morning_summary_sent(today_str, slot, uids)  # as the real delivery does
 
         with mock.patch("unibot.morning.prepare_morning_summary", prepare), \
                 mock.patch("unibot.morning._deliver_morning_summary_at", deliver):
@@ -241,6 +244,10 @@ class MorningTests(unittest.TestCase):
 
 
 class PreviousSemesterTests(unittest.TestCase):
+    def setUp(self):
+        for uid in (8060, 8061):
+            activate_student(uid)
+
     def test_previous_semester_courses_only_for_opted_in_students(self):
         from unibot import monitoring, state
         monitoring._prev_semester_courses.clear()
@@ -266,7 +273,7 @@ class PreviousSemesterTests(unittest.TestCase):
                 mock.patch.object(monitoring, "get_semester_options", options), \
                 mock.patch.object(monitoring, "_list_courses_api", api), \
                 mock.patch.object(monitoring, "load_default_semester", lambda uid=None: {}), \
-                mock.patch.object(monitoring, "list_courses", mock.AsyncMock()), \
+                mock.patch.object(monitoring, "list_courses", mock.AsyncMock(side_effect=lambda session=None, user_id=None: [(n, c) for c, n in state.user_courses_map[user_id].items()])), \
                 mock.patch.object(monitoring.course_registry, "has_stored_login", lambda s: True):
             plan = asyncio.run(monitoring.watched_courses())
         self.assertEqual(fetched, [("prev", 8060)])  # with the student's own session, only for 8060
@@ -284,11 +291,12 @@ class SettingsMenuTests(unittest.TestCase):
         query.edit_message_text = mock.AsyncMock()
         query.message.reply_text = mock.AsyncMock()
         with mock.patch.object(settings_menu, "is_user_allowed", lambda u: True):
-            asyncio.run(settings_menu.handle_settings(mock.MagicMock(callback_query=query), None))
+            run_handler(settings_menu.handle_settings, mock.MagicMock(callback_query=query), None)
         return query
 
     def test_buttons_change_preferences(self):
         uid = 8070
+        preferences.set_pref(uid, "outfit", True)
         q = self._tap(uid, "settings")
         self.assertIn("Settings", q.message.reply_text.call_args.args[0])
         self._tap(uid, "settings|cycle|diet")

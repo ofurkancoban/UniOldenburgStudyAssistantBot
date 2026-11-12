@@ -707,9 +707,9 @@ async def collect_course_topics(session, user_id: Optional[int] = None) -> dict:
     which courses to track, only those are scanned."""
     if user_id is None or not get_ai_personal_enabled(user_id):
         cached_topics = load_study_plan_cache()
-        user_courses_map = student_courses(user_id) if user_id is not None else state.courses_map
+        owned_courses = student_courses(user_id) if user_id is not None else state.courses_map
         tracked = load_study_progress(user_id=user_id).get("tracked")
-        course_ids = set(user_courses_map)
+        course_ids = set(owned_courses)
         if tracked is not None:
             course_ids &= set(tracked)
         return {cid: entries for cid, entries in cached_topics.items() if cid in course_ids}
