@@ -31,6 +31,7 @@ from unibot.storage import (
     load_default_semester,
     rebuild_watched_courses,
     save_default_semester,
+    withdraw_course_access,
 )
 from unibot.telegram_ui import (
     user_data,
@@ -395,6 +396,13 @@ async def _submit_course_action(query, user_id: int, course_id: str, action: str
                 return
             operation = enroll_now if action == "enroll" else decline_course
             success, message = await operation(session, course_id, user_id=user_id)
+            if success and is_user_allowed(user_id) and db.private_context_is_current(user_id):
+                if action == "deenroll":
+                    withdraw_course_access(user_id, course_id)
+                else:
+                    db.confirm_course_memberships(user_id, [course_id], float("inf"))
+                    from unibot.monitoring import forget_user_runtime_state
+                    forget_user_runtime_state(user_id)
         except Exception as e:
             logging.error("course %s action failed: %s", action, e)
             await query.message.reply_text(f"❌ Failed: {str(e)[:200]}")

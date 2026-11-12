@@ -38,6 +38,7 @@ class CourseContentIsolationTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(db, "get_all_users", return_value=[
                 {"telegram_id": uid, "is_active": 1, "role": "admin" if uid == 202 else "user"}
                 for uid in self.courses]),
+            mock.patch.object(auth, "is_user_allowed", return_value=True),
             mock.patch.object(telegram_ui, "_is_inactive", return_value=False),
             mock.patch.object(registry, "is_user_allowed", return_value=True),
             mock.patch.object(registry, "lifecycle_state", return_value=registry.ACTIVE),

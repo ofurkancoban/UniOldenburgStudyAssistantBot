@@ -115,6 +115,17 @@ CREATE TABLE IF NOT EXISTS user_courses (
     PRIMARY KEY (user_id, course_id)
 );
 CREATE INDEX IF NOT EXISTS idx_user_courses_course ON user_courses(course_id);
+CREATE TABLE IF NOT EXISTS course_access_revocations (
+    user_id INTEGER NOT NULL,
+    course_id TEXT NOT NULL,
+    revoked_at REAL NOT NULL,
+    PRIMARY KEY (user_id, course_id)
+);
+CREATE TABLE IF NOT EXISTS outgoing_actions (
+    action_key TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 
 -- Private student data, one encrypted row per student and kind; never part
 -- of the shared document store or the course registry.
@@ -643,11 +654,17 @@ def set_user_active(telegram_id: int, is_active: bool) -> None:
 
 
 def set_user_role(telegram_id: int, role: str) -> None:
+    uid = _require_uid(telegram_id)
     with _lock:
-        _connection().execute(
-            "UPDATE users SET role = ? WHERE telegram_id = ?",
-            (role, telegram_id),
-        )
+        conn = _connection()
+        row = conn.execute("SELECT role FROM users WHERE telegram_id = ?", (uid,)).fetchone()
+        if row is None or row[0] == role:
+            return
+        cur = conn.execute("UPDATE users SET role = ? WHERE telegram_id = ?", (role, uid))
+        if cur.rowcount:
+            # Role changes revoke privileges. In-flight work bound to this
+            # account must not continue under the role it observed earlier.
+            _private_write_generation[uid] = _private_write_generation.get(uid, 0) + 1
 
 
 def update_user_studip(telegram_id: int, studip_username: str) -> None:
@@ -1013,7 +1030,6 @@ def mark_course_scanned(course_id: str, scanner_uid: Optional[int], *, file_hash
 def _sync_user_courses(user_id: int, course_ids, now: Optional[float] = None) -> None:
     """Make the user's followed courses exactly `course_ids`: new ones get the
     default preferences, existing ones keep theirs, dropped ones go."""
-    wanted = set(course_ids)
     with _lock:
         context = _private_write_context.get()
         if (user_id in _private_deletions_in_progress
@@ -1022,6 +1038,9 @@ def _sync_user_courses(user_id: int, course_ids, now: Optional[float] = None) ->
             logging.debug("Skipped stale course sync for user %s", user_id)
             return
         conn = _connection()
+        revoked = {r[0] for r in conn.execute(
+            "SELECT course_id FROM course_access_revocations WHERE user_id = ?", (user_id,))}
+        wanted = set(course_ids) - revoked
         have = {r[0] for r in conn.execute("SELECT course_id FROM user_courses WHERE user_id = ?", (user_id,))}
         stamp = now if now is not None else time.time()
         for cid in wanted - have:
@@ -1036,6 +1055,49 @@ def forget_user_courses(user_id: int) -> None:
     uid = _require_uid(user_id)
     with _lock:
         _connection().execute("DELETE FROM user_courses WHERE user_id = ?", (uid,))
+        _connection().execute("DELETE FROM course_access_revocations WHERE user_id = ?", (uid,))
+
+
+def revoked_course_ids(user_id: int) -> set[str]:
+    with _lock:
+        return {row[0] for row in _connection().execute(
+            "SELECT course_id FROM course_access_revocations WHERE user_id = ?", (user_id,))}
+
+
+def revoke_user_course(user_id: int, course_id: str) -> None:
+    """Deny stale snapshots immediately, including across process restarts."""
+    with _transaction() as conn:
+        conn.execute("INSERT OR REPLACE INTO course_access_revocations VALUES (?, ?, ?)",
+                     (user_id, course_id, time.time()))
+        conn.execute("DELETE FROM user_courses WHERE user_id = ? AND course_id = ?", (user_id, course_id))
+
+
+def confirm_course_memberships(user_id: int, course_ids, started_at: float) -> None:
+    """Only a listing begun after withdrawal may confirm a later re-enrollment."""
+    with _lock:
+        for cid in course_ids:
+            _connection().execute(
+                "DELETE FROM course_access_revocations WHERE user_id = ? AND course_id = ? AND revoked_at < ?",
+                (user_id, cid, started_at))
+
+
+def claim_outgoing_action(action_key: str) -> Optional[str]:
+    """Reserve before external I/O; an interrupted send remains uncertain."""
+    with _transaction() as conn:
+        previous = conn.execute("SELECT state FROM outgoing_actions WHERE action_key = ?", (action_key,)).fetchone()
+        if previous:
+            return previous[0]
+        conn.execute("INSERT INTO outgoing_actions VALUES (?, 'pending', ?)", (action_key, time.time()))
+    return None
+
+
+def finish_outgoing_action(action_key: str, state: Optional[str]) -> None:
+    with _lock:
+        if state is None:
+            _connection().execute("DELETE FROM outgoing_actions WHERE action_key = ?", (action_key,))
+        else:
+            _connection().execute("UPDATE outgoing_actions SET state = ?, updated_at = ? WHERE action_key = ?",
+                                  (state, time.time(), action_key))
 
 
 def course_followers(course_id: str) -> list[int]:

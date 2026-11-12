@@ -4,7 +4,6 @@ dotenvModule.config({ path: '../.env' });
 import express from 'express';
 import makeWASocket, { DisconnectReason, jidNormalizedUser } from '@whiskeysockets/baileys';
 import { pino } from 'pino';
-import qrcodeTerminal from 'qrcode-terminal';
 import qrcode from 'qrcode';
 import FormData from 'form-data';
 import https from 'https';
@@ -260,8 +259,10 @@ async function _connectToWhatsApp() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('QR Code received, scan please:');
-            qrcodeTerminal.generate(qr, { small: true });
+            // The QR payload grants a WhatsApp session pairing. Never print
+            // it into persistent service logs; deliver it only to the
+            // configured administrator through Telegram.
+            console.log('WhatsApp pairing QR generated; sending it to the configured administrator.');
             sendQRToTelegram(qr);
         }
 

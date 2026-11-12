@@ -584,6 +584,20 @@ def is_user_admin(user_id: Optional[int]) -> bool:
         logging.warning("Admin check failed for a user; not an admin", exc_info=True)
         return False
 
+
+def private_request_is_current(user_id: Optional[int]) -> bool:
+    """Check allowlist and request-generation ownership at a private-data boundary.
+
+    Call this inside ``acting_as(user_id)`` or another user-bound private write
+    context. It intentionally does not imply that a university login exists.
+    """
+    if user_id is None or not is_user_allowed(user_id):
+        return False
+    try:
+        return db.private_context_is_current(user_id)
+    except Exception:
+        return False
+
 # ── single-instance lock ───────────────────────────────────────────────────────
 LOCK_FILE = ".bot_instance.lock"
 _instance_lock_fd: Optional[int] = None

@@ -244,7 +244,7 @@ async def _fetch_today_events(session, today_date, user_id: Optional[int] = None
     except Exception as e:
         logging.error("Summary schedule fetch error: %s", e)
         return [], [], False
-    return events, [ev for ev in events if ev["date_key"] == today_date], True
+    return events, [ev for ev in events if ev["date_key"] == today_date], getattr(events, "complete", True)
 
 
 async def _fetch_lunch_pick(loc_id: str = "2", user_id: Optional[int] = None) -> Optional[dict]:

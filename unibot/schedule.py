@@ -205,7 +205,7 @@ async def check_calendar_reminders(bot, chat_id, silent: bool = False):
             return
         async with locks.setdefault(chat_id, asyncio.Lock()):
             if db.private_context_is_current(chat_id):
-                await _check_calendar_reminders(bot, chat_id, silent=silent)
+                return await _check_calendar_reminders(bot, chat_id, silent=silent)
 
 
 async def _check_calendar_reminders(bot, chat_id, silent: bool = False):
@@ -216,6 +216,7 @@ async def _check_calendar_reminders(bot, chat_id, silent: bool = False):
     session = user_session or state.global_session
     reminders = None
     updated = False
+    delivery_ok = True
     try:
         if not silent:
             logging.info("⏰ Checking calendar reminders for %s...", chat_id)
@@ -228,9 +229,6 @@ async def _check_calendar_reminders(bot, chat_id, silent: bool = False):
         if (not db.private_context_is_current(chat_id)
                 or not is_user_allowed(chat_id) or lifecycle_state(chat_id) != ACTIVE):
             return
-        if not events:
-            return
-
         now = datetime.now(TZ_BERLIN)
 
         # Only the day's *first* class gets the weather-based earlier
@@ -329,9 +327,12 @@ async def _check_calendar_reminders(bot, chat_id, silent: bool = False):
                     reminders[event_key] = int(now.timestamp())
                     updated = True
                 except Exception as e:
+                    delivery_ok = False
                     logging.error("Failed to send reminder for %s: %s", title, e)
 
         # Study window reminders (30 minutes before, window: 25-35 minutes)
+        if not getattr(events, "complete", True):
+            return False  # unknown appointments must not become free study time
         today_windows = find_study_windows_for_day(events, now.date(), user_id=chat_id)
         for w in today_windows:
             if (not db.private_context_is_current(chat_id)
@@ -385,6 +386,7 @@ async def _check_calendar_reminders(bot, chat_id, silent: bool = False):
                     reminders[study_key] = int(now.timestamp())
                     updated = True
                 except Exception as e:
+                    delivery_ok = False
                     logging.error("Failed to send study session reminder: %s", e)
 
             # The block has just started: send the study pack (course, work
@@ -407,6 +409,7 @@ async def _check_calendar_reminders(bot, chat_id, silent: bool = False):
                     record_study_block(chat_id, int(start_dt.timestamp()), "sent", course[1] if course else None,
                                        w["duration_minutes"])
                 except Exception as e:
+                    delivery_ok = False
                     logging.error("Failed to send study pack: %s", e)
 
         # Cleanup old reminders (older than 24 hours)
@@ -417,6 +420,7 @@ async def _check_calendar_reminders(bot, chat_id, silent: bool = False):
             updated = True
     except Exception as e:
         log = logging.debug if getattr(e, "quiet", False) else logging.error
+        delivery_ok = False
         log("❌ Error in check_calendar_reminders: %s", e)
     finally:
         # Persist any reminders already delivered even if a later event or
@@ -426,7 +430,10 @@ async def _check_calendar_reminders(bot, chat_id, silent: bool = False):
             try:
                 save_reminders_cache(reminders, user_id=chat_id)
             except Exception:
+                delivery_ok = False
                 logging.error("Could not save calendar reminders for %s", chat_id, exc_info=True)
+
+    return delivery_ok and db.private_context_is_current(chat_id) and is_user_allowed(chat_id)
 
 
 # ── Calendar, Schedule & Activity Stream helpers ──────────────────────────────
@@ -496,6 +503,11 @@ EXTRA_COURSE_EVENTS_CACHE_SECONDS = 600  # dates of courses outside the weekly t
 _COURSE_EVENTS_CACHE: dict[str, tuple[float, list]] = {}  # cid -> (expires at, /courses/{cid}/events data)
 
 
+class CalendarEvents(list):
+    """Calendar rows with an explicit completeness flag for planning consumers."""
+    complete: bool = True
+
+
 async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[int] = None, session: Optional[object] = None) -> list[dict]:
     """Fetch and merge calendar events for `[week_start, week_start + days)` from:
       1. `/users/{id}/schedule` (recurring `seminar-cycle-dates` + schedule entries)
@@ -520,7 +532,7 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
             if slot.get("location"):
                 cycle_locs[(cid, slot["weekday"], slot["start"][:5])] = slot["location"]
 
-    events: list[dict] = []
+    events = CalendarEvents()
     # Event titles and times are not unique: parallel groups can meet under the
     # same course title at the same time, and students can create duplicate
     # personal appointments. Prefer Stud.IP's resource ID so only the same
@@ -545,6 +557,7 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
             return cid, data
         except Exception as exc:
             logging.warning("_get_calendar_events_api: /courses/%s/events unavailable: %s", cid, exc)
+            events.complete = False
             return cid, []
 
     # Courses outside the weekly timetable (/users/{id}/schedule lists only regular
@@ -564,6 +577,7 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
             data, _ = await studip_api_get_all(f"/courses/{cid}/events", session=session, user_id=user_id)
         except Exception as exc:
             logging.warning("_get_calendar_events_api: /courses/%s/events unavailable: %s", cid, exc)
+            events.complete = False
             return cid, []
         _COURSE_EVENTS_CACHE[cid] = (time.time() + EXTRA_COURSE_EVENTS_CACHE_SECONDS, data)
         return cid, data
@@ -730,6 +744,7 @@ async def _get_calendar_events_api(week_start, days: int = 7, user_id: Optional[
         # Personal events are optional; preserve course schedule results if
         # the personal calendar endpoint is temporarily unavailable.
         logging.warning("Personal calendar events unavailable: %s: %s", type(exc).__name__, exc)
+        events.complete = False
 
     events.sort(key=lambda e: e["start_dt"])
     return events
@@ -871,7 +886,7 @@ async def get_calendar_events(session, week_start, days: int = 7, user_id: Optio
     """
     events = await _get_calendar_events_api(week_start, days=days, user_id=user_id, session=session)
     if not events:
-        return []
+        return events
 
     cids_to_fetch: set[str] = {
         ev["course_id"]

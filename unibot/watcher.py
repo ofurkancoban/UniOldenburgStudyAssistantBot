@@ -289,7 +289,9 @@ async def _send_calendar_reminders(bot):
             return
         try:
             with acting_as(uid):
-                await asyncio.wait_for(check_calendar_reminders(bot, uid, silent=True), 60)
+                completed = await asyncio.wait_for(check_calendar_reminders(bot, uid, silent=True), 60)
+                if completed is not True:
+                    raise RuntimeError("calendar reminder fetch or delivery did not complete")
         except Exception as exc:
             failures = _cycle_failures.get()
             if failures is not None:

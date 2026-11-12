@@ -5,11 +5,12 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 
 import asyncio
 import contextlib
+import inspect
 import logging
 import os
 import signal
 import subprocess
-from typing import Any
+from typing import Any, Awaitable
 
 import psutil
 import atexit
@@ -18,6 +19,7 @@ from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeChat, BotCom
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
+    BaseUpdateProcessor,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -29,6 +31,42 @@ from telegram.error import BadRequest, Forbidden, NetworkError, TelegramError
 
 
 from unibot import db, state
+
+
+class UserUpdateProcessor(BaseUpdateProcessor):
+    """Serialize one student's wizard while other students keep working."""
+
+    def __init__(self):
+        super().__init__(4096)
+        self._capacity = asyncio.Semaphore(16)
+        self._owners: dict[int, tuple[asyncio.Lock, int]] = {}
+
+    async def initialize(self) -> None:
+        pass
+
+    async def shutdown(self) -> None:
+        pass
+
+    async def do_process_update(self, update: object, coroutine: Awaitable[Any]) -> None:
+        owner = getattr(getattr(update, "effective_user", None), "id", None)
+        key = owner if isinstance(owner, int) else id(update)
+        lock, pending = self._owners.get(key, (asyncio.Lock(), 0))
+        self._owners[key] = (lock, pending + 1)
+        started = False
+        try:
+            async with lock, self._capacity:
+                started = True
+                await coroutine
+        finally:
+            if not started and inspect.iscoroutine(coroutine):
+                coroutine.close()
+            remaining = self._owners[key][1] - 1
+            if remaining:
+                self._owners[key] = (lock, remaining)
+            else:
+                self._owners.pop(key, None)
+
+
 from unibot.config import (
     ALLOWED_USER_IDS,
     PROJECT_ROOT,
@@ -514,7 +552,8 @@ async def main():
             logging.warning("⚠️ Not logged in to Stud.IP yet. Starting bot so you can sign in via /login.")
 
         # validate_settings() requires the token; every API call is spaced and survives flood waits
-        app = ApplicationBuilder().token(TELEGRAM_TOKEN or "").rate_limiter(TelegramSafetyLimiter()).build()
+        app = (ApplicationBuilder().token(TELEGRAM_TOKEN or "")
+               .concurrent_updates(UserUpdateProcessor()).rate_limiter(TelegramSafetyLimiter()).build())
         register_handlers(app)
 
         # Explicitly initialize and start the application
@@ -555,7 +594,7 @@ async def main():
         await restore_pending_fastenroll_jobs(app)
 
         logging.info("🤖 Starting Telegram bot polling...")
-        await app.updater.start_polling(drop_pending_updates=True)
+        await app.updater.start_polling(drop_pending_updates=False)
         logging.info("✅ Telegram polling started successfully")
 
         logging.info("💬 Bot is now online and listening for messages.")

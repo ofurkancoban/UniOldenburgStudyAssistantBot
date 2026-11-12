@@ -561,10 +561,16 @@ async def _check_new_announcements_parallel_unlocked(bot, chat_id, silent: bool 
                     logging.warning("Announcements API failed for %s (%s), falling back to the overview page", course_name, e)
                 try:
                     url = f"{BASE_URL}/dispatch.php/course/overview?cid={cid}"
-                    async with await session.get(url) as r:
-                        if r.status != 200:
-                            raise RuntimeError(f"course overview answered HTTP {r.status}")
-                        html_text = await r.text()
+                    async def fetch_overview(scan_session):
+                        async with await scan_session.get(url) as response:
+                            if response.status != 200:
+                                raise RuntimeError(f"course overview answered HTTP {response.status}")
+                            return await response.text()
+
+                    html_text, used_session = await course_registry.scan_with_failover(
+                        cid, session, fetch_overview,
+                    )
+                    course_registry.record_scan(cid, used_session)
 
                     if "loginform" in html_text:
                         logging.warning("🔐 Session expired while accessing %s.", course_name)
@@ -934,8 +940,10 @@ async def _scan_course_files(course_name: str, cid: str, cache: dict, session=No
                 return [], False
             logging.warning("File API failed for %s with every member (%s), falling back to the HTML page",
                             course_name, e)
-            files = await _list_course_files_recursive(cid, session, _list_files_html)
-            used = session
+            files, used = await course_registry.scan_with_failover(
+                cid, session,
+                lambda scan_session: _list_course_files_recursive(cid, scan_session, _list_files_html),
+            )
             api_ok = False
         if not files:
             if api_ok:

@@ -42,6 +42,7 @@ from unibot.storage import (
     set_ai_personal_enabled,
 )
 from unibot.watcher import PERSONAL_LAST_KEY, _run_stums_checks, _user_sender, mark_personal_check
+from unibot.security_events import log_security_event
 
 MANUAL_CHECK_KEY = "personal_check_manual"
 MANUAL_CHECK_COOLDOWN_SECONDS = 3600
@@ -299,6 +300,7 @@ async def handle_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await delete_personal_data(user_id)
         except Exception:
+            log_security_event("personal_data_deletion", actor_id=user_id, outcome="failed")
             logging.error("Personal data deletion did not complete for user %s", user_id, exc_info=True)
             text, markup = delete_confirm_view()
             await query.edit_message_text(
@@ -308,6 +310,7 @@ async def handle_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=markup,
             )
             return
+        log_security_event("personal_data_deletion", actor_id=user_id)
         if context.user_data is not None:
             for key in ("pending_step", "task_wizard", "fastenroll_wizard", "studip_reply_target",
                         "pending_voice", "pending_voice_clarify"):

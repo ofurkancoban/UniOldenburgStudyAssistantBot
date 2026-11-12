@@ -102,7 +102,8 @@ def _full_file_sender(it: dict, text: str, keyboard, downloader_uid: Optional[in
         document = shared.get("file_id")
         if document is None:
             try:
-                if not is_user_allowed(downloader_uid) or lifecycle_state(downloader_uid) != ACTIVE:
+                if (not is_user_allowed(downloader_uid) or lifecycle_state(downloader_uid) != ACTIVE
+                        or not has_course_access(downloader_uid, it.get("cid"))):
                     raise RuntimeError("designated downloader is no longer active")
                 session = get_user_session(downloader_uid) or state.global_session
                 if session is None:
@@ -116,7 +117,8 @@ def _full_file_sender(it: dict, text: str, keyboard, downloader_uid: Optional[in
                     content = await read_response_limited(resp, FULL_FILE_MAX_BYTES)
                 if len(content) > FULL_FILE_MAX_BYTES:
                     raise RuntimeError(f"{len(content)} bytes")
-                if not is_user_allowed(downloader_uid) or lifecycle_state(downloader_uid) != ACTIVE:
+                if (not is_user_allowed(downloader_uid) or lifecycle_state(downloader_uid) != ACTIVE
+                        or not has_course_access(downloader_uid, it.get("cid"))):
                     raise RuntimeError("designated downloader was blocked during the download")
             except Exception as e:
                 logging.info("Full file alert for %s falls back to the card: %s", it.get("name"), e)

@@ -11,7 +11,7 @@ import os
 import tempfile
 import uuid
 from collections.abc import Mapping
-from typing import Optional
+from typing import Optional, TypedDict
 
 from telegram import (
     InlineKeyboardButton,
@@ -31,6 +31,12 @@ from unibot.config import ADMIN_USER_IDS, ALLOWED_USER_IDS
 from unibot.storage import has_course_access
 
 nav_names: dict[int, list[str]] = {}  # user_id -> [name1, name2, ...]  (for breadcrumb)
+
+
+class BroadcastResult(TypedDict):
+    sent: list[int]
+    failed: list[int]
+    sender_revoked: bool
 
 
 def user_data(context) -> dict:
@@ -197,7 +203,7 @@ def broadcast_targets(cid: Optional[str] = None, members=None) -> set:
                 targets |= {u["telegram_id"] for u in db.get_all_users() if u.get("is_active", 1)}
             except Exception:
                 logging.debug("User list unavailable", exc_info=True)
-        return {uid for uid in targets if not _is_inactive(uid)}
+        return {uid for uid in targets if _is_allowed_target(uid) and not _is_inactive(uid)}
 
     targets = {uid for uid in members if _takes_course(uid, cid)} if members is not None else set()
     try:
@@ -209,12 +215,24 @@ def broadcast_targets(cid: Optional[str] = None, members=None) -> set:
                 targets.add(uid)
     except Exception:
         logging.debug("Ignored a non-critical error", exc_info=True)
-    return {uid for uid in targets if not _is_inactive(uid)}
+    return {uid for uid in targets if _is_allowed_target(uid) and not _is_inactive(uid)}
 
 
 def _takes_course(uid: int, cid: str) -> bool:
     """Whether trusted enrollment data permits this student's course access."""
     return has_course_access(uid, cid)
+
+
+def _is_allowed_target(uid: int) -> bool:
+    """Resolve current allowlist state lazily to preserve package layering."""
+    from unibot.auth import is_user_allowed
+    return is_user_allowed(uid)
+
+
+def _private_recipient_context_is_current(uid: int) -> bool:
+    """Use the shared authorization invariant at the last send boundary."""
+    from unibot.auth import private_request_is_current
+    return private_request_is_current(uid)
 
 
 def _is_inactive(uid: int) -> bool:
@@ -243,7 +261,8 @@ async def broadcast(
     reply_markup=None,
     cid: Optional[str] = None,
     members=None,
-):
+    sender_user_id: Optional[int] = None,
+) -> BroadcastResult:
     """Send a message with optional reply markup; return delivery counts.
 
     HTML announcements may exceed Telegram's per-message limit after escaping
@@ -252,26 +271,51 @@ async def broadcast(
     """
     sent_ids = []
     failed_ids = []
+    sender_revoked = False
     messages = split_html(text) if parse_mode == "HTML" else [text]
     for uid in broadcast_targets(cid, members):
+        if sender_user_id is not None and not _broadcast_sender_is_admin(sender_user_id):
+            sender_revoked = True
+            break
+        recipient_complete = True
         try:
-            for index, message in enumerate(messages):
-                await bot.send_message(
-                    chat_id=uid,
-                    text=message,
-                    parse_mode=parse_mode,
-                    disable_notification=disable_notification,
-                    reply_markup=(markup_for(uid, reply_markup)
-                                  if index == len(messages) - 1 else None),
-                )
-                if index < len(messages) - 1:
-                    await asyncio.sleep(0.3)
-            sent_ids.append(uid)
-            await asyncio.sleep(0.3)  # Telegram rate limit safety
+            with db.private_write_context(uid):
+                for index, message in enumerate(messages):
+                    if sender_user_id is not None and not _broadcast_sender_is_admin(sender_user_id):
+                        sender_revoked = True
+                        recipient_complete = False
+                        break
+                    if (not _private_recipient_context_is_current(uid) or _is_inactive(uid)
+                            or (cid is not None and not has_course_access(uid, cid))):
+                        raise PermissionError("Recipient access changed before broadcast delivery")
+                    await bot.send_message(
+                        chat_id=uid, text=message, parse_mode=parse_mode,
+                        disable_notification=disable_notification,
+                        reply_markup=markup_for(uid, reply_markup) if index == len(messages) - 1 else None,
+                    )
+                    if sender_user_id is not None and not _broadcast_sender_is_admin(sender_user_id):
+                        sender_revoked = True
+                        recipient_complete = False
+                        break
+                    if index < len(messages) - 1:
+                        await asyncio.sleep(0.3)
+            if recipient_complete:
+                sent_ids.append(uid)
+            else:
+                failed_ids.append(uid)
+            if sender_revoked:
+                break
+            await asyncio.sleep(0.3)
         except Exception as e:
             failed_ids.append(uid)
             logging.warning("Failed to send broadcast to %s: %s", uid, e)
-    return {"sent": sent_ids, "failed": failed_ids}
+    return {"sent": sent_ids, "failed": failed_ids, "sender_revoked": sender_revoked}
+
+
+def _broadcast_sender_is_admin(user_id: int) -> bool:
+    """A role revoked during fan-out stops all later recipient sends."""
+    from unibot.auth import is_user_admin, is_user_allowed
+    return is_user_allowed(user_id) and is_user_admin(user_id)
 
 
 async def _show_typing(sender, action=ChatAction.TYPING):

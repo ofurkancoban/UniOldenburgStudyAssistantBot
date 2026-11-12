@@ -53,6 +53,7 @@ from unibot.auth import (
 from unibot.studip_api import get_studip_user_profile, list_courses
 from unibot.ai import check_gwdg_health, check_openrouter_health
 from unibot.weather import check_weather_health, load_weather_location
+from unibot.security_events import log_security_event
 
 
 async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -518,7 +519,17 @@ async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━\n"
             "<i>Sent to all registered students.</i>"
         )
-        result = await broadcast(context.bot, announcement, parse_mode="HTML", disable_notification=False)
+        result = await broadcast(
+            context.bot, announcement, parse_mode="HTML", disable_notification=False,
+            sender_user_id=user.id,
+        )
+        sender_current = _admin_authority_is_current(user.id)
+        outcome = "revoked" if result.get("sender_revoked") or not sender_current else (
+            "failed" if result["failed"] else "success"
+        )
+        log_security_event("admin_broadcast", actor_id=user.id, outcome=outcome)
+        if result.get("sender_revoked") or not sender_current:
+            return
         sent_count = len(result["sent"])
         failed_count = len(result["failed"])
         if failed_count:
@@ -639,6 +650,11 @@ def _is_protected_admin(user_id: int) -> bool:
             or user_id == PRIMARY_ADMIN_ID)
 
 
+def _admin_authority_is_current(user_id: int) -> bool:
+    """Recheck live access and role after an awaited admin operation."""
+    return is_user_allowed(user_id) and is_user_admin(user_id)
+
+
 def _build_user_detail_view(target_id: int, viewer_id: int):
     """The admin dashboard's view of one user, or None when the user is gone."""
     target = db.get_user(target_id)
@@ -691,6 +707,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     user = query.from_user
     if not user or not is_user_admin(user.id):
+        log_security_event("admin_callback", actor_id=getattr(user, "id", None), outcome="denied")
         await query.answer("⛔ Access denied. Admin-only feature.", show_alert=True)
         return
 
@@ -710,6 +727,9 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
                 await query.answer("Cannot revoke this administrator's session.", show_alert=True)
                 return
             await _perform_logout(user_id=target_id)
+            log_security_event("admin_session_revoked", actor_id=user.id, subject_id=target_id)
+            if not _admin_authority_is_current(user.id):
+                return
             notice = "Stud.IP session revoked and credentials cleared."
         else:
             if _is_protected_admin(target_id) or target_id == user.id:
@@ -732,10 +752,14 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
                     clear_pending_job(target_id)
                     for task in (fastenroll_tasks.pop(target_id, None) or {}).values():
                         task.cancel()
+                log_security_event(
+                    "admin_account_state_changed", actor_id=user.id, subject_id=target_id,
+                )
                 notice = f"User {'activated' if new_state else 'blocked'}."
             elif target:
                 new_role = "user" if target["role"] == "admin" else "admin"
                 db.set_user_role(target_id, new_role)
+                log_security_event("admin_role_changed", actor_id=user.id, subject_id=target_id)
                 notice = f"Role updated to {new_role}."
         data = f"admin_user_detail|{target_id}"
 
@@ -748,10 +772,14 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
             await query.answer("User not found.", show_alert=True)
             return
         await query.answer(notice, show_alert=bool(notice))
+        if not _admin_authority_is_current(user.id):
+            return
         await query.edit_message_text(view[0], parse_mode="HTML", reply_markup=view[1])
         return
 
     await query.answer()
+    if not _admin_authority_is_current(user.id):
+        return
 
     if data == "admin_menu":
         # This is also the Cancel button on the pending broadcast prompt.
@@ -813,6 +841,8 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
     if data == "admin_new_invite":
         code = db.create_invite_token(created_by=user.id, label="Dashboard Generated", expires_days=7.0)
         bot_me = await context.bot.get_me()
+        if not _admin_authority_is_current(user.id):
+            return
         deep_link = f"https://t.me/{bot_me.username}?start=inv_{code.replace('-', '').lower()}"
         text = (
             "✅ <b>New Invite Code Generated</b>\n"
@@ -869,5 +899,7 @@ async def handle_admin_callbacks(update: Update, context: ContextTypes.DEFAULT_T
 
     if data == "admin_restart_confirm":
         await query.edit_message_text("♻️ <b>Restarting bot...</b>", parse_mode="HTML")
+        if not _admin_authority_is_current(user.id):
+            return
         state.spawn(_restart_process(), name="restart")
         return

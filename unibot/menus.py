@@ -817,7 +817,7 @@ async def _selection_folder(update, context, query, data, user_id):
 
     user_sess = get_user_session(user_id)
     files = await list_files(cid, folder_url, session=user_sess, user_id=user_id)
-    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
         return
     await send_folder(query, files, cid, user_id, current_url=folder_url)
 
@@ -839,7 +839,7 @@ async def _selection_file(update, context, query, data, user_id):
         await query.message.reply_text("⚠️ Invalid file reference. Cache may have expired.")
         logging.error("❌ Invalid file reference: cid=%s, fname=%s", cid, fname)
         return
-    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
         return
 
     # Check cached or current URL
@@ -860,7 +860,7 @@ async def _selection_file(update, context, query, data, user_id):
                         await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
                         return
 
-                    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+                    if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
                         return
 
                     await _send_file_bytes(query.message, content, fname, sid)
@@ -890,7 +890,7 @@ async def _selection_file(update, context, query, data, user_id):
 
     try:
         url = await get_fresh_file_url(cid, fname, current_url, session=user_sess, user_id=user_id)
-        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
             return
         if not url:
             await query.message.reply_text(f"⚠️ Could not get download link for:\n{fname}")
@@ -902,7 +902,7 @@ async def _selection_file(update, context, query, data, user_id):
             **info,
             "url": url,
             "ts": time.time(),
-            "user_id": user_id  # Save current user
+            **({} if info.get("shared") is True or info.get("user_id") is None else {"user_id": user_id})
         }
         cleanup_link_cache()
 
@@ -918,7 +918,7 @@ async def _selection_file(update, context, query, data, user_id):
                     await query.message.reply_text("⚠️ File too large for Telegram (>48MB).")
                     return
 
-                if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+                if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
                     return
 
                 await _send_file_bytes(query.message, content, fname, sid, caption=f"✅ {fname}")
@@ -960,7 +960,7 @@ async def _selection_nav(update, context, query, data, user_id):
         if nav_stack.get(user_id):
             back_url = nav_stack[user_id][-1]
             files = await list_files(cid, back_url, session=get_user_session(user_id), user_id=user_id)
-            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
                 return
             await send_folder(query, files, cid, user_id, current_url=back_url)
         else:
@@ -970,7 +970,7 @@ async def _selection_nav(update, context, query, data, user_id):
             nav_names[user_id] = [student_courses(user_id).get(cid, f"Course {cid[:6]}")]
             user_sess = get_user_session(user_id)
             files = await list_files(cid, root_url, session=user_sess, user_id=user_id)
-            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
                 return
             await send_folder(query, files, cid, user_id, current_url=root_url)
 
@@ -980,19 +980,19 @@ async def _selection_nav(update, context, query, data, user_id):
         nav_names[user_id] = [student_courses(user_id).get(cid, f"Course {cid[:6]}")]
         user_sess = get_user_session(user_id)
         files = await list_files(cid, root_url, session=user_sess, user_id=user_id)
-        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
             return
         await send_folder(query, files, cid, user_id, current_url=root_url)
 
     elif action == "courses":
         user_sess = get_user_session(user_id)
         courses = await list_courses(session=user_sess, user_id=user_id)
-        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
             return
         await _send_courses_menu(query, courses)
 
     elif action == "zip":
-        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
             return
         current_url = info.get("current_url") or (
             nav_stack.get(user_id, [None])[-1] if nav_stack.get(user_id) else None)
@@ -1006,7 +1006,7 @@ async def _selection_nav(update, context, query, data, user_id):
         await _show_typing(query, action=ChatAction.UPLOAD_DOCUMENT)
 
         async def progress(total, current):
-            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+            if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
                 return
             pct = int((current / total) * 100) if total else 100
             try:
@@ -1033,7 +1033,7 @@ async def _selection_nav(update, context, query, data, user_id):
             await msg.edit_text("⚠️ None of the files could be downloaded, so no ZIP was created.")
             return
 
-        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
             return
 
         zip_name = f"{root_name}.zip"
@@ -1062,7 +1062,7 @@ async def _selection_nav(update, context, query, data, user_id):
             await query.message.reply_text(summary, parse_mode="HTML")
             return
 
-        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
             return
         await msg.edit_text(f"✅ {success_count} files added, sending ZIP...")
         await query.message.reply_document(document=buf, filename=zip_name)
@@ -1122,7 +1122,7 @@ async def _selection_message(update, context, query, data, user_id):
             body_container = soup.select_one("div.formatted-content, .message-content, .formatted-content.ck-content")
             content = clean_html_text(body_container) if body_container else "No content found."
 
-        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+        if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
             return
 
         # Send to Telegram
@@ -1141,7 +1141,7 @@ async def _selection_message(update, context, query, data, user_id):
         if chunks:
             await query.message.reply_text(f"{header}{chunks[0]}", parse_mode="HTML")
             for part in chunks[1:]:
-                if not is_user_allowed(user_id) or not db.private_context_is_current(user_id):
+                if not is_user_allowed(user_id) or not db.private_context_is_current(user_id) or not link_cache_owned_by(info, user_id):
                     return
                 await query.message.reply_text(part, parse_mode="HTML")
         else:
@@ -1344,7 +1344,18 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
             "━━━━━━━━━━━━━━━━━━\n"
             "<i>Sent to all registered students.</i>"
         )
-        result = await broadcast(context.bot, announcement, parse_mode="HTML", disable_notification=False)
+        result = await broadcast(
+            context.bot, announcement, parse_mode="HTML", disable_notification=False,
+            sender_user_id=update.effective_user.id,
+        )
+        from unibot.security_events import log_security_event
+        sender_current = is_user_allowed(update.effective_user.id) and is_user_admin(update.effective_user.id)
+        outcome = "revoked" if result.get("sender_revoked") or not sender_current else (
+            "failed" if result["failed"] else "success"
+        )
+        log_security_event("admin_broadcast", actor_id=update.effective_user.id, outcome=outcome)
+        if result.get("sender_revoked") or not sender_current:
+            return True
         sent_count = len(result["sent"])
         failed_count = len(result["failed"])
         if failed_count:

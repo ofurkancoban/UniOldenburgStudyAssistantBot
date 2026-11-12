@@ -5,7 +5,8 @@ from unibot.studip_api import (
     _parse_file_date_v2,
     file_date_timestamp,
 )
-from urllib.parse import urlsplit
+import re
+from urllib.parse import parse_qs, urlsplit
 
 
 def _file_identity(file: dict) -> str:
@@ -18,6 +19,13 @@ def _file_identity(file: dict) -> str:
     if url:
         try:
             parts = urlsplit(url)
+            match = re.search(r"/(?:file-refs|file/download)/([^/]+)(?:/content)?$", parts.path)
+            query = parse_qs(parts.query)
+            resource = match.group(1) if match else None
+            if parts.path.endswith("/sendfile.php"):
+                resource = next((query[key][0] for key in ("file_id", "id") if query.get(key)), None)
+            if resource:
+                return f"id:{resource}"
             if parts.path:
                 # Stud.IP file links identify the resource in the path. Keep
                 # the query too for legacy download routes that put the ID there.
@@ -68,6 +76,16 @@ def _diff_course_files(current: dict, old: dict) -> tuple[list, list]:
     unmatched_old = set(old)
     for identity, file in current.items():
         old_identity = identity if identity in unmatched_old else None
+        if old_identity is None:
+            aliases = {_file_identity({"url": file.get("url")})}
+            if file.get("id"):
+                aliases.add(f"id:{file['id']}")
+            matches = [key for key in unmatched_old if isinstance(old.get(key), dict)
+                       and not (file.get("id") and old[key].get("id") and file["id"] != old[key]["id"])
+                       and (aliases & {_file_identity(old[key]), _file_identity({"url": old[key].get("url")})})
+                       and file.get("url") and old[key].get("url")]
+            if len(matches) == 1:
+                old_identity = matches[0]
         if old_identity is None:
             # Migrate cache entries written by older releases, which used the
             # filename as the key. This also avoids announcing every existing

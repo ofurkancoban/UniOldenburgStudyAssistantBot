@@ -132,6 +132,8 @@ def link_cache_owned_by(info: Any, user_id: int) -> bool:
     """Allow explicitly shared course links and the student's own browser links."""
     if not isinstance(info, dict):
         return False
+    if info.get("cid") and not has_course_access(user_id, info["cid"]):
+        return False
     owner = info.get("user_id")
     if owner is None:
         # `shared` is explicit on current course alert cards. Keep their
@@ -187,6 +189,12 @@ def has_course_access(user_id: Optional[int], cid: Optional[str]) -> bool:
     if (not isinstance(user_id, int) or isinstance(user_id, bool)
             or not isinstance(cid, str) or not cid):
         return False
+    try:
+        if cid in db.revoked_course_ids(user_id):
+            return False
+    except Exception:
+        logging.warning("Course revocation lookup failed for %s", user_id, exc_info=True)
+        return False
     if cid in (state.user_courses_map.get(user_id) or {}):
         return True
     try:
@@ -200,6 +208,29 @@ def has_course_access(user_id: Optional[int], cid: Optional[str]) -> bool:
             and cid in state.courses_map)
 
 
+def withdraw_course_access(user_id: int, cid: str) -> None:
+    """Invalidate enrollment and held content before reporting withdrawal."""
+    db.revoke_user_course(user_id, cid)
+    state.user_courses_map.get(user_id, {}).pop(cid, None)
+    if getattr(state.global_session, "user_id", None) == user_id:
+        state.courses_map.pop(cid, None)
+        state._courses_map_refreshed_at = 0.0
+    state.course_members.get(cid, set()).discard(user_id)
+    from unibot.course_registry import forget_user_course
+    forget_user_course(user_id, cid)
+    scope = db.get_user_scope(user_id)
+    queued = scope.private("alert_queue")
+    if isinstance(queued, list):
+        scope.save_private("alert_queue", [
+            item for item in queued if not isinstance(item, dict) or item.get("cid") != cid
+        ])
+    for sid, info in list(link_cache.items()):
+        if info.get("cid") == cid and info.get("user_id") == user_id:
+            link_cache.pop(sid, None)
+    from unibot.monitoring import forget_user_runtime_state
+    forget_user_runtime_state(user_id)
+
+
 def student_courses(user_id: Optional[int]) -> dict:
     """{cid: title} of the student's own courses: their fetched course list,
     else the courses the registry knows they follow (titles from the
@@ -207,9 +238,10 @@ def student_courses(user_id: Optional[int]) -> dict:
     to the watcher's map. Never another student's courses."""
     if user_id is None:
         return {}
+    revoked = db.revoked_course_ids(int(user_id))
     own = state.user_courses_map.get(user_id)
     if own:
-        return dict(own)
+        return {cid: name for cid, name in own.items() if cid not in revoked}
     try:
         cids = db.get_user_scope(int(user_id)).course_ids()
     except Exception:
@@ -224,10 +256,10 @@ def student_courses(user_id: Optional[int]) -> dict:
             except Exception:
                 logging.debug("Course title unavailable", exc_info=True)
             titles[cid] = (row or {}).get("title") or state.courses_map.get(cid) or cid
-        return titles
+        return {cid: name for cid, name in titles.items() if cid not in revoked}
     watcher = state.global_session
     if watcher is not None and getattr(watcher, "user_id", None) == user_id:
-        return dict(state.courses_map)
+        return {cid: name for cid, name in state.courses_map.items() if cid not in revoked}
     return {}
 
 # Buttons on course alerts (shared course content, no personal data) keep

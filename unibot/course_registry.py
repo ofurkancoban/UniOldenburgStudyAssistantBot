@@ -79,6 +79,11 @@ def _session_active(uid: Optional[int]) -> bool:
     return uid is None or (is_user_allowed(uid) and lifecycle_state(uid) == ACTIVE)
 
 
+def _can_scan_course(uid: Optional[int], cid: str) -> bool:
+    """Require a named student's live enrollment before using their session."""
+    return _session_active(uid) and (uid is None or has_course_access(uid, cid))
+
+
 def _candidate_uid(cid: str, session) -> Optional[int]:
     return next((uid for uid, candidate in _candidates.get(cid, []) if candidate is session), _uid_of(session))
 
@@ -128,11 +133,26 @@ def forget_user(user_id: int) -> None:
     _failed_at.pop(uid, None)
 
 
+def forget_user_course(user_id: int, course_id: str) -> None:
+    """Remove a withdrawn student's session from a course's scan plan."""
+    uid = int(user_id)
+    candidates = _candidates.get(course_id) or []
+    remaining = [(candidate_uid, sess) for candidate_uid, sess in candidates
+                 if candidate_uid != uid]
+    if remaining:
+        _candidates[course_id] = remaining
+        _rotation[course_id] = 0
+    else:
+        _candidates.pop(course_id, None)
+        _rotation.pop(course_id, None)
+    _failed_at.pop(uid, None)
+
+
 def pick_scanner(cid: str, now: Optional[float] = None):
     """The next healthy member session for the course (round-robin), any
     member session when none is healthy, None when the course has none."""
     cands = _candidates.get(cid) or []
-    eligible = [c for c in cands if _session_active(c[0])]
+    eligible = [c for c in cands if _can_scan_course(c[0], cid)]
     if not eligible:
         return None
     now = now if now is not None else time.time()
@@ -146,9 +166,9 @@ def pick_scanner(cid: str, now: Optional[float] = None):
 def failover_order(cid: str, primary, now: Optional[float] = None) -> list:
     """The primary session first, then the course's other healthy members."""
     now = now if now is not None else time.time()
-    order = [primary] if primary is not None and _session_active(_candidate_uid(cid, primary)) else []
+    order = [primary] if primary is not None and _can_scan_course(_candidate_uid(cid, primary), cid) else []
     for uid, sess in _candidates.get(cid) or []:
-        if sess is not primary and _healthy(uid, sess, now):
+        if sess is not primary and _can_scan_course(uid, cid) and _healthy(uid, sess, now):
             order.append(sess)
     return order
 
@@ -160,7 +180,8 @@ async def scan_with_failover(cid: str, primary, fetch: Callable[..., Awaitable])
     global failover_count
     last_error: Optional[BaseException] = None
     for sess in failover_order(cid, primary):
-        if not _session_active(_candidate_uid(cid, sess)):
+        uid = _candidate_uid(cid, sess)
+        if not _can_scan_course(uid, cid):
             continue
         try:
             result = await fetch(sess)
@@ -173,6 +194,10 @@ async def scan_with_failover(cid: str, primary, fetch: Callable[..., Awaitable])
             report_failure(sess)
             logging.warning("Scanner %s failed for course %s (%s), trying the next member",
                             _uid_of(sess), cid, e)
+            continue
+        # A withdrawal can complete while the HTTP read is in flight. Do not
+        # let that stale response enter the shared scan cache or alert pipeline.
+        if not _can_scan_course(uid, cid):
             continue
         report_success(sess)
         if sess is not primary:
@@ -461,7 +486,8 @@ async def fan_out(bot, cid: Optional[str], kind: str, text: str, title_text: str
             except Exception as e:
                 logging.warning("Failed to deliver a %s alert to %s: %s", kind, uid, e)
                 if (not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE
-                        or not db.private_context_is_current(uid)):
+                        or not db.private_context_is_current(uid)
+                        or (cid is not None and not has_course_access(uid, cid))):
                     counts["skipped"] += 1
                     continue
                 try:

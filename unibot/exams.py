@@ -379,6 +379,8 @@ async def handle_examopen_wa_confirm(update: Update, context: ContextTypes.DEFAU
         await query.answer("This message is already being sent.", show_alert=True)
         return
     await query.answer("Sending to WhatsApp...")
+    if not is_user_admin(query.from_user.id) or not db.private_context_is_current(query.from_user.id):
+        return
     sid = query.data.split("|", 1)[1]
     info = _exam_action(sid, query.from_user.id)
     if not info:

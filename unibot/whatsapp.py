@@ -3,6 +3,7 @@
 Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
+import hashlib
 import html
 import logging
 import re
@@ -16,7 +17,8 @@ from unibot.config import (
     get_wa_group_id,
     set_wa_group_id,
 )
-from unibot.auth import is_user_admin
+from unibot import db
+from unibot.auth import ACTIVE, current_user_id, is_user_admin, is_user_allowed, lifecycle_state
 from unibot.storage import shared_http
 
 
@@ -64,6 +66,11 @@ async def handle_forward_wa_cancel(update: Update, context: ContextTypes.DEFAULT
         logging.warning("handle_forward_wa_cancel: failed to restore markup: %s", e)
 
 
+def _forward_allowed(uid) -> bool:
+    return (uid is not None and is_user_admin(uid) and is_user_allowed(uid)
+            and lifecycle_state(uid) == ACTIVE and db.private_context_is_current(uid))
+
+
 async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forward message to WhatsApp group via Node.js microservice."""
     query = update.callback_query
@@ -72,11 +79,15 @@ async def forward_to_whatsapp(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer(WA_ADMIN_ONLY, show_alert=True)
         return
     await query.answer("Sending to WhatsApp...")
+    if not _forward_allowed(query.from_user.id):
+        return
 
     text = query.message.text or query.message.caption or "No text found"
     text = text.replace(EXAM_DATES_FOOTER, "").rstrip()
     key = (query.message.chat_id, query.message.message_id)
     success, message = await _send_text_to_whatsapp(text, dedupe_key=key)
+    if not _forward_allowed(query.from_user.id):
+        return
     if success:
         await query.edit_message_reply_markup(reply_markup=None)  # Remove button after sending
     await context.bot.send_message(chat_id=query.message.chat_id, text=f"✅ {message}" if success else f"❌ {message}")
@@ -155,6 +166,9 @@ async def _send_text_to_whatsapp(text: str, *, dedupe_key: tuple[int, int] | Non
     never a manually-typed group name (fragile: names can collide or drift
     from what WhatsApp actually has stored, which was silently sending
     nothing in exactly the group-not-found case)."""
+    owner = dedupe_key[0] if dedupe_key is not None else current_user_id()
+    if not _forward_allowed(owner):
+        return False, "Forward cancelled because account access changed."
     group_id = get_wa_group_id()
     if not group_id:
         return False, "No WhatsApp group is set yet. Use /status → \"📱 WhatsApp\" → \"🔍 Detect WA Groups\" and pick one first."
@@ -162,19 +176,38 @@ async def _send_text_to_whatsapp(text: str, *, dedupe_key: tuple[int, int] | Non
         if dedupe_key in _wa_forwards_in_flight:
             return False, "This message is already being sent."
         _wa_forwards_in_flight.add(dedupe_key)
+    action_key = hashlib.sha256(f"wa:{group_id}:{dedupe_key}".encode()).hexdigest() if dedupe_key is not None else None
+    attempted = False
+    claimed = False
     text = _html_to_whatsapp_text(text)
     try:
+        if action_key:
+            previous = db.claim_outgoing_action(action_key)
+            if previous == "sent":
+                return True, "This message was already sent to WhatsApp."
+            if previous is not None:
+                return False, "Delivery status is uncertain. Check the WhatsApp group before sending again."
+            claimed = True
         async with shared_http() as session:
+            if not _forward_allowed(owner):
+                return False, "Forward cancelled because account access changed."
             payload = {"text": text, "groupName": group_id}
+            attempted = True
             async with session.post(f"{WA_SERVICE_URL}/send", headers=WA_HEADERS, json=payload, timeout=10) as resp:
                 if resp.status == 200:
+                    if action_key:
+                        db.finish_outgoing_action(action_key, "sent")
                     return True, "Sent to WhatsApp successfully!"
+                if action_key and 400 <= resp.status < 500:
+                    db.finish_outgoing_action(action_key, None)
                 data = await resp.json()
                 return False, f"Failed to send to WhatsApp: {data.get('error')}"
     except Exception as e:
         logging.error("WhatsApp forward error: %s", e)
         return False, f"Error connecting to WhatsApp service: {e}"
     finally:
+        if action_key and claimed and not attempted:
+            db.finish_outgoing_action(action_key, None)
         if dedupe_key is not None:
             _wa_forwards_in_flight.discard(dedupe_key)
 

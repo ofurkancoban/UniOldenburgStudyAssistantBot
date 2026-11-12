@@ -75,7 +75,7 @@ class RegistryTableTests(unittest.TestCase):
 class ScannerTests(unittest.TestCase):
     def setUp(self):
         for uid in (1, 2, 3):
-            activate_student(uid)
+            activate_student(uid, {"c1": "Course 1"})
         cr._rotation.clear()
         cr._failed_at.clear()
         cr._candidates.clear()

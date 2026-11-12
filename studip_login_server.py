@@ -45,6 +45,8 @@ logger = logging.getLogger("StudIPLoginServer")
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 TOKEN_TTL = 600          # seconds a link token stays valid
 INITDATA_MAX_AGE = 3600  # seconds a Mini App payload stays valid
+PROXY_HTML_MAX_BYTES = 8 * 1024 * 1024
+PROXY_CHUNK_BYTES = 64 * 1024
 PROXY_COOKIE = "_bot_proxy_auth"
 PROXY_SESSION_TTL = 3600
 AUTH_DATE_FUTURE_SKEW_SECONDS = 60
@@ -87,10 +89,67 @@ _STRIP_REQ_PREFIXES = ("x-forwarded-", "cf-", "x-telegram-")
 
 _STRIP_RESP_HEADERS = {
     "content-encoding", "content-length", "transfer-encoding", "connection",
-    "keep-alive", "set-cookie", "x-upstream-set-cookie", "content-security-policy",
-    "content-security-policy-report-only", "x-frame-options",
+    "keep-alive", "set-cookie", "x-upstream-set-cookie", "x-upstream-set-cookie-json", "x-frame-options",
     "strict-transport-security",
 }
+
+
+def _proxy_headers(headers) -> dict:
+    forwarded = {}
+    for key, value in headers.items():
+        if key.lower() in _STRIP_RESP_HEADERS:
+            continue
+        if key.lower() in ("content-security-policy", "content-security-policy-report-only"):
+            # Keep upstream script/resource restrictions while replacing only
+            # frame-ancestors, which must allow the Telegram Mini App.
+            key = ("Content-Security-Policy" if key.lower() == "content-security-policy"
+                   else "Content-Security-Policy-Report-Only")
+            previous = forwarded.get(key)
+            if previous:
+                value = f"{previous}, {value}"
+            policies = []
+            for policy in value.split(","):
+                directives = [
+                    part.strip() for part in policy.split(";")
+                    if part.strip() and part.strip().split(None, 1)[0].lower() != "frame-ancestors"
+                ]
+                directives.append(FRAME_ANCESTORS)
+                policies.append("; ".join(directives))
+            value = ", ".join(policies)
+        if key.lower() == "location":
+            match = _LOCATION_ORIGIN_RE.match(value.strip())
+            if match:
+                value = match.group(1) or "/"
+        forwarded[key] = value
+    forwarded["Cache-Control"] = "no-store"
+    return forwarded
+
+
+def _is_proxy_file_download(path: str, status: int, headers) -> bool:
+    return any(key.lower() == "content-disposition" for key in headers) or (
+        path.rstrip("/") == "/sendfile.php" and not 300 <= status < 400
+    )
+
+
+def _proxy_download_headers(headers) -> dict:
+    """Return browser-safe headers for upstream file bytes."""
+    forwarded = _proxy_headers(headers)
+    forwarded["Content-Disposition"] = "attachment"
+    forwarded["Content-Type"] = "application/octet-stream"
+    forwarded["X-Content-Type-Options"] = "nosniff"
+    return forwarded
+
+
+async def _read_proxy_html(response) -> bytes:
+    length = response.content_length
+    if length is not None and length > PROXY_HTML_MAX_BYTES:
+        raise web.HTTPBadGateway(text="University HTML response exceeded the size limit.")
+    body = bytearray()
+    async for chunk in response.content.iter_chunked(PROXY_CHUNK_BYTES):
+        if len(body) + len(chunk) > PROXY_HTML_MAX_BYTES:
+            raise web.HTTPBadGateway(text="University HTML response exceeded the size limit.")
+        body.extend(chunk)
+    return bytes(body)
 
 
 def _lan_ip() -> str:
@@ -684,6 +743,23 @@ class LoginServer:
             logger.warning("on_session_authenticated hook failed: %s", exc)
 
     # ── reverse proxy ─────────────────────────────────────────────────────
+    async def _stream_proxy_response(self, request, user_id, upstream, response_headers=None):
+        if not self._proxy_session_is_current(request, user_id):
+            return web.Response(status=401, text="Login session expired.", headers={"Cache-Control": "no-store"})
+        headers = response_headers if response_headers is not None else _proxy_headers(upstream.headers)
+        response = web.StreamResponse(status=upstream.status, headers=headers)
+        await response.prepare(request)
+        if request.method != "HEAD" and upstream.status not in (204, 304):
+            async for chunk in upstream.content.iter_chunked(PROXY_CHUNK_BYTES):
+                if not self._proxy_session_is_current(request, user_id):
+                    response.force_close()
+                    if request.transport is not None:
+                        request.transport.close()
+                    raise ConnectionResetError("Proxy access was revoked during streaming")
+                await response.write(chunk)
+        await response.write_eof()
+        return response
+
     async def _proxy(self, request: web.Request) -> web.StreamResponse:
         proxy_sess = self._check_proxy_session(request)
         if not proxy_sess:
@@ -773,8 +849,21 @@ class LoginServer:
                 )
             async with up_resp:
                 status = up_resp.status
-                raw_body = await up_resp.read()
                 up_headers = up_resp.headers
+                is_file_download = _is_proxy_file_download(request.path, status, up_headers)
+                if is_file_download:
+                    # Never let an HTML attachment or inline file execute on
+                    # the authenticated proxy origin. Keep file bytes, but
+                    # force a non-sniffable download in the browser.
+                    download_headers = _proxy_download_headers(up_headers)
+                    return await self._stream_proxy_response(
+                        request, user_id, up_resp, response_headers=download_headers,
+                    )
+                if "text/html" not in up_headers.get("Content-Type", "").lower():
+                    return await self._stream_proxy_response(request, user_id, up_resp)
+                raw_body = await _read_proxy_html(up_resp)
+        except (web.HTTPException, ConnectionResetError):
+            raise
         except Exception as exc:
             logger.error("Proxy upstream error for %s: %s", redact_url(target_url), exc)
             return web.Response(text=f"Upstream error: {exc}", status=502)
@@ -791,20 +880,7 @@ class LoginServer:
                 headers={"Cache-Control": "no-store"},
             )
 
-        resp_headers = {}
-        for k, v in up_headers.items():
-            kl = k.lower()
-            if kl in _STRIP_RESP_HEADERS:
-                continue
-            if kl == "location":
-                m = _LOCATION_ORIGIN_RE.match(v.strip())
-                if m:
-                    v = m.group(1) or "/"
-                resp_headers[k] = v
-                continue
-            resp_headers[k] = v
-
-        resp_headers["Cache-Control"] = "no-store"
+        resp_headers = _proxy_headers(up_headers)
 
         ctype = up_headers.get("Content-Type", "")
         if "text/html" in ctype.lower():

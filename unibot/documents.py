@@ -4,12 +4,13 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 """
 
 import asyncio
+import contextvars
 import html
 import io
 import logging
 import os
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -53,13 +54,17 @@ FILE_AUDIO_SUMMARY_SYSTEM_PROMPT = (
 )
 
 
+_file_access_check: contextvars.ContextVar[Optional[Callable[[], bool]]] = contextvars.ContextVar("document_access_check", default=None)
+
+
 def _personal_ai_allowed(user_id: Optional[int]) -> bool:
     """Whether this task may still send the user's document to an AI provider.
 
     The generation check prevents a request started before personal-data
     deletion from continuing into another provider after the first one fails.
     """
-    return personal_ai_allowed(user_id)
+    check = _file_access_check.get()
+    return personal_ai_allowed(user_id) and (check is None or check())
 
 
 async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,7 +107,7 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
 
     async def cancel_if_stale() -> bool:
         if (is_user_allowed(user_id) and db.private_context_is_current(user_id)
-                and get_ai_personal_enabled(user_id)):
+                and get_ai_personal_enabled(user_id) and link_cache_owned_by(info, user_id)):
             return False
         try:
             await status_msg.edit_text("⚠️ Request cancelled because access, data or AI permission changed.")
@@ -150,7 +155,11 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
 
         if await cancel_if_stale():
             return
-        extracted = await extract_text_from_file_async(fname, content, user_id=user_id)
+        token = _file_access_check.set(lambda: link_cache_owned_by(info, user_id))
+        try:
+            extracted = await extract_text_from_file_async(fname, content, user_id=user_id)
+        finally:
+            _file_access_check.reset(token)
         if await cancel_if_stale():
             return
         if not extracted or len(extracted.strip()) < 40:
@@ -177,7 +186,7 @@ async def handle_file_audio_summary(update: Update, context: ContextTypes.DEFAUL
             temperature=0.3,
             timeout=35,
             reasoning=False,
-            can_send=lambda: _personal_ai_allowed(user_id),
+            can_send=lambda: _personal_ai_allowed(user_id) and link_cache_owned_by(info, user_id),
         )
         if not script:
             await _stop_loading_animation(stop_evt, anim_task)

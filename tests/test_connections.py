@@ -1255,7 +1255,7 @@ class LayeringTests(unittest.TestCase):
 
     def test_monitoring_layers(self):
         # change detection is pure; neither lower layer reaches up to the watchers
-        self.assertEqual(self._imports("unibot/monitoring_diff.py"), {"urllib.parse", "unibot.studip_api"})
+        self.assertEqual(self._imports("unibot/monitoring_diff.py"), {"urllib.parse", "unibot.studip_api", "re"})
         for rel in ("unibot/monitoring_fetch.py", "unibot/monitoring_diff.py", "unibot/monitoring_alerts.py"):
             self.assertNotIn("unibot.monitoring", self._imports(rel), rel)
         self.assertNotIn("telegram", {m.split(".")[0] for m in self._imports("unibot/monitoring_fetch.py")})

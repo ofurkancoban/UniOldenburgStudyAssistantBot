@@ -163,6 +163,8 @@ def _record_course(cid: str, name: str, user_id: Optional[int] = None, semester_
     if semester_id is not None:
         return
     if user_id is not None:
+        if cid in db.revoked_course_ids(user_id):
+            return
         if user_id not in state.user_courses_map:
             state.user_courses_map[user_id] = {}
         state.user_courses_map[user_id][cid] = name
@@ -180,16 +182,19 @@ async def list_courses(
     semester when None), via the JSON:API with the my_courses page as
     fallback. Also records courses in user_courses_map and courses_map."""
     user_id = _course_list_owner(session, user_id)
+    started_at = time.time()
     try:
         courses = await _list_courses_api(semester_id, session=session, user_id=user_id)
-        if courses:
-            for name, cid in courses:
-                _record_course(cid, name, user_id=user_id, semester_id=semester_id)
-            logging.info("✅ %s courses from the Stud.IP API.", len(courses))
-            return courses
     except Exception as e:
         logging.warning("list_courses: API failed (%s), falling back to the my_courses page", e)
-    return await _list_courses_html(semester_id, session=session, user_id=user_id)
+        courses = await _list_courses_html(semester_id, session=session, user_id=user_id)
+    if user_id is not None:
+        db.confirm_course_memberships(user_id, [cid for _, cid in courses], started_at)
+        revoked = db.revoked_course_ids(user_id)
+        courses = [(name, cid) for name, cid in courses if cid not in revoked]
+    for name, cid in courses:
+        _record_course(cid, name, user_id=user_id, semester_id=semester_id)
+    return courses
 
 
 async def _list_courses_html(
