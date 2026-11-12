@@ -46,6 +46,7 @@ files = [
     "unibot/formatting.py",
     "unibot/telegram_ui.py",
     "unibot/auth.py",
+    "unibot/security_events.py",
     "unibot/studip_api.py",
     "unibot/monitoring_fetch.py",
     "unibot/monitoring_diff.py",
