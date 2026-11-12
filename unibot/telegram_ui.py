@@ -314,8 +314,8 @@ async def broadcast(
 
 def _broadcast_sender_is_admin(user_id: int) -> bool:
     """A role revoked during fan-out stops all later recipient sends."""
-    from unibot.auth import is_user_admin, is_user_allowed
-    return is_user_allowed(user_id) and is_user_admin(user_id)
+    from unibot.auth import is_user_admin
+    return is_user_admin(user_id)
 
 
 async def _show_typing(sender, action=ChatAction.TYPING):

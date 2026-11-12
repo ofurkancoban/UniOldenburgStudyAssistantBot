@@ -17,6 +17,7 @@ Entry point: ``python studip_bot.py`` (calls unibot.app.run()).
 # Dependency order, lowest layer first.
 MODULE_ORDER = (
     "config",       # environment, constants, logging (side effects: chdir, .env)
+    "security_events",  # bounded privacy-conscious security audit records
     "db",           # SQLite document store (caches and settings)
     "state",        # mutable runtime state
     "diagnostics",  # read-only connection report for /healthcheck

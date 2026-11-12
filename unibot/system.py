@@ -651,8 +651,8 @@ def _is_protected_admin(user_id: int) -> bool:
 
 
 def _admin_authority_is_current(user_id: int) -> bool:
-    """Recheck live access and role after an awaited admin operation."""
-    return is_user_allowed(user_id) and is_user_admin(user_id)
+    """Recheck the actor's current administrator role after an awaited operation."""
+    return is_user_admin(user_id)
 
 
 def _build_user_detail_view(target_id: int, viewer_id: int):

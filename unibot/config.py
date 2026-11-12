@@ -34,6 +34,7 @@ except ImportError:
 
 # ── env / asyncio ──────────────────────────────────────────────────────────────
 ALLOWED_USER_IDS_ENV = os.getenv("ALLOWED_USER_IDS", "").strip()
+SECURITY_AUDIT_KEY = os.getenv("SECURITY_AUDIT_KEY", "")
 STUDIP_URL = "https://elearning.uni-oldenburg.de/dispatch.php/my_courses"
 
 

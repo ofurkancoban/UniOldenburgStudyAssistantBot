@@ -1349,7 +1349,7 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
             sender_user_id=update.effective_user.id,
         )
         from unibot.security_events import log_security_event
-        sender_current = is_user_allowed(update.effective_user.id) and is_user_admin(update.effective_user.id)
+        sender_current = is_user_admin(update.effective_user.id)
         outcome = "revoked" if result.get("sender_revoked") or not sender_current else (
             "failed" if result["failed"] else "success"
         )

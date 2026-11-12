@@ -8,9 +8,10 @@ operator configures SECURITY_AUDIT_KEY; the key itself is never logged.
 import hashlib
 import hmac
 import logging
-import os
 import re
 from typing import Optional
+
+from unibot.config import SECURITY_AUDIT_KEY
 
 _EVENT_NAME = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _logger = logging.getLogger("security.audit")
@@ -40,7 +41,7 @@ def log_security_event(
         raise ValueError("Invalid security event outcome")
 
     fields = [f"event={event}", f"outcome={outcome}"]
-    key = os.getenv("SECURITY_AUDIT_KEY", "")
+    key = SECURITY_AUDIT_KEY
     if len(key.encode("utf-8")) >= 32:
         actor = _subject_tag(actor_id, key)
         subject = _subject_tag(subject_id, key)

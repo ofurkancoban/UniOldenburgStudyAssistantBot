@@ -49,7 +49,7 @@ class ReauditRegressions(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(auth.private_request_is_current(A))
 
     def test_security_events_log_only_keyed_user_tags(self):
-        with mock.patch.dict(os.environ, {'SECURITY_AUDIT_KEY': 'test-only-audit-key-0123456789abcdef'}), \
+        with mock.patch.object(security_events, 'SECURITY_AUDIT_KEY', 'test-only-audit-key-0123456789abcdef'), \
                 self.assertLogs('security.audit', level='INFO') as captured:
             security_events.log_security_event(
                 'admin_role_changed', actor_id=910101, subject_id=910102,
