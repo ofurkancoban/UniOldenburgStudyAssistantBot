@@ -49,6 +49,7 @@ class PrimaryAdminTests(unittest.TestCase):
         with mock.patch.object(monitoring, "MESSAGE_POLL_SECONDS", 0), \
                 mock.patch.object(monitoring, "PRIMARY_ADMIN_ID", 7192285920), \
                 mock.patch.object(monitoring, "has_stored_login", lambda s: True), \
+                mock.patch.object(monitoring, "is_user_allowed", lambda uid: True), \
                 mock.patch.object(monitoring, "lifecycle_state", lambda uid: auth.ACTIVE), \
                 mock.patch.object(monitoring, "check_new_messages", check), \
                 mock.patch.object(state, "global_session", watcher), \
