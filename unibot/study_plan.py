@@ -69,6 +69,7 @@ from unibot.studip_api import (
     _parse_file_date_v2,
     file_date_sort_key,
     file_date_timestamp,
+    is_shared_folder,
     read_response_limited,
     _switch_semester_filter,
     list_courses,
@@ -356,7 +357,8 @@ async def _list_course_files(cid, skip_folder_re=None, session=None) -> list:
     for item in await list_files(cid, session=session):
         if item.get("type") == "file":
             out.append((None, item))
-        elif item.get("type") == "folder" and item.get("url") and not skip_folder_re.match(item.get("name", "")):
+        elif (item.get("type") == "folder" and item.get("url") and is_shared_folder(item)
+              and not skip_folder_re.match(item.get("name", ""))):
             try:
                 sub = await list_files(cid, item["url"], session=session)
             except Exception as e:
@@ -979,7 +981,8 @@ async def _list_course_files_deep(cid, session=None) -> list:
         if item.get("type") == "file":
             out.append((None, item))
             continue
-        if item.get("type") != "folder" or not item.get("url") or _WORKLOAD_SKIPPED_FOLDER_RE.match(item.get("name", "")):
+        if (item.get("type") != "folder" or not item.get("url") or not is_shared_folder(item)
+                or _WORKLOAD_SKIPPED_FOLDER_RE.match(item.get("name", ""))):
             continue
         try:
             sub = await list_files(cid, item["url"], session=session)
@@ -989,7 +992,7 @@ async def _list_course_files_deep(cid, session=None) -> list:
             if s.get("type") == "file":
                 out.append((item["name"], s))
             elif (
-                s.get("type") == "folder" and s.get("url") and _folder_date(item["name"])
+                s.get("type") == "folder" and s.get("url") and is_shared_folder(s) and _folder_date(item["name"])
                 and (_PROBLEM_SET_FOLDER_RE.match(s.get("name", "")) or _PROJECT_FOLDER_RE.match(s.get("name", "")))
             ):
                 try:

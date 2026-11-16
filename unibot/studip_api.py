@@ -737,6 +737,21 @@ async def _list_courses_api(
     return result
 
 
+# Folder types that only some members of a course see (staff only, one group, hand-in
+# folders, before their release time). What a scan shared with every follower reads
+# (the search index, topics, workload) must not include them: the scanning member may
+# be the one person allowed to see such a folder. A folder without a known type (the
+# HTML fallback gives none) is kept, as before.
+RESTRICTED_FOLDER_TYPES = frozenset({
+    "PermissionEnabledFolder", "HiddenFolder", "CourseGroupFolder", "HomeworkFolder", "TimedFolder",
+})
+
+
+def is_shared_folder(item: dict) -> bool:
+    """Whether a list_files folder item is meant for every member of the course."""
+    return item.get("folder_type") not in RESTRICTED_FOLDER_TYPES
+
+
 async def _list_files_api(cid, folder_url=None, session=None, user_id=None) -> list:
     """One folder level of a course in list_files' format: the course's root
     folder, or the folder a list_files folder "url" points to."""
@@ -765,6 +780,7 @@ async def _list_files_api(cid, folder_url=None, session=None, user_id=None) -> l
             "type": "folder", "name": f["attributes"].get("name", "Unknown Folder"),
             "url": f"{BASE_URL}/dispatch.php/course/files/index/{f['id']}?cid={cid}",
             "size": "-", "modified": modified, "modified_iso": modified_iso,
+            "folder_type": f["attributes"].get("folder-type"),
         })
     file_refs, _ = await studip_api_get_all(f"/folders/{folder_id}/file-refs", session=session, user_id=user_id)
     for f in file_refs:
