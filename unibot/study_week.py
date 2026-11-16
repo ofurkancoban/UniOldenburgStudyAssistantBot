@@ -340,7 +340,9 @@ async def study_buddy_view(user_id: int, now: Optional[datetime] = None) -> tupl
     lines = ["👥 <b>Study Buddy</b>", "",
              "Find common free time with classmates from your courses who use the bot too.",
              "<i>Only the free windows you share are shown to each other, never your timetable. "
-             "Both of you have to turn this on.</i>", "",
+             "Both of you have to turn this on.</i>",
+             "<i>A classmate who turned it on can see your first name, up to two courses you share "
+             "and the times you are both free. Turn it off to disappear from their list.</i>", "",
              f"Status: {'✅ On' if enabled else '🔲 Off'}"]
     if enabled:
         matches = await study_buddy_matches(user_id, _week_start(now.date()), after=now)

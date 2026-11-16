@@ -150,5 +150,31 @@ class EncryptedRemindersTests(unittest.TestCase):
         self.db.delete(storage.REMINDERS_CACHE_PATH)
 
 
+class StudyBuddyDisclosureTests(unittest.TestCase):
+    def test_the_screen_says_what_a_classmate_sees(self):
+        from unibot import study_week
+        for enabled in (False, True):
+            with mock.patch.object(study_week, "get_study_buddy_enabled", lambda uid, enabled=enabled: enabled), \
+                    mock.patch.object(study_week, "study_buddy_matches", mock.AsyncMock(return_value=[])):
+                text, _markup = asyncio.run(study_week.study_buddy_view(UID))
+            self.assertIn("never your timetable", text)
+            self.assertIn("first name", text)
+            self.assertIn("up to two courses you share", text)
+            self.assertIn("Turn it off", text)
+
+    def test_what_the_screen_promises_is_what_is_shown(self):
+        from datetime import datetime
+        from unibot import study_week
+        from studip_utils import TZ_BERLIN
+        start = datetime(2026, 11, 16, 10, tzinfo=TZ_BERLIN)
+        match = {"user_id": 5, "name": "Maria Secret-Surname", "courses": ["A", "B", "C"],
+                 "windows": [{"start_dt": start, "end_dt": start.replace(hour=12), "minutes": 120, "spot": None}]}
+        text = "\n".join(study_week.format_buddy_lines([match]))
+        self.assertIn("Maria", text)
+        self.assertNotIn("Secret-Surname", text)  # the first name only
+        self.assertIn("A, B", text)
+        self.assertNotIn("C", text.replace("Common", ""))  # two courses at most
+
+
 if __name__ == "__main__":
     unittest.main()
