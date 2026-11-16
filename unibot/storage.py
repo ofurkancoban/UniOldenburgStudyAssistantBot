@@ -449,23 +449,54 @@ def save_study_plan_cache(data: dict) -> None:
         logging.error("Failed to save study plan cache: %s", e)
 
 
+REMINDERS_RECORD = "calendar_reminders"
+
+
+def _legacy_reminders_path(user_id) -> str:
+    return f"reminders_cache_{user_id}.json"
+
+
 def load_reminders_cache(user_id: Optional[int] = None):
-    path = f"reminders_cache_{user_id}.json" if user_id else REMINDERS_CACHE_PATH
-    if db.exists(path):
-        try:
-            value = db.load(path)
-            if isinstance(value, dict):
-                return value
-            logging.warning("Reminder cache %s has an invalid top-level shape; starting empty", path)
-        except Exception as e:
-            logging.warning("Could not load reminders cache: %s", e)
+    """Which lecture reminders were already sent. A student's own list is in
+    their encrypted record (it holds class titles and times); a plain
+    per-student document from before is moved there on first read."""
+    if not user_id:
+        path = REMINDERS_CACHE_PATH
+        if db.exists(path):
+            try:
+                value = db.load(path)
+                if isinstance(value, dict):
+                    return value
+                logging.warning("Reminder cache %s has an invalid top-level shape; starting empty", path)
+            except Exception as e:
+                logging.warning("Could not load reminders cache: %s", e)
+        return {}
+    try:
+        value = personal_record(user_id, REMINDERS_RECORD)
+        if isinstance(value, dict):
+            return value
+        legacy = _legacy_reminders_path(user_id)
+        if db.exists(legacy):
+            old = db.load(legacy)
+            if isinstance(old, dict):
+                save_personal_record(user_id, REMINDERS_RECORD, old)  # moved first, then the plain copy goes
+                db.delete(legacy)
+                return old
+            logging.warning("Reminder cache %s has an invalid top-level shape; starting empty", legacy)
+    except Exception as e:
+        logging.warning("Could not load reminders cache: %s", e)
     return {}
 
 
 def save_reminders_cache(data, user_id: Optional[int] = None):
-    path = f"reminders_cache_{user_id}.json" if user_id else REMINDERS_CACHE_PATH
     try:
-        db.save(path, data)
+        if not user_id:
+            db.save(REMINDERS_CACHE_PATH, data)
+            return
+        save_personal_record(user_id, REMINDERS_RECORD, data)
+        legacy = _legacy_reminders_path(user_id)
+        if db.exists(legacy):
+            db.delete(legacy)  # the plain copy must not come back on a later read
     except Exception as e:
         logging.error("Could not save reminders cache: %s", e)
 

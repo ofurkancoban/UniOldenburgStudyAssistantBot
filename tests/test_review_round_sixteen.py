@@ -98,5 +98,57 @@ class VoiceNoteDisclosureTests(unittest.TestCase):
         context.bot.get_file.assert_not_awaited()  # the recording was never even fetched
 
 
+class EncryptedRemindersTests(unittest.TestCase):
+    def setUp(self):
+        from unibot import db
+        self.db = db
+        self.uid = UID + 1
+
+    def test_reminders_are_stored_encrypted_and_per_student(self):
+        from unibot import storage
+        storage.save_reminders_cache({"Statistics canaryreminder|1700000000": 1700000000}, user_id=self.uid)
+        storage.save_reminders_cache({"Other|1": 1}, user_id=self.uid + 100)
+        self.assertEqual(storage.load_reminders_cache(user_id=self.uid), {"Statistics canaryreminder|1700000000": 1700000000})
+        self.assertEqual(storage.load_reminders_cache(user_id=self.uid + 100), {"Other|1": 1})
+        self.assertFalse(self.db.exists(f"reminders_cache_{self.uid}.json"))  # no plain document
+        self.db._connection().execute("PRAGMA wal_checkpoint(FULL)")
+        data = b""
+        for suffix in ("", "-wal"):
+            if os.path.exists(self.db._db_path() + suffix):
+                with open(self.db._db_path() + suffix, "rb") as fh:
+                    data += fh.read()
+        self.assertNotIn(b"canaryreminder", data)  # the title is not in the file in the clear
+
+    def test_a_plain_document_from_before_is_moved_on_first_read(self):
+        from unibot import storage
+        legacy = f"reminders_cache_{self.uid + 1}.json"
+        self.db.save(legacy, {"Lecture|5": 5})
+        self.assertEqual(storage.load_reminders_cache(user_id=self.uid + 1), {"Lecture|5": 5})
+        self.assertFalse(self.db.exists(legacy))
+        self.assertEqual(self.db.get_user_scope(self.uid + 1).private("cache.calendar_reminders"), {"Lecture|5": 5})
+        self.assertEqual(storage.load_reminders_cache(user_id=self.uid + 1), {"Lecture|5": 5})  # and it stays
+
+    def test_saving_removes_a_plain_copy_left_over(self):
+        from unibot import storage
+        legacy = f"reminders_cache_{self.uid + 2}.json"
+        self.db.save(legacy, {"Old|1": 1})
+        storage.save_reminders_cache({"New|2": 2}, user_id=self.uid + 2)
+        self.assertFalse(self.db.exists(legacy))
+        self.assertEqual(storage.load_reminders_cache(user_id=self.uid + 2), {"New|2": 2})
+
+    def test_deleting_a_students_data_clears_it(self):
+        from unibot import storage
+        storage.save_reminders_cache({"Gone|1": 1}, user_id=self.uid + 3)
+        self.db.get_user_scope(self.uid + 3).delete_private(keep=(self.db.TASKS_KIND,))
+        self.assertEqual(storage.load_reminders_cache(user_id=self.uid + 3), {})
+
+    def test_the_account_without_a_student_keeps_its_shared_document(self):
+        from unibot import storage
+        storage.save_reminders_cache({"Shared|1": 1})
+        self.assertEqual(storage.load_reminders_cache(), {"Shared|1": 1})
+        self.assertTrue(self.db.exists(storage.REMINDERS_CACHE_PATH))
+        self.db.delete(storage.REMINDERS_CACHE_PATH)
+
+
 if __name__ == "__main__":
     unittest.main()
