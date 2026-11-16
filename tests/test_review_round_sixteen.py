@@ -421,12 +421,15 @@ class StumsReconnectNoticeTests(unittest.TestCase):
         self.assertFalse(sent_again)
         bot_again.send_message.assert_not_awaited()
 
-    def test_checks_that_fail_while_paused_send_the_notice_once_a_check_failing_otherwise_does_not(self):
+    def test_the_notice_only_comes_after_automatic_sign_in_failed_for_hours(self):
         from unibot import watcher
-        for paused in (True, False):
+        import time as _time
+        for case in ("first failure", "failing for hours", "not paused"):
             session = _StumsSession()
             session.user_id = self.uid
-            session.stums.blocked_until = (__import__("time").time() + 600) if paused else 0.0
+            session.stums.blocked_until = 0.0 if case == "not paused" else _time.time() + 600
+            if case == "failing for hours":
+                session.stums.failing_since = _time.time() - watcher.STUMS_NOTICE_AFTER_SECONDS - 60
             notice = mock.AsyncMock()
             with mock.patch.object(watcher, "check_exam_reminders", mock.AsyncMock(return_value=None)), \
                     mock.patch.object(watcher, "check_grade_reminders", mock.AsyncMock(return_value=None)), \
@@ -434,7 +437,18 @@ class StumsReconnectNoticeTests(unittest.TestCase):
                     mock.patch.object(watcher, "notify_stums_reconnect", notice):
                 with self.assertRaises(RuntimeError):
                     run_as(self.uid, watcher._run_stums_checks(mock.AsyncMock(), session, mock.AsyncMock()))
-            self.assertEqual(notice.await_count, 1 if paused else 0, f"paused={paused}")
+            self.assertEqual(notice.await_count, 1 if case == "failing for hours" else 0, case)
+
+
+class CookieFlagTests(unittest.TestCase):
+    def test_a_cookie_with_an_unknown_flag_is_kept(self):
+        from http.cookies import SimpleCookie
+        import studip_session
+        header = "JSESSIONID=abc; Path=/qisserver; Secure; HttpOnly; SameSite=Lax; Partitioned"
+        self.assertEqual(len(SimpleCookie(header)), 0)  # the stock parser loses it
+        jar = SimpleCookie()
+        jar.load(studip_session._strip_unknown_cookie_flags(header))
+        self.assertEqual(jar["JSESSIONID"].value, "abc")
 
 
 class WorkerUsageTests(unittest.TestCase):

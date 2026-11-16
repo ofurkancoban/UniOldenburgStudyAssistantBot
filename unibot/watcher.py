@@ -82,6 +82,7 @@ from unibot.system import HEALTH_CHECK_LABELS, run_health_checks
 
 FILE_WATCHER_INTERVAL = 30 * 60
 CONTENT_SCAN_INTERVAL_SECONDS = 8 * 60  # announcements and forum posts
+STUMS_NOTICE_AFTER_SECONDS = 3 * 3600  # automatic StuMS sign-in must fail this long before the student is asked
 
 
 def _cache_datetime(value) -> Optional[datetime]:
@@ -363,9 +364,13 @@ async def _run_stums_checks(bot, session, send) -> bool:
             failed.append(label)
     if failed:
         if user_id is not None and session.stums.blocked_until > time.time():
-            # StuMS refused the sign-in and the retry pause is on: the student has to reconnect,
-            # nothing else brings their exam and grade alerts back
-            await _guarded("StuMS reconnect notice", notify_stums_reconnect, bot, user_id)
+            # The bot signs in again by itself every retry pause. Only when that has failed for
+            # hours is the student asked to reconnect by hand.
+            now = time.time()
+            if not session.stums.failing_since:
+                session.stums.failing_since = now
+            elif now - session.stums.failing_since >= STUMS_NOTICE_AFTER_SECONDS:
+                await _guarded("StuMS reconnect notice", notify_stums_reconnect, bot, user_id)
         raise RuntimeError("StuMS check delivery or fetch failed: " + ", ".join(failed))
     return True
 

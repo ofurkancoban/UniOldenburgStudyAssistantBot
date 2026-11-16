@@ -257,6 +257,7 @@ class StumsState:
     verified_at: float = 0.0
     referer: Optional[str] = None
     blocked_until: float = 0.0
+    failing_since: float = 0.0  # in memory only: when automatic sign-in started failing
     _lock: Optional[asyncio.Lock] = field(default=None, repr=False)
     _lock_loop: object = field(default=None, repr=False)
 
@@ -290,6 +291,23 @@ class StumsState:
         if self._lock is None or self._lock_loop is not loop:
             self._lock, self._lock_loop = asyncio.Lock(), loop
         return self._lock
+
+
+_KNOWN_COOKIE_ATTRIBUTES = {"expires", "path", "comment", "domain", "max-age", "secure", "httponly", "version",
+                            "samesite"}
+
+
+def _strip_unknown_cookie_flags(header: str) -> str:
+    """Drop Set-Cookie attributes SimpleCookie does not know (e.g. Partitioned).
+
+    SimpleCookie silently discards the whole cookie when it meets one, which
+    would lose a session cookie."""
+    parts = header.split(";")
+    kept = [parts[0]]
+    for part in parts[1:]:
+        if part.strip().split("=", 1)[0].strip().lower() in _KNOWN_COOKIE_ATTRIBUTES:
+            kept.append(part)
+    return ";".join(kept)
 
 
 class StudIPSession(SsoFlowMixin):
@@ -438,12 +456,16 @@ class StudIPSession(SsoFlowMixin):
         for header in raw:
             jar_entry = SimpleCookie()
             try:
-                jar_entry.load(header)
+                jar_entry.load(_strip_unknown_cookie_flags(header))
             except CookieError:
-                self.logger.debug("Skipping unparsable cookie from %s", redact_url(real_url))
+                self.logger.warning("Dropped an unparsable cookie from %s (name %r)", redact_url(real_url),
+                                    header.split("=", 1)[0].strip()[:40])
                 continue
             if jar_entry:
                 self._client.cookie_jar.update_cookies(jar_entry, response_url=URL(real_url))
+            else:
+                self.logger.warning("Dropped an empty cookie parse from %s (name %r)", redact_url(real_url),
+                                    header.split("=", 1)[0].strip()[:40])
 
     async def _send_once(self, method: str, url: str, headers: dict, body: dict, timeout, extra: dict):
         host = (urlsplit(url).hostname or "").lower()

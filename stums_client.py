@@ -157,6 +157,7 @@ def _mark_stums_verified(session, referer: str) -> str:
     session.stums.verified_at = time.time()
     session.stums.referer = referer
     session.stums.blocked_until = 0.0
+    session.stums.failing_since = 0.0
     return referer
 
 
@@ -256,6 +257,8 @@ async def _establish_stums_session(session) -> str:
                 raise RuntimeError(f"StuMS SSO handoff failed: {e}") from e
             if await _stums_logged_in(session, referer):
                 return _mark_stums_verified(session, referer)
+            logging.warning("StuMS handoff attempt %s ended at %r without a session; StuMS cookie names: %s",
+                            attempt, redact_url(referer), _stums_cookie_names(session))
             if attempt == 1:
                 logging.info("exam_reminder: StuMS session expired; dropping StuMS cookies and signing in again")
                 session.session.cookie_jar.clear_domain(STUMS_HOST)
@@ -265,6 +268,15 @@ async def _establish_stums_session(session) -> str:
             "StuMS portal still shows you as logged out. Background checks retry in "
             f"{STUMS_RETRY_SECONDS // 60} min."
         )
+
+
+def _stums_cookie_names(session) -> list:
+    """Names only, never values."""
+    try:
+        from yarl import URL
+        return sorted(session.session.cookie_jar.filter_cookies(URL(STUDY_PLANNER_URL)).keys())
+    except Exception:
+        return []
 
 
 def _has_stums_cookie(session) -> bool:

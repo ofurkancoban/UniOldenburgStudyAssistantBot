@@ -195,6 +195,11 @@ class SsoFlowMixin:
 
         # 1. Entry
         async with self._s_get(entry_url, headers={"Referer": referer} if referer else None) as r:
+            try:
+                hops = [(urlparse(str(h.url)).netloc, urlparse(str(h.url)).path, h.status) for h in r.history]
+                self.logger.info("SSO entry redirect chain (host, path, status): %s", hops)
+            except Exception:
+                self.logger.debug("Could not summarise the SSO redirect chain", exc_info=True)
             curr_url, curr_text = await follow_redirects(unroute_proxy_url(str(r.url)), await r.text(), "entry")
 
         # 2. Main state-machine loop
