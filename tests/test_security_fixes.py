@@ -150,11 +150,11 @@ class ProxyCookieTests(unittest.TestCase):
 class InviteGuessLimitTests(unittest.TestCase):
     def setUp(self):
         auth._reset_invite_failures()
-        auth._gate_replied.clear()
+        auth._reset_gate_replies()
 
     def tearDown(self):
         auth._reset_invite_failures()
-        auth._gate_replied.clear()
+        auth._reset_gate_replies()
 
     def test_guessing_is_capped_per_account_and_window(self):
         for _ in range(auth.INVITE_MAX_FAILURES):
@@ -347,11 +347,11 @@ class EmptyTimetableTests(unittest.TestCase):
 class InviteGatePersistenceTests(unittest.TestCase):
     def setUp(self):
         auth._reset_invite_failures()
-        auth._gate_replied.clear()
+        auth._reset_gate_replies()
 
     def tearDown(self):
         auth._reset_invite_failures()
-        auth._gate_replied.clear()
+        auth._reset_gate_replies()
 
     def test_the_guess_count_survives_a_restart(self):
         for _ in range(auth.INVITE_MAX_FAILURES):

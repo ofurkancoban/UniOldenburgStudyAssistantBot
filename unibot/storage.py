@@ -894,6 +894,20 @@ def get_primary_user_name() -> Optional[str]:
         return None
 
 
+def forget_user_name(user_id) -> None:
+    """Drop the name Stud.IP gave this student (on logout: it belongs to the
+    signed-in account and comes back with the next sign-in). The primary
+    admin's separate watcher-name copy goes too."""
+    try:
+        uid = int(user_id)
+        delete_personal_record(uid, USER_NAME_RECORD)
+        if uid == PRIMARY_ADMIN_ID:
+            delete_personal_record(uid, WATCHER_NAME_RECORD)
+        _names_migrated.add(uid)  # a legacy shared name must not be taken back in
+    except Exception as e:
+        logging.error("Could not drop the user name: %s", e)
+
+
 def save_user_name(user_id, name: str) -> None:
     try:
         save_personal_record(int(user_id), USER_NAME_RECORD, name)

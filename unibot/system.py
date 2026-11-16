@@ -16,6 +16,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppI
 from telegram.ext import ContextTypes
 
 from datetime import datetime
+from typing import Optional
 import studip_oauth
 from fast_enroll import semester_display
 from studip_utils import TZ_BERLIN, berlin_now
@@ -24,7 +25,6 @@ from unibot import db, state
 from unibot.telegram_ui import user_data, broadcast
 from unibot.config import (
     ADMIN_USER_IDS,
-    ALLOWED_USER_IDS,
     PRIMARY_ADMIN_ID,
     PROJECT_ROOT,
     WA_HEADERS,
@@ -229,6 +229,14 @@ async def healthcheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show detailed bot status"""
     user_id = update.effective_user.id if update.effective_user else None
+    text, markup = await build_status_view(user_id)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+
+async def build_status_view(user_id: Optional[int]) -> tuple:
+    """The /status screen (text, buttons) for this account: the student's own
+    account status, or for an administrator the bot's too. Built fresh each
+    time, so the same view can replace an old status message after a logout."""
     is_admin = is_user_admin(user_id)
 
     use_oauth = studip_oauth.oauth_enabled()
@@ -247,7 +255,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin:
         sess = get_user_session(user_id)
         user_logged_in = await sess.is_logged_in()
-        studip_status = f"✅ Connected ({auth_label})" if user_logged_in else "❌ Not connected"
+        studip_status = "✅ Connected" if user_logged_in else "❌ Not connected"
 
         user_info = db.get_user(user_id) if user_id else None
         db_studip = (user_info.get("studip_username") if user_info else "") or ""
@@ -270,7 +278,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━\n"
             "🎓 <b>Student Account Status</b>\n"
             "━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Stud.IP Account:</b> {html.escape(profile_name or 'Not linked')}\n"
+            # the account name only while connected: after a logout nothing of it stays on screen
+            f"👤 <b>Stud.IP Account:</b> {html.escape((profile_name or 'Not linked') if user_logged_in else 'Not connected')}\n"
             f"🔑 <b>Connection:</b> {studip_status}\n"
             f"📆 <b>Current Semester:</b> {default_semester_label}\n"
             f"📍 <b>Campus / Weather:</b> {weather_location_label}\n"
@@ -296,8 +305,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("📄 Documents & Tuition", callback_data="status_group|docs_tuition"),
             InlineKeyboardButton("🌤️ Weather & Location", callback_data="status_group|weather"),
         ])
-        await update.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(keyboard))
-        return
+        return text, InlineKeyboardMarkup(keyboard)
 
     # ── Administrator full system status ──────────────────────────────────────
     is_active = state.global_session and await state.global_session.is_logged_in()
@@ -391,14 +399,16 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n👀 Watch Previous Semester Too: {'✅ On' if watch_prev else '🔲 Off'}"
 
     studip_name = None
-    try:
-        profile = await get_studip_user_profile()
-        studip_name = profile.get("formatted_name") or profile.get("given_name")
-    except Exception:
-        logging.debug("Stud.IP profile lookup failed", exc_info=True)
-    if not studip_name:
-        studip_name = get_user_name(user_id)
-    text += f"\n👤 Name: {html.escape(studip_name or 'Not connected')} (from Stud.IP)"
+    own_connected = bool(user_id is not None and await get_user_session(user_id).is_logged_in())
+    if own_connected:  # the name comes from the account's own sign-in: none shown once it is gone
+        try:
+            profile = await get_studip_user_profile()
+            studip_name = profile.get("formatted_name") or profile.get("given_name")
+        except Exception:
+            logging.debug("Stud.IP profile lookup failed", exc_info=True)
+        if not studip_name:
+            studip_name = get_user_name(user_id)
+    text += f"\n👤 Name: {html.escape(studip_name or 'Not connected')}" + (" (from Stud.IP)" if studip_name else "")
 
     weather_location = load_weather_location(user_id)
     weather_location_label = (html.escape(f"{weather_location['name']}, {weather_location['country']}")
@@ -424,9 +434,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("⚙️ Admin Dashboard", callback_data="admin_menu")],
     ]
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
-
+    return text, InlineKeyboardMarkup(keyboard)
 
 
 def _format_time_ago(ts: float) -> str:
@@ -646,8 +654,7 @@ async def invite_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _is_protected_admin(user_id: int) -> bool:
     """Administrators set in the environment (and the primary admin): no other
     admin can block them, change their role or revoke their session."""
-    return (user_id in (ADMIN_USER_IDS or set()) or user_id in (ALLOWED_USER_IDS or set())
-            or user_id == PRIMARY_ADMIN_ID)
+    return user_id in (ADMIN_USER_IDS or set()) or user_id == PRIMARY_ADMIN_ID
 
 
 def _admin_authority_is_current(user_id: int) -> bool:

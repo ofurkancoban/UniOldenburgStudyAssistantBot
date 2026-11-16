@@ -13,6 +13,7 @@ import math
 import os
 import re
 import threading
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -548,16 +549,52 @@ def _reset_invite_failures() -> None:
         logging.debug("No invite failure record to reset", exc_info=True)
 
 
+GATE_REPLIES_PATH = "gate_replies.json"
+
+
+def _gate_key(user_id: int) -> str:
+    """A stranger's account is never stored as such, only a hash of it."""
+    return hashlib.sha256(f"gate:{int(user_id)}".encode("ascii")).hexdigest()[:16]
+
+
+def _persisted_gate_replies(now: float) -> dict:
+    try:
+        raw = db.load(GATE_REPLIES_PATH) if db.exists(GATE_REPLIES_PATH) else {}
+    except Exception:
+        logging.debug("Gate reply record unreadable", exc_info=True)
+        raw = {}
+    return {k: t for k, t in (raw or {}).items() if isinstance(t, (int, float)) and now - t < GATE_REPLY_INTERVAL}
+
+
+def _reset_gate_replies() -> None:
+    _gate_replied.clear()
+    try:
+        db.delete(GATE_REPLIES_PATH)
+    except Exception:
+        logging.debug("No gate reply record to reset", exc_info=True)
+
+
 def _gate_reply_due(user_id: int) -> bool:
-    """Whether an unknown account gets the "invite only" reply now (once
-    per GATE_REPLY_INTERVAL, so a flood of messages isn't answered)."""
+    """Whether an unknown account gets the "invite only" reply now: once per
+    GATE_REPLY_INTERVAL, also across restarts (every deploy used to start the
+    count again, so the same stranger got it again after each one)."""
     now = time.time()
     if len(_gate_replied) > 1000:
         for uid in [u for u, t in _gate_replied.items() if now - t >= GATE_REPLY_INTERVAL]:
             _gate_replied.pop(uid, None)
-    if now - _gate_replied.get(user_id, 0.0) < GATE_REPLY_INTERVAL:
+    persisted = _persisted_gate_replies(now)
+    key = _gate_key(user_id)
+    last = max(_gate_replied.get(user_id, 0.0), persisted.get(key, 0.0))
+    if now - last < GATE_REPLY_INTERVAL:
         return False
     _gate_replied[user_id] = now
+    persisted[key] = now
+    try:
+        db.save(GATE_REPLIES_PATH, persisted)
+    except Exception:
+        logging.warning("Could not record a gate reply", exc_info=True)
+    # visible in the log (hash only) so "who keeps getting this" can be answered
+    logging.info("Invite-only reply sent to an unregistered account (%s)", key)
     return True
 
 
@@ -1197,6 +1234,8 @@ async def _perform_logout(user_id: Optional[int] = None) -> None:
         # clear_tokens invalidates in-flight refreshes even when no token is active.
         studip_oauth.clear_tokens(user_id=user_id)
         db.update_user_studip(user_id, "")
+        from unibot.storage import forget_user_name
+        forget_user_name(user_id)  # the name belongs to the signed-in account; /status must not keep showing it
         state.user_courses_map.pop(user_id, None)
         if state.global_session is sess:
             # keep the watcher running on another signed-in admin, if any

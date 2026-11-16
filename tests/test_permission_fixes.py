@@ -167,7 +167,6 @@ class AdminPanelTests(unittest.TestCase):
         update, query = _query_update(admin_id, data)
         with mock.patch.object(system, "is_user_admin", lambda uid: True), \
                 mock.patch.object(system, "ADMIN_USER_IDS", {1}), \
-                mock.patch.object(system, "ALLOWED_USER_IDS", set()), \
                 mock.patch.object(system, "PRIMARY_ADMIN_ID", 1), \
                 mock.patch.object(system, "_perform_logout", mock.AsyncMock()) as logout:
             run_handler(system.handle_admin_callbacks, update, mock.MagicMock())

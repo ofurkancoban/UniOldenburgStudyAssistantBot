@@ -176,5 +176,144 @@ class StudyBuddyDisclosureTests(unittest.TestCase):
         self.assertNotIn("C", text.replace("Common", ""))  # two courses at most
 
 
+class AdministratorDefaultTests(unittest.TestCase):
+    def _admins(self, allowed, admin=""):
+        import subprocess
+        env = {**os.environ, "ALLOWED_USER_IDS": allowed, "ADMIN_USER_IDS": admin,
+               "BOT_LOG_FILE": os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")}
+        out = subprocess.run([sys.executable, "-c", "import unibot.config as c; print(sorted(c.ADMIN_USER_IDS))"],
+                             cwd=ROOT, env=env, capture_output=True, text=True, timeout=60)
+        return out.stdout.strip().splitlines()[-1]
+
+    def test_without_admin_ids_only_the_first_allowed_account_is_an_administrator(self):
+        self.assertEqual(self._admins("5,6"), "[5]")
+        self.assertEqual(self._admins("7"), "[7]")
+        self.assertEqual(self._admins(""), "[]")
+
+    def test_explicit_admin_ids_win(self):
+        self.assertEqual(self._admins("5,6", "6"), "[6]")
+        self.assertEqual(self._admins("5,6", "5,6"), "[5, 6]")
+
+    def test_an_allowed_but_ordinary_account_is_not_protected_from_demotion(self):
+        from unibot import system
+        with mock.patch.object(system, "ADMIN_USER_IDS", {5}), mock.patch.object(system, "PRIMARY_ADMIN_ID", 5):
+            self.assertTrue(system._is_protected_admin(5))
+            self.assertFalse(system._is_protected_admin(6))
+
+
+class SignedOutStatusTests(unittest.TestCase):
+    NAME = "Canary Student"
+
+    def _status(self, *, admin, connected):
+        from unibot import storage, system
+
+        class Session:
+            user_id = UID + 5
+
+            async def is_logged_in(self):
+                return connected
+
+        storage.save_user_name(UID + 5, self.NAME)
+        with mock.patch.object(system, "is_user_admin", return_value=admin), \
+                mock.patch.object(system, "get_user_session", lambda uid=None: Session()), \
+                mock.patch.object(system, "get_studip_user_profile", mock.AsyncMock(return_value={"formatted_name": self.NAME})), \
+                mock.patch.object(system, "_login_public_url", lambda: "http://localhost"), \
+                mock.patch.object(system, "shared_http", mock.MagicMock(side_effect=RuntimeError("no WhatsApp in a test"))):
+            text, markup = asyncio.run(system.build_status_view(UID + 5))
+        return text, markup
+
+    def test_a_student_signed_out_sees_no_name(self):
+        text, _ = self._status(admin=False, connected=False)
+        self.assertNotIn(self.NAME, text)
+        self.assertIn("Not connected", text)
+
+    def test_a_student_signed_in_sees_the_name_but_no_internals(self):
+        text, _ = self._status(admin=False, connected=True)
+        self.assertIn("Connected", text)
+        for internal in ("Self-Healing", "OAuth2", "Cookie"):
+            self.assertNotIn(internal, text)
+
+    def test_an_administrator_signed_out_sees_no_name_either(self):
+        text, _ = self._status(admin=True, connected=False)
+        self.assertNotIn(self.NAME, text)
+        self.assertIn("Name: Not connected", text)
+
+    def test_an_administrator_signed_in_sees_the_name_and_the_bot_status(self):
+        text, markup = self._status(admin=True, connected=True)
+        self.assertIn(self.NAME, text)
+        self.assertIn("Bot Status", text)
+        self.assertIn("Admin Dashboard", " ".join(b.text for row in markup.inline_keyboard for b in row))
+
+    def test_the_student_screen_has_nothing_of_the_administrator(self):
+        text, markup = self._status(admin=False, connected=True)
+        buttons = " ".join(b.text for row in markup.inline_keyboard for b in row)
+        for admin_only in ("Bot Status", "Unified Watcher", "WA Group", "Bot Memory", "Admin Dashboard", "WhatsApp", "Wardrobe"):
+            self.assertNotIn(admin_only, text + " " + buttons, admin_only)
+
+
+class LogoutForgetsTheNameTests(unittest.TestCase):
+    def test_logout_drops_the_name_and_the_old_status_message_is_redrawn(self):
+        import types
+        from unibot import menus, state, storage, system
+        uid = UID + 6
+        storage.save_user_name(uid, "Canary Leaver")
+        self.assertEqual(storage.get_user_name(uid), "Canary Leaver")
+
+        class Session:
+            user_id = uid
+            logged_in = True
+
+            async def logout(self):
+                Session.logged_in = False
+
+            async def close(self):
+                pass
+
+            async def is_logged_in(self):
+                return Session.logged_in
+
+        fake = Session()
+        query = mock.AsyncMock()
+        query.message.text = "old status"
+        query.message.text_html = "old <b>status</b> Canary Leaver"
+        update = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=uid), callback_query=query)
+        with mock.patch.dict(state.user_sessions, {uid: fake}), \
+                mock.patch.object(menus, "is_user_allowed", return_value=True), \
+                mock.patch.object(system, "get_user_session", lambda user_id=None: fake), \
+                mock.patch.object(system, "is_user_admin", return_value=False), \
+                mock.patch.object(system, "_login_public_url", lambda: "http://localhost"):
+            asyncio.run(menus._status_button_studip_logout(update, None, query))
+        self.assertIsNone(storage.get_user_name(uid))
+        edited = query.edit_message_text.call_args.args[0]
+        self.assertNotIn("Canary Leaver", edited)
+        self.assertIn("Not connected", edited)
+        self.assertNotIn("Disconnect", " ".join(b.text for row in query.edit_message_text.call_args.kwargs["reply_markup"].inline_keyboard for b in row))
+        self.assertIn("Logged out", query.message.reply_text.call_args.args[0])
+
+
+class InviteReplyThrottleTests(unittest.TestCase):
+    def setUp(self):
+        from unibot import auth
+        auth._reset_gate_replies()
+        self.addCleanup(auth._reset_gate_replies)
+
+    def test_a_stranger_is_answered_once_even_across_a_restart(self):
+        from unibot import auth
+        self.assertTrue(auth._gate_reply_due(424242))
+        self.assertFalse(auth._gate_reply_due(424242))
+        auth._gate_replied.clear()  # a restart forgets the memory, not the record
+        self.assertFalse(auth._gate_reply_due(424242))
+        self.assertTrue(auth._gate_reply_due(424243))  # another account is its own
+
+    def test_the_stranger_is_logged_and_stored_only_as_a_hash(self):
+        from unibot import auth, db
+        with self.assertLogs(level="INFO") as logs:
+            auth._gate_reply_due(424244)
+        text = " ".join(logs.output)
+        self.assertIn("Invite-only reply", text)
+        self.assertNotIn("424244", text)
+        self.assertNotIn("424244", str(db.load(auth.GATE_REPLIES_PATH)))
+
+
 if __name__ == "__main__":
     unittest.main()

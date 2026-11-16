@@ -56,8 +56,6 @@ ALLOWED_USER_IDS = _parse_allowed_user_ids(ALLOWED_USER_IDS_ENV)
 
 ADMIN_USER_IDS_ENV = os.getenv("ADMIN_USER_IDS", "").strip()
 ADMIN_USER_IDS = _parse_allowed_user_ids(ADMIN_USER_IDS_ENV)
-if not ADMIN_USER_IDS and ALLOWED_USER_IDS:
-    ADMIN_USER_IDS = set(ALLOWED_USER_IDS)
 
 
 def _first_user_id(*env_values: str):
@@ -68,6 +66,15 @@ def _first_user_id(*env_values: str):
             except ValueError:
                 continue
     return None
+
+
+# Without ADMIN_USER_IDS only the first ALLOWED_USER_IDS entry is an administrator
+# (least privilege). It used to be every listed account, which made a second listed
+# person an administrator too: the bot status, the administrator dashboard and the
+# daily health report all went to them.
+if not ADMIN_USER_IDS and ALLOWED_USER_IDS:
+    _only_admin = _first_user_id(ALLOWED_USER_IDS_ENV)
+    ADMIN_USER_IDS = {_only_admin} if _only_admin is not None else set()
 
 
 # The account the single-user era files (studip_cookies.json, ...) belong to:

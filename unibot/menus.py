@@ -103,7 +103,7 @@ from unibot.study_plan import progress_command, study_plan_command, track_course
 from unibot.tasks import _handle_task_wizard_reply, send_tasks_menu
 from unibot.enrollment import _handle_fastenroll_wizard_reply, send_fastenroll_list
 from unibot.voice import nav_stack
-from unibot.system import status_command
+from unibot.system import build_status_view, status_command
 
 
 user_courses: dict[int, str] = {}  # user_id -> cid
@@ -115,10 +115,11 @@ def _status_group_view(group: str, user_id: Optional[int] = None) -> tuple:
     the on/off toggles, which go through status_group_toggle so the
     submenu redraws in place instead of being replaced by a confirmation."""
     if group == "profile":
-        studip_name = get_user_name(user_id) if user_id is not None else None
+        signed_in = user_id is not None and has_stored_login(get_user_session(user_id))
+        studip_name = get_user_name(user_id) if signed_in else None  # no name once signed out
         if studip_name:
             name_line = f"Name: <b>{_h(studip_name)}</b>\n<i>(Automatically synced from Stud.IP)</i>"
-        elif user_id is not None and has_stored_login(get_user_session(user_id)):
+        elif signed_in:
             name_line = "Name: <i>not synced from Stud.IP yet, try again in a minute</i>"
         else:
             name_line = "Name: <i>not signed in, use /login</i>"
@@ -547,16 +548,10 @@ async def _status_button_studip_logout(update, context, query):
     await _perform_logout(user_id=user_id)
     try:
         if query.message and query.message.text:
-            updated_html = query.message.text_html
-            if "🔑 Logged in: ✅ Yes" in updated_html:
-                updated_html = updated_html.replace("🔑 Logged in: ✅ Yes", "🔑 Logged in: ❌ No")
-            if "🔑 <b>Connection:</b> ✅ Connected" in updated_html:
-                updated_html = updated_html.replace("✅ Connected", "❌ Not connected")
-            await query.edit_message_text(
-                updated_html,
-                parse_mode="HTML",
-                reply_markup=query.message.reply_markup,
-            )
+            # redrawn from scratch: patching two words left the name (and everything else
+            # from the signed-in state) on the old message
+            text, markup = await build_status_view(user_id)
+            await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
     except TelegramError:
         pass
     await query.message.reply_text(
