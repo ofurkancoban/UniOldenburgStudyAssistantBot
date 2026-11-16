@@ -196,7 +196,8 @@ class SsoFlowMixin:
         # 1. Entry
         async with self._s_get(entry_url, headers={"Referer": referer} if referer else None) as r:
             try:
-                hops = [(urlparse(str(h.url)).netloc, urlparse(str(h.url)).path, h.status) for h in r.history]
+                hops = [(urlparse(str(h)).netloc, urlparse(str(h)).path) for h in r.history]
+                hops.append((urlparse(str(r.url)).netloc, urlparse(str(r.url)).path, getattr(r, "status", None)))
                 self.last_sso_chain = hops
                 self.logger.info("SSO entry redirect chain (host, path, status): %s", hops)
             except Exception:
