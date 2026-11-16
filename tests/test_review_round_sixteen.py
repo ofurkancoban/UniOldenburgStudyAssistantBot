@@ -73,5 +73,30 @@ class SharedScanFolderTests(unittest.TestCase):
         self.assertEqual([(i["name"], i["folder_type"]) for i in items], [("Tutors only", "HiddenFolder")])  # shown, with its type
 
 
+class VoiceNoteDisclosureTests(unittest.TestCase):
+    def test_the_privacy_screen_says_what_happens_to_a_voice_message(self):
+        from unibot import privacy
+        text, _markup = privacy.privacy_view(UID)
+        lowered = text.lower()
+        self.assertIn("voice messages need the same permission", lowered)
+        self.assertIn("recording itself is sent", lowered)
+        for service in ("GWDG Whisper", "Google"):
+            self.assertIn(service, text)
+
+    def test_a_voice_message_without_permission_is_refused_before_anything_is_sent(self):
+        import types
+        from unibot import monitoring
+        message = mock.AsyncMock()
+        message.voice = types.SimpleNamespace(file_id="f", file_unique_id="u")
+        update = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=UID), message=message,
+                                       effective_chat=types.SimpleNamespace(id=UID))
+        context = types.SimpleNamespace(user_data={}, bot=mock.AsyncMock())
+        with mock.patch.object(monitoring, "is_user_allowed", return_value=True), \
+                mock.patch.object(monitoring, "get_ai_personal_enabled", lambda uid: False):
+            asyncio.run(monitoring.handle_voice_message(update, context))
+        self.assertIn("Privacy", message.reply_text.call_args.args[0])
+        context.bot.get_file.assert_not_awaited()  # the recording was never even fetched
+
+
 if __name__ == "__main__":
     unittest.main()

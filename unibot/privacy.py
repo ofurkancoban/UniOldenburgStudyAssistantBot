@@ -105,7 +105,9 @@ def privacy_view(user_id: int, now: Optional[datetime] = None, note: str = "") -
         "fetched only with your own login. Alerts about them go only to this chat.</i>\n\n"
         "<i>The spoken morning summary, 🔊 Listen and spoken questions are made by outside AI services "
         "(GWDG, OpenRouter and, for wardrobe features, other image services; speech recognition may use Google). They use personal context, including your timetable, tasks, exams, first name, weather place, course-file text for requested summaries or study-plan topics, meal preferences for AI meal suggestions, clothing photos and your reference photo for outfit suggestions, only when you "
-        "allow it. Course announcement or forum text is sent only after you tap its task-suggestion button and only while this permission is on; grades need their own permission.</i>"
+        "allow it. Course announcement or forum text is sent only after you tap its task-suggestion button and only while this permission is on; grades need their own permission.</i>\n\n"
+        "<i>Voice messages need the same permission: the recording itself is sent for transcription "
+        "(GWDG Whisper, else Google speech recognition) and its text then goes to the AI service that understands it.</i>"
     )
     if note:
         text += f"\n\n{note}"
