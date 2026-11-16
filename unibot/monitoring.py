@@ -1292,12 +1292,16 @@ async def _check_new_forum_posts_parallel_unlocked(bot, chat_id, silent: bool = 
             courses = [(name, cid, session) for cid, name in state.courses_map.items()]
 
         semaphore = asyncio.Semaphore(3)  # Don't overload the server
+        known_by_course: dict = {}
+        for entry in cache.values():
+            if isinstance(entry, dict) and entry.get("cid") and entry.get("disc_id"):
+                known_by_course.setdefault(entry["cid"], {})[str(entry["disc_id"])] = entry
 
         async def fetch(course_name, cid, sess):
             async with semaphore:
                 try:
                     entries, used = await course_registry.scan_with_failover(
-                        cid, sess, lambda s: _fetch_course_forum_strict(s, course_name, cid))
+                        cid, sess, lambda s: _fetch_course_forum_strict(s, course_name, cid, known_by_course.get(cid)))
                 except Exception as e:
                     log = logging.debug if getattr(e, "quiet", False) else logging.warning
                     log("Forum of %s unavailable with every member: %s", course_name, e)

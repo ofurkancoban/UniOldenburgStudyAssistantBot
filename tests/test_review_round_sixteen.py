@@ -481,5 +481,122 @@ class WorkerUsageTests(unittest.TestCase):
             self.assertIn(f"{count} of 100000", line)
 
 
+class ContentScanFrequencyTests(unittest.TestCase):
+    def _run(self, moments):
+        from datetime import datetime
+        from unibot import watcher
+        from studip_utils import TZ_BERLIN
+        ran = []
+        cache: dict = {}
+
+        def job(name):
+            async def run(*args, **kwargs):
+                ran.append(name)
+            return run
+
+        patches = {
+            "watched_courses": mock.AsyncMock(return_value=[]),
+            "check_new_announcements_parallel": job("announcements"),
+            "check_new_forum_posts_parallel": job("forum"),
+            "check_new_files_parallel": job("files"),
+            "load_general_cache": lambda: dict(cache),
+            "update_general_cache": lambda data: cache.update(data),
+        }
+        history = []
+        with mock.patch.multiple(watcher, **patches), mock.patch.object(watcher.asyncio, "sleep", mock.AsyncMock()):
+            for hh, mm in moments:
+                before = len(ran)
+                now = datetime(2026, 11, 16, hh, mm, tzinfo=TZ_BERLIN)
+                asyncio.run(watcher._run_content_watchers(None, UID, 1, now))
+                history.append(ran[before:])
+        return history
+
+    def test_announcements_and_forum_run_about_every_second_cycle(self):
+        # cycles are about 4.5 minutes apart
+        history = self._run([(10, 0), (10, 4), (10, 9), (10, 13), (10, 18)])
+        self.assertEqual([("announcements" in h, "forum" in h) for h in history],
+                         [(True, True), (False, False), (True, True), (False, False), (True, True)])
+
+    def test_files_keep_their_own_thirty_minute_rhythm(self):
+        history = self._run([(10, 0), (10, 9), (10, 18), (10, 27), (10, 31)])
+        self.assertEqual(["files" in h for h in history], [True, False, False, False, True])
+
+
+class _JsonResp:
+    status = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def json(self):
+        return self.payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _ForumSession:
+    def __init__(self, discussions, posts):
+        self.discussions, self.posts, self.requested = discussions, posts, []
+
+    async def get(self, url, **kwargs):
+        self.requested.append(url)
+        if url.endswith("/forum-discussions"):
+            return _JsonResp({"data": self.discussions})
+        disc_id = url.split("/forum-discussions/")[1].split("/")[0]
+        return _JsonResp({"data": self.posts[disc_id], "included": []})
+
+
+class ForumUnchangedDiscussionTests(unittest.TestCase):
+    def _session(self):
+        def disc(i, chdate):
+            return {"id": i, "attributes": {"title": f"Topic {i}", "chdate": chdate}, "meta": {}}
+
+        def post(i, pid):
+            return [{"id": pid, "attributes": {"content-html": "<p>hello</p>", "mkdate": "2026-11-16T09:00:00+01:00"},
+                     "relationships": {"author": {"data": {"id": "a"}}}}]
+        return _ForumSession([disc("d1", "2026-11-16T09:00:00+01:00"), disc("d2", "2026-11-16T10:00:00+01:00")],
+                             {"d1": post("d1", "p1"), "d2": post("d2", "p2")})
+
+    def _fetch(self, session, known=None):
+        from unibot import monitoring_fetch
+        return asyncio.run(monitoring_fetch._fetch_course_forum_strict(session, "Course", "c1", known))
+
+    def _read_postings(self, session):
+        return sorted(u.split("/forum-discussions/")[1].split("/")[0] for u in session.requested if "/postings" in u)
+
+    def test_first_scan_reads_every_discussion_and_keeps_what_the_next_scan_needs(self):
+        session = self._session()
+        entries = self._fetch(session)
+        self.assertEqual(self._read_postings(session), ["d1", "d2"])
+        self.assertEqual({e["disc_id"]: e["disc_chdate"] for e in entries},
+                         {"d1": "2026-11-16T09:00:00+01:00", "d2": "2026-11-16T10:00:00+01:00"})
+        self.assertTrue(all(e["checked_at"] > 0 for e in entries))
+
+    def test_an_unchanged_discussion_is_not_read_again_a_changed_one_is(self):
+        first = self._fetch(self._session())
+        known = {str(e["disc_id"]): e for e in first}
+        again = self._session()
+        again.discussions[1]["attributes"]["chdate"] = "2026-11-16T11:30:00+01:00"  # a reply in d2
+        entries = self._fetch(again, known)
+        self.assertEqual(self._read_postings(again), ["d2"])
+        self.assertEqual(sorted(e["disc_id"] for e in entries), ["d1", "d2"])  # d1 is still reported, from the cache
+
+    def test_everything_is_read_again_after_an_hour(self):
+        first = self._fetch(self._session())
+        known = {str(e["disc_id"]): {**e, "checked_at": e["checked_at"] - 3601} for e in first}
+        again = self._session()
+        self._fetch(again, known)
+        self.assertEqual(self._read_postings(again), ["d1", "d2"])
+
+    def test_an_old_cache_entry_without_the_new_fields_is_read_normally(self):
+        again = self._session()
+        self._fetch(again, {"d1": {"key": "c1:Topic d1:d1", "cid": "c1"}})
+        self.assertEqual(self._read_postings(again), ["d1", "d2"])
+
+
 if __name__ == "__main__":
     unittest.main()

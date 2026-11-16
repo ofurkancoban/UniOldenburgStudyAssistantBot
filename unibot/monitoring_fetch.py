@@ -4,6 +4,7 @@ Nothing here keeps state or sends a message (see unibot.monitoring)."""
 
 import html
 import logging
+import time
 import re
 from datetime import datetime
 from typing import Optional
@@ -295,6 +296,10 @@ def _forum_thread_entry(course_name: str, cid: str, disc: dict, posts_data: dict
         # in an existing discussion from a discussion it already cached.
         "last_post_id": last_post.get("id"),
         "key": f"{cid}:{title}:{disc_id}",
+        # what the next scan compares to decide whether the postings must be read again
+        "disc_id": disc_id,
+        "disc_chdate": disc.get("attributes", {}).get("chdate"),
+        "checked_at": time.time(),
         # A thread counts as new when Stud.IP reports unread postings
         "is_new": disc.get("meta", {}).get("unread-postings-count", 0) > 0,
         # Keep full precision for ordering and legacy-cache diffing; `date`
@@ -303,8 +308,15 @@ def _forum_thread_entry(course_name: str, cid: str, disc: dict, posts_data: dict
     }
 
 
-async def _fetch_course_forum_strict(session, course_name: str, cid: str) -> list:
+# A discussion whose own change date did not move since the last scan is not read again
+# for this long (a safety net in case a reply does not move that date); it was one
+# request per discussion and course on every scan.
+FORUM_RECHECK_SECONDS = 60 * 60
+
+
+async def _fetch_course_forum_strict(session, course_name: str, cid: str, known: Optional[dict] = None) -> list:
     """Entries for the 10 most recently updated discussions of one course.
+    `known` is {discussion id: its cached entry}: an unchanged one is reused.
     Raises when the session cannot read the course (expired login, no
     access), so the course registry can hand the scan to another member."""
     url = f"{BASE_URL}/jsonapi.php/v1/courses/{cid}/forum-discussions"
@@ -314,6 +326,12 @@ async def _fetch_course_forum_strict(session, course_name: str, cid: str) -> lis
         data = await r.json()
     entries = []
     for disc in data.get("data", [])[:10]:
+        disc_chdate = disc.get("attributes", {}).get("chdate")
+        previous = (known or {}).get(str(disc.get("id")))
+        if (previous and disc_chdate and previous.get("disc_chdate") == disc_chdate
+                and time.time() - float(previous.get("checked_at") or 0) < FORUM_RECHECK_SECONDS):
+            entries.append(previous)
+            continue
         posts_url = f"{BASE_URL}/jsonapi.php/v1/forum-discussions/{disc.get('id')}/postings?include=author"
         async with await session.get(posts_url, headers=JSONAPI_HEADERS) as r2:
             if r2.status != 200:

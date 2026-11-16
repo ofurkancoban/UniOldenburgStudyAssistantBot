@@ -304,7 +304,7 @@ class FirstScanBaselineTests(unittest.TestCase):
         posts = {"known": [{"key": "k1", "cid": "known", "is_new": True}],
                  "fresh": [{"key": "f1", "cid": "fresh", "is_new": True}]}
 
-        async def fetch(sess, name, cid):
+        async def fetch(sess, name, cid, known=None):
             return posts[cid]
 
         with mock.patch.object(monitoring, "_fetch_course_forum_strict", fetch), \

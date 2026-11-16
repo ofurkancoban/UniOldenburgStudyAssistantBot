@@ -81,6 +81,7 @@ from unibot.system import HEALTH_CHECK_LABELS, run_health_checks
 
 
 FILE_WATCHER_INTERVAL = 30 * 60
+CONTENT_SCAN_INTERVAL_SECONDS = 8 * 60  # announcements and forum posts
 
 
 def _cache_datetime(value) -> Optional[datetime]:
@@ -738,12 +739,18 @@ async def _run_content_watchers(bot, admin_id, cycle_count: int, now: datetime):
     except Exception as e:
         logging.error("❌ Could not build the course watch plan: %s", e)
         raise
-    await _guarded("Announcement check", check_new_announcements_parallel, bot, admin_id, silent=True,
-                   courses=courses, start_message="📢 Checking announcements...")
-    await asyncio.sleep(15)
-    await _guarded("Forum check", check_new_forum_posts_parallel, bot, admin_id, silent=True,
-                   courses=courses, start_message="💬 Checking forum posts...")
-    await asyncio.sleep(15)
+    # Announcements and the forum are read every CONTENT_SCAN_INTERVAL_SECONDS (about every
+    # second cycle), not every cycle: with 22 courses they were most of the requests sent
+    # through the Cloudflare Worker, whose free plan answers 100,000 a day.
+    for cache_key, label, job, start_message in (
+        ("last_announcement_check", "Announcement check", check_new_announcements_parallel,
+         "📢 Checking announcements..."),
+        ("last_forum_check", "Forum check", check_new_forum_posts_parallel, "💬 Checking forum posts..."),
+    ):
+        if _is_due(cache_key, now, CONTENT_SCAN_INTERVAL_SECONDS):
+            await _run_throttled(cache_key, now, CONTENT_SCAN_INTERVAL_SECONDS, label, job, bot, admin_id,
+                                 silent=True, courses=courses, start_message=start_message)
+            await asyncio.sleep(15)
     # File checks recursively query folder hierarchies; throttle to once every 30 minutes.
     await _run_throttled("last_file_check", now, FILE_WATCHER_INTERVAL, "File check",
                          check_new_files_parallel, bot, admin_id, silent=True, courses=courses,
