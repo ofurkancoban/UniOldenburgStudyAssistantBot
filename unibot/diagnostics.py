@@ -40,6 +40,13 @@ def _session_line(uid, sess) -> str:
             f"Stud.IP cookie {studip}, StuMS {stums}")
 
 
+def _worker_usage_line(worker: dict) -> str:
+    used, limit = worker["requests_today"], worker["daily_limit"]
+    share = used / limit if limit else 0.0
+    icon = "🔴" if share >= 0.9 else "🟠" if share >= 0.7 else "☁️"
+    return f"{icon} Worker requests today (UTC): {used} of {limit} ({share:.0%}); the free plan stops answering at the limit"
+
+
 def connection_report() -> list[str]:
     """HTML lines for the admin part of /healthcheck."""
     lines = ["🌐 <b>University connections</b> (since start)"]
@@ -64,6 +71,8 @@ def connection_report() -> list[str]:
         lines.append(f"☁️ Cloudflare Worker: ✅ in use ({worker['failovers']} failovers since start)")
     if worker["refused_hosts"]:
         lines.append("☁️ Refused by the worker: " + ", ".join(worker["refused_hosts"]))
+    if worker["configured"]:
+        lines.append(_worker_usage_line(worker))
 
     sessions = {uid: s for uid, s in state.user_sessions.items() if s is not None}
     lines.append(f"👥 <b>Sessions</b> ({len(sessions)})")
@@ -256,6 +265,7 @@ def daily_digest(now: datetime, log_paths: Iterable[str], previous: Optional[dic
     if worker["configured"]:
         state_label = "⚠️ down" if worker["down_for"] > 0 else "✅ up"
         lines.append(f"☁️ Cloudflare Worker: {state_label}, {failovers} failovers since the last digest")
+        lines.append(_worker_usage_line(worker))
 
     lines.append(backup_line())
     lines.append(restart_line())

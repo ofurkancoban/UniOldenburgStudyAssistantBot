@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
-from studip_utils import tag_attr
+from studip_utils import redact_url, tag_attr
 from stums_parsers import (
     _extract_action_params,
     _parse_candidate_units,
@@ -95,6 +95,11 @@ class StumsSessionExpired(RuntimeError):
     """StuMS explicitly returned a login page or redirected to university SSO."""
 
 
+class StumsPageRefused(RuntimeError):
+    """StuMS answered HTTP 403 for a page of a signed-in session: it no longer
+    accepts that session (the same message as any other HTTP error, so logs read as before)."""
+
+
 # Background checks (watcher) respect the retry pause; anything the user
 # triggers (a button, a command) always tries StuMS right away.
 _stums_background = contextvars.ContextVar("stums_background", default=False)
@@ -161,9 +166,20 @@ async def _read_stums_page(session, url: str, referer: str) -> tuple[str, str]:
         text = await r.text()
         status = r.status
         final_url = str(getattr(r, "url", "") or "")
+        headers = getattr(r, "headers", None) or {}
+        refused_by = {k: str(headers.get(k, "")) for k in ("Server", "X-Proxy-Upstream", "X-Proxy-Error", "Content-Type")}
     if status == 401:
         session.stums.verified_at = 0.0
         raise StumsSessionExpired("StuMS answered HTTP 401")
+    if status == 403:
+        session.stums.verified_at = 0.0
+        title = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+        # who said no and on what page: no cookies, no body beyond the page title
+        logging.warning("StuMS refused %s with HTTP 403 (page %r; server %r; via worker %r; worker error %r; type %r)",
+                        redact_url(final_url), re.sub(r"\s+", " ", title.group(1)).strip()[:80] if title else "",
+                        refused_by["Server"][:40], refused_by["X-Proxy-Upstream"], refused_by["X-Proxy-Error"],
+                        refused_by["Content-Type"][:40])
+        raise StumsPageRefused("StuMS page answered HTTP 403")
     if status != 200:
         raise RuntimeError(f"StuMS page answered HTTP {status}")
     if final_url and (urlsplit(final_url).hostname or "").lower() != STUMS_HOST:
@@ -211,7 +227,7 @@ async def _establish_stums_session(session) -> str:
             try:
                 if await _stums_logged_in(session, known_referer):
                     return _mark_stums_verified(session, known_referer)
-            except StumsSessionExpired as exc:
+            except (StumsSessionExpired, StumsPageRefused) as exc:
                 logging.debug("exam_reminder: StuMS pre-check failed: %s", exc)
 
         for attempt in (1, 2):
@@ -265,7 +281,9 @@ async def _stums_logged_in(session, referer: str) -> bool:
     try:
         await _read_stums_page(session, STUDY_PLANNER_URL, referer)
         return True
-    except StumsSessionExpired as exc:
+    except (StumsSessionExpired, StumsPageRefused) as exc:
+        # a refused (403) page is a session StuMS no longer accepts: the same path as a
+        # login form (drop the cookies, sign in again, then pause and tell the student)
         logging.debug("StuMS session check failed: %s", exc)
         return False
 

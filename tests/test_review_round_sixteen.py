@@ -13,7 +13,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import run_as, use_temp_db  # noqa: E402
 use_temp_db()
 
 from unibot import studip_api, study_plan  # noqa: E402
@@ -313,6 +313,172 @@ class InviteReplyThrottleTests(unittest.TestCase):
         self.assertIn("Invite-only reply", text)
         self.assertNotIn("424244", text)
         self.assertNotIn("424244", str(db.load(auth.GATE_REPLIES_PATH)))
+
+
+class _Resp:
+    def __init__(self, status, text="", url="https://stums.uni-oldenburg.de/qisserver/page", headers=None):
+        self.status, self._text, self.url, self.headers = status, text, url, headers or {}
+
+    async def text(self):
+        return self._text
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _StumsSession:
+    """A signed-in session whose StuMS pages all answer with `status`."""
+    user_id = UID + 30
+
+    def __init__(self, status=403, text="<html><title>403 Forbidden</title></html>"):
+        import studip_session
+        self.status, self.text = status, text
+        self.stums = studip_session.StumsState()
+        self.explicitly_logged_out = False
+        self.handoffs = 0
+        jar = types_namespace(filter_cookies=lambda url: {}, clear_domain=lambda host: None)
+        self.session = types_namespace(cookie_jar=jar)
+
+    async def get(self, url, **kwargs):
+        return _Resp(self.status, self.text, headers={"Server": "Apache/2.4", "X-Proxy-Upstream": "1"})
+
+    async def sso_handoff(self, entry, host, referer=None):
+        self.handoffs += 1
+        return "https://stums.uni-oldenburg.de/qisserver/pages/cs/sys/portal/hisinoneStartPage.faces"
+
+
+def types_namespace(**kw):
+    import types
+    return types.SimpleNamespace(**kw)
+
+
+class StumsRefusalTests(unittest.TestCase):
+    def test_a_403_is_a_refused_session_and_the_log_says_who_refused(self):
+        import stums_client
+        session = _StumsSession()
+        session.stums.verified_at = 123.0
+        with self.assertLogs(level="WARNING") as logs, self.assertRaises(stums_client.StumsPageRefused) as caught:
+            asyncio.run(stums_client._read_stums_page(session, stums_client.STUDY_PLANNER_URL, "r"))
+        self.assertEqual(str(caught.exception), "StuMS page answered HTTP 403")  # the message logs always had
+        text = " ".join(logs.output)
+        for detail in ("403 Forbidden", "Apache/2.4", "via worker '1'"):
+            self.assertIn(detail, text)
+        self.assertEqual(session.stums.verified_at, 0.0)  # not trusted any more
+
+    def test_other_errors_are_not_a_refused_session(self):
+        import stums_client
+        session = _StumsSession(status=500, text="boom")
+        with self.assertRaises(RuntimeError) as caught:
+            asyncio.run(stums_client._read_stums_page(session, stums_client.STUDY_PLANNER_URL, "r"))
+        self.assertNotIsInstance(caught.exception, stums_client.StumsPageRefused)
+
+    def test_a_refused_session_pauses_background_checks_instead_of_signing_in_again_every_time(self):
+        import stums_client
+        session = _StumsSession()
+        with stums_client.background_stums():
+            with self.assertRaises(stums_client.StumsLoginUnavailable):
+                asyncio.run(stums_client._establish_stums_session(session))
+            tried = session.handoffs
+            self.assertGreaterEqual(tried, 1)
+            self.assertGreater(session.stums.blocked_until, 0)
+            with self.assertRaises(stums_client.StumsLoginUnavailable) as again:
+                asyncio.run(stums_client._establish_stums_session(session))
+        self.assertTrue(again.exception.quiet)  # the pause is on: quiet, and no new sign-in attempt
+        self.assertEqual(session.handoffs, tried)
+
+
+class StumsReconnectNoticeTests(unittest.TestCase):
+    def setUp(self):
+        from tests.testenv import activate_student
+        self.uid = UID + 31
+        activate_student(self.uid)
+
+    def _notice(self):
+        from unibot import auth
+        bot = mock.AsyncMock()
+        server = mock.MagicMock()
+        server.start = mock.AsyncMock()
+        server.app_url = lambda target="": f"https://bot.example/app?target={target}"
+        with mock.patch.object(auth, "_get_login_server", lambda: server), \
+                mock.patch.object(auth, "_login_public_url", lambda: "https://bot.example"):
+            sent = run_as(self.uid, auth.notify_stums_reconnect(bot, self.uid))
+        return sent, bot
+
+    def test_the_notice_comes_with_a_reconnect_button_and_not_again_for_half_a_day(self):
+        from unibot import storage
+        storage.delete_personal_record(self.uid, "stums_reconnect_notice")
+        sent, bot = self._notice()
+        self.assertTrue(sent)
+        kwargs = bot.send_message.call_args.kwargs
+        self.assertIn("StuMS needs a fresh sign-in", kwargs["text"])
+        button = kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(button.text, "🎓 Reconnect StuMS")
+        self.assertTrue(button.web_app.url.endswith("target=stums"))
+        sent_again, bot_again = self._notice()
+        self.assertFalse(sent_again)
+        bot_again.send_message.assert_not_awaited()
+
+    def test_checks_that_fail_while_paused_send_the_notice_once_a_check_failing_otherwise_does_not(self):
+        from unibot import watcher
+        for paused in (True, False):
+            session = _StumsSession()
+            session.user_id = self.uid
+            session.stums.blocked_until = (__import__("time").time() + 600) if paused else 0.0
+            notice = mock.AsyncMock()
+            with mock.patch.object(watcher, "check_exam_reminders", mock.AsyncMock(return_value=None)), \
+                    mock.patch.object(watcher, "check_grade_reminders", mock.AsyncMock(return_value=None)), \
+                    mock.patch.object(watcher, "check_tuition_reminders", mock.AsyncMock(return_value=None)), \
+                    mock.patch.object(watcher, "notify_stums_reconnect", notice):
+                with self.assertRaises(RuntimeError):
+                    run_as(self.uid, watcher._run_stums_checks(mock.AsyncMock(), session, mock.AsyncMock()))
+            self.assertEqual(notice.await_count, 1 if paused else 0, f"paused={paused}")
+
+
+class WorkerUsageTests(unittest.TestCase):
+    def setUp(self):
+        import studip_session
+        from unibot import db
+        self.module = studip_session
+        self.db = db
+        studip_session._WORKER_USAGE.update(day="", count=0, saved=0, warned=[])
+        self.addCleanup(lambda: db.delete(studip_session.WORKER_USAGE_PATH))
+        db.delete(studip_session.WORKER_USAGE_PATH)
+
+    def test_every_request_is_counted_for_the_utc_day(self):
+        for _ in range(7):
+            self.module.count_worker_request()
+        with mock.patch.dict(os.environ, {"CLOUDFLARE_WORKER_URL": "https://w.example"}):
+            status = self.module.worker_status()
+        self.assertEqual(status["requests_today"], 7)
+        self.assertEqual(status["daily_limit"], 100_000)
+
+    def test_the_count_survives_a_restart_and_starts_over_on_a_new_day(self):
+        for _ in range(self.module.WORKER_USAGE_SAVE_EVERY):
+            self.module.count_worker_request()
+        self.module._WORKER_USAGE.update(day="", count=0, saved=0, warned=[])  # a restart
+        self.assertEqual(self.module._worker_usage_today()["count"], self.module.WORKER_USAGE_SAVE_EVERY)
+        self.db.save(self.module.WORKER_USAGE_PATH, {"day": "2000-01-01", "count": 99999})
+        self.module._WORKER_USAGE.update(day="", count=0, saved=0, warned=[])
+        self.assertEqual(self.module._worker_usage_today()["count"], 0)  # yesterday's count is not today's
+
+    def test_it_warns_at_seventy_and_ninety_percent_once_each(self):
+        with mock.patch.object(self.module, "worker_daily_limit", lambda: 10), self.assertLogs(level="WARNING") as logs:
+            for _ in range(10):
+                self.module.count_worker_request()
+        warnings = [line for line in logs.output if "free requests used today" in line]
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("7 of 10", warnings[0])
+        self.assertIn("9 of 10", warnings[1])
+
+    def test_the_health_report_and_the_digest_show_it(self):
+        from unibot import diagnostics
+        for count, icon in ((10, "☁️"), (75_000, "🟠"), (95_000, "🔴")):
+            line = diagnostics._worker_usage_line({"requests_today": count, "daily_limit": 100_000})
+            self.assertTrue(line.startswith(icon), line)
+            self.assertIn(f"{count} of 100000", line)
 
 
 if __name__ == "__main__":

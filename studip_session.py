@@ -143,6 +143,62 @@ def _worker_failure(resp) -> str:
     return ""
 
 
+# Cloudflare's free plan answers 100,000 Worker requests a day (counted in UTC) and then
+# stops answering until midnight UTC. Every request that goes through the Worker is
+# counted here, so /healthcheck and the daily digest can show how close that is.
+WORKER_USAGE_PATH = "worker_usage.json"
+WORKER_USAGE_SAVE_EVERY = 50
+WORKER_USAGE_WARN_AT = (0.7, 0.9)
+_WORKER_USAGE: dict = {"day": "", "count": 0, "saved": 0, "warned": []}
+
+
+def worker_daily_limit() -> int:
+    try:
+        return max(1, int(os.getenv("CLOUDFLARE_WORKER_DAILY_LIMIT", "").strip() or 100_000))
+    except ValueError:
+        return 100_000
+
+
+def _utc_day() -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime())
+
+
+def _worker_usage_today() -> dict:
+    """The counter for today (UTC); a new day, or the first use after a restart,
+    starts from what was saved for today."""
+    today = _utc_day()
+    if _WORKER_USAGE["day"] != today:
+        count = 0
+        try:
+            from unibot import db
+            saved = db.load(WORKER_USAGE_PATH) if db.exists(WORKER_USAGE_PATH) else {}
+            if isinstance(saved, dict) and saved.get("day") == today:
+                count = int(saved.get("count") or 0)
+        except Exception:
+            logging.debug("Worker usage record unreadable", exc_info=True)
+        _WORKER_USAGE.update(day=today, count=count, saved=count, warned=[])
+    return _WORKER_USAGE
+
+
+def count_worker_request() -> None:
+    """One more request went to the Worker (a redirect hop or a retry is one too)."""
+    usage = _worker_usage_today()
+    usage["count"] += 1
+    limit = worker_daily_limit()
+    for share in WORKER_USAGE_WARN_AT:
+        if usage["count"] >= limit * share and share not in usage["warned"]:
+            usage["warned"].append(share)
+            logging.warning("Cloudflare Worker: %s of %s free requests used today (UTC); it stops answering at the limit "
+                            "until 00:00 UTC", usage["count"], limit)
+    if usage["count"] - usage["saved"] >= WORKER_USAGE_SAVE_EVERY:
+        try:
+            from unibot import db
+            db.save(WORKER_USAGE_PATH, {"day": usage["day"], "count": usage["count"]})
+            usage["saved"] = usage["count"]
+        except Exception:
+            logging.debug("Worker usage not saved", exc_info=True)
+
+
 def worker_status() -> dict:
     """The worker's routing state for /healthcheck."""
     url = _worker_url()
@@ -152,6 +208,8 @@ def worker_status() -> dict:
         "down_for": max(0.0, _WORKER_HEALTH["down_until"] - now),
         "failovers": _WORKER_HEALTH.get("failovers", 0),
         "refused_hosts": sorted(h for h, until in _WORKER_REFUSED.items() if until > now),
+        "requests_today": _worker_usage_today()["count"],
+        "daily_limit": worker_daily_limit(),
     }
 
 
@@ -405,6 +463,8 @@ class StudIPSession(SsoFlowMixin):
         else:
             routed, http = url, self._client
         via_worker = http is self._proxy_http
+        if via_worker:
+            count_worker_request()
         worker_error = None
         async with THROTTLE.slot(host):
             try:

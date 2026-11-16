@@ -56,6 +56,7 @@ from unibot.auth import (
     is_user_allowed,
     lifecycle_state,
     login_studip,
+    notify_stums_reconnect,
     send_reauth_notice,
     signed_in_accounts,
 )
@@ -360,6 +361,10 @@ async def _run_stums_checks(bot, session, send) -> bool:
         if result is not True:
             failed.append(label)
     if failed:
+        if user_id is not None and session.stums.blocked_until > time.time():
+            # StuMS refused the sign-in and the retry pause is on: the student has to reconnect,
+            # nothing else brings their exam and grade alerts back
+            await _guarded("StuMS reconnect notice", notify_stums_reconnect, bot, user_id)
         raise RuntimeError("StuMS check delivery or fetch failed: " + ", ".join(failed))
     return True
 

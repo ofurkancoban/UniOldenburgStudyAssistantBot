@@ -258,6 +258,35 @@ async def send_reauth_notice(bot, user_id: int) -> None:
             _reauth_prompted_at[user_id] = time.time()
 
 
+STUMS_NOTICE_RECORD = "stums_reconnect_notice"
+STUMS_NOTICE_INTERVAL_SECONDS = 12 * 3600
+
+
+async def notify_stums_reconnect(bot, user_id: int) -> bool:
+    """Tell a student once in a while that StuMS no longer accepts their sign-in
+    (so exam and grade alerts are paused), with a one-tap button to reconnect.
+    Returns whether a message was sent."""
+    from unibot.storage import personal_record, save_personal_record
+    now = time.time()
+    last = personal_record(user_id, STUMS_NOTICE_RECORD)
+    if isinstance(last, (int, float)) and now - last < STUMS_NOTICE_INTERVAL_SECONDS:
+        return False
+    if not is_user_allowed(user_id) or lifecycle_state(user_id) != ACTIVE or not db.private_context_is_current(user_id):
+        return False
+    server = _get_login_server()
+    await server.start()
+    markup = None
+    if _login_public_url().startswith("https://"):
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🎓 Reconnect StuMS", web_app=WebAppInfo(url=server.app_url("stums")))]])
+    text = ("🎓 <b>StuMS needs a fresh sign-in</b>\n"
+            "Your exam and grade alerts are paused: StuMS no longer accepts the saved session. "
+            + ("Tap the button once to sign in again (about 30 seconds). " if markup else "Send /login to sign in again. ")
+            + "Stud.IP itself keeps working.")
+    await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=markup)
+    save_personal_record(user_id, STUMS_NOTICE_RECORD, now)
+    return True
+
+
 async def _lifecycle_on_interaction(update: Update, user_id: int) -> None:
     """Resume a stopped student on /start; remind an expired one to sign in."""
     state_now = lifecycle_state(user_id)
