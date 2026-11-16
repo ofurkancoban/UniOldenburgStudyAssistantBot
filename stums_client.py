@@ -257,8 +257,9 @@ async def _establish_stums_session(session) -> str:
                 raise RuntimeError(f"StuMS SSO handoff failed: {e}") from e
             if await _stums_logged_in(session, referer):
                 return _mark_stums_verified(session, referer)
-            logging.warning("StuMS handoff attempt %s ended at %r without a session; StuMS cookie names: %s",
-                            attempt, redact_url(referer), _stums_cookie_names(session))
+            logging.warning("StuMS handoff attempt %s ended at %r without a session; StuMS cookie names: %s; "
+                            "redirect chain (host, path, status): %s", attempt, redact_url(referer),
+                            _stums_cookie_names(session), getattr(session, "last_sso_chain", None))
             if attempt == 1:
                 logging.info("exam_reminder: StuMS session expired; dropping StuMS cookies and signing in again")
                 session.session.cookie_jar.clear_domain(STUMS_HOST)

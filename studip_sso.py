@@ -197,6 +197,7 @@ class SsoFlowMixin:
         async with self._s_get(entry_url, headers={"Referer": referer} if referer else None) as r:
             try:
                 hops = [(urlparse(str(h.url)).netloc, urlparse(str(h.url)).path, h.status) for h in r.history]
+                self.last_sso_chain = hops
                 self.logger.info("SSO entry redirect chain (host, path, status): %s", hops)
             except Exception:
                 self.logger.debug("Could not summarise the SSO redirect chain", exc_info=True)
