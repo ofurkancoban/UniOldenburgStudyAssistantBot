@@ -839,7 +839,7 @@ class CampusLunchPickTests(unittest.TestCase):
                 prepared = asyncio.run(morning._prepare_morning_summary(None, [1, 2, 3]))
         finally:
             state.global_session = saved
-        self.assertEqual(sorted(calls), ["2", "3"])  # one pick per mensa, shared by its students
+        self.assertEqual(sorted(calls), ["2", "2", "3"])  # every student gets a pick of their own
         self.assertIn("dish-3 (Mensa Wechloy)", prepared["texts"][1])
         self.assertIn("dish-2 (Counter 1)", prepared["texts"][2])
         self.assertEqual({uid: p[0] for uid, p in prepared["photos"].items()}, {1: "photo-3", 2: "photo-2", 3: "photo-2"})

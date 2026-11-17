@@ -82,6 +82,7 @@ DEFAULTS: dict[str, Any] = {
     "diet": "all",
     "food_avoid_codes": [],
     "food_avoid_keywords": [],
+    "food_like_keywords": [],
     "morning_time": "07:00",
     "morning_sections": {key: True for key in MORNING_SECTIONS},
     "outfit": False,
@@ -139,7 +140,7 @@ def validate(key: str, value) -> Any:
                 and value["start"] != value["end"]):
             raise ValueError("quiet_hours is None or {'start': 'HH:MM', 'end': 'HH:MM'}")
         return {"start": value["start"], "end": value["end"]}
-    if key in ("food_avoid_codes", "food_avoid_keywords"):
+    if key in ("food_avoid_codes", "food_avoid_keywords", "food_like_keywords"):
         if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
             raise ValueError(f"{key} is a list of strings")
         return [v.strip() for v in value if v.strip()]
@@ -342,5 +343,6 @@ def food_filter(user_id: Optional[int]) -> dict:
         "diet": prefs["diet"],
         "avoid_codes": set(base["avoid_codes"]) | set(prefs["food_avoid_codes"]),
         "avoid_keywords": {k.lower() for k in base["avoid_keywords"]} | {k.lower() for k in prefs["food_avoid_keywords"]},
+        "like_keywords": [k.lower() for k in prefs["food_like_keywords"]],
         "max_price": base["max_price"],
     }

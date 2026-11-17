@@ -6,7 +6,6 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 import hashlib
 import html
 import logging
-import random
 import re
 from datetime import date, datetime, timedelta
 from typing import Optional
@@ -21,7 +20,7 @@ from telegram.error import TelegramError
 
 from studip_utils import TZ_BERLIN, berlin_now, tag_attr
 
-from unibot.storage import shared_http
+from unibot.storage import personal_record, save_personal_record, shared_http
 from unibot.telegram_ui import (
     _delete_status_message,
     _show_typing,
@@ -45,9 +44,10 @@ def load_food_preferences(user_id: Optional[int] = None) -> dict:
     doesn't eat, from their own preferences. Empty without a student."""
     uid = user_id if user_id is not None else current_user_id()
     if uid is None:
-        return {"avoid_codes": [], "avoid_keywords": []}
+        return {"avoid_codes": [], "avoid_keywords": [], "like_keywords": []}
     prefs = get_prefs(uid)
-    return {"avoid_codes": list(prefs["food_avoid_codes"]), "avoid_keywords": list(prefs["food_avoid_keywords"])}
+    return {"avoid_codes": list(prefs["food_avoid_codes"]), "avoid_keywords": list(prefs["food_avoid_keywords"]),
+            "like_keywords": list(prefs["food_like_keywords"])}
 
 
 def effective_food_filter(user_id: Optional[int] = None) -> dict:
@@ -77,6 +77,186 @@ def save_food_preferences(avoid_codes: list, avoid_keywords: list, user_id: Opti
         set_pref(uid, "food_avoid_keywords", list(avoid_keywords))
     except Exception as e:
         logging.error("Could not save food preferences: %s", e)
+
+
+def save_food_likes(like_keywords: list, user_id: Optional[int] = None) -> None:
+    uid = user_id if user_id is not None else current_user_id()
+    if uid is None:
+        logging.warning("Food likes need a student; nothing saved")
+        return
+    try:
+        set_pref(uid, "food_like_keywords", list(like_keywords))
+    except Exception as e:
+        logging.error("Could not save liked ingredients: %s", e)
+
+
+MAX_FOOD_WORDS = 25
+_FOOD_WORD_SPLIT = re.compile(r"[,;\n]+|\s+(?:and|und|ve)\s+", re.IGNORECASE)
+
+
+def parse_food_words(text: str) -> list[str]:
+    """Ingredient words from a typed answer: split on commas, line breaks, "and", lower-cased, 2 to 30 characters."""
+    words = []
+    for part in _FOOD_WORD_SPLIT.split(text or ""):
+        word = re.sub(r"\s+", " ", part.strip().strip("\"'`.!?").lower())
+        if 2 <= len(word) <= 30 and word not in words:
+            words.append(word)
+    return words[:MAX_FOOD_WORDS]
+
+
+def add_food_words(user_id: int, kind: str, text: str) -> tuple[list[str], list[str]]:
+    """Add typed ingredient words to the student's liked ("like") or avoided ("avoid") list.
+
+    A word moves from one list to the other when it was on the opposite one.
+    Returns (added, ignored)."""
+    words = parse_food_words(text)
+    prefs = load_food_preferences(user_id)
+    likes, avoids = list(prefs["like_keywords"]), list(prefs["avoid_keywords"])
+    added = []
+    for word in words:
+        target, other = (likes, avoids) if kind == "like" else (avoids, likes)
+        if word in target:
+            continue
+        if word in other:
+            other.remove(word)
+        if len(target) >= MAX_FOOD_WORDS:
+            continue
+        target.append(word)
+        added.append(word)
+    save_food_preferences(prefs["avoid_codes"], avoids, user_id=user_id)
+    save_food_likes(likes, user_id=user_id)
+    return added, [w for w in words if w not in added]
+
+
+# English ingredient names the student may type, and the German words the Mensa menu uses for them
+FOOD_SYNONYMS = {
+    "chicken": ("hähnchen", "hühnchen", "huhn", "geflügel", "chicken"),
+    "turkey": ("pute", "puten", "truthahn"),
+    "beef": ("rind", "beef"),
+    "fish": ("fisch", "lachs", "forelle", "kabeljau", "pangasius", "fish"),
+    "salmon": ("lachs", "salmon"),
+    "cheese": ("käse", "mozzarella", "feta", "parmesan", "gouda", "cheese"),
+    "pasta": ("pasta", "nudel", "spaghetti", "penne", "tagliatelle", "fusilli", "gnocchi"),
+    "noodles": ("nudel", "noodle"),
+    "rice": ("reis", "rice"),
+    "potato": ("kartoffel", "pommes", "püree", "kroketten", "potato"),
+    "potatoes": ("kartoffel", "pommes", "püree", "kroketten", "potato"),
+    "fries": ("pommes", "fries"),
+    "vegetables": ("gemüse", "vegetable"),
+    "veggies": ("gemüse", "vegetable"),
+    "egg": ("ei", "eier", "rührei", "spiegelei", "egg"),
+    "eggs": ("ei", "eier", "rührei", "spiegelei", "egg"),
+    "mushroom": ("pilz", "champignon", "mushroom"),
+    "mushrooms": ("pilz", "champignon", "mushroom"),
+    "tomato": ("tomate", "tomato"),
+    "lentils": ("linse", "lentil"),
+    "chickpeas": ("kichererbse", "chickpea"),
+    "spinach": ("spinat", "spinach"),
+    "salad": ("salat", "salad"),
+    "sausage": ("wurst", "sausage"),
+    "bread": ("brot", "brötchen", "bread"),
+    "dessert": ("dessert", "pudding", "kuchen", "eis"),
+    "soup": ("suppe", "eintopf", "soup"),
+    "spicy": ("scharf", "chili", "spicy"),
+}
+
+
+def keyword_forms(keyword: str) -> set[str]:
+    """Lower-case spellings to look for in a dish text for one typed ingredient."""
+    key = (keyword or "").strip().lower()
+    forms = {key} | set(FOOD_SYNONYMS.get(key, ()))
+    return {f for f in forms if f}
+
+
+def _dish_text(item: dict) -> str:
+    return f"{item.get('name', '')} {item.get('description', '')}".lower()
+
+
+def _text_has_form(text: str, form: str) -> bool:
+    # short words only count as whole words ("ei" must not match "Eintopf"); longer ones also inside German compounds
+    if len(form) < 4:
+        return re.search(rf"(?<!\w){re.escape(form)}(?!\w)", text) is not None
+    return form in text
+
+
+def matched_likes(item: dict, like_keywords: list) -> list[str]:
+    """The student's liked ingredients that appear in this dish."""
+    text = _dish_text(item)
+    return [kw for kw in like_keywords if any(_text_has_form(text, f) for f in keyword_forms(kw))]
+
+
+FOOD_HISTORY_RECORD = "food_history"
+FOOD_HISTORY_DAYS = 14
+LIKE_POINTS = 4.0
+LIKE_POINTS_CAP = 3
+
+
+def _recent_picks(user_id: Optional[int], today: date) -> list[dict]:
+    """{"date", "dish"} of what was recommended to this student in the last FOOD_HISTORY_DAYS days."""
+    if user_id is None:
+        return []
+    try:
+        records = personal_record(user_id, FOOD_HISTORY_RECORD, [])
+    except Exception:
+        logging.warning("Could not read the recommendation history", exc_info=True)
+        return []
+    kept = []
+    for entry in records if isinstance(records, list) else []:
+        try:
+            day = date.fromisoformat(entry["date"])
+            dish = str(entry["dish"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= (today - day).days <= FOOD_HISTORY_DAYS:
+            kept.append({"date": day.isoformat(), "dish": dish})
+    return kept
+
+
+def _remember_pick(user_id: Optional[int], dish: str, today: date) -> None:
+    if user_id is None or not dish:
+        return
+    try:
+        history = _recent_picks(user_id, today)
+        history.append({"date": today.isoformat(), "dish": dish})
+        save_personal_record(user_id, FOOD_HISTORY_RECORD, history[-60:])
+    except Exception:
+        logging.warning("Could not save the recommendation history", exc_info=True)
+
+
+def _repeat_penalty(dish: str, recent: list[dict], today: date) -> float:
+    """How much to hold back a dish this student was already given lately."""
+    penalty = 0.0
+    for entry in recent:
+        if entry["dish"].strip().lower() != dish.strip().lower():
+            continue
+        age = (today - date.fromisoformat(entry["date"])).days
+        penalty = max(penalty, 8.0 if age == 0 else 6.0 if age <= 3 else 3.0 if age <= 7 else 1.0)
+    return penalty
+
+
+def _personal_jitter(user_id: Optional[int], today: date, dish: str) -> float:
+    """0 to 2 points that differ per student, per day and per dish, so equal candidates are not ranked alike for everyone."""
+    digest = hashlib.sha256(f"{user_id}|{today.isoformat()}|{dish}".encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 1000 / 500.0
+
+
+def rank_candidates(candidates: list[dict], like_keywords: list, recent: list[dict], user_id: Optional[int],
+                    today: date) -> list[tuple[float, dict, list[str]]]:
+    """Candidates best first as (score, dish, matched liked ingredients), for this student only.
+
+    Liked ingredients weigh most, dishes given in the last days weigh down, and a small personal
+    jitter breaks ties differently for every student and day."""
+    ranked = []
+    for item in candidates:
+        liked = matched_likes(item, like_keywords)
+        score = LIKE_POINTS * min(len(liked), LIKE_POINTS_CAP)
+        if not like_keywords and item.get("codes") and item["codes"] & MEAT_CODES:
+            score += 0.5  # without stated likes a protein dish is a mild default
+        score -= _repeat_penalty(item["name"], recent, today)
+        score += _personal_jitter(user_id, today, item["name"])
+        ranked.append((score, item, liked))
+    ranked.sort(key=lambda row: row[0], reverse=True)
+    return ranked
 
 
 # ── menu functions ─────────────────────────────────────────────────
@@ -302,12 +482,13 @@ async def fetch_todays_menu_items(session, sub_path="2/") -> list:
         return []
 
 
+FOOD_SHORTLIST = 5  # how many of the best matches the model chooses between
 MEAT_CODES = {"G", "R", "L", "W", "F", "Fi"}  # Poultry (incl. turkey - no separate code for it), Beef, Lamb, Game, Fish (F and Fi both mean Fish in this Mensa's code table) - used to flag/prioritize meat/fish dishes
 # What a diet leaves out (pork, alcohol, gelatine for halal, ...) is in preferences.diet_filter.
 
-MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for a student's lunch from today's Mensa Counter/Culinarium options, from the given candidate list only - everything on it is already filtered to exclude what they don't eat, so don't second-guess that. Weigh three things together: (1) prioritize a meat, chicken, turkey, or fish dish when one is available - the [tag] next to a candidate flags this; (2) how nutritious/filling it likely is, judged from its name and description (lean protein, vegetables, a balanced plate > something clearly just a light side or dessert-like); (3) price - a student budget, so don't default to the most expensive option without reason. None of these mechanically overrides the others; weigh the actual tradeoff for today's specific candidates.
+MEAL_RECOMMENDATION_SYSTEM_PROMPT = """You are picking exactly ONE recommended dish for one specific student's lunch from today's Mensa options, from the given candidate list only. Everything on it is already filtered to exclude what they don't eat, so don't second-guess that, and it is already ordered with the best match for THIS student first. Weigh these together: (1) the ingredients the student told us they like: a candidate marked [likes: ...] contains them, prefer those, the more the better; (2) variety: the student has been recommended some dishes recently (listed under "Recently recommended"), avoid repeating them and don't fall back on the same kind of dish every day; (3) how nutritious and filling the dish likely is, judged from its name and description; (4) price, since this is a student budget. Do NOT favour meat or the most expensive option by default: a vegetarian dish is a perfectly good pick when it fits the student's tastes. None of these mechanically overrides the others.
 
-Respond with strict JSON only, no other text: {"dish": "<the exact dish name, copied verbatim from the candidate list>", "reasoning": "<1-2 warm, casual sentences naming the dish naturally and explaining the pick (you can mention price/value or how filling it is if that's genuinely part of why) - this will be read aloud as a voice message, so plain spoken-friendly text only: no markdown, no lists, no emojis>"}"""
+Respond with strict JSON only, no other text: {"dish": "<the exact dish name, copied verbatim from the candidate list>", "reasoning": "<1-2 warm, casual sentences naming the dish naturally and saying why it suits this student (mention a liked ingredient when the pick has one, or that it is something different from the last days, or the price or how filling it is, whichever is genuinely the reason) - this will be read aloud as a voice message, so plain spoken-friendly text only: no markdown, no lists, no emojis>"}"""
 
 MENSA_PHOTO_AJAX_URL = "https://sw-oldenburg-spl56.maxmanager.xyz/inc/ajax-php_konnektor.inc.php"
 MENSA_PHOTO_BASE_URL = "https://sw-oldenburg-spl56.maxmanager.xyz/"
@@ -515,9 +696,10 @@ async def build_food_recommendation(loc_id: str = "2", user_id: Optional[int] = 
     (their food_preferences.json settings, unioned with a fixed
     pork/alcohol/wine/gelatine floor per their stated restriction), keep
     only Counter/Culinarium items, and ask the LLM to pick ONE dish,
-    weighing meat/chicken/turkey/fish priority, likely nutritional value,
-    and price together (see MEAL_RECOMMENDATION_SYSTEM_PROMPT) - not a
-    random pick, a real judged one.
+    weighing the student's liked ingredients, variety against their recent
+    recommendations, nutritional value and price together (see
+    rank_candidates and MEAL_RECOMMENDATION_SYSTEM_PROMPT): a pick made for
+    this student alone, remembered in their own history.
 
     Returns {"dish", "category" (raw, e.g. "COUNTER TWO" - pass through
     _friendly_menu_category_label for display), "reasoning"}, or None on
@@ -568,19 +750,31 @@ async def build_food_recommendation(loc_id: str = "2", user_id: Optional[int] = 
             "reasoning": f"Couldn't find anything on today's menu that fits your diet ({DIETS.get(food['diet'], food['diet'])}) and preferences. Check the full menu, there might be something elsewhere on it.",
         }
 
+    today = berlin_now().date()
+    like_keywords = list(food.get("like_keywords") or [])
+    recent = _recent_picks(uid, today)
+    ranked = rank_candidates(candidates, like_keywords, recent, uid, today)
+    shortlist = ranked[:FOOD_SHORTLIST]
+
     lines = []
     lookup = []
-    for it in candidates:
+    for _score, it, liked in shortlist:
         meat_tags = sorted({ALLERGEN_CODE_NAMES.get(c, c) for c in it["codes"] if c in MEAT_CODES})
         tag_note = f" [{', '.join(meat_tags)}]" if meat_tags else ""
+        like_note = f" [likes: {', '.join(liked)}]" if liked else ""
         price_part = f" - {it['price']}" if it["price"] else ""
         desc_part = f": {it['description']}" if it["description"] else ""
-        lines.append(f"- {it['name']} ({it['category']}){tag_note}{price_part}{desc_part}")
+        lines.append(f"- {it['name']} ({it['category']}){tag_note}{like_note}{price_part}{desc_part}")
         lookup.append((it["name"], it))
+    prompt = "Today's candidates, best match first:\n" + "\n".join(lines)
+    if like_keywords:
+        prompt += "\n\nThe student likes: " + ", ".join(like_keywords)
+    if recent:
+        prompt += "\n\nRecently recommended: " + ", ".join(dict.fromkeys(e["dish"] for e in recent[-8:]))
 
     raw = await _call_openrouter(
         MEAL_RECOMMENDATION_SYSTEM_PROMPT,
-        "Today's candidates:\n" + "\n".join(lines),
+        prompt,
         temperature=0.9,
         can_send=lambda: owner is None or personal_ai_allowed(owner),
     )
@@ -590,13 +784,13 @@ async def build_food_recommendation(loc_id: str = "2", user_id: Optional[int] = 
     if isinstance(model_dish, str) and model_dish.strip():
         chosen = _best_title_match(model_dish.strip(), lookup, min_score=0.5)
     if chosen is None:
-        meat_candidates = [c for c in candidates if c["codes"] & MEAT_CODES]
-        chosen = random.choice(meat_candidates or candidates)
+        chosen = shortlist[0][1]  # the best match for this student, never a random dish
 
     raw_reasoning = (parsed or {}).get("reasoning")
     reasoning = raw_reasoning.strip()[:500] if isinstance(raw_reasoning, str) and chosen is not None else ""
     reasoning = reasoning or f"I'd recommend the {chosen['name']} today."
 
+    _remember_pick(uid, chosen["name"], today)
     return {"dish": chosen["name"], "category": chosen["category"], "reasoning": reasoning, "loc_id": loc_id}
 
 
@@ -1182,6 +1376,7 @@ def _food_preferences_management_view(category="main"):
     prefs = load_food_preferences()
     avoid_codes_set = set(prefs.get("avoid_codes", []))
     avoid_keywords = prefs.get("avoid_keywords", [])
+    like_keywords = prefs.get("like_keywords", [])
 
     if category in FOOD_PREF_CATEGORIES:
         cat_info = FOOD_PREF_CATEGORIES[category]
@@ -1245,12 +1440,26 @@ def _food_preferences_management_view(category="main"):
     else:
         text += "<b>Currently avoiding:</b> None (all dishes shown)\n\n"
 
+    if like_keywords:
+        text += f"<b>👍 Ingredients you like ({len(like_keywords)}):</b>\n"
+        text += "\n".join(f"• {html.escape(str(kw))}" for kw in like_keywords)
+        text += "\n\n"
+    else:
+        text += "<b>👍 Ingredients you like:</b> none yet\n\n"
+
     text += (
-        "Select a category below to browse the Mensa legend and toggle ingredients to avoid. "
-        "Dishes containing avoided ingredients will be filtered out automatically."
+        "Your lunch picks lean towards the ingredients you like and away from dishes you were "
+        "given in the last days, so they are different for every student. Tell me what you like "
+        "(for example chicken, pasta, tofu) and what you never want to see. "
+        "Select a category below to browse the Mensa legend and toggle ingredients to avoid; "
+        "dishes with avoided ingredients are filtered out automatically."
     )
 
     keyboard = [
+        [
+            InlineKeyboardButton("👍 Add liked ingredients", callback_data="foodpref_add|like"),
+            InlineKeyboardButton("🚫 Add disliked ones", callback_data="foodpref_add|avoid"),
+        ],
         [
             InlineKeyboardButton("🥩 Meat & Gelatin", callback_data="foodpref_cat|meat"),
             InlineKeyboardButton("🥜 Common Allergens", callback_data="foodpref_cat|allergens"),
@@ -1273,7 +1482,13 @@ def _food_preferences_management_view(category="main"):
             label = _prefix_by_telegram_length(label, 63) + "…"
         keyboard.append([InlineKeyboardButton(label, callback_data=foodpref_remove_data(i, kw))])
 
-    if avoided_items:
+    for i, kw in enumerate(like_keywords):
+        label = f'❌ Unlike "{kw}"'
+        if _telegram_length(label) > 64:
+            label = _prefix_by_telegram_length(label, 63) + "…"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"foodpref_unlike|k{i}:{_keyword_tag(kw)}")])
+
+    if avoided_items or like_keywords:
         keyboard.append([InlineKeyboardButton("🗑 Clear All Preferences", callback_data="foodpref_clear_ask")])
 
     keyboard.append([InlineKeyboardButton("🍽️ Back to Mensa Menu", callback_data="menu_nav|2/")])
@@ -1457,6 +1672,45 @@ async def handle_foodpref_remove(update: Update, context: ContextTypes.DEFAULT_T
         await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
+FOOD_WORD_PROMPTS = {
+    "like": "👍 Which ingredients or dishes do you like? Send them in one message, separated by commas "
+            "(for example: chicken, pasta, tofu). Send /status to cancel.",
+    "avoid": "🚫 Which ingredients do you never want to see? Send them in one message, separated by commas "
+             "(for example: mushrooms, fish). Send /status to cancel.",
+}
+
+
+async def handle_foodpref_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tapped "Add liked ingredients" or "Add disliked ones" - the next text message holds the words."""
+    query = update.callback_query
+    await query.answer()
+    if not is_user_allowed(query.from_user.id):
+        return
+    kind = (query.data or "").split("|", 1)[-1]
+    if kind not in FOOD_WORD_PROMPTS:
+        return
+    if context.user_data is not None:
+        context.user_data["pending_step"] = f"food_{kind}_add"
+    await query.message.reply_text(FOOD_WORD_PROMPTS[kind])
+
+
+async def handle_foodpref_unlike(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tapped "Unlike <word>" - drop that one liked ingredient and redraw the screen."""
+    query = update.callback_query
+    await query.answer()
+    if not is_user_allowed(query.from_user.id):
+        return
+    prefs = load_food_preferences()
+    word = _resolve_foodpref_remove((query.data or "").split("|", 1)[-1], prefs["like_keywords"])
+    if word is not None:  # None: a stale button, nothing is removed
+        save_food_likes([k for k in prefs["like_keywords"] if k != word])
+    text, keyboard = _food_preferences_management_view(category="main")
+    try:
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+    except TelegramError:
+        await query.message.reply_text(text, parse_mode="HTML", reply_markup=keyboard)
+
+
 async def handle_foodpref_clear_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1471,6 +1725,7 @@ async def handle_foodpref_clear_confirm(update: Update, context: ContextTypes.DE
     query = update.callback_query
     await query.answer("Cleared")
     save_food_preferences([], [])
+    save_food_likes([])
     text, keyboard = _food_preferences_management_view(category="main")
     try:
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)

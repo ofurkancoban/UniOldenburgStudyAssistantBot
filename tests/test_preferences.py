@@ -158,8 +158,10 @@ class DailyLifeTests(unittest.TestCase):
     def test_food_preferences_are_per_student(self):
         from unibot import mensa
         mensa.save_food_preferences(["Kn"], ["onion"], user_id=8034)
-        self.assertEqual(mensa.load_food_preferences(8034), {"avoid_codes": ["Kn"], "avoid_keywords": ["onion"]})
-        self.assertEqual(mensa.load_food_preferences(8035), {"avoid_codes": [], "avoid_keywords": []})
+        self.assertEqual(mensa.load_food_preferences(8034),
+                         {"avoid_codes": ["Kn"], "avoid_keywords": ["onion"], "like_keywords": []})
+        self.assertEqual(mensa.load_food_preferences(8035),
+                         {"avoid_codes": [], "avoid_keywords": [], "like_keywords": []})
 
     def test_wardrobe_is_private_per_student_and_migrates(self):
         db.save(storage.WARDROBE_CACHE_PATH, {"8040": {"items": [{"id": "w_1", "label": "coat"}],

@@ -84,6 +84,8 @@ from unibot.studip_api import (
 )
 from unibot.weather import geocode_location, save_weather_location
 from unibot.mensa import (
+    _food_preferences_management_view,
+    add_food_words,
     effective_food_filter,
     get_menu_navigation_keyboard,
     get_todays_menu_enhanced,
@@ -1259,6 +1261,26 @@ async def handle_pending_step(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if step in ("task_text", "task_time"):
         return await _handle_task_wizard_reply(update, context, step, text)
+
+    if step in ("food_like_add", "food_avoid_add"):
+        kind = "like" if step == "food_like_add" else "avoid"
+        user_id = update.effective_user.id if update.effective_user else None
+        context.user_data.pop("pending_step", None)
+        if user_id is None:
+            return True
+        added, ignored = add_food_words(user_id, kind, text)
+        if not added and not ignored:
+            await update.effective_message.reply_text(
+                "🤷 I didn't find any ingredient in that. Tap the button again and send words like: chicken, pasta.")
+            return True
+        verb = "like" if kind == "like" else "never want to see"
+        line = f"Noted, you {verb}: {', '.join(added)}." if added else "Nothing new to add."
+        if ignored:
+            line += f" Already on the list: {', '.join(ignored)}."
+        await update.effective_message.reply_text(f"🍽️ {line}", reply_markup=get_main_keyboard())
+        view_text, view_markup = _food_preferences_management_view(category="main")
+        await update.effective_message.reply_text(view_text, parse_mode="HTML", reply_markup=view_markup)
+        return True
 
     if step == "user_name":
         context.user_data.pop("pending_step", None)

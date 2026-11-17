@@ -18,7 +18,7 @@ from telegram.ext import ContextTypes
 from studip_utils import TZ_BERLIN, aread_bytes, berlin_now, format_hours as _format_hours, html_escape as _h
 
 from unibot import course_registry, db, state
-from unibot.preferences import campus_anchor, food_filter, get_pref
+from unibot.preferences import campus_anchor, get_pref
 from unibot.storage import (
     AI_PERSONAL_OFF_NOTE,
     get_ai_personal_enabled,
@@ -370,14 +370,11 @@ async def _prepare_morning_summary(bot, user_ids) -> Optional[dict]:
     weather_of: dict[int, Optional[dict]] = {}
     # The lunch pick and its photo are per mensa: made once for each mensa
     # someone has lunch at today (one AI call each), shared by its students.
-    # One pick per mensa and diet: students with the same filter share it.
+    # The pick is made for each student alone (their likes, their recent picks), never shared.
     picks: dict[tuple, tuple] = {}
 
     async def lunch_at(loc_id: str, uid: Optional[int] = None) -> tuple:
-        food_rules = food_filter(uid)
-        key = (loc_id, food_rules["diet"], tuple(sorted(food_rules["avoid_codes"])),
-               tuple(sorted(food_rules["avoid_keywords"])), food_rules["max_price"],
-               bool(uid is not None and get_ai_personal_enabled(uid)))
+        key = (loc_id, uid)
         if key not in picks:
             food = await _fetch_lunch_pick(loc_id, user_id=uid)
             picks[key] = (food, *await _prepare_lunch_photo(food))

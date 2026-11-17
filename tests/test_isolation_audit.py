@@ -47,6 +47,8 @@ CANARY = "canary"
 def _populate_a():
     storage.save_user_name(A, "CanaryAlice")
     prefs.set_pref(A, "food_avoid_keywords", ["canaryfood"])
+    prefs.set_pref(A, "food_like_keywords", ["canarylike"])
+    storage.save_personal_record(A, "food_history", [{"date": "2026-11-17", "dish": "canary dish"}])
     storage.add_user_task(A, {"id": "t1", "user_id": A, "text": "canary task", "due_time": None, "course": "Canary Course"})
     weather.save_weather_location("CanaryTown", "DE", 53.0, 8.0, user_id=A)
     storage.save_default_semester("sem1", "CanarySemester", user_id=A)
@@ -94,6 +96,7 @@ class IsolationAuditTests(unittest.TestCase):
             "alert queue": db.get_user_scope(uid).private("alert_queue"),
             "studip name": storage.personal_record(uid, "studip_name"),
             "study blocks": storage.personal_record(uid, "study_blocks"),
+            "food history": storage.personal_record(uid, "food_history"),
             "preferences": prefs.get_prefs(uid),
             "food filter": {k: sorted(v) if isinstance(v, set) else v for k, v in prefs.food_filter(uid).items()},
         }
@@ -102,7 +105,7 @@ class IsolationAuditTests(unittest.TestCase):
         # without this, "nothing found for B" would prove nothing
         own = self._everything_of(A)
         for name in ("name", "tasks", "weather", "semester", "wardrobe", "messages", "exam cache", "button action",
-                     "alert queue", "studip name", "study blocks", "preferences"):
+                     "alert queue", "studip name", "study blocks", "food history", "preferences"):
             self.assertIn(CANARY, json.dumps(own[name], default=str).lower(), name)
 
     def test_b_reads_none_of_a_through_any_accessor(self):
