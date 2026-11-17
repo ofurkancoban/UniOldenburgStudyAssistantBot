@@ -505,7 +505,8 @@ class StumsNavigationHeadersTests(unittest.TestCase):
 
 class StumsLoginPageDetectionTests(unittest.TestCase):
     SIGNED_IN = ('<html><title>Planner of studies</title><form id="sessionTimeoutLoginForm" action="/x">'
-                 '<input id="sessionTimeoutLoginForm:login"></form></html>')
+                 '<input id="sessionTimeoutLoginForm:login"></form>'
+                 '<form action="/qisserver/rds?state=user" name="loginform" class="formular"></form></html>')
 
     def test_the_hidden_session_timeout_dialog_of_a_signed_in_page_is_not_a_login_page(self):
         from stums_parsers import is_stums_login_page
@@ -515,7 +516,7 @@ class StumsLoginPageDetectionTests(unittest.TestCase):
         from stums_parsers import is_stums_login_page
         self.assertTrue(is_stums_login_page("<title>Login notwendig - Universit\u00e4t Oldenburg</title>"))
         self.assertTrue(is_stums_login_page('<form id="loginForm" action="/x"></form>'))
-        self.assertTrue(is_stums_login_page('<input name="loginForm:username">'))
+        self.assertTrue(is_stums_login_page('<form name="loginform" action="/x"></form>'))
         self.assertFalse(is_stums_login_page(""))
 
     def test_a_signed_in_page_passes_the_page_reader(self):
