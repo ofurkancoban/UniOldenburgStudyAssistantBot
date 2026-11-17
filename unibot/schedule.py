@@ -98,6 +98,12 @@ async def run_morning_summary_schedule(bot, user_ids, now: datetime) -> None:
     # for Stud.IP dates. Delivery tasks subtract an aware Berlin timestamp, so
     # normalize here before constructing send_at.
     now = now.replace(tzinfo=TZ_BERLIN) if now.tzinfo is None else now.astimezone(TZ_BERLIN)
+    # yesterday's pinned summary goes as soon as the new day starts, before today's arrives
+    try:
+        from unibot.morning import unpin_stale_morning_summaries
+        await unpin_stale_morning_summaries(bot, user_ids, now)
+    except Exception:
+        logging.warning("Could not unpin old morning summaries", exc_info=True)
     groups: dict = {}
     for uid in user_ids:
         try:

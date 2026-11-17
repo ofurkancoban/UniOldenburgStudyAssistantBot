@@ -13,6 +13,7 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
+from telegram.error import NetworkError, RetryAfter
 from telegram.ext import ContextTypes
 
 from studip_utils import TZ_BERLIN, aread_bytes, berlin_now, format_hours as _format_hours, html_escape as _h
@@ -475,6 +476,55 @@ async def _prepare_user_summary(uid: int, today_date, weather, lunch_at) -> tupl
     return text, voice, menu_button, (photo_url, photo_caption)
 
 
+PINNED_SUMMARY_RECORD = "pinned_morning_summary"
+
+
+def _pinned_summary(uid: int) -> tuple[Optional[int], Optional[str]]:
+    """(message id, day it was pinned) of this student's pinned summary. Records
+    from before the day was stored are a bare message id: the day is unknown."""
+    record = personal_record(uid, PINNED_SUMMARY_RECORD)
+    if isinstance(record, dict):
+        message_id = record.get("id")
+        return (message_id if isinstance(message_id, int) else None), record.get("date")
+    return (record if isinstance(record, int) and not isinstance(record, bool) else None), None
+
+
+async def _unpin_pinned_summary(bot, uid: int) -> None:
+    """Unpin the summary pinned earlier and forget it. Best-effort: a failure (missing chat
+    permission, message already gone) never blocks anything else."""
+    message_id, _day = _pinned_summary(uid)
+    if message_id is None:
+        return
+    try:
+        await bot.unpin_chat_message(chat_id=uid, message_id=message_id)
+    except (NetworkError, RetryAfter) as e:
+        # a passing problem: keep the record, the next cycle tries again
+        logging.warning("Could not unpin the previous morning summary for %s yet: %s", uid, e)
+        return
+    except Exception as e:
+        # the message is gone or the bot may not unpin here: retrying would never help
+        logging.warning("Failed to unpin the previous morning summary for %s: %s", uid, e)
+    if db.private_context_is_current(uid):
+        save_personal_record(uid, PINNED_SUMMARY_RECORD, None)
+
+
+async def unpin_stale_morning_summaries(bot, user_ids, now: datetime) -> None:
+    """Unpin every morning summary pinned on an earlier day, as soon as the new day starts,
+    so yesterday's summary is gone before today's arrives (and also for students who get none
+    today). A summary pinned today stays; a record without a day is left for the next delivery."""
+    today = now.date().isoformat()
+    for uid in user_ids:
+        if not is_user_allowed(uid) or not _private_context_current(uid):
+            continue
+        with acting_as(uid):
+            if not db.private_context_is_current(uid):
+                continue
+            message_id, day = _pinned_summary(uid)
+            if message_id is None or day is None or day >= today:
+                continue
+            await _unpin_pinned_summary(bot, uid)
+
+
 async def deliver_morning_summary(bot, user_ids, prepared: dict, on_delivered=None) -> list[int]:
     """Send a prepare_morning_summary result: text (pinned), lunch photo,
     outfit, voice message, back to back."""
@@ -498,6 +548,10 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict, on_delivered=No
         with acting_as(uid):
             if not db.private_context_is_current(uid):
                 continue
+            # yesterday's summary goes first, so it is never pinned next to today's
+            await _unpin_pinned_summary(bot, uid)
+            if not db.private_context_is_current(uid):
+                continue
             try:
                 sent_msg = await bot.send_message(
                     chat_id=uid,
@@ -518,17 +572,10 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict, on_delivered=No
                 except Exception:
                     logging.error("Failed to record morning summary delivery for %s", uid, exc_info=True)
 
-            prev_msg_id = personal_record(uid, "pinned_morning_summary")
-            if not db.private_context_is_current(uid):
-                continue
-            if prev_msg_id:
-                try:
-                    await bot.unpin_chat_message(chat_id=uid, message_id=prev_msg_id)
-                except Exception as e:
-                    logging.warning("Failed to unpin previous morning summary for %s: %s", uid, e)
             try:
                 await bot.pin_chat_message(chat_id=uid, message_id=sent_msg.message_id, disable_notification=True)
-                save_personal_record(uid, "pinned_morning_summary", sent_msg.message_id)
+                save_personal_record(uid, PINNED_SUMMARY_RECORD,
+                                     {"id": sent_msg.message_id, "date": datetime.now(TZ_BERLIN).date().isoformat()})
             except Exception as e:
                 logging.warning("Failed to pin morning summary for %s: %s", uid, e)
 
