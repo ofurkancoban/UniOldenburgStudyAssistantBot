@@ -1,6 +1,7 @@
 # Core (versions tested together; upper bounds stop a future major release
 # from silently breaking the bot on a fresh install)
 aiohttp>=3.14.4,<4
+aiohttp-socks>=0.10,<1     # SOCKS5 proxy for university requests (UNI_PROXY_URL)
 Brotli>=1.2,<2             # aiohttp needs it to decode "br" responses (Stud.IP sends them)
 python-telegram-bot>=22.5,<23
 python-dotenv>=1.2.2,<2

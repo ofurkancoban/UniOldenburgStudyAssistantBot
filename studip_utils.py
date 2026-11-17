@@ -140,6 +140,8 @@ def route_proxy_url(
     X-Target-Host, X-Proxy-Secret, and injected target domain cookies.
     """
     worker_url = os.getenv("CLOUDFLARE_WORKER_URL", "").strip().rstrip("/")
+    if os.getenv("UNI_PROXY_URL", "").strip():
+        worker_url = ""  # a university proxy replaces the Worker
     worker_secret = os.getenv("CLOUDFLARE_WORKER_SECRET", "").strip()
     headers = dict(extra_headers or {})
 

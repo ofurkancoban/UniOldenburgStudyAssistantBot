@@ -15,6 +15,7 @@ from typing import Iterable, Optional
 
 from studip_http import THROTTLE
 from studip_utils import TZ_BERLIN
+from studip_http import uni_proxy_reachable
 from studip_session import worker_status
 from unibot import db, state
 from unibot.config import PROJECT_ROOT
@@ -61,8 +62,14 @@ def connection_report() -> list[str]:
             line += f" ⏸ cooldown {int(cooldown)} s"
         lines.append(line)
 
+    proxy_up = uni_proxy_reachable()
+    if proxy_up is not None:
+        lines.append("🛡️ University proxy: " + ("✅ reachable (the server address is hidden)" if proxy_up
+                                              else "🔴 NOT reachable, university requests fail until it is back"))
     worker = worker_status()
-    if not worker["configured"]:
+    if proxy_up is not None:
+        pass  # the proxy replaces the Worker
+    elif not worker["configured"]:
         lines.append("☁️ Cloudflare Worker: not configured (direct requests)")
     elif worker["down_for"] > 0:
         lines.append(f"☁️ Cloudflare Worker: ⚠️ down, direct requests for {int(worker['down_for'] // 60) + 1} min "

@@ -58,6 +58,40 @@ def user_agent() -> str:
     return os.getenv("STUDIP_USER_AGENT", "").strip() or DEFAULT_USER_AGENT
 
 
+def uni_proxy_url() -> str:
+    """SOCKS5 proxy for every request to the university (UNI_PROXY_URL, e.g. socks5://127.0.0.1:40000).
+
+    With it set the server's own address never reaches the university and the Cloudflare Worker is not used.
+    There is no fallback: when the proxy is down, requests fail instead of leaving from the server."""
+    return os.getenv("UNI_PROXY_URL", "").strip()
+
+
+def make_uni_connector(limit: int, limit_per_host: int) -> aiohttp.BaseConnector:
+    """Connector for university requests: through UNI_PROXY_URL when set, else a plain TCP connector."""
+    proxy = uni_proxy_url()
+    if proxy:
+        from aiohttp_socks import ProxyConnector
+        return ProxyConnector.from_url(proxy, rdns=True, limit=limit, limit_per_host=limit_per_host,
+                                       ttl_dns_cache=300)
+    return aiohttp.TCPConnector(limit=limit, limit_per_host=limit_per_host, ttl_dns_cache=300)
+
+
+def uni_proxy_reachable() -> Optional[bool]:
+    """None without a proxy, else whether its local port accepts a connection."""
+    proxy = uni_proxy_url()
+    if not proxy:
+        return None
+    import socket
+    from urllib.parse import urlsplit
+    parts = urlsplit(proxy)
+    with socket.socket() as probe:
+        probe.settimeout(1.0)
+        try:
+            return probe.connect_ex((parts.hostname or "127.0.0.1", parts.port or 1080)) == 0
+        except OSError:
+            return False
+
+
 def _env_float(name: str, default: float) -> float:
     try:
         value = float(os.getenv(name, "").strip() or default)

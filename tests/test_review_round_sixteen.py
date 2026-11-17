@@ -569,6 +569,46 @@ class NoRegisteredExamsTests(unittest.TestCase):
             self._schedule("<html><p>something else</p></html>")
 
 
+class UniversityProxyTests(unittest.TestCase):
+    def test_without_a_proxy_the_connector_is_plain_and_the_worker_may_be_used(self):
+        import os
+        import studip_http
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("UNI_PROXY_URL", None)
+            self.assertEqual(studip_http.uni_proxy_url(), "")
+            self.assertIsNone(studip_http.uni_proxy_reachable())
+
+            async def build():
+                return type(studip_http.make_uni_connector(4, 2)).__name__
+            self.assertEqual(asyncio.run(build()), "TCPConnector")
+
+    def test_with_a_proxy_requests_use_it_and_the_worker_is_skipped(self):
+        import os
+        import studip_http
+        import studip_session
+        from studip_utils import route_proxy_url
+        env = {"UNI_PROXY_URL": "socks5://127.0.0.1:40000", "CLOUDFLARE_WORKER_URL": "https://w.example",
+               "CLOUDFLARE_WORKER_SECRET": "s"}
+        with mock.patch.dict(os.environ, env):
+            async def build():
+                return type(studip_http.make_uni_connector(4, 2)).__name__
+            self.assertEqual(asyncio.run(build()), "ProxyConnector")
+            sess = studip_session.StudIPSession.__new__(studip_session.StudIPSession)
+            self.assertFalse(sess._via_worker("elearning.uni-oldenburg.de"))
+            url = "https://elearning.uni-oldenburg.de/dispatch.php/login"
+            self.assertEqual(route_proxy_url(url)[0], url)
+
+    def test_a_closed_proxy_port_is_reported_unreachable(self):
+        import os
+        import socket
+        import studip_http
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        with mock.patch.dict(os.environ, {"UNI_PROXY_URL": f"socks5://127.0.0.1:{port}"}):
+            self.assertFalse(studip_http.uni_proxy_reachable())
+
+
 class WorkerUsageTests(unittest.TestCase):
     def setUp(self):
         import studip_session

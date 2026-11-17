@@ -50,7 +50,7 @@ from urllib.parse import parse_qs, urlsplit
 import aiohttp
 from bs4 import BeautifulSoup
 
-from studip_http import THROTTLE, parse_retry_after, user_agent
+from studip_http import THROTTLE, make_uni_connector, parse_retry_after, user_agent
 from studip_utils import route_proxy_url
 
 logger = logging.getLogger("StudIPOAuth")
@@ -414,7 +414,8 @@ async def refresh(tokens: Optional[dict] = None, user_id: Optional[int] = None) 
     # still routed through the optional worker and the shared host throttle.
     routed_tok, tok_headers = route_proxy_url(TOKEN_URL, {"User-Agent": user_agent()})
     host = urlsplit(TOKEN_URL).hostname or ""
-    async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar()) as http:
+    async with aiohttp.ClientSession(cookie_jar=aiohttp.DummyCookieJar(),
+                                     connector=make_uni_connector(limit=4, limit_per_host=2)) as http:
         async with THROTTLE.slot(host):
             try:
                 resp_cm = http.post(routed_tok, data=data, headers=tok_headers, allow_redirects=False,

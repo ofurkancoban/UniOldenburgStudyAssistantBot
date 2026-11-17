@@ -25,9 +25,11 @@ from studip_http import (
     THROTTLE,
     UNI_HOSTS,
     UniResponse,
+    make_uni_connector,
     parse_retry_after,
     rewrite_headers,
     to_timeout,
+    uni_proxy_url,
     user_agent,
 )
 from studip_sso import SsoFlowMixin, _describe_page  # noqa: F401 - _describe_page re-exported
@@ -391,7 +393,7 @@ class StudIPSession(SsoFlowMixin):
                 self.session = aiohttp.ClientSession(
                     headers=self.headers,
                     cookie_jar=aiohttp.CookieJar(unsafe=True),
-                    connector=aiohttp.TCPConnector(limit=20, limit_per_host=6, ttl_dns_cache=300),
+                    connector=make_uni_connector(limit=20, limit_per_host=6),
                     timeout=DEFAULT_TIMEOUT,
                 )
                 await self.load_cookies()
@@ -430,7 +432,7 @@ class StudIPSession(SsoFlowMixin):
     # mixing every host's JSESSIONID under the worker's hostname.
 
     def _via_worker(self, host: str) -> bool:
-        if not _worker_url() or host not in UNI_HOSTS or not _worker_available():
+        if uni_proxy_url() or not _worker_url() or host not in UNI_HOSTS or not _worker_available():
             return False
         if host == "stums.uni-oldenburg.de" and os.environ.get("STUMS_VIA_WORKER", "").lower() not in ("1", "true", "yes"):
             # StuMS answers "Login notwendig" (403) to a session created through the Worker, while the
