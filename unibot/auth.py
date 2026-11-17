@@ -430,6 +430,15 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
             "━━━━━━━━━━━━━━━━━━"
         )
         if _gate_reply_due(user.id):
+            # what kind of sender this is, never who: a bot, an update kind, the language the client reports
+            logging.warning(
+                "Invite-only reply sent to an unregistered account (bot=%s, update=%s, chat=%s, language=%s, hash=%s)",
+                bool(getattr(user, "is_bot", False)),
+                "callback" if update.callback_query else "message",
+                getattr(update.effective_chat, "type", None),
+                getattr(user, "language_code", None),
+                _gate_key(user.id)[:6],
+            )
             try:
                 await update.effective_message.reply_text(gate_text, parse_mode="HTML")
             except TelegramError:
