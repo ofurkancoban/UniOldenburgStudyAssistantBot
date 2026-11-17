@@ -337,10 +337,62 @@ async def _call_gwdg_chat(messages: list, model: str, temperature: float = 0,
 # ── per-student AI budget ─────────────────────────────────────────────────────
 # The GWDG/OpenRouter quotas are shared by everyone: one student can't use
 # them up for all. Background work (no acting user) and admins don't count.
-AI_CALLS_PER_HOUR = 60
-AI_CALLS_PER_DAY = 300
+def _env_limit(name: str, default: int) -> int:
+    try:
+        value = int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+AI_CALLS_PER_HOUR = _env_limit("AI_CALLS_PER_HOUR", 60)   # per student, overridable in .env
+AI_CALLS_PER_DAY = _env_limit("AI_CALLS_PER_DAY", 300)
 AI_BUDGET_MESSAGE = "⏳ You've used a lot of AI answers recently - please try again in a while."
+AI_CALLS_PATH = "ai_calls.json"
+AI_CALLS_SAVE_EVERY = 5
 _ai_calls: dict[int, list[float]] = {}
+_ai_calls_loaded = False
+_ai_calls_unsaved = 0
+
+
+def _load_ai_calls() -> None:
+    """Pick up the counts of the last 24 hours once after a start, so a restart does not give everyone a fresh budget."""
+    global _ai_calls_loaded
+    if _ai_calls_loaded:
+        return
+    _ai_calls_loaded = True
+    try:
+        stored = db.load(AI_CALLS_PATH) if db.exists(AI_CALLS_PATH) else {}
+    except Exception:
+        logging.warning("Could not read the stored AI call counts", exc_info=True)
+        return
+    now = time.time()
+    for key, times in (stored or {}).items():
+        try:
+            uid = int(key)
+            recent = [float(t) for t in times if now - float(t) < 86400]
+        except (TypeError, ValueError):
+            continue
+        if recent:
+            _ai_calls[uid] = sorted(set(_ai_calls.get(uid, []) + recent))
+
+
+def _save_ai_calls() -> None:
+    global _ai_calls_unsaved
+    _ai_calls_unsaved = 0
+    try:
+        now = time.time()
+        db.save(AI_CALLS_PATH, {str(uid): [t for t in times if now - t < 86400] for uid, times in _ai_calls.items()})
+    except Exception:
+        logging.warning("Could not store the AI call counts", exc_info=True)
+
+
+def ai_usage_last_day() -> list[tuple[int, int]]:
+    """(student, AI calls in the last 24 hours), the heaviest users first. For the administrators."""
+    _load_ai_calls()
+    now = time.time()
+    usage = [(uid, len(_recent_ai_calls(uid, now))) for uid in list(_ai_calls)]
+    return sorted((u for u in usage if u[1] > 0), key=lambda row: row[1], reverse=True)
 
 
 def _budget_user(user_id=None) -> Optional[int]:
@@ -364,6 +416,7 @@ def ai_budget_left(user_id=None) -> bool:
     uid = _budget_user(user_id)
     if uid is None:
         return True
+    _load_ai_calls()
     now = time.time()
     calls = _recent_ai_calls(uid, now)
     return len(calls) < AI_CALLS_PER_DAY and sum(1 for t in calls if now - t < 3600) < AI_CALLS_PER_HOUR
@@ -378,7 +431,11 @@ def use_ai_budget(user_id=None) -> bool:
     if not ai_budget_left(uid):
         logging.info("AI budget used up for user %s", uid)
         return False
+    global _ai_calls_unsaved
     _ai_calls.setdefault(uid, []).append(time.time())
+    _ai_calls_unsaved += 1
+    if _ai_calls_unsaved >= AI_CALLS_SAVE_EVERY:
+        _save_ai_calls()
     return True
 
 

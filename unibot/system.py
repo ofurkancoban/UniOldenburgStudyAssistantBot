@@ -553,6 +553,32 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=reply_markup)
 
 
+def _admin_health_block() -> str:
+    """System state and AI use for the admin dashboard: what the last background health check found, the
+    off-site backup, and which students used the most AI calls in 24 hours (each against their own cap)."""
+    from unibot.ai import AI_CALLS_PER_DAY, ai_usage_last_day
+    from unibot.diagnostics import backup_line, offsite_line
+    health = load_general_cache().get("health_state") or {}
+    down = [HEALTH_CHECK_LABELS[k] for k, ok in health.items() if not ok and k in HEALTH_CHECK_LABELS]
+    text = "\n🩺 <b>System:</b> " + ("✅ all checks passed\n" if health and not down
+                                    else ("⚠️ " + html.escape(", ".join(down)) + "\n" if down
+                                          else "<i>no health check yet</i>\n"))
+    text += html.escape(backup_line()) + "\n"
+    offsite = offsite_line()
+    if offsite:
+        text += html.escape(offsite) + "\n"
+    usage = [row for row in ai_usage_last_day() if not is_user_admin(row[0])][:5]
+    text += "\n🤖 <b>AI calls, last 24 h</b> (cap per student: " + str(AI_CALLS_PER_DAY) + "):\n"
+    if usage:
+        for uid, count in usage:
+            user = db.get_user(uid) or {}
+            name = html.escape(str(user.get("username") or user.get("full_name") or uid))
+            text += f"• <b>@{name}</b>: {count}" + (" ⚠️ at the cap" if count >= AI_CALLS_PER_DAY else "") + "\n"
+    else:
+        text += "<i>none yet</i>\n"
+    return text
+
+
 def _build_admin_overview_view() -> tuple[str, InlineKeyboardMarkup]:
     stats = db.get_user_analytics()
     text = (
@@ -575,6 +601,7 @@ def _build_admin_overview_view() -> tuple[str, InlineKeyboardMarkup]:
     else:
         text += "<i>No activity records yet.</i>\n"
 
+    text += _admin_health_block()
     text += "\n⚡ <b>Recent Activities:</b>\n"
     if stats["recent_activities"]:
         for a in stats["recent_activities"]:
