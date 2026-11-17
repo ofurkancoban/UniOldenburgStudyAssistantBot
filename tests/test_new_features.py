@@ -25,6 +25,13 @@ use_temp_db()
 from unibot import ai, db, system  # noqa: E402
 
 
+def _write_executable(path, text):
+    import stat
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC)
+
+
 class AiBudgetPersistenceTests(unittest.TestCase):
     def setUp(self):
         self.addCleanup(lambda: (ai._ai_calls.clear(), setattr(ai, "_ai_calls_loaded", False),
@@ -663,6 +670,130 @@ class CanaryTests(unittest.TestCase):
             results = asyncio.run(system.run_health_checks())
         self.assertFalse(results["canary"][0])
         self.assertIn("canary", system.HEALTH_CHECK_LABELS)
+
+
+class StagingScriptTests(unittest.TestCase):
+    """scripts/staging.sh against a stand-in server: local folders, an ssh that runs the script locally and a
+    pm2 that records what it was asked. Nothing leaves the temporary directory (its own origin, its own push)."""
+
+    def setUp(self):
+        import shutil
+        import subprocess
+        self.subprocess = subprocess
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        t = self.tmp
+        self.origin, self.work, self.prod, self.staging = (os.path.join(t, n) for n in ("origin.git", "work", "prod", "staging"))
+        self.home, self.bin = os.path.join(t, "home"), os.path.join(t, "bin")
+        for d in (self.home, self.bin, os.path.join(self.home, ".pm2", "logs")):
+            os.makedirs(d)
+        git = lambda *a, cwd=t: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, text=True,
+                                               env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                                                    "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+        git("init", "-q", "--bare", self.origin)
+        git("clone", "-q", self.origin, self.work)
+        os.makedirs(os.path.join(self.work, "scripts"))
+        shutil.copy(os.path.join(ROOT, "scripts", "staging.sh"), os.path.join(self.work, "scripts", "staging.sh"))
+        for name, text in (("requirements.txt", "aiohttp\n"), ("studip_bot.py", "print('bot')\n"),
+                           (".env.example", "# TELEGRAM_TOKEN=\n# ALLOWED_USER_IDS=\n")):
+            with open(os.path.join(self.work, name), "w") as fh:
+                fh.write(text)
+        git("add", "-A", cwd=self.work)
+        git("commit", "-q", "-m", "first", cwd=self.work)
+        git("push", "-q", "origin", "HEAD:refs/heads/main", cwd=self.work)
+        git("clone", "-q", "-b", "main", self.origin, self.prod)
+        with open(os.path.join(self.prod, ".env"), "w") as fh:
+            fh.write("TELEGRAM_TOKEN=111111:production-secret\nUNI_PROXY_URL=socks5://127.0.0.1:40000\n")
+        _write_executable(os.path.join(self.bin, "ssh"), '#!/usr/bin/env bash\nshift\nexec env "$@"\n')
+        _write_executable(os.path.join(self.bin, "pm2"), f"""#!/usr/bin/env bash
+echo "$*" >> "{t}/pm2_calls.txt"
+LOG="$HOME/.pm2/logs/UniAssistantStaging-error.log"
+case "$1" in
+  describe) [ -f "{t}/started" ];;
+  start|restart) touch "{t}/started"; echo "x | INFO | Unified watcher controller started successfully" >> "$LOG";;
+  jlist) echo '[{{"name": "UniAssistantStaging", "pm2_env": {{"status": "online"}}}}]';;
+esac
+""")
+        self.git = git
+
+    def _run(self, command):
+        env = {**os.environ, "HOME": self.home, "PATH": f"{self.bin}:{os.environ['PATH']}", "DEPLOY_HOST": "stand-in",
+               "DEPLOY_DIR": self.prod, "STAGING_DIR": self.staging, "NODE_BIN": self.bin, "STAGING_SKIP_PIP": "1",
+               "HEALTH_TIMEOUT": "5", "STAGING_SSH": os.path.join(self.bin, "ssh")}
+        return self.subprocess.run(["bash", os.path.join(self.work, "scripts", "staging.sh"), command], env=env,
+                                   cwd=self.work, capture_output=True, text=True, timeout=120)
+
+    def _set_staging_token(self, token):
+        with open(os.path.join(self.staging, ".env"), "a") as fh:
+            fh.write(f"TELEGRAM_TOKEN={token}\n")
+
+    def test_setup_makes_a_separate_copy_that_shares_no_secret_with_production(self):
+        result = self._run("setup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(os.path.join(self.staging, ".env")) as fh:
+            env = fh.read()
+        for line in ("BOT_DB_FILE=bot_data.sqlite3", "PORT=3939", "LOGIN_PORT=8898", "CLOUDFLARE_TUNNEL=",
+                     "UNI_PROXY_URL=socks5://127.0.0.1:40000"):
+            self.assertIn(line, env)
+        self.assertNotIn("production-secret", env)
+        self.assertIn("@BotFather", result.stdout)
+        self.assertEqual(oct(os.stat(os.path.join(self.staging, ".env")).st_mode & 0o777), "0o600")
+
+    def test_setup_is_safe_to_run_again(self):
+        self._run("setup")
+        self._set_staging_token("222222:staging-secret")
+        self.assertEqual(self._run("setup").returncode, 0)
+        with open(os.path.join(self.staging, ".env")) as fh:
+            self.assertIn("222222:staging-secret", fh.read())  # an existing .env is never overwritten
+
+    def test_deploy_without_the_staging_bots_own_token_stops(self):
+        self._run("setup")
+        result = self._run("deploy")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("own TELEGRAM_TOKEN", result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "pm2_calls.txt")))  # nothing was started
+
+    def test_deploy_with_the_production_token_stops_before_anything_starts(self):
+        self._run("setup")
+        self._set_staging_token("111111:another-string-same-bot")  # the same bot id as production
+        result = self._run("deploy")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("PRODUCTION bot's token", result.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "pm2_calls.txt")))
+
+    def test_deploy_updates_the_copy_starts_it_and_a_second_deploy_restarts_it(self):
+        self._run("setup")
+        self._set_staging_token("222222:staging-secret")
+        first = self._run("deploy")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("the staging bot runs", first.stdout)
+        head = self.git("rev-parse", "--short", "HEAD", cwd=self.work).stdout.strip()
+        self.assertIn(head, first.stdout)
+        self.assertEqual(self.git("rev-parse", "--short", "HEAD", cwd=self.staging).stdout.strip(), head)
+        with open(os.path.join(self.work, "studip_bot.py"), "a") as fh:
+            fh.write("# a change to try\n")
+        self.git("commit", "-q", "-am", "change", cwd=self.work)
+        second = self._run("deploy")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        with open(os.path.join(self.tmp, "pm2_calls.txt")) as fh:
+            calls = fh.read()
+        self.assertIn("start .venv/bin/python --name UniAssistantStaging", calls)
+        self.assertIn("restart UniAssistantStaging", calls)
+        self.assertEqual(self.git("rev-parse", "--short", "HEAD", cwd=self.staging).stdout.strip(),
+                         self.git("rev-parse", "--short", "HEAD", cwd=self.work).stdout.strip())
+
+    def test_status_shows_the_commit_and_whether_it_runs(self):
+        self._run("setup")
+        self._set_staging_token("222222:staging-secret")
+        self._run("deploy")
+        result = self._run("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("commit:", result.stdout)
+        self.assertIn("online", result.stdout)
+
+    def test_an_unknown_command_prints_the_usage(self):
+        self.assertEqual(self._run("nonsense").returncode, 2)
+        self.assertIn("scripts/staging.sh setup", self._run("help").stdout)
 
 
 def _async(function):

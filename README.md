@@ -147,6 +147,15 @@ Every voice note is transcribed first (via the free Google Web Speech API, no AP
 
 ---
 
+### 🧰 Everyday extras
+
+- **📅 Calendar link** (`/status`, Calendar sync): one live link (or a `.ics` file) with your **lectures** (cancelled ones marked and not blocking the time), the **exams you registered for** (all-day when StuMS has no time yet), your study blocks and your lunch breaks, for this and the next week. The link is a secret: anyone who has it sees your timetable, **🔑 New link** replaces it.
+- **🧾 Summarize** under a long announcement or forum post (200 characters or more): one to three sentences about it. Made only when you tap the button, only with your AI permission and only for courses you follow, like **📝 Add as Task**.
+- **📦 Download my data** (Privacy screen): everything stored about you as one readable JSON file, once an hour. Login cookies and tokens are not in it, and nothing of any other student.
+- **👍 I like it / 🔁 Another one** under a lunch pick: a liked dish teaches the picks its ingredients (never one you avoid), "Another one" gives a different dish.
+- **📘 Weekly study plan, exam revision**: for every registered exam the plan week holds revision time that grows as the exam nears (60 minutes at three weeks, up to 240 in the last three days); past papers count towards it, and a course without past papers gets plain revision.
+- **🤖 AI limits**: each student may make `AI_CALLS_PER_HOUR` (60) and `AI_CALLS_PER_DAY` (300) AI calls; the counts survive a restart and the admin dashboard lists the heaviest users.
+
 ## 🛠️ Installation & Deployment
 
 **Recommended Setup (Unix/Mac):**
@@ -162,6 +171,11 @@ chmod +x setup.sh
 1.  **Environment Isolation**: Creates and activates a Python `.venv`.
 2.  **Dependency Resolution**: Installs Python requirements and the WhatsApp service's locked Node.js dependencies. Node.js 20.9+ and npm are required.
 3.  **Configuration**: Creates `.env` from `.env.example` if it is missing, then starts the bot.
+
+### Staging and the nightly check
+
+- **`scripts/staging.sh`** runs a second copy of the bot on the same server to try a change before production: `setup` once (separate checkout, virtualenv, database, ports, no public tunnel), then `deploy` (pushes HEAD to the `staging` branch, updates and restarts the copy and waits for a healthy start) and `status`. It needs its own Telegram bot (`@BotFather`, `/newbot`) and refuses to start with the production bot's token. When it looks right, release with `scripts/deploy.sh`.
+- **Nightly canary** (`unibot/canary.py`, after 04:00): checks that the public StuMS, NetIQ and Stud.IP pages and the Mensa widget still look like the pages the parsers were written for, and, with a signed-in administrator's account, that StuMS sign-in and the study planner, results, enrolments and study service pages still parse. A change is alerted to the administrators the same night (health check "Nightly page check", also in `/healthcheck`), instead of when a student misses an alert.
 
 ### Deploy updates to the VPS
 
