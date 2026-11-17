@@ -100,6 +100,7 @@ HEALTH_CHECK_LABELS = {
     "gwdg": "🎓 GWDG AI (text, tagging, try-on fallback)",
     "disk": "💾 Server disk",
     "uni_proxy": "🛡️ University proxy (WARP)",
+    "offsite_backup": "☁️ Off-site backup (Google Drive)",
 }
 
 # Below this much free space the disk counts as unhealthy: a full disk
@@ -247,6 +248,10 @@ async def run_health_checks(live_openrouter: bool = False) -> dict:
     from studip_http import uni_proxy_url
     if uni_proxy_url():
         results["uni_proxy"] = await check_uni_proxy_health()
+    from unibot.diagnostics import offsite_backup_status
+    offsite = offsite_backup_status()
+    if offsite is not None:  # only once the nightly upload to Drive has been set up
+        results["offsite_backup"] = offsite
     return results
 
 

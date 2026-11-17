@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import html
 import logging
+import json
 import os
 import re
 import time
@@ -166,6 +167,42 @@ def backup_line(backup_dir: Optional[str] = None, now: Optional[float] = None) -
     return f"💾 Database backup: {flag} {names[-1]} ({size_mb:.1f} MB, {len(names)} kept)"
 
 
+OFFSITE_STATUS_FILE = "offsite_status.json"
+OFFSITE_STALE_HOURS = 36
+
+
+def offsite_backup_status(backup_dir: Optional[str] = None, now: Optional[float] = None) -> Optional[tuple[bool, str]]:
+    """(ok, detail) of the encrypted Google Drive copy that scripts/offsite_backup.sh makes every night,
+    or None when that job was never set up (no status file)."""
+    backup_dir = backup_dir or os.path.join(PROJECT_ROOT, db.BACKUP_DIR)
+    path = os.path.join(backup_dir, OFFSITE_STATUS_FILE)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            status = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return False, "the status file is unreadable"
+    now_ts = time.time() if now is None else now
+    try:
+        age_hours = (now_ts - float(status["at"])) / 3600
+    except (KeyError, TypeError, ValueError):
+        return False, "the status file has no time"
+    if not status.get("ok"):
+        return False, f"the last upload failed ({str(status.get('detail') or 'no reason given')[:120]})"
+    if age_hours > OFFSITE_STALE_HOURS:
+        return False, f"the last upload was {age_hours:.0f} hours ago"
+    return True, f"{status.get('files', 0)} encrypted file(s) on Drive, last upload {age_hours:.0f} h ago"
+
+
+def offsite_line(backup_dir: Optional[str] = None, now: Optional[float] = None) -> Optional[str]:
+    status = offsite_backup_status(backup_dir, now)
+    if status is None:
+        return None
+    ok, detail = status
+    return f"☁️ Off-site backup (Google Drive): {'✅' if ok else '⚠️'} {detail}"
+
+
 # ── restarts ──────────────────────────────────────────────────────────────────
 RESTART_LOG = "restart_log.json"
 RESTART_LOG_KEEP = 200
@@ -275,6 +312,9 @@ def daily_digest(now: datetime, log_paths: Iterable[str], previous: Optional[dic
         lines.append(_worker_usage_line(worker))
 
     lines.append(backup_line())
+    offsite = offsite_line()
+    if offsite:
+        lines.append(offsite)
     lines.append(restart_line())
 
     sessions = {uid: s for uid, s in state.user_sessions.items() if s is not None}
