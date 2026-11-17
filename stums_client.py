@@ -406,6 +406,10 @@ async def get_registered_exam_schedule(session) -> list[dict]:
     soup = BeautifulSoup(html_text, "html.parser")
     tables = soup.find_all("table", class_="belegungen")
     if not tables:
+        if "searchOwnEnrollmentInfo-flow" in html_text and not soup.find("table"):
+            # the page is there and shows no table at all: nothing is registered
+            # ("You haven't applied any courses or examinations yet")
+            return []
         raise RuntimeError("StuMS registered-exams page did not contain its expected exam table")
     results = []
     for table in tables:

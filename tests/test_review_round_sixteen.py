@@ -547,6 +547,28 @@ class StumsLoginPageDetectionTests(unittest.TestCase):
         self.assertIn("Planner of studies", text)
 
 
+class NoRegisteredExamsTests(unittest.TestCase):
+    def _schedule(self, html):
+        import stums_client
+        with mock.patch.object(stums_client, "_establish_stums_session", mock.AsyncMock(return_value="r")), \
+                mock.patch.object(stums_client, "_read_stums_page", mock.AsyncMock(return_value=(html, "u"))):
+            return asyncio.run(stums_client.get_registered_exam_schedule(object()))
+
+    def test_a_page_without_any_table_means_nothing_is_registered(self):
+        html = ('<html><form action="/x?_flowId=searchOwnEnrollmentInfo-flow"></form>'
+                "<p>You haven't applied any courses or examinations yet.</p></html>")
+        self.assertEqual(self._schedule(html), [])
+
+    def test_a_changed_page_with_other_tables_is_still_an_error(self):
+        html = '<html><form action="/x?_flowId=searchOwnEnrollmentInfo-flow"></form><table class="other"></table></html>'
+        with self.assertRaises(RuntimeError):
+            self._schedule(html)
+
+    def test_an_unrelated_page_is_still_an_error(self):
+        with self.assertRaises(RuntimeError):
+            self._schedule("<html><p>something else</p></html>")
+
+
 class WorkerUsageTests(unittest.TestCase):
     def setUp(self):
         import studip_session
