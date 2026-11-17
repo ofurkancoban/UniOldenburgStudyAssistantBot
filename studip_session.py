@@ -432,6 +432,10 @@ class StudIPSession(SsoFlowMixin):
     def _via_worker(self, host: str) -> bool:
         if not _worker_url() or host not in UNI_HOSTS or not _worker_available():
             return False
+        if host == "stums.uni-oldenburg.de" and os.environ.get("STUMS_VIA_WORKER", "").lower() not in ("1", "true", "yes"):
+            # StuMS answers "Login notwendig" (403) to a session created through the Worker, while the
+            # same sign-in made directly from the server works; StuMS has no block against the server IP.
+            return False
         return time.time() >= _WORKER_REFUSED.get(host, 0.0)
 
     def _store_proxied_cookies(self, resp, real_url: str) -> None:

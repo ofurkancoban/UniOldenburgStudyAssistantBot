@@ -122,7 +122,8 @@ class WorkerRoutingTests(unittest.TestCase):
             stums_cookies = sess.session.cookie_jar.filter_cookies(URL(f"https://{STUMS}/qisserver/x"))
             return body, final, jar_hosts, {k: m.value for k, m in stums_cookies.items()}
 
-        body, final, jar_hosts, stums_cookies = _run_with_worker(worker, scenario)
+        with mock.patch.dict(os.environ, {"STUMS_VIA_WORKER": "1"}):
+            body, final, jar_hosts, stums_cookies = _run_with_worker(worker, scenario)
         self.assertIn("Abmelden", body)
         # the response reports the university URL, never the worker's
         self.assertEqual(final, f"https://{STUMS}/qisserver/start")

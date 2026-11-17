@@ -451,6 +451,22 @@ class CookieFlagTests(unittest.TestCase):
         self.assertEqual(jar["JSESSIONID"].value, "abc")
 
 
+class StumsSkipsTheWorkerTests(unittest.TestCase):
+    def test_stums_goes_direct_unless_asked_otherwise(self):
+        import os
+        import studip_session
+        sess = studip_session.StudIPSession.__new__(studip_session.StudIPSession)
+        host = "stums.uni-oldenburg.de"
+        with mock.patch.object(studip_session, "_worker_url", return_value="https://w.example"), \
+                mock.patch.object(studip_session, "_worker_available", return_value=True), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("STUMS_VIA_WORKER", None)
+            self.assertFalse(sess._via_worker(host))
+            self.assertTrue(sess._via_worker("elearning.uni-oldenburg.de"))
+            os.environ["STUMS_VIA_WORKER"] = "1"
+            self.assertTrue(sess._via_worker(host))
+
+
 class WorkerUsageTests(unittest.TestCase):
     def setUp(self):
         import studip_session
