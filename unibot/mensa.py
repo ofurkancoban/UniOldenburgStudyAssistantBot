@@ -7,6 +7,7 @@ import hashlib
 import html
 import logging
 import re
+import time
 from datetime import date, datetime, timedelta
 from typing import Optional
 from urllib.parse import urljoin
@@ -555,9 +556,28 @@ async def fetch_menu_titles(loc_id: str, target_date=None) -> list[str]:
         return []
 
 
+SPEISEPLAN_CACHE_SECONDS = 10 * 60
+_SPEISEPLAN_CACHE: dict = {}  # (canteen, day) -> (fetched at, page): the menu is public and the same for everyone
+
+
 async def _fetch_speiseplan_html(loc_id: str, target_date=None) -> Optional[str]:
-    """The Studierendenwerk Speiseplan widget HTML for one canteen and day, or None."""
+    """The Studierendenwerk Speiseplan widget HTML for one canteen and day, or None.
+
+    Kept for a few minutes: the morning summary asks once per student, and every student sees
+    the same public page."""
     date_str = (target_date or berlin_now().date()).strftime("%Y-%m-%d")
+    cached = _SPEISEPLAN_CACHE.get((loc_id, date_str))
+    if cached and time.monotonic() - cached[0] < SPEISEPLAN_CACHE_SECONDS:
+        return cached[1]
+    page = await _fetch_speiseplan_html_uncached(loc_id, date_str)
+    if page:
+        if len(_SPEISEPLAN_CACHE) > 16:
+            _SPEISEPLAN_CACHE.clear()
+        _SPEISEPLAN_CACHE[(loc_id, date_str)] = (time.monotonic(), page)
+    return page
+
+
+async def _fetch_speiseplan_html_uncached(loc_id: str, date_str: str) -> Optional[str]:
     try:
         async with shared_http() as session:
             async with session.post(

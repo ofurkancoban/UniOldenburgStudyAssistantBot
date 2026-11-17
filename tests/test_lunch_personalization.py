@@ -1,6 +1,7 @@
 """Lunch recommendations are personal: liked ingredients weigh most, dishes given
 in the last days weigh down, nothing is shared between students."""
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -174,6 +175,42 @@ class RecommendationTests(unittest.TestCase):
         mensa.add_food_words(uid, "avoid", "tofu")
         for _ in range(4):
             self.assertNotEqual(self._recommend(uid)["dish"], "Tofu Bowl")
+
+
+class MenuCacheTests(unittest.TestCase):
+    def test_the_public_menu_is_fetched_once_for_all_students_within_minutes(self):
+        calls = []
+
+        async def fetch(loc, date_str):
+            calls.append((loc, date_str))
+            return "<html>menu</html>"
+
+        mensa._SPEISEPLAN_CACHE.clear()
+
+        async def scenario():
+            return [await mensa._fetch_speiseplan_html("3") for _ in range(3)]
+
+        with mock.patch.object(mensa, "_fetch_speiseplan_html_uncached", fetch):
+            pages = asyncio.run(scenario())
+        self.assertEqual(pages, ["<html>menu</html>"] * 3)
+        self.assertEqual(len(calls), 1)
+
+    def test_a_failed_fetch_is_not_remembered(self):
+        calls = []
+
+        async def fetch(loc, date_str):
+            calls.append(loc)
+            return None
+
+        mensa._SPEISEPLAN_CACHE.clear()
+
+        async def scenario():
+            await mensa._fetch_speiseplan_html("3")
+            await mensa._fetch_speiseplan_html("3")
+
+        with mock.patch.object(mensa, "_fetch_speiseplan_html_uncached", fetch):
+            asyncio.run(scenario())
+        self.assertEqual(len(calls), 2)
 
 
 class MorningPickIsPersonalTests(unittest.TestCase):
