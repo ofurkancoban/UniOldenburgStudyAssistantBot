@@ -11,6 +11,7 @@ import shutil
 import sys
 import time
 
+import aiohttp
 import psutil
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, WebAppInfo
 from telegram.ext import ContextTypes
@@ -98,6 +99,7 @@ HEALTH_CHECK_LABELS = {
     "openrouter": "🤖 OpenRouter (AI features)",
     "gwdg": "🎓 GWDG AI (text, tagging, try-on fallback)",
     "disk": "💾 Server disk",
+    "uni_proxy": "🛡️ University proxy (WARP)",
 }
 
 # Below this much free space the disk counts as unhealthy: a full disk
@@ -138,6 +140,25 @@ async def check_whatsapp_health() -> tuple[bool, str]:
         return False, f"Service unreachable: {str(e)[:120]}"
 
 
+async def check_uni_proxy_health() -> tuple[bool, str]:
+    """(ok, detail) for the proxy every university request goes through: its local port answers and
+    a real request to the university login page gets through it. Without the proxy no request
+    reaches the university at all (there is no fallback), so this is the first thing to look at."""
+    from studip_http import make_uni_connector, uni_proxy_reachable
+    if not uni_proxy_reachable():
+        return False, "The proxy port does not answer (is warp-svc running? try: warp-cli connect)"
+    try:
+        async with aiohttp.ClientSession(connector=make_uni_connector(limit=2, limit_per_host=1),
+                                         timeout=aiohttp.ClientTimeout(total=20)) as http:
+            async with http.get("https://elearning.uni-oldenburg.de/dispatch.php/login",
+                                allow_redirects=False) as resp:
+                if resp.status >= 500:
+                    return False, f"The university answered HTTP {resp.status} through the proxy"
+                return True, f"OK (HTTP {resp.status} through the proxy)"
+    except Exception as e:
+        return False, f"Proxy port answers but a request through it failed: {type(e).__name__}"[:150]
+
+
 def check_disk_health() -> tuple[bool, str]:
     """(ok, detail) for the disk the bot's files live on; unhealthy below
     DISK_MIN_FREE_GB free."""
@@ -163,7 +184,12 @@ async def run_health_checks(live_openrouter: bool = False) -> dict:
     openrouter = await check_openrouter_health(live=live_openrouter)
     gwdg = await check_gwdg_health(live=live_openrouter)
     disk = check_disk_health()
-    return {"studip": studip, "whatsapp": whatsapp, "weather": weather, "openrouter": openrouter, "gwdg": gwdg, "disk": disk}
+    results = {"studip": studip, "whatsapp": whatsapp, "weather": weather, "openrouter": openrouter, "gwdg": gwdg,
+               "disk": disk}
+    from studip_http import uni_proxy_url
+    if uni_proxy_url():
+        results["uni_proxy"] = await check_uni_proxy_health()
+    return results
 
 
 async def _student_health_text(user_id: int) -> str:

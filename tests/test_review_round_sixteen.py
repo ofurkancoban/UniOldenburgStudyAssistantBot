@@ -636,6 +636,38 @@ class QuietLogTests(unittest.TestCase):
             self.assertTrue(studip_session.worker_status()["configured"])
 
 
+class UniversityProxyHealthTests(unittest.TestCase):
+    def test_the_check_only_exists_with_a_proxy(self):
+        import os
+        from unibot import system
+        env_without = {k: v for k, v in os.environ.items() if k != "UNI_PROXY_URL"}
+        quiet = mock.AsyncMock(return_value=(True, "OK"))
+        with mock.patch.dict(os.environ, env_without, clear=True), \
+                mock.patch.object(system, "check_studip_health", quiet), \
+                mock.patch.object(system, "check_whatsapp_health", quiet), \
+                mock.patch.object(system, "check_weather_health", quiet), \
+                mock.patch.object(system, "check_openrouter_health", quiet), \
+                mock.patch.object(system, "check_gwdg_health", quiet):
+            self.assertNotIn("uni_proxy", asyncio.run(system.run_health_checks()))
+            with mock.patch.dict(os.environ, {"UNI_PROXY_URL": "socks5://127.0.0.1:1"}), \
+                    mock.patch.object(system, "check_uni_proxy_health", mock.AsyncMock(return_value=(False, "down"))):
+                results = asyncio.run(system.run_health_checks())
+        self.assertEqual(results["uni_proxy"], (False, "down"))
+        self.assertIn("uni_proxy", system.HEALTH_CHECK_LABELS)
+
+    def test_a_closed_port_is_reported_with_the_fix(self):
+        import os
+        import socket
+        from unibot import system
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        with mock.patch.dict(os.environ, {"UNI_PROXY_URL": f"socks5://127.0.0.1:{port}"}):
+            ok, detail = asyncio.run(system.check_uni_proxy_health())
+        self.assertFalse(ok)
+        self.assertIn("warp-cli connect", detail)
+
+
 class WorkerUsageTests(unittest.TestCase):
     def setUp(self):
         import studip_session
