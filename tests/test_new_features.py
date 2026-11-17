@@ -690,7 +690,7 @@ class StagingScriptTests(unittest.TestCase):
         git = lambda *a, cwd=t: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, text=True,
                                                env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                                                     "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
-        git("init", "-q", "--bare", self.origin)
+        git("init", "-q", "--bare", "--initial-branch=trunk", self.origin)  # a remote HEAD that names no pushed branch
         git("clone", "-q", self.origin, self.work)
         os.makedirs(os.path.join(self.work, "scripts"))
         shutil.copy(os.path.join(ROOT, "scripts", "staging.sh"), os.path.join(self.work, "scripts", "staging.sh"))

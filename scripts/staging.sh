@@ -45,7 +45,8 @@ cmd_setup() {
 set -euo pipefail
 [ -n "$NODE_BIN" ] && export PATH="$NODE_BIN:$PATH"
 if [ ! -d "$STAGING_DIR/.git" ]; then
-  git clone -q "$(git -C "$PROD_DIR" remote get-url origin)" "$STAGING_DIR"
+  branch="$(git -C "$PROD_DIR" rev-parse --abbrev-ref HEAD)"   # the branch production runs, whatever the remote's HEAD says
+  git clone -q -b "$branch" "$(git -C "$PROD_DIR" remote get-url origin)" "$STAGING_DIR"
   echo "cloned the code into $STAGING_DIR"
 fi
 cd "$STAGING_DIR"
