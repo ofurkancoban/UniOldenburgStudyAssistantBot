@@ -898,6 +898,13 @@ def _has_private(user_id: int, kind: str) -> bool:
         ).fetchone() is not None
 
 
+def _private_kinds(user_id: int) -> list:
+    uid = _require_uid(user_id)
+    with _lock:
+        return [row[0] for row in _connection().execute(
+            "SELECT kind FROM user_private_data WHERE user_id = ? ORDER BY kind", (uid,)).fetchall()]
+
+
 def _delete_private(user_id: int, kind: Optional[str] = None, keep: tuple = ()) -> None:
     uid = _require_uid(user_id)
     with _lock:
@@ -1225,6 +1232,10 @@ class UserScope:
 
     def has_private(self, kind: str) -> bool:
         return _has_private(self.user_id, kind)
+
+    def private_kinds(self) -> list:
+        """The names of every private record this student has (for the data export)."""
+        return _private_kinds(self.user_id)
 
     def delete_private(self, kind: Optional[str] = None, keep: tuple = ()) -> None:
         """Delete one kind, or every kind except those in `keep`."""

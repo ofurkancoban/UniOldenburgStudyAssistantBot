@@ -181,7 +181,7 @@ class PrivacyScreenTests(unittest.TestCase):
         self.assertIn(stagger.describe_slots(501, now.date(), False), text)
         self.assertIn("2 a day", text)
         data = [b.callback_data for row in markup.inline_keyboard for b in row]
-        self.assertEqual(data, ["privacy|check", "privacy|ai_personal", "privacy|ai", "privacy|delete"])
+        self.assertEqual(data, ["privacy|check", "privacy|ai_personal", "privacy|ai", "privacy|export", "privacy|delete"])
 
     def test_check_now_is_rate_limited_and_needs_a_login(self):
         runs = []

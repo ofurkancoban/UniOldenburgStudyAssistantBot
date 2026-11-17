@@ -3,6 +3,8 @@
 everything personal the bot keeps about them."""
 
 import asyncio
+import io
+import json
 import logging
 import math
 import time
@@ -40,6 +42,7 @@ from unibot.storage import (
     save_personal_record,
     set_ai_grades_enabled,
     set_ai_personal_enabled,
+    student_courses,
 )
 from unibot.watcher import PERSONAL_LAST_KEY, _run_stums_checks, _user_sender, mark_personal_check
 from unibot.security_events import log_security_event
@@ -117,9 +120,47 @@ def privacy_view(user_id: int, now: Optional[datetime] = None, note: str = "") -
                               else "🤖 Let the assistant use my timetable", callback_data="privacy|ai_personal")],
         [InlineKeyboardButton("🤖 Don't let the assistant use my grades" if ai_on
                               else "🤖 Let the assistant use my grades", callback_data="privacy|ai")],
+        [InlineKeyboardButton("📦 Download my data", callback_data="privacy|export")],
         [InlineKeyboardButton("🗑️ Delete my data", callback_data="privacy|delete")],
     ]
     return text, InlineKeyboardMarkup(rows)
+
+
+EXPORT_INTERVAL_SECONDS = 3600
+EXPORT_SKIPPED_KINDS = {"callbacks"}  # button state of old messages: no use outside the bot
+_export_at: dict[int, float] = {}
+
+
+def export_user_data(user_id: int, now: Optional[datetime] = None) -> dict:
+    """Everything the bot keeps about one student, readable: their account entry, every private record
+    (decrypted with their own key) and their courses. Login cookies and tokens are not part of it, and
+    nothing of any other student is."""
+    now = now or datetime.now(TZ_BERLIN)
+    scope = db.get_user_scope(int(user_id))
+    records = {}
+    for kind in scope.private_kinds():
+        if kind in EXPORT_SKIPPED_KINDS:
+            continue
+        records[kind.removeprefix("cache.")] = scope.private(kind)
+    account = db.get_user(int(user_id)) or {}
+    courses = student_courses(int(user_id))
+    return {
+        "exported_at": now.isoformat(timespec="seconds"),
+        "about": "Everything UniOldenburg Student Assistant stores about you. Login cookies and tokens are "
+                 "left out on purpose.",
+        "account": {k: account.get(k) for k in ("role", "username", "full_name", "studip_username", "is_active",
+                                                 "created_at", "last_active_at", "interaction_count")},
+        "courses": courses if isinstance(courses, dict) else {},
+        "records": records,
+    }
+
+
+def export_wait(user_id: int, now_ts: Optional[float] = None) -> int:
+    """Seconds until this student may export again (0: now)."""
+    last = _export_at.get(user_id)
+    if last is None:
+        return 0
+    return max(0, math.ceil(EXPORT_INTERVAL_SECONDS - ((time.time() if now_ts is None else now_ts) - last)))
 
 
 def delete_confirm_view() -> tuple:
@@ -320,6 +361,21 @@ async def handle_privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "🗑️ <b>Your data was deleted.</b>\n\nYou are signed out. Send /start, then /login to start again.",
             parse_mode="HTML")
+        return
+    if action == "export":
+        wait = export_wait(user_id)
+        if wait:
+            await query.answer(f"You can download your data again in {math.ceil(wait / 60)} min.", show_alert=True)
+            return
+        await query.answer("Preparing...")
+        _export_at[user_id] = time.time()
+        payload = json.dumps(export_user_data(user_id), ensure_ascii=False, indent=2, default=str).encode("utf-8")
+        buffer = io.BytesIO(payload)
+        buffer.name = f"uniassistant-my-data-{datetime.now(TZ_BERLIN):%Y-%m-%d}.json"
+        await query.message.reply_document(
+            document=buffer, caption="📦 Everything stored about you. Keep this file private: it holds your timetable, "
+                                     "tasks and messages. Login cookies and tokens are not in it.")
+        log_security_event("personal_data_export", actor_id=user_id)
         return
     note = ""
     if action == "check":

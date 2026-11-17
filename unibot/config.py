@@ -161,6 +161,19 @@ def _parse_service_port(value: str) -> int:
     return port
 
 
+def _positive_int(name: str, default: int) -> int:
+    """A positive whole number from the environment; anything else means the default."""
+    try:
+        value = int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# AI calls one student may make: per hour and per 24 hours (administrators and background work are not counted)
+AI_CALLS_PER_HOUR = _positive_int("AI_CALLS_PER_HOUR", 60)
+AI_CALLS_PER_DAY = _positive_int("AI_CALLS_PER_DAY", 300)
+
 WA_SERVICE_PORT = _parse_service_port(os.getenv("PORT", "3838"))
 WA_SERVICE_URL = f"http://127.0.0.1:{WA_SERVICE_PORT}"
 WA_SERVICE_TOKEN = os.getenv("WA_SERVICE_TOKEN", "").strip() or secrets.token_urlsafe(32)

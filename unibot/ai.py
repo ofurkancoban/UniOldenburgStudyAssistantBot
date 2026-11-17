@@ -20,6 +20,8 @@ import aiohttp
 from studip_utils import TZ_BERLIN, aread_bytes, awrite_bytes
 
 from unibot.config import (
+    AI_CALLS_PER_DAY,
+    AI_CALLS_PER_HOUR,
     GWDG_API_KEY,
     GWDG_API_URL,
     GWDG_IMAGE_EDIT_SERVICE,
@@ -337,16 +339,6 @@ async def _call_gwdg_chat(messages: list, model: str, temperature: float = 0,
 # ── per-student AI budget ─────────────────────────────────────────────────────
 # The GWDG/OpenRouter quotas are shared by everyone: one student can't use
 # them up for all. Background work (no acting user) and admins don't count.
-def _env_limit(name: str, default: int) -> int:
-    try:
-        value = int(os.getenv(name, "").strip() or default)
-    except ValueError:
-        return default
-    return value if value > 0 else default
-
-
-AI_CALLS_PER_HOUR = _env_limit("AI_CALLS_PER_HOUR", 60)   # per student, overridable in .env
-AI_CALLS_PER_DAY = _env_limit("AI_CALLS_PER_DAY", 300)
 AI_BUDGET_MESSAGE = "⏳ You've used a lot of AI answers recently - please try again in a while."
 AI_CALLS_PATH = "ai_calls.json"
 AI_CALLS_SAVE_EVERY = 5
