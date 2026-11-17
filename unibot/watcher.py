@@ -77,7 +77,7 @@ from unibot.exams import exam_action_cache
 from unibot.study_plan import index_course_files, prune_course_index, run_weekly_study_plan_job
 from unibot.tasks import check_task_reminders
 from unibot.study_week import weekly_report, weekly_report_due
-from unibot.system import HEALTH_CHECK_LABELS, run_health_checks
+from unibot.system import HEALTH_CHECK_LABELS, ensure_uni_proxy, run_health_checks
 
 
 FILE_WATCHER_INTERVAL = 30 * 60
@@ -234,6 +234,7 @@ async def _run_scheduled_jobs(bot, session, now: datetime):
     # Morning summary: prepared ahead of time (AI lunch pick, outfit
     # image, voice), then sent all at once at MORNING_SUMMARY_HOUR.
     active_uids = _get_active_user_ids()
+    await _guarded("University proxy", ensure_uni_proxy)
     await _guarded("Morning summary", run_morning_summary_schedule, bot, active_uids, now)
 
     # Weekly content-aware study plan (Sunday evening, opt-in toggle).

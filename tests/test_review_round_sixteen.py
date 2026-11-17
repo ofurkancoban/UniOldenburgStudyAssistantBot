@@ -668,6 +668,69 @@ class UniversityProxyHealthTests(unittest.TestCase):
         self.assertIn("warp-cli connect", detail)
 
 
+class ProxyRepairTests(unittest.TestCase):
+    PROXY = {"UNI_PROXY_URL": "socks5://127.0.0.1:40000"}
+
+    def setUp(self):
+        from unibot import system
+        self.system = system
+        system._uni_proxy_repaired_at = 0.0
+        self.addCleanup(lambda: setattr(system, "_uni_proxy_repaired_at", 0.0))
+
+    def _run(self, statuses, reachable=True, which=lambda name: "/usr/bin/" + name):
+        import os
+        commands = []
+        outputs = iter(statuses)
+
+        async def run_command(*args, timeout=25.0):
+            commands.append(" ".join(args[1:] if args[0] == "warp-cli" else args[1:]))
+            if args[-1] == "status":
+                return 0, next(outputs)
+            return 0, "Success"
+
+        async def no_wait(seconds):
+            return None
+
+        with mock.patch.dict(os.environ, self.PROXY), \
+                mock.patch.object(self.system, "_run_command", run_command), \
+                mock.patch.object(self.system.shutil, "which", which), \
+                mock.patch.object(self.system.asyncio, "sleep", no_wait), \
+                mock.patch("studip_http.uni_proxy_reachable", return_value=reachable):
+            result = asyncio.run(self.system.ensure_uni_proxy())
+        return result, commands
+
+    def test_a_connected_proxy_is_left_alone(self):
+        result, commands = self._run(["Status update: Connected"])
+        self.assertIsNone(result)
+        self.assertEqual(commands, ["--accept-tos status"])
+
+    def test_a_dropped_connection_is_reconnected(self):
+        result, commands = self._run(["Status update: Disconnected. Reason: Manual", "Status update: Connected"])
+        self.assertEqual(result, "reconnected")
+        self.assertIn("--accept-tos connect", commands)
+        self.assertNotIn("restart warp-svc", commands)
+
+    def test_when_reconnecting_does_not_help_the_service_is_restarted(self):
+        result, commands = self._run(["Disconnected", "Disconnected", "Status update: Connected"])
+        self.assertEqual(result, "service restarted")
+        self.assertIn("restart warp-svc", commands)
+
+    def test_a_failed_repair_is_reported_and_not_repeated_within_the_cooldown(self):
+        result, _ = self._run(["Disconnected", "Disconnected", "Disconnected"])
+        self.assertEqual(result, "failed")
+        result_again, commands = self._run(["Disconnected"])
+        self.assertIsNone(result_again)
+        self.assertEqual(commands, ["--accept-tos status"])  # looked, but within the cooldown nothing is tried
+
+    def test_nothing_happens_without_a_proxy_or_without_warp_cli(self):
+        import os
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items() if k != "UNI_PROXY_URL"}, clear=True):
+            self.assertIsNone(asyncio.run(self.system.ensure_uni_proxy()))
+        result, commands = self._run(["Disconnected"], which=lambda name: None)
+        self.assertIsNone(result)
+        self.assertEqual(commands, [])
+
+
 class WorkerUsageTests(unittest.TestCase):
     def setUp(self):
         import studip_session

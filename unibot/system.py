@@ -140,11 +140,69 @@ async def check_whatsapp_health() -> tuple[bool, str]:
         return False, f"Service unreachable: {str(e)[:120]}"
 
 
+UNI_PROXY_REPAIR_COOLDOWN = 5 * 60
+_uni_proxy_repaired_at = 0.0
+
+
+async def _run_command(*args: str, timeout: float = 25.0) -> tuple[int, str]:
+    """(exit code, output) of a short command, never raising."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+        return proc.returncode or 0, out.decode("utf-8", "replace")
+    except Exception as e:
+        return 1, f"{type(e).__name__}: {e}"
+
+
+def _warp_connected(output: str) -> bool:
+    lowered = output.lower()
+    return "connected" in lowered and "disconnected" not in lowered
+
+
+async def ensure_uni_proxy() -> Optional[str]:
+    """Keep Cloudflare WARP (the university proxy) connected without anyone logging in.
+
+    Does nothing without a proxy, without warp-cli on this machine, or while WARP is connected.
+    Otherwise it reconnects, and restarts the WARP service when that does not help, at most once
+    every UNI_PROXY_REPAIR_COOLDOWN seconds. Returns what it did (None: nothing to do)."""
+    global _uni_proxy_repaired_at
+    from studip_http import uni_proxy_reachable, uni_proxy_url
+    if not uni_proxy_url() or not shutil.which("warp-cli"):
+        return None
+    _code, status = await _run_command("warp-cli", "--accept-tos", "status")
+    if _warp_connected(status) and uni_proxy_reachable():
+        return None
+    if time.monotonic() - _uni_proxy_repaired_at < UNI_PROXY_REPAIR_COOLDOWN:
+        return None
+    _uni_proxy_repaired_at = time.monotonic()
+    logging.warning("The university proxy (WARP) is not connected (%s); reconnecting", status.strip()[:80])
+    await _run_command("warp-cli", "--accept-tos", "connect")
+    await asyncio.sleep(5)
+    _code, status = await _run_command("warp-cli", "--accept-tos", "status")
+    if _warp_connected(status) and uni_proxy_reachable():
+        logging.warning("The university proxy (WARP) is connected again")
+        return "reconnected"
+    if shutil.which("systemctl"):
+        await _run_command("systemctl", "restart", "warp-svc")
+        await asyncio.sleep(6)
+        await _run_command("warp-cli", "--accept-tos", "connect")
+        await asyncio.sleep(5)
+        _code, status = await _run_command("warp-cli", "--accept-tos", "status")
+        if _warp_connected(status) and uni_proxy_reachable():
+            logging.warning("The university proxy (WARP) is connected again after restarting its service")
+            return "service restarted"
+    logging.error("The university proxy (WARP) could not be reconnected (%s)", status.strip()[:80])
+    return "failed"
+
+
 async def check_uni_proxy_health() -> tuple[bool, str]:
     """(ok, detail) for the proxy every university request goes through: its local port answers and
     a real request to the university login page gets through it. Without the proxy no request
     reaches the university at all (there is no fallback), so this is the first thing to look at."""
     from studip_http import make_uni_connector, uni_proxy_reachable
+    if not uni_proxy_reachable():
+        await ensure_uni_proxy()  # one try to bring it back before reporting it down
     if not uni_proxy_reachable():
         return False, "The proxy port does not answer (is warp-svc running? try: warp-cli connect)"
     try:
