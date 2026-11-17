@@ -101,6 +101,7 @@ HEALTH_CHECK_LABELS = {
     "disk": "💾 Server disk",
     "uni_proxy": "🛡️ University proxy (WARP)",
     "offsite_backup": "☁️ Off-site backup (Google Drive)",
+    "canary": "🐤 Nightly page check (StuMS and the pages the bot reads)",
 }
 
 # Below this much free space the disk counts as unhealthy: a full disk
@@ -252,6 +253,10 @@ async def run_health_checks(live_openrouter: bool = False) -> dict:
     offsite = offsite_backup_status()
     if offsite is not None:  # only once the nightly upload to Drive has been set up
         results["offsite_backup"] = offsite
+    from unibot.canary import canary_health
+    canary = canary_health()
+    if canary is not None:  # only once the nightly canary has run
+        results["canary"] = canary
     return results
 
 

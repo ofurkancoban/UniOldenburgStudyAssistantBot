@@ -480,6 +480,191 @@ class ExamRevisionPlanTests(unittest.TestCase):
         self.assertGreater(plan["stats"]["needed"]["c2"], plan["stats"]["needed"]["c1"])
 
 
+class CanaryTests(unittest.TestCase):
+    def setUp(self):
+        from unibot import canary
+        self.canary = canary
+        db.delete(canary.CANARY_STATUS_PATH)
+        self.addCleanup(db.delete, canary.CANARY_STATUS_PATH)
+
+    # ── public pages ───────────────────────────────────────────────────────
+    def test_a_page_with_every_marker_passes(self):
+        spec = self.canary.PUBLIC_PAGE_CHECKS["StuMS start page"]
+        ok, detail = self.canary.evaluate_public_page(spec, 200, "", '<form id="startPage"> javax.faces.ViewState')
+        self.assertTrue(ok)
+
+    def test_a_changed_page_names_what_is_missing(self):
+        spec = self.canary.PUBLIC_PAGE_CHECKS["StuMS start page"]
+        ok, detail = self.canary.evaluate_public_page(spec, 200, "", "<html>a new design</html>")
+        self.assertFalse(ok)
+        self.assertIn('id="startPage"', detail)
+        self.assertIn("javax.faces.ViewState", detail)
+
+    def test_a_wrong_status_is_reported(self):
+        spec = self.canary.PUBLIC_PAGE_CHECKS["Stud.IP JSON API"]
+        self.assertTrue(self.canary.evaluate_public_page(spec, 401, "", "")[0])
+        ok, detail = self.canary.evaluate_public_page(spec, 404, "", "")
+        self.assertFalse(ok)
+        self.assertIn("404", detail)
+
+    def test_the_sign_in_entry_must_still_redirect_to_the_netiq_authorisation(self):
+        spec = self.canary.PUBLIC_PAGE_CHECKS["StuMS sign-in entry"]
+        good = "https://login.uni-oldenburg.de/nidp/oauth/nam/authz?scope=openid"
+        self.assertTrue(self.canary.evaluate_public_page(spec, 302, good, "")[0])
+        ok, detail = self.canary.evaluate_public_page(spec, 302, "https://elsewhere.example/login", "")
+        self.assertFalse(ok)
+        self.assertIn("elsewhere.example", detail)
+        self.assertFalse(self.canary.evaluate_public_page(spec, 200, "", "")[0])
+
+    def test_unreachable_pages_and_a_changed_menu_widget_are_reported_not_raised(self):
+        class Resp:
+            def __init__(self, status=200, body="", headers=None):
+                self.status, self._body, self.headers = status, body, headers or {}
+
+            async def text(self, errors="strict"):
+                return self._body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class Http:
+            def get(self, url, **kw):
+                if "dispatch.php" in url:
+                    raise OSError("proxy down")
+                return Resp(200, 'nidp getToContent id="startPage" javax.faces.ViewState sso=oidc name="login_ticket"')
+
+            def post(self, url, **kw):
+                return Resp(200, "<html>nothing like the old widget</html>")
+
+        results = asyncio.run(self.canary.check_public_pages(Http()))
+        self.assertEqual(results["Stud.IP login page"], (False, "unreachable (OSError)"))
+        self.assertFalse(results["Mensa menu widget"][0])
+        self.assertIn("gruppenkopf", results["Mensa menu widget"][1])
+        self.assertTrue(results["NetIQ login page"][0])
+
+    # ── the account ────────────────────────────────────────────────────────
+    def test_the_verifiers_accept_good_pages_and_reject_changed_ones(self):
+        c = self.canary
+        self.assertIsNone(c._verify_grades('<form id="examsReadonly"></form>'))
+        self.assertIn("examsReadonly", c._verify_grades("<form id='other'></form>"))
+        self.assertIsNone(c._verify_enrolments('<table class="belegungen"></table>'))
+        self.assertIsNone(c._verify_enrolments('<form action="x?_flowId=searchOwnEnrollmentInfo-flow"></form>'))
+        self.assertIn("changed", c._verify_enrolments("<html>other</html>"))
+        self.assertIsNone(c._verify_study_service('<a href="start.xhtml?_flowId=studyservice-flow">'))
+        self.assertIn("changed", c._verify_study_service("<html>other</html>"))
+
+    def test_the_account_check_reports_each_page_and_a_failed_sign_in(self):
+        import stums_client
+        pages = {stums_client.STUDY_PLANNER_URL: "planner", stums_client.GRADES_URL: '<form id="examsReadonly"></form>',
+                 stums_client.ENROLLMENT_INFO_URL: "<html>other</html>",
+                 stums_client.STUDY_SERVICE_URL: "studyservice-flow"}
+
+        async def read(session, url, referer):
+            return pages[url], url
+
+        session = mock.MagicMock()
+        with mock.patch.object(stums_client, "_establish_stums_session", mock.AsyncMock(return_value="ref")), \
+                mock.patch.object(stums_client, "_read_stums_page", read), \
+                mock.patch.object(self.canary, "_verify_planner", lambda text: None), \
+                mock.patch("unibot.auth.get_user_session", lambda uid: session):
+            results = asyncio.run(self.canary.check_account(7851))
+        self.assertTrue(results["StuMS sign-in"][0])
+        self.assertTrue(results["Study planner"][0] and results["Results page"][0] and results["Study service page"][0])
+        self.assertFalse(results["Enrolments page"][0])
+        with mock.patch.object(stums_client, "_establish_stums_session",
+                               mock.AsyncMock(side_effect=RuntimeError("StuMS did not sign this account in"))), \
+                mock.patch("unibot.auth.get_user_session", lambda uid: session):
+            failed = asyncio.run(self.canary.check_account(7851))
+        self.assertEqual(list(failed), ["StuMS sign-in"])
+        self.assertIn("did not sign", failed["StuMS sign-in"][1])
+
+    def test_a_planner_page_that_no_longer_parses_is_caught(self):
+        self.assertIn("changed", self.canary._verify_planner("<html>nothing</html>"))
+
+    # ── the nightly run ────────────────────────────────────────────────────
+    def _run(self, public, account, admin=7852, now=None):
+        public_check = mock.AsyncMock(return_value=public)
+        account_check = mock.AsyncMock(return_value=account)
+        with mock.patch.object(self.canary, "check_public_pages", public_check), \
+                mock.patch.object(self.canary, "check_account", account_check), \
+                mock.patch.object(self.canary, "_admin_with_login", lambda: admin):
+            status = asyncio.run(self.canary.run_nightly_canary(now))
+        return status, account_check
+
+    def test_a_good_night_is_stored_as_ok(self):
+        status, _ = self._run({"Page": (True, "OK")}, {"StuMS sign-in": (True, "OK")})
+        self.assertTrue(status["ok"])
+        self.assertEqual(self.canary.canary_status()["results"]["Page"], [True, "OK"])
+        self.assertEqual(self.canary.canary_health(), (True, "2 checks passed"))
+
+    def test_a_failure_is_stored_logged_and_named_in_the_health_check(self):
+        with self.assertLogs(level="WARNING") as logs:
+            status, _ = self._run({"Page": (True, "OK")}, {"Results page": (False, "no form examsReadonly")})
+        self.assertFalse(status["ok"])
+        self.assertTrue(any("Results page" in line for line in logs.output))
+        ok, detail = self.canary.canary_health()
+        self.assertFalse(ok)
+        self.assertIn("Results page (no form examsReadonly)", detail)
+
+    def test_without_a_signed_in_administrator_only_the_public_pages_are_checked(self):
+        status, account = self._run({"Page": (True, "OK")}, {}, admin=None)
+        account.assert_not_awaited()
+        self.assertTrue(status["ok"])
+        self.assertIn("skipped", status["account"])
+        self.assertIn("skipped", self.canary.canary_health()[1])
+
+    def test_the_health_check_is_silent_until_the_first_run_and_flags_a_stale_one(self):
+        self.assertIsNone(self.canary.canary_health())
+        self._run({"Page": (True, "OK")}, {})
+        self.assertTrue(self.canary.canary_health()[0])
+        ok, detail = self.canary.canary_health(now_ts=time.time() + 40 * 3600)
+        self.assertFalse(ok)
+        self.assertIn("has not run for", detail)
+
+    def test_it_runs_once_a_day_after_four_o_clock(self):
+        tz = __import__("studip_utils").TZ_BERLIN
+        ran = mock.AsyncMock(return_value={"ok": True})
+        with mock.patch.object(self.canary, "run_nightly_canary", ran):
+            self.assertIsNone(asyncio.run(self.canary.run_canary_if_due(datetime(2026, 11, 18, 3, 30, tzinfo=tz))))
+            ran.assert_not_awaited()  # too early
+            asyncio.run(self.canary.run_canary_if_due(datetime(2026, 11, 18, 4, 5, tzinfo=tz)))
+            self.assertEqual(ran.await_count, 1)
+        db.save(self.canary.CANARY_STATUS_PATH, {"day": "2026-11-18", "at": time.time(), "results": {}, "ok": True})
+        with mock.patch.object(self.canary, "run_nightly_canary", ran):
+            asyncio.run(self.canary.run_canary_if_due(datetime(2026, 11, 18, 19, 0, tzinfo=tz)))
+            self.assertEqual(ran.await_count, 1)  # already ran today
+            asyncio.run(self.canary.run_canary_if_due(datetime(2026, 11, 19, 4, 5, tzinfo=tz)))
+            self.assertEqual(ran.await_count, 2)  # the next day
+
+    def test_an_administrator_with_a_login_is_chosen(self):
+        users = [{"telegram_id": 1, "role": "user", "is_active": 1}, {"telegram_id": 2, "role": "admin", "is_active": 0},
+                 {"telegram_id": 3, "role": "admin", "is_active": 1}]
+        with mock.patch.object(db, "get_all_users", return_value=users), \
+                mock.patch("unibot.auth.get_user_session", lambda uid: uid), \
+                mock.patch("unibot.auth.has_stored_login", lambda session: session == 3):
+            self.assertEqual(self.canary._admin_with_login(), 3)
+        with mock.patch.object(db, "get_all_users", return_value=users), \
+                mock.patch("unibot.auth.get_user_session", lambda uid: uid), \
+                mock.patch("unibot.auth.has_stored_login", lambda session: False):
+            self.assertIsNone(self.canary._admin_with_login())
+
+    def test_the_bots_health_check_includes_it_only_once_it_ran(self):
+        quiet = mock.AsyncMock(return_value=(True, "OK"))
+        with mock.patch.object(system, "check_studip_health", quiet), \
+                mock.patch.object(system, "check_whatsapp_health", quiet), \
+                mock.patch.object(system, "check_weather_health", quiet), \
+                mock.patch.object(system, "check_openrouter_health", quiet), \
+                mock.patch.object(system, "check_gwdg_health", quiet):
+            self.assertNotIn("canary", asyncio.run(system.run_health_checks()))
+            self._run({"Page": (False, "changed")}, {})
+            results = asyncio.run(system.run_health_checks())
+        self.assertFalse(results["canary"][0])
+        self.assertIn("canary", system.HEALTH_CHECK_LABELS)
+
+
 def _async(function):
     async def runner():
         return function()

@@ -180,6 +180,8 @@ class WeeklyPlanCatchUpTests(unittest.TestCase):
         with mock.patch.object(watcher, "_get_active_user_ids", lambda: [UID]), \
                 mock.patch.object(watcher, "get_pref", lambda uid, key: True), \
                 mock.patch.object(watcher, "run_morning_summary_schedule", mock.AsyncMock()), \
+                mock.patch.object(watcher, "run_canary_if_due", mock.AsyncMock()), \
+                mock.patch.object(watcher, "ensure_uni_proxy", mock.AsyncMock()), \
                 mock.patch.object(watcher, "GWDG_API_KEY", ""), \
                 mock.patch.object(watcher, "_run_once_per_period", once):
             asyncio.run(watcher._run_scheduled_jobs(None, None, moment.replace(tzinfo=TZ_BERLIN)))

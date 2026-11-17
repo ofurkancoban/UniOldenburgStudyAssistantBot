@@ -27,6 +27,7 @@ MODULE_ORDER = (
     "stagger",      # per-student personal check times (pure)
     "telegram_ui",  # Telegram message helpers
     "auth",         # access control, Stud.IP login, /login Mini App
+    "canary",       # nightly check that the university pages still look as the parsers expect
     "studip_api",   # Stud.IP JSON:API and HTML access
     "ai",           # LLM providers, speech-to-text, text-to-speech
     "documents",    # text extraction from course files
