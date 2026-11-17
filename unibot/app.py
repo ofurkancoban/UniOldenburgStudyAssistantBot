@@ -184,6 +184,7 @@ from unibot.study_plan import (
 )
 from unibot.tasks import (
     handle_announcement_to_task,
+    handle_summary_button,
     handle_task_buttons,
     handle_task_course_pick,
     handle_task_reminder_action,
@@ -388,6 +389,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_task_course_pick, pattern="^(task_course\\|.*|task_course_skip)$"))
     app.add_handler(CallbackQueryHandler(handle_task_suggestion_add, pattern=r"^tasksug_add\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_announcement_to_task, pattern=r"^ann_to_task\|.*$"))
+    app.add_handler(CallbackQueryHandler(handle_summary_button, pattern=r"^summary\|[af]\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_task_reminder_action, pattern=r"^(task_reminder_done|task_reminder_snooze)\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_course_view, pattern="^course_view\\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_browse_courses, pattern="^browse_courses$"))

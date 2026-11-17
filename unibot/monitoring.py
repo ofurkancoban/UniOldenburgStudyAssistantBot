@@ -54,6 +54,7 @@ from unibot.formatting import (
     truncate_html,
 )
 from unibot.monitoring_alerts import (  # noqa: F401 - the notification layer, re-exported for callers
+    SUMMARY_MIN_CHARS,
     _file_alert,
     _format_exam_dates_message,
     _forum_alert_markup,
@@ -669,6 +670,8 @@ async def _check_new_announcements_parallel_unlocked(bot, chat_id, silent: bool 
                     [InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")],
                     [InlineKeyboardButton("📝 Add as Task", callback_data=f"ann_to_task|{sid}")],
                 ]
+                if len(str(ann.get("body") or "")) >= SUMMARY_MIN_CHARS:  # a short text is its own summary
+                    buttons.append([InlineKeyboardButton("🧾 Summarize", callback_data=f"summary|a|{sid}")])
                 markup = InlineKeyboardMarkup(buttons)
                 await course_registry.fan_out(bot, ann.get("cid"), "announcements", text,
                                               announcement_title_text(ann), reply_markup=markup,

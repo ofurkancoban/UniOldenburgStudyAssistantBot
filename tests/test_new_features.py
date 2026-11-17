@@ -342,6 +342,85 @@ class CalendarFeedTests(unittest.TestCase):
         self.assertIn("Keep the link private", text)
 
 
+class SummaryButtonTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from unibot import monitoring_alerts
+        cls.alerts = monitoring_alerts
+        for uid in (7841, 7842):
+            activate_student(uid)
+
+    def setUp(self):
+        from unibot import tasks
+        self.tasks = tasks
+        tasks._summary_cache.clear()
+
+    def _press(self, uid, data, access=True, ai=True, llm=None):
+        query = mock.AsyncMock()
+        query.data = data
+        query.from_user = types.SimpleNamespace(id=uid)
+        update = types.SimpleNamespace(callback_query=query, effective_user=types.SimpleNamespace(id=uid))
+        llm = llm or mock.AsyncMock(return_value="The exam moves to Friday.")
+        with mock.patch.object(self.tasks, "is_user_allowed", lambda u: True), \
+                mock.patch.object(self.tasks, "has_course_access", lambda u, c: access), \
+                mock.patch.object(self.tasks, "get_ai_personal_enabled", lambda u: ai), \
+                mock.patch.object(self.tasks, "personal_ai_allowed", lambda u: ai), \
+                mock.patch.object(self.tasks, "_call_openrouter", llm):
+            run_handler(self.tasks.handle_summary_button, update, types.SimpleNamespace(user_data={}))
+        return query, llm
+
+    def _announcement(self, body="x" * 300):
+        self.tasks.announcement_task_cache["sid1"] = {"cid": "c1", "course": "Econ", "subject": "Exam", "body": body}
+
+    def test_a_long_announcement_gets_the_button_and_a_short_one_does_not(self):
+        from unibot import monitoring_alerts
+        long_post = {"cid": "c1", "course": "Econ", "thread": "T", "last_message_plain": "y" * 300}
+        short_post = {"cid": "c1", "course": "Econ", "thread": "T", "last_message_plain": "short"}
+        def data(p):
+            return [b.callback_data for row in monitoring_alerts._forum_alert_markup(p).inline_keyboard for b in row]
+        self.assertTrue(any(d.startswith("summary|f|") for d in data(long_post)))
+        self.assertFalse(any(d.startswith("summary|") for d in data(short_post)))
+
+    def test_the_summary_is_made_on_the_tap_and_shown_escaped(self):
+        self._announcement()
+        query, llm = self._press(7841, "summary|a|sid1", llm=mock.AsyncMock(return_value="Move <exam> & more"))
+        text = query.message.reply_text.call_args.args[0]
+        self.assertIn("🧾 <b>Summary</b>", text)
+        self.assertIn("Move &lt;exam&gt; &amp; more", text)
+        self.assertEqual(llm.await_count, 1)
+        self.assertIn("Course: Econ", llm.call_args.args[1])
+
+    def test_a_second_tap_on_the_same_message_reuses_the_summary(self):
+        self._announcement()
+        _q, llm1 = self._press(7841, "summary|a|sid1")
+        _q, llm2 = self._press(7842, "summary|a|sid1")
+        self.assertEqual(llm1.await_count + llm2.await_count, 1)
+
+    def test_without_the_ai_permission_nothing_is_sent_to_the_ai(self):
+        self._announcement()
+        query, llm = self._press(7841, "summary|a|sid1", ai=False)
+        llm.assert_not_awaited()
+        self.assertIn("Enable AI use", query.message.reply_text.call_args.args[0])
+
+    def test_a_student_who_does_not_follow_the_course_gets_nothing(self):
+        self._announcement()
+        query, llm = self._press(7841, "summary|a|sid1", access=False)
+        llm.assert_not_awaited()
+        self.assertIn("unavailable", query.answer.call_args.args[0])
+
+    def test_an_expired_message_and_a_failed_ai_are_said_plainly(self):
+        query, _llm = self._press(7841, "summary|a|missing")
+        self.assertIn("expired", query.answer.call_args.args[0])
+        self._announcement()
+        query, _llm = self._press(7841, "summary|a|sid1", llm=mock.AsyncMock(return_value=None))
+        self.assertIn("Couldn't summarize", query.message.reply_text.call_args.args[0])
+
+    def test_junk_callback_data_is_ignored(self):
+        query, llm = self._press(7841, "summary|x|sid1")
+        llm.assert_not_awaited()
+        query.message.reply_text.assert_not_awaited()
+
+
 def _async(function):
     async def runner():
         return function()

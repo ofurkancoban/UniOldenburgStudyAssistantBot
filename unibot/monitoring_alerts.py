@@ -32,6 +32,7 @@ from unibot.telegram_ui import (  # noqa: F401 - broadcast is re-exported for ca
 # short_id -> { course, thread, body }; persisted so the per-user AI task
 # suggestion button can find its source forum post after a restart.
 task_suggestion_cache = persistent_callback_cache("task_suggestions.json")
+SUMMARY_MIN_CHARS = 200  # a shorter announcement or post is its own summary: no Summarize button
 # short_id -> { course, subject, body } - raw announcement, converted to a
 # task on demand when "📝 Add as Task" is tapped
 announcement_task_cache = persistent_callback_cache("announcement_tasks.json")
@@ -225,6 +226,8 @@ def _forum_alert_markup(p: dict) -> InlineKeyboardMarkup:
             "body": p.get("last_message_plain"),
         }
         buttons.append([InlineKeyboardButton("📝 Suggest task", callback_data=f"tasksug_add|{sid}")])
+        if len(str(p.get("last_message_plain"))) >= SUMMARY_MIN_CHARS:  # a short text is its own summary
+            buttons.append([InlineKeyboardButton("🧾 Summarize", callback_data=f"summary|f|{sid}")])
     return InlineKeyboardMarkup(buttons)
 
 

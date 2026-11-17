@@ -895,6 +895,75 @@ async def convert_announcement_to_task(course_name: str, subject: Optional[str],
     return {"text": task_text, "due_time": _resolve_task_due_time(parsed.get("due_date"), parsed.get("due_time"))}
 
 
+SUMMARY_SYSTEM_PROMPT = (
+    "You summarise a university course announcement or forum post for a student. Answer with one to three short "
+    "sentences in the same language as the text: what it is about and, if there is one, what the student has to do "
+    "and by when. Plain text only: no markdown, no lists, no greeting, nothing that is not in the text."
+)
+_summary_cache: dict = {}        # (kind, sid) -> summary; the text is the same for every follower of the course
+
+
+async def summarize_course_text(course: str, title: Optional[str], body: str, user_id: Optional[int] = None,
+                                course_id: Optional[str] = None) -> Optional[str]:
+    """One to three sentences about an announcement or forum post, or None. Only for a student who may use
+    AI on personal data and follows the course; called when they tap the button, never on its own."""
+    if not _course_task_allowed(user_id, course_id) or not (body or "").strip():
+        return None
+    text = f"Course: {course}\n" + (f"Title: {title}\n" if title else "") + f"\n{body[:3500]}"
+    raw = await _call_openrouter(SUMMARY_SYSTEM_PROMPT, text, temperature=0.2,
+                                 can_send=lambda: _course_task_allowed(user_id, course_id))
+    summary = (raw or "").strip()
+    return summary[:700] if summary else None
+
+
+async def handle_summary_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """summary|a|<sid> (announcement) and summary|f|<sid> (forum post): the "🧾 Summarize" button."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        await query.answer()
+        return
+    parts = (query.data or "").split("|")
+    if len(parts) != 3 or parts[1] not in ("a", "f"):
+        await query.answer()
+        return
+    kind, sid = parts[1], parts[2]
+    info = (announcement_task_cache if kind == "a" else task_suggestion_cache).get(sid)
+    if not info:
+        await query.answer("This message has expired.", show_alert=True)
+        return
+    cid = info.get("cid")
+    if not has_course_access(user_id, cid):
+        await query.answer("This message is unavailable for your account. Reopen the course updates.", show_alert=True)
+        return
+    if not get_ai_personal_enabled(user_id):
+        await query.answer()
+        await query.message.reply_text("🔒 Enable AI use in /settings > Privacy before summarizing course messages.")
+        return
+    await query.answer("Summarizing...")
+    if not db.private_context_is_current(user_id):
+        return
+    title = info.get("subject") if kind == "a" else info.get("thread")
+    summary = _summary_cache.get((kind, sid))
+    if summary is None:
+        try:
+            summary = await summarize_course_text(info.get("course") or "", title, info.get("body") or "",
+                                                  user_id=user_id, course_id=cid)
+        except Exception as e:
+            logging.warning("summarize_course_text failed: %s", type(e).__name__)
+            summary = None
+        if summary:
+            if len(_summary_cache) > 200:
+                _summary_cache.clear()
+            _summary_cache[(kind, sid)] = summary
+    if not db.private_context_is_current(user_id) or not has_course_access(user_id, cid):
+        return
+    if not summary:
+        await query.message.reply_text("⚠️ Couldn't summarize this right now, try again in a bit.")
+        return
+    await query.message.reply_text(f"🧾 <b>Summary</b>\n{html.escape(summary)}", parse_mode="HTML")
+
+
 TASK_FROM_TEXT_SYSTEM_PROMPT = """You read a person's own task/to-do request (typed or spoken, Turkish or English) for a university assistant bot's task list, and extract a clean task description plus a due date/time - but only if they actually stated one in the same sentence.
 
 Respond with strict JSON only, no other text: {"task_text": "<short, clean task description, same language as the request, just tidied up - e.g. 'yarın rapor teslim et' -> 'Rapor teslim et', 'add a task submit the report tomorrow' -> 'Submit the report'>", "due_date": "<YYYY-MM-DD>" or null, "due_time": "<HH:MM 24h>" or null}.
