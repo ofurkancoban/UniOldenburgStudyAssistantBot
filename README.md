@@ -186,6 +186,15 @@ Time-sensitive task and calendar reminders run in their own loop. AI study plans
 
 ---
 
+### Backups and disaster recovery
+
+The server writes a database backup every night at 03:00 (`backups/`, the last 7 are kept). Every student's private records in it are encrypted with keys derived from the server's **`.vault_key`**, so **a backup without that key cannot be read**, and both live on the same disk. `scripts/pull_backup.sh` copies them to another machine:
+
+- It downloads `.vault_key` (checked against the server's checksum) and every database backup the machine does not have yet (each one checked as a valid archive), into `~/Library/Application Support/UniAssistantBackup` (mode 0700, not synced by iCloud). Copies older than 14 days are deleted, so a student whose data was deleted is not kept in backups for long. A failure shows a macOS notification.
+- A launchd job (`~/Library/LaunchAgents/com.uniassistant.backup.plist`) runs it every day at 04:15 (after waking, if the machine slept). Run it by hand any time with `scripts/pull_backup.sh`. Its settings are in `UniAssistantBackup/config.env` (`DEPLOY_HOST`, `DEPLOY_DIR`).
+- **To restore on a new server:** put `vault_key` into the checkout as `.vault_key` (mode 0600), `gunzip` a backup to `bot_data.sqlite3`, set `TELEGRAM_TOKEN` and the rest of `.env`, start the bot. A restored copy was tested: all of its private records decrypted with the pulled key.
+- That folder holds the key **and** the data it opens: keep FileVault on, do not sync or share the folder, and treat the Mac like the server.
+
 ## ⚙️ Configuration (`.env`)
 
 ```ini
