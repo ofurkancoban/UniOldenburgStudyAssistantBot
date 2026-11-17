@@ -155,6 +155,26 @@ class InviteTests(unittest.TestCase):
         self.assertIn("private invitation", update.effective_message.reply_text.call_args.args[0])
 
 
+    def test_the_bots_own_pin_message_gets_no_invitation_notice(self):
+        # pinning the morning summary comes back as an update from the bot itself; it used to be
+        # answered with the invite-only text in the student's chat, every morning at 07:00
+        update = _update(798, text=None)
+        update.effective_user.is_bot = True
+        with mock.patch.object(auth, "is_user_allowed", lambda uid: False):
+            with self.assertRaises(ApplicationHandlerStop):
+                asyncio.run(auth._authorization_gate(update, None))
+        update.effective_message.reply_text.assert_not_awaited()
+
+    def test_a_human_stranger_still_gets_the_notice_when_telegram_says_not_a_bot(self):
+        auth._reset_gate_replies()
+        update = _update(797, text="hello")
+        update.effective_user.is_bot = False
+        with mock.patch.object(auth, "is_user_allowed", lambda uid: False):
+            with self.assertRaises(ApplicationHandlerStop):
+                asyncio.run(auth._authorization_gate(update, None))
+        self.assertIn("private invitation", update.effective_message.reply_text.call_args.args[0])
+
+
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         auth._renewal_failures.clear()

@@ -314,6 +314,11 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     _current_user.set(None)
     db.clear_private_write_context()
     set_request_priority(BACKGROUND)
+    if user is not None and getattr(user, "is_bot", False) is True:
+        # Telegram hands the bot its own service messages back as updates from the bot itself
+        # (every pinned morning summary: "the bot pinned a message"). Never answer them: the bot
+        # would send its invite-only notice into a student's chat.
+        raise ApplicationHandlerStop
     if user is not None and is_user_allowed(user.id):
         if db.private_deletion_in_progress(user.id):
             # Do not let a concurrent /start reactivate the account or let a
