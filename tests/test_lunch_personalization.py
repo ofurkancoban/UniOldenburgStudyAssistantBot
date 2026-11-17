@@ -177,6 +177,57 @@ class RecommendationTests(unittest.TestCase):
             self.assertNotEqual(self._recommend(uid)["dish"], "Tofu Bowl")
 
 
+class SpokenFoodPreferenceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        for uid in (7780, 7781, 7782, 7783):
+            activate_student(uid)
+
+    def _voice(self, uid, intent, query):
+        from unibot import voice
+        message = mock.AsyncMock()
+        update = types.SimpleNamespace(effective_user=types.SimpleNamespace(id=uid), effective_message=message)
+        run_as(uid, voice._voice_intent_food_words(update, None, {}, "", intent, query, [], message))
+        return message.reply_text.call_args.args[0]
+
+    def test_every_food_intent_is_known_labelled_and_routed(self):
+        from unibot import voice
+        for intent in ("food_like", "food_avoid", "food_allow"):
+            self.assertIn(intent, voice.VOICE_INTENTS)
+            self.assertIn(intent, voice.INTENT_LABELS)
+            self.assertIn(intent, voice._VOICE_INTENT_HANDLERS)
+            self.assertIn(intent + ":", voice.CLASSIFY_INTENT_SYSTEM_PROMPT)
+
+    def test_i_like_saves_liked_ingredients(self):
+        reply = self._voice(7780, "food_like", "chicken, pasta")
+        self.assertIn("chicken, pasta", reply)
+        self.assertEqual(mensa.load_food_preferences(7780)["like_keywords"], ["chicken", "pasta"])
+
+    def test_i_dont_eat_hides_the_word_and_its_official_codes(self):
+        self._voice(7781, "food_avoid", "pork, mushrooms")
+        prefs = mensa.load_food_preferences(7781)
+        self.assertEqual(prefs["avoid_keywords"], ["pork", "mushrooms"])
+        self.assertEqual(set(prefs["avoid_codes"]), {"S", "Sch", "Su"})
+        self.assertEqual(mensa.load_food_preferences(7780)["avoid_codes"], [])  # nobody else
+
+    def test_i_eat_it_again_takes_the_word_and_its_codes_off(self):
+        self._voice(7782, "food_avoid", "pork, fish")
+        reply = self._voice(7782, "food_allow", "pork")
+        self.assertIn("pork", reply)
+        prefs = mensa.load_food_preferences(7782)
+        self.assertEqual(prefs["avoid_keywords"], ["fish"])
+        self.assertEqual(set(prefs["avoid_codes"]), {"F", "Fi"})  # fish stays avoided
+
+    def test_a_code_stays_while_another_avoided_word_still_needs_it(self):
+        self._voice(7783, "food_avoid", "pork, schwein")
+        self._voice(7783, "food_allow", "schwein")
+        self.assertEqual(set(mensa.load_food_preferences(7783)["avoid_codes"]), {"S", "Sch", "Su"})
+
+    def test_nothing_to_allow_and_nothing_understood_are_said_plainly(self):
+        self.assertIn("None of those", self._voice(7780, "food_allow", "caviar"))
+        self.assertIn("didn't catch", self._voice(7780, "food_like", ""))
+
+
 class MenuCacheTests(unittest.TestCase):
     def test_the_public_menu_is_fetched_once_for_all_students_within_minutes(self):
         calls = []

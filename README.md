@@ -113,7 +113,9 @@ Every voice note is transcribed first (via the free Google Web Speech API, no AP
     | "what are my upcoming exams" | Opens **📚 My Exam Dates**. |
     | "what's on the menu today" | Shows today's Mensa menu (filtered per your food preferences). |
     | "what should I eat today" | 🍽️ Picks **one** recommended dish instead of showing the full menu - see 🍽️ "What should I eat?" above. |
-    | "I don't eat pork or mushrooms" | Saves those as food preferences (see 🍽️ Enhanced Mensa Menu above). |
+    | "I don't eat pork or mushrooms" | Saves those as food preferences, including the official allergen codes behind words like pork, fish or egg (see 🍽️ Enhanced Mensa Menu above). |
+| "I like chicken and pasta" | Remembers them as ingredients you like: your lunch picks lean towards them (see 🍽️ "What should I eat?" above). |
+| "I eat fish now" / "stop avoiding mushrooms" | Takes those off your do-not-eat list again. |
     | "I eat fish now" / "stop avoiding mushrooms" | Undoes an earlier food preference for that item. |
     | "show bot status" | Runs `/status`. |
     | "list the last file of Development Economics" | Finds that course's most recently uploaded file and offers a one-tap **📥 Download**. |

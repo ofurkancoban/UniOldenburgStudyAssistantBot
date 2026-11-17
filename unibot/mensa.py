@@ -31,7 +31,17 @@ from unibot.telegram_ui import (
 )
 from unibot.auth import current_user_id, is_user_allowed, login_studip
 from unibot.formatting import _prefix_by_telegram_length, _telegram_length, split_html, truncate_html
-from unibot.preferences import DIETS, diet_filter, food_filter, get_pref, get_prefs, set_pref
+from unibot.preferences import (
+    ANIMAL_BY_PRODUCT_CODES,
+    DIETS,
+    FISH_CODES,
+    PORK_CODES,
+    diet_filter,
+    food_filter,
+    get_pref,
+    get_prefs,
+    set_pref,
+)
 from unibot.studip_api import BASE_URL
 from unibot.ai import _call_openrouter, _extract_json_object, personal_ai_allowed
 
@@ -105,6 +115,24 @@ def parse_food_words(text: str) -> list[str]:
     return words[:MAX_FOOD_WORDS]
 
 
+# Spoken or typed words that also stand for the Mensa's official allergen/ingredient codes
+FOOD_WORD_CODES = {
+    "pork": PORK_CODES, "schwein": PORK_CODES, "alcohol": {"A"}, "alkohol": {"A"},
+    "gelatin": ANIMAL_BY_PRODUCT_CODES, "gelatine": ANIMAL_BY_PRODUCT_CODES,
+    "fish": FISH_CODES, "fisch": FISH_CODES, "beef": {"R", "RG"}, "lamb": {"L"}, "poultry": {"G"},
+    "peanut": {"En"}, "peanuts": {"En"}, "egg": {"Ei"}, "eggs": {"Ei"}, "milk": {"Mi"}, "lactose": {"Mi"},
+    "garlic": {"Kn"}, "celery": {"Sl"}, "soy": {"So"}, "mustard": {"Sf"}, "sesame": {"Se"},
+    "gluten": {"We", "Ro", "Ge", "Ha", "Di", "Ka", "Hy"},
+}
+
+
+def _codes_for_words(words) -> set:
+    codes: set = set()
+    for word in words:
+        codes |= set(FOOD_WORD_CODES.get(word, ()))
+    return codes
+
+
 def add_food_words(user_id: int, kind: str, text: str) -> tuple[list[str], list[str]]:
     """Add typed ingredient words to the student's liked ("like") or avoided ("avoid") list.
 
@@ -124,9 +152,27 @@ def add_food_words(user_id: int, kind: str, text: str) -> tuple[list[str], list[
             continue
         target.append(word)
         added.append(word)
-    save_food_preferences(prefs["avoid_codes"], avoids, user_id=user_id)
+    codes = list(prefs["avoid_codes"])
+    if kind == "avoid":
+        codes = sorted(set(codes) | _codes_for_words(added))  # "pork" also hides every dish with a pork code
+    save_food_preferences(codes, avoids, user_id=user_id)
     save_food_likes(likes, user_id=user_id)
     return added, [w for w in words if w not in added]
+
+
+def remove_food_words(user_id: int, text: str) -> list[str]:
+    """Stop avoiding the typed or spoken ingredients ("I eat fish now"). Returns the words that were avoided."""
+    words = parse_food_words(text)
+    prefs = load_food_preferences(user_id)
+    avoids = list(prefs["avoid_keywords"])
+    removed = [w for w in words if w in avoids]
+    codes_of_removed = _codes_for_words(words)
+    avoids = [w for w in avoids if w not in words]
+    # a code stays when another avoided word still stands for it
+    codes = [c for c in prefs["avoid_codes"] if c not in codes_of_removed or c in _codes_for_words(avoids)]
+    if removed or codes_of_removed & set(prefs["avoid_codes"]):
+        save_food_preferences(codes, avoids, user_id=user_id)
+    return removed or [w for w in words if _codes_for_words([w]) & set(prefs["avoid_codes"])]
 
 
 # English ingredient names the student may type, and the German words the Mensa menu uses for them

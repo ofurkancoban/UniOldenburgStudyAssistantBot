@@ -94,7 +94,8 @@ VOICE_INTENTS = [
     "check_status", "show_menu",
     "show_last_file", "list_course_files", "exam_dates_all", "upcoming_dashboard",
     "calendar_today", "calendar_weekly", "set_default_semester", "run_check",
-    "fastenroll_list", "read_daily_plan", "read_weekly_plan", "ask_question", "recommend_meal", "unclear",
+    "fastenroll_list", "read_daily_plan", "read_weekly_plan", "ask_question", "recommend_meal",
+    "food_like", "food_avoid", "food_allow", "unclear",
 ]
 
 # Friendly button labels for every real (non-"unclear") intent, used both by
@@ -125,6 +126,9 @@ INTENT_LABELS = {
     "read_daily_plan": "🔊 Read today's plan aloud",
     "read_weekly_plan": "🔊 Read this week's plan aloud",
     "ask_question": "💬 Ask a question about my studies",
+    "food_like": "👍 Remember what I like to eat",
+    "food_avoid": "🚫 Remember what I don't eat",
+    "food_allow": "✅ I eat that again",
 }
 
 CLASSIFY_INTENT_SYSTEM_PROMPT = """You classify a spoken command (transcribed from Turkish or English) sent to a university assistant Telegram bot into exactly one intent.
@@ -153,9 +157,12 @@ Intents, each with example phrasings in both languages:
 - set_default_semester: "varsayılan dönemi ayarla" / "set my default semester" / "change my default semester" - opens the semester picker, doesn't require a semester to be named
 - run_check: "her şeyi manuel kontrol et" / "run a manual sync" / "check for updates now" - force-refreshes messages/announcements/files/forum right now
 - fastenroll_list: "planlanmış fast enroll işlerimi listele" / "list my scheduled fast enroll jobs" / "show my pending enrollments"
+- food_like: "tavuk ve makarna severim" / "I like chicken and pasta" / "add tofu to my favourite foods" - says which ingredients or dishes they LIKE
+- food_avoid: "domuz eti ve mantar yemiyorum" / "I don't eat pork or mushrooms" / "I never want to see fish" - says which ingredients they do NOT eat
+- food_allow: "artık balık yiyorum" / "I eat fish now" / "stop avoiding mushrooms" - takes an ingredient off the do-not-eat list
 - unclear: anything that doesn't clearly match one of the above
 
-For course_enroll, course_deenroll, exam_register, exam_deregister, create_exam_reminder_task, show_last_file, and list_course_files, also extract the course or exam name mentioned (in whatever language it was said) as "query"; otherwise "query" is null.
+For course_enroll, course_deenroll, exam_register, exam_deregister, create_exam_reminder_task, show_last_file, and list_course_files, also extract the course or exam name mentioned (in whatever language it was said) as "query"; for food_like, food_avoid and food_allow, "query" is the ingredients as plain English words separated by commas (the Mensa menu is in English), for example "chicken, pasta"; otherwise "query" is null.
 
 If - and only if - you pick "unclear", also set "alternatives" to an array of the 1-2 intents (from the list above, excluding "unclear") that are the next most plausible reading of the phrase; use an empty array if nothing else is remotely plausible. For every other intent, "alternatives" is an empty array.
 
@@ -892,6 +899,32 @@ async def _voice_intent_recommend_meal(update, context, result, transcript, inte
     return True
 
 
+async def _voice_intent_food_words(update, context, result, transcript, intent, query_text, alternatives, message):
+    """Voice intents: food_like, food_avoid, food_allow. Saves the spoken ingredients in this student's own
+    food preferences (the same lists the Food Preferences screen shows)."""
+    from unibot.mensa import add_food_words, parse_food_words, remove_food_words
+    user_id = update.effective_user.id if update.effective_user else None
+    if user_id is None:
+        return True
+    if not parse_food_words(query_text or ""):
+        await message.reply_text("🤷 I didn't catch which ingredients you mean. Try: \"I like chicken and pasta\" "
+                                 "or \"I don't eat pork\".")
+        return True
+    if intent == "food_allow":
+        removed = remove_food_words(user_id, query_text or "")
+        reply = (f"✅ Noted, I won't hide {', '.join(removed)} any more." if removed
+                 else "ℹ️ None of those were on your do-not-eat list.")
+    else:
+        kind = "like" if intent == "food_like" else "avoid"
+        added, already = add_food_words(user_id, kind, query_text or "")
+        verb = "you like" if kind == "like" else "you don't eat"
+        reply = f"🍽️ Noted, {verb}: {', '.join(added)}." if added else f"ℹ️ Already on your list: {', '.join(already)}."
+        if added and kind == "like":
+            reply += " Your lunch picks will lean towards that."
+    await message.reply_text(reply + "\nSee and change it under 🍽️ Mensa, then Food Preferences.")
+    return True
+
+
 async def _voice_intent_course_enroll(update, context, result, transcript, intent, query_text, alternatives, message):
     """Voice intent: course_enroll."""
     from unibot.menus import _show_semester_picker
@@ -1136,6 +1169,9 @@ _VOICE_INTENT_HANDLERS = {
     "set_default_semester": _voice_intent_set_default_semester,
     "run_check": _voice_intent_run_check,
     "fastenroll_list": _voice_intent_fastenroll_list,
+    "food_like": _voice_intent_food_words,
+    "food_avoid": _voice_intent_food_words,
+    "food_allow": _voice_intent_food_words,
 }
 
 
