@@ -205,6 +205,143 @@ class MealFeedbackTests(unittest.TestCase):
         self.assertEqual(record["loc_id"], "3")
 
 
+class CalendarFeedTests(unittest.TestCase):
+    UID = 7831
+
+    @classmethod
+    def setUpClass(cls):
+        activate_student(cls.UID)
+
+    def _ics(self, entries):
+        from unibot import study_week
+        raw = study_week.build_ics(entries, self.UID, now=datetime(2026, 11, 17, 7, 0, tzinfo=study_week.TZ_BERLIN))
+        self.assertTrue(all(len(line.encode("utf-8")) <= 75 for line in raw.split("\r\n")))  # folded as RFC 5545 asks
+        return raw.replace("\r\n ", "")  # unfolded, so a sentence can be searched for
+
+    def _lecture(self, **extra):
+        from unibot import study_week
+        tz = study_week.TZ_BERLIN
+        return {"kind": "lecture", "title": "Applied Econometrics", "location": "A06 0-006",
+                "start_dt": datetime(2026, 11, 18, 10, 15, tzinfo=tz), "end_dt": datetime(2026, 11, 18, 11, 45, tzinfo=tz),
+                "cancelled": False, "event_id": "ev1", **extra}
+
+    def test_a_lecture_becomes_a_busy_event_with_its_room(self):
+        ics = self._ics([self._lecture()])
+        self.assertIn("SUMMARY:🎓 Applied Econometrics", ics)
+        self.assertIn("LOCATION:A06 0-006", ics)
+        self.assertIn("DTSTART:20261118T091500Z", ics)  # 10:15 Berlin in winter time
+        self.assertIn("STATUS:CONFIRMED", ics)
+        self.assertIn("TRANSP:OPAQUE", ics)
+
+    def test_a_cancelled_lecture_is_marked_and_does_not_block_the_time(self):
+        ics = self._ics([self._lecture(cancelled=True)])
+        self.assertIn("SUMMARY:❌ Cancelled: Applied Econometrics", ics)
+        self.assertIn("STATUS:CANCELLED", ics)
+        self.assertIn("TRANSP:TRANSPARENT", ics)
+
+    def test_a_timed_exam_has_a_start_and_a_default_length(self):
+        from unibot import study_week
+        start = datetime(2026, 12, 8, 14, 0, tzinfo=study_week.TZ_BERLIN)
+        ics = self._ics([{"kind": "exam", "title": "Macro; Part 1, final", "start_dt": start,
+                          "end_dt": start + timedelta(minutes=90), "all_day": False}])
+        self.assertIn("DTSTART:20261208T130000Z", ics)
+        self.assertIn("DTEND:20261208T143000Z", ics)
+        self.assertIn("SUMMARY:📝 Exam: Macro\\; Part 1\\, final", ics)  # RFC 5545 escaping
+
+    def test_an_exam_without_a_time_is_an_all_day_event(self):
+        ics = self._ics([{"kind": "exam", "title": "Statistics", "day": date(2026, 12, 9), "all_day": True}])
+        self.assertIn("DTSTART;VALUE=DATE:20261209", ics)
+        self.assertIn("DTEND;VALUE=DATE:20261210", ics)
+        self.assertIn("The time is not set in StuMS yet", ics)
+
+    def test_the_calendar_has_valid_structure_and_stable_unique_ids(self):
+        ics = self._ics([self._lecture(), self._lecture(event_id="ev2", title="Other")])
+        self.assertTrue(ics.startswith("BEGIN:VCALENDAR\r\n") and ics.endswith("END:VCALENDAR\r\n"))
+        self.assertEqual(ics.count("BEGIN:VEVENT"), ics.count("END:VEVENT"))
+        uids = [line for line in ics.split("\r\n") if line.startswith("UID:")]
+        self.assertEqual(len(uids), len(set(uids)))
+        self.assertEqual(uids, [line for line in self._ics([self._lecture(), self._lecture(event_id="ev2", title="Other")]).split("\r\n")
+                                if line.startswith("UID:")])  # the same entries give the same ids
+
+    def test_the_feed_merges_study_blocks_lectures_and_exams_from_today(self):
+        from unibot import study_week
+        tz = study_week.TZ_BERLIN
+        wed = date(2026, 11, 18)
+
+        async def plan(uid, week_start, session=None):
+            return [{"kind": "lunch", "mensa": "Mensa", "start_dt": datetime(2026, 11, 18, 12, 0, tzinfo=tz),
+                     "end_dt": datetime(2026, 11, 18, 12, 45, tzinfo=tz)}]
+
+        async def lectures(uid, week_start, session=None):
+            return [self._lecture()] if week_start == date(2026, 11, 16) else []
+
+        async def exams(uid, session=None):
+            return [{"kind": "exam", "title": "Past exam", "day": date(2026, 10, 1), "all_day": True},
+                    {"kind": "exam", "title": "Future exam", "day": date(2026, 12, 9), "all_day": True}]
+
+        with mock.patch.object(study_week, "plan_entries", plan), \
+                mock.patch.object(study_week, "lecture_entries", lectures), \
+                mock.patch.object(study_week, "exam_entries", exams):
+            ics = asyncio.run(study_week.calendar_for(self.UID, today=wed))
+        self.assertIn("Applied Econometrics", ics)
+        self.assertIn("Future exam", ics)
+        self.assertNotIn("Past exam", ics)  # already over
+        self.assertIn("Lunch at Mensa", ics)
+
+    def test_a_failing_lecture_fetch_still_gives_the_rest(self):
+        from unibot import study_week
+
+        async def plan(uid, week_start, session=None):
+            return []
+
+        async def broken(uid, week_start, session=None):
+            raise RuntimeError("Stud.IP down")
+
+        async def exams(uid, session=None):
+            return [{"kind": "exam", "title": "Still shown", "day": date(2026, 12, 9), "all_day": True}]
+
+        with mock.patch.object(study_week, "plan_entries", plan), \
+                mock.patch.object(study_week, "lecture_entries", broken), \
+                mock.patch.object(study_week, "exam_entries", exams):
+            ics = asyncio.run(study_week.calendar_for(self.UID, today=date(2026, 11, 18)))
+        self.assertIn("Still shown", ics)
+
+    def test_exam_entries_come_from_stums_are_cached_and_never_raise(self):
+        from unibot import study_week
+        study_week._exam_cache.pop(self.UID, None)
+        stums = mock.AsyncMock(return_value=[
+            {"title": "Macro", "start_datetime": "2026-12-08T14:00:00", "date": "2026-12-08"},
+            {"title": "Stats", "start_datetime": None, "date": "2026-12-09"},
+            {"title": "Broken", "start_datetime": "not a time", "date": None}])
+        session = mock.MagicMock()
+        with mock.patch.object(study_week, "get_registered_exam_schedule", stums), \
+                mock.patch.object(study_week, "has_stored_login", lambda s: True), \
+                mock.patch.object(study_week, "is_user_allowed", lambda uid: True):
+            first = asyncio.run(study_week.exam_entries(self.UID, session=session))
+            second = asyncio.run(study_week.exam_entries(self.UID, session=session))
+        self.assertEqual([e["title"] for e in first], ["Macro", "Stats"])  # the broken one is skipped
+        self.assertFalse(first[0]["all_day"])
+        self.assertTrue(first[1]["all_day"])
+        self.assertEqual(stums.await_count, 1)  # the second call came from the cache
+        self.assertEqual(first, second)
+
+    def test_a_stums_failure_gives_the_last_list_or_nothing(self):
+        from unibot import study_week
+        study_week._exam_cache.pop(self.UID, None)
+        broken = mock.AsyncMock(side_effect=RuntimeError("StuMS paused"))
+        with mock.patch.object(study_week, "get_registered_exam_schedule", broken), \
+                mock.patch.object(study_week, "has_stored_login", lambda s: True), \
+                mock.patch.object(study_week, "is_user_allowed", lambda uid: True):
+            self.assertEqual(asyncio.run(study_week.exam_entries(self.UID, session=mock.MagicMock())), [])
+
+    def test_the_screen_says_what_is_in_the_feed_and_warns_about_the_link(self):
+        from unibot import study_week
+        text, _markup = study_week.calendar_sync_view(self.UID)
+        self.assertIn("lectures", text)
+        self.assertIn("exams", text)
+        self.assertIn("Keep the link private", text)
+
+
 def _async(function):
     async def runner():
         return function()

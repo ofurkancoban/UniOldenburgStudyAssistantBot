@@ -12,6 +12,7 @@ import html
 import io
 import logging
 import math
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote
@@ -20,6 +21,7 @@ from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
+from exam_reminder import background_stums, get_registered_exam_schedule
 from studip_utils import TZ_BERLIN, format_hours
 from unibot import db, state
 from unibot.auth import ACTIVE, INACTIVE, acting_as, get_user_session, has_stored_login, is_user_allowed, lifecycle_state
@@ -68,6 +70,74 @@ async def plan_entries(user_id: int, week_start: date, session=None) -> list[dic
     return sorted(entries, key=lambda e: e["start_dt"])
 
 
+def _aware(moment: datetime) -> datetime:
+    return moment if moment.tzinfo else moment.replace(tzinfo=TZ_BERLIN)
+
+
+async def lecture_entries(user_id: int, week_start: date, session=None) -> list[dict]:
+    """The student's lectures and seminars of one week as calendar entries, cancelled ones marked as such;
+    [] without a stored login."""
+    if not is_user_allowed(user_id):
+        return []
+    session = session or get_user_session(user_id)
+    if not has_stored_login(session):
+        return []
+    with acting_as(user_id):
+        if not db.private_context_is_current(user_id) or not is_user_allowed(user_id):
+            return []
+        events = await get_calendar_events(session=session, week_start=week_start, user_id=user_id) or []
+        if not db.private_context_is_current(user_id) or not is_user_allowed(user_id):
+            return []
+    entries = []
+    for ev in events:
+        start, end = ev.get("start_dt"), ev.get("end_dt")
+        if not start or not end or not ev.get("title") or ev["title"] == "Untitled":
+            continue
+        entries.append({"kind": "lecture", "title": str(ev["title"]), "location": str(ev.get("location") or ""),
+                        "start_dt": _aware(start), "end_dt": _aware(end), "cancelled": bool(ev.get("is_cancelled")),
+                        "event_id": str(ev.get("id") or "")})
+    return entries
+
+
+EXAM_ENTRY_MINUTES = 90        # StuMS gives the start only
+EXAM_CACHE_SECONDS = 3 * 3600  # the exam list changes rarely and every refresh asks StuMS
+_exam_cache: dict[int, tuple[float, list]] = {}
+
+
+async def exam_entries(user_id: int, session=None) -> list[dict]:
+    """The exams the student is registered for as calendar entries (all-day when StuMS has no time yet).
+    Kept for a few hours; on any StuMS problem the last list, else none: the feed itself never fails over it."""
+    cached = _exam_cache.get(user_id)
+    if cached and time.monotonic() - cached[0] < EXAM_CACHE_SECONDS:
+        return cached[1]
+    if not is_user_allowed(user_id):
+        return []
+    session = session or get_user_session(user_id)
+    if not has_stored_login(session):
+        return []
+    try:
+        with acting_as(user_id), background_stums():
+            exams = await get_registered_exam_schedule(session) or []
+    except Exception as e:
+        logging.info("Exam dates for the calendar feed unavailable: %s", type(e).__name__)
+        return cached[1] if cached else []
+    entries = []
+    for exam in exams:
+        title = str(exam.get("title") or "Exam")
+        try:
+            if exam.get("start_datetime"):
+                start = _aware(datetime.fromisoformat(exam["start_datetime"]))
+                entries.append({"kind": "exam", "title": title, "start_dt": start,
+                                "end_dt": start + timedelta(minutes=EXAM_ENTRY_MINUTES), "all_day": False})
+            elif exam.get("date"):
+                entries.append({"kind": "exam", "title": title, "day": date.fromisoformat(exam["date"]),
+                                "all_day": True})
+        except (TypeError, ValueError) as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
+    _exam_cache[user_id] = (time.monotonic(), entries)
+    return entries
+
+
 # ── calendar feed (iCalendar, RFC 5545) ───────────────────────────────────────
 def _ics_text(value: str) -> str:
     # Normalize every newline form before escaping. Escaping LF first would
@@ -96,17 +166,28 @@ def _ics_time(moment: datetime) -> str:
     return moment.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def _ics_day(day: date) -> str:
+    return day.strftime("%Y%m%d")
+
+
+def _entry_day(entry: dict) -> date:
+    return entry["day"] if entry.get("all_day") else entry["start_dt"].date()
+
+
 def build_ics(entries: list[dict], user_id: int, now: Optional[datetime] = None) -> str:
-    """An iCalendar of study windows ("busy", so the phone calendar shows the
-    time as taken) and lunch breaks."""
+    """An iCalendar of the student's lectures (cancelled ones marked), registered exams, study windows
+    ("busy", so the phone calendar shows the time as taken) and lunch breaks."""
     stamp = _ics_time(now or datetime.now(TZ_BERLIN))
     owner = hashlib.sha256(str(user_id).encode()).hexdigest()[:12]
     lines = [
-        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//UniAssistant//Study blocks//EN", "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH", "X-WR-CALNAME:Study blocks", "X-WR-TIMEZONE:Europe/Berlin",
+        "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//UniAssistant//Timetable//EN", "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH", "X-WR-CALNAME:UniAssistant", "X-WR-TIMEZONE:Europe/Berlin",
         "REFRESH-INTERVAL;VALUE=DURATION:PT1H", "X-PUBLISHED-TTL:PT1H",
     ]
     for e in entries:
+        if e.get("kind") in ("lecture", "exam"):
+            lines += _ics_event_lines(e, owner, stamp)
+            continue
         if e.get("kind") == "lunch":
             summary, kind = f"🥗 Lunch at {e['mensa']}", "lunch"
             description, location = "Lunch break between the study blocks.", e["mensa"]
@@ -137,12 +218,45 @@ def build_ics(entries: list[dict], user_id: int, now: Optional[datetime] = None)
     return "\r\n".join(folded for line in lines for folded in _ics_fold(line)) + "\r\n"
 
 
+def _ics_event_lines(e: dict, owner: str, stamp: str) -> list[str]:
+    """One lecture or exam as VEVENT lines."""
+    if e["kind"] == "exam":
+        uid_part = hashlib.sha256(f"{e['title']}|{_entry_day(e)}".encode()).hexdigest()[:10]
+        lines = ["BEGIN:VEVENT", f"UID:exam-{uid_part}-{owner}@uniassistant", f"DTSTAMP:{stamp}"]
+        if e.get("all_day"):
+            lines += [f"DTSTART;VALUE=DATE:{_ics_day(e['day'])}", f"DTEND;VALUE=DATE:{_ics_day(e['day'] + timedelta(days=1))}"]
+        else:
+            lines += [f"DTSTART:{_ics_time(e['start_dt'])}", f"DTEND:{_ics_time(e['end_dt'])}"]
+        lines += [f"SUMMARY:{_ics_text('📝 Exam: ' + e['title'])}",
+                  "DESCRIPTION:" + _ics_text("You are registered for this exam." + (
+                      "" if not e.get("all_day") else " The time is not set in StuMS yet.")),
+                  "TRANSP:OPAQUE", "STATUS:CONFIRMED", "END:VEVENT"]
+        return lines
+    ident = e.get("event_id") or hashlib.sha256(e["title"].encode()).hexdigest()[:8]
+    cancelled = bool(e.get("cancelled"))
+    summary = ("❌ Cancelled: " if cancelled else "🎓 ") + e["title"]
+    lines = ["BEGIN:VEVENT", f"UID:lecture-{ident}-{e['start_dt']:%Y%m%dT%H%M}-{owner}@uniassistant", f"DTSTAMP:{stamp}",
+             f"DTSTART:{_ics_time(e['start_dt'])}", f"DTEND:{_ics_time(e['end_dt'])}",
+             f"SUMMARY:{_ics_text(summary)}", f"STATUS:{'CANCELLED' if cancelled else 'CONFIRMED'}",
+             "TRANSP:TRANSPARENT" if cancelled else "TRANSP:OPAQUE"]
+    if e.get("location"):
+        lines.append(f"LOCATION:{_ics_text(e['location'])}")
+    return lines + ["END:VEVENT"]
+
+
 async def calendar_for(user_id: int, today: Optional[date] = None) -> str:
     today = today or datetime.now(TZ_BERLIN).date()
     entries: list[dict] = []
     for week in range(CALENDAR_FEED_WEEKS):
-        entries += await plan_entries(user_id, _week_start(today) + timedelta(weeks=week))
-    return build_ics([e for e in entries if e["end_dt"].date() >= today], user_id)
+        week_start = _week_start(today) + timedelta(weeks=week)
+        entries += await plan_entries(user_id, week_start)
+        try:
+            entries += await lecture_entries(user_id, week_start)
+        except Exception as e:  # the study blocks are still worth showing
+            logging.info("Lectures for the calendar feed unavailable: %s", type(e).__name__)
+    entries += await exam_entries(user_id)
+    keep = [e for e in entries if (e["day"] if e.get("all_day") else e["end_dt"].date()) >= today]
+    return build_ics(sorted(keep, key=lambda e: e["day"] if e.get("all_day") else e["start_dt"].date()), user_id)
 
 
 async def feed_handler(request: web.Request) -> web.Response:
@@ -185,7 +299,8 @@ def feed_url(user_id: int) -> Optional[str]:
 def calendar_sync_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
     url = feed_url(user_id)
     lines = ["📅 <b>Calendar sync</b>", "",
-             "Your study blocks and lunch breaks for this and next week, shown as <b>busy</b> in your phone's calendar.",
+             "Your lectures (cancellations marked), exams you registered for, study blocks and lunch breaks for this "
+             "and the next week in your phone's calendar. <i>Keep the link private: anyone who has it sees your timetable.</i>",
              "", "📄 <b>One tap:</b> open the file below and add it to your calendar."]
     rows = [[InlineKeyboardButton("📄 Send calendar file (.ics)", callback_data="cal_sync|file")]]
     if url:
@@ -196,8 +311,8 @@ def calendar_sync_view(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         rows.append([InlineKeyboardButton("➕ Add to Google Calendar",
                                           url="https://calendar.google.com/calendar/render?cid=" + quote(webcal, safe=""))])
         if CLOUDFLARE_TUNNEL == "quick":
-            lines.append("<i>⚠️ The live link changes when the bot restarts (temporary address); "
-                         "the file always works.</i>")
+            lines.append("<i>⚠️ The live link is a temporary address: it changes if the server restarts, "
+                         "then use 🔑 New link or the file.</i>")
         rows.append([InlineKeyboardButton("🔑 New link (old one stops working)", callback_data="cal_sync|reset")])
     else:
         lines += ["", "<i>The live link is not available right now; the file always works.</i>"]
@@ -222,7 +337,7 @@ async def handle_calendar_sync(update: Update, context: ContextTypes.DEFAULT_TYP
                 or lifecycle_state(user_id) == INACTIVE or not is_user_allowed(user_id)):
             return
         with io.BytesIO(body.encode("utf-8")) as buffer:
-            await query.message.reply_document(document=buffer, filename="study-blocks.ics",
+            await query.message.reply_document(document=buffer, filename="uniassistant.ics",
                                                caption="📅 Open this file to add your study blocks to your calendar.")
         return
     if action == "reset":

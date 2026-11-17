@@ -135,7 +135,7 @@ class CalendarFeedTests(unittest.TestCase):
             text, markup = study_week.calendar_sync_view(self.UID)
         token = storage.calendar_token(self.UID)
         self.assertIn(f"webcal://bot.example.org/cal/{token}.ics", text)
-        self.assertIn("changes when the bot restarts", text)
+        self.assertIn("changes if the server restarts", text)
         google = markup.inline_keyboard[1][0].url
         self.assertTrue(google.startswith("https://calendar.google.com/calendar/render?cid=webcal%3A%2F%2F"))
         server.base_url.return_value = "http://192.168.1.5:8899"  # not reachable from a phone's calendar app
@@ -152,7 +152,7 @@ class CalendarFeedTests(unittest.TestCase):
                 mock.patch.object(study_week, "calendar_for", mock.AsyncMock(return_value="BEGIN:VCALENDAR\r\n")):
             run_handler(study_week.handle_calendar_sync, mock.MagicMock(callback_query=query), None)
         kwargs = query.message.reply_document.await_args.kwargs
-        self.assertEqual(kwargs["filename"], "study-blocks.ics")
+        self.assertEqual(kwargs["filename"], "uniassistant.ics")
         self.assertEqual(seen, [b"BEGIN:VCALENDAR\r\n"])
 
 
