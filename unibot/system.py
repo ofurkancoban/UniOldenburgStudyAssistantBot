@@ -142,7 +142,7 @@ async def check_whatsapp_health() -> tuple[bool, str]:
 
 
 UNI_PROXY_REPAIR_COOLDOWN = 5 * 60
-_uni_proxy_repaired_at = 0.0
+_uni_proxy_repaired_at = float("-inf")  # monotonic time counts from boot: 0 would mean 'just repaired' on a fresh server
 
 
 async def _run_command(*args: str, timeout: float = 25.0) -> tuple[int, str]:
@@ -255,6 +255,10 @@ async def run_health_checks(live_openrouter: bool = False) -> dict:
     return results
 
 
+# Checks a student's own experience does not depend on: their failing is for the administrators only
+ADMIN_ONLY_CHECKS = {"disk", "offsite_backup"}
+
+
 async def _student_health_text(user_id: int) -> str:
     """What a student sees: their own Stud.IP connection and one line from
     the last background health check. Server details (and the live, paid AI
@@ -265,7 +269,8 @@ async def _student_health_text(user_id: int) -> str:
         logging.debug("Session check failed", exc_info=True)
         signed_in = False
     health = load_general_cache().get("health_state") or {}
-    down = [HEALTH_CHECK_LABELS[k] for k, ok in health.items() if not ok and k in HEALTH_CHECK_LABELS]
+    down = [HEALTH_CHECK_LABELS[k] for k, ok in health.items()
+            if not ok and k in HEALTH_CHECK_LABELS and k not in ADMIN_ONLY_CHECKS]
     service = ("✅ All services are working." if not down
                else "⚠️ Some services have problems right now; the administrators have been told.")
     return "\n".join([

@@ -674,8 +674,8 @@ class ProxyRepairTests(unittest.TestCase):
     def setUp(self):
         from unibot import system
         self.system = system
-        system._uni_proxy_repaired_at = 0.0
-        self.addCleanup(lambda: setattr(system, "_uni_proxy_repaired_at", 0.0))
+        system._uni_proxy_repaired_at = float("-inf")
+        self.addCleanup(lambda: setattr(system, "_uni_proxy_repaired_at", float("-inf")))
 
     def _run(self, statuses, reachable=True, which=lambda name: "/usr/bin/" + name):
         import os
@@ -698,6 +698,12 @@ class ProxyRepairTests(unittest.TestCase):
                 mock.patch("studip_http.uni_proxy_reachable", return_value=reachable):
             result = asyncio.run(self.system.ensure_uni_proxy())
         return result, commands
+
+    def test_a_freshly_booted_server_may_repair_at_once(self):
+        # time.monotonic() counts from boot: right after a boot it is below the cooldown
+        with mock.patch.object(self.system.time, "monotonic", return_value=30.0):
+            result, commands = self._run(["Disconnected", "Status update: Connected"])
+        self.assertEqual(result, "reconnected")
 
     def test_a_connected_proxy_is_left_alone(self):
         result, commands = self._run(["Status update: Connected"])
@@ -729,6 +735,25 @@ class ProxyRepairTests(unittest.TestCase):
         result, commands = self._run(["Disconnected"], which=lambda name: None)
         self.assertIsNone(result)
         self.assertEqual(commands, [])
+
+
+class StudentHealthTextTests(unittest.TestCase):
+    def _text(self, state):
+        from unibot import system
+        session = mock.MagicMock()
+        session.is_logged_in = mock.AsyncMock(return_value=True)
+        with mock.patch.object(system, "get_user_session", return_value=session), \
+                mock.patch.object(system, "load_general_cache", return_value={"health_state": state}):
+            return asyncio.run(system._student_health_text(1))
+
+    def test_a_failing_backup_or_disk_is_not_a_service_problem_for_students(self):
+        text = self._text({"offsite_backup": False, "disk": False, "studip": True})
+        self.assertIn("All services are working", text)
+
+    def test_a_failing_service_students_use_still_shows_the_notice_without_names(self):
+        text = self._text({"studip": False, "offsite_backup": True})
+        self.assertIn("Some services have problems", text)
+        self.assertNotIn("Stud.IP:", text)
 
 
 class WorkerUsageTests(unittest.TestCase):

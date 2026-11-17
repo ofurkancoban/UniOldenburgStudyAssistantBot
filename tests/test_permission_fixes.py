@@ -199,13 +199,13 @@ class HealthCheckTests(unittest.TestCase):
                 mock.patch.object(system, "is_user_admin", lambda uid: False), \
                 mock.patch.object(system, "get_user_session", lambda uid: session), \
                 mock.patch.object(system, "run_health_checks", live), \
-                mock.patch.object(system, "load_general_cache", lambda: {"health_state": {"disk": False}}):
+                mock.patch.object(system, "load_general_cache", lambda: {"health_state": {"openrouter": False}}):
             asyncio.run(system.healthcheck_command(update, mock.MagicMock()))
         live.assert_not_called()  # no live (paid) AI check for students
         text = update.message.reply_text.call_args.args[0]
         self.assertIn("connected", text)
         self.assertIn("Some services", text)
-        self.assertNotIn("Disk", text)
+        self.assertNotIn("OpenRouter", text)  # the notice names no service
 
 
 if __name__ == "__main__":
