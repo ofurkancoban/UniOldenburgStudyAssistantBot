@@ -200,10 +200,12 @@ async def _read_stums_page(session, url: str, referer: str) -> tuple[str, str]:
         raise RuntimeError(f"StuMS page answered HTTP {status}")
     if final_url and (urlsplit(final_url).hostname or "").lower() != STUMS_HOST:
         session.stums.verified_at = 0.0
-        raise StumsSessionExpired("StuMS redirected to the university login")
+        raise StumsSessionExpired(f"StuMS redirected to another host ({redact_url(final_url)})")
     if is_stums_login_page(text):
         session.stums.verified_at = 0.0
-        raise StumsSessionExpired("StuMS session expired; the page returned a login form")
+        title = re.search(r"<title[^>]*>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+        raise StumsSessionExpired("StuMS session expired; the page returned a login form (page %r, %d bytes, %s)" % (
+            re.sub(r"\s+", " ", title.group(1)).strip()[:60] if title else "", len(text), redact_url(final_url)))
     return text, final_url
 
 
@@ -312,7 +314,7 @@ async def _stums_logged_in(session, referer: str) -> bool:
     except (StumsSessionExpired, StumsPageRefused) as exc:
         # a refused (403) page is a session StuMS no longer accepts: the same path as a
         # login form (drop the cookies, sign in again, then pause and tell the student)
-        logging.debug("StuMS session check failed: %s", exc)
+        logging.warning("StuMS session check failed (%s): %s", type(exc).__name__, exc)
         return False
 
 
