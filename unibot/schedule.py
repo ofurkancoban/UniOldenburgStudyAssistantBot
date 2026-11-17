@@ -2302,6 +2302,19 @@ async def schedule_fastenroll_job(chat_id: int, sem_id: Optional[str], target_ti
         fastenroll_tasks.setdefault(chat_id, {})[sem_id] = task
         return f"🎯 Fast enroll scheduled for course {sem_id} at {when} (Europe/Berlin)."
 STUDY_PLAN_EXAM_WINDOW_DAYS = 21
+# Revision time the plan week should hold for a course with an exam: (at most this many days to the exam, minutes).
+# Past papers count towards it; what they do not cover is filled with plain revision of the studied material.
+EXAM_REVISION_MINUTES = ((3, 240), (7, 180), (14, 120), (21, 60))
+
+
+def exam_revision_minutes(days_until: int) -> int:
+    """How much revision the plan week should hold for an exam this many days away (0: too far or past)."""
+    if days_until < 0:
+        return 0
+    for limit, minutes in EXAM_REVISION_MINUTES:
+        if days_until <= limit:
+            return minutes
+    return 0
 
 
 STUDY_PLAN_MIN_PIECE_MINUTES = 20  # don't start a task in the last few minutes of a block
@@ -2360,6 +2373,24 @@ def schedule_study_sessions(gaps: list, rows: list, exams: list, week_start, sho
                         "task_key": t["key"], "title": t["title"], "remaining": t["remaining"], "total": t["remaining"],
                         "reason": reason, "due": due, "order": order,
                     })
+
+    # exam revision: the closer the exam, the more of the week it gets; past papers count towards it
+    for row in rows:
+        cid = row["cid"]
+        if cid not in exam_days:
+            continue
+        want = exam_revision_minutes(exam_days[cid])
+        have = sum(t["remaining"] for u in row["exam_practice"] for t in u["tasks"] if t["remaining"] > 0)
+        missing = want - have
+        if missing >= STUDY_PLAN_MIN_PIECE_MINUTES:
+            days = exam_days[cid]
+            items.append({
+                "cid": cid, "course": row["name"], "unit": "exam-revision",
+                "unit_label": f"Exam revision ({days} day{'s' if days != 1 else ''} to go)",
+                "task_key": f"exam-revision-{week_start.isoformat()}",
+                "title": f"Revise for the exam in {days} day{'s' if days != 1 else ''}",
+                "remaining": missing, "total": missing, "reason": "exam prep", "due": None, "order": 999,
+            })
 
     score = {r["cid"]: r["backlog_minutes"] / 60 + (STUDY_PLAN_EXAM_WINDOW_DAYS + 1 - exam_days[r["cid"]] if r["cid"] in exam_days else 0) for r in rows}
     needed: dict[str, Any] = {}

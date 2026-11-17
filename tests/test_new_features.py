@@ -421,6 +421,65 @@ class SummaryButtonTests(unittest.TestCase):
         query.message.reply_text.assert_not_awaited()
 
 
+class ExamRevisionPlanTests(unittest.TestCase):
+    WED = date(2026, 11, 18)
+
+    def _plan(self, exams, rows, hours=8):
+        from unibot import schedule, study_plan
+        tz = __import__("studip_utils").TZ_BERLIN
+        start = datetime(2026, 11, 23, 9, 0, tzinfo=tz)
+        end = start + timedelta(hours=hours)
+        gaps = [{"start_dt": start, "end_dt": end, "date_key": start.date()}]
+        with mock.patch.object(study_plan, "_split_gaps_into_blocks", lambda g: [(start, end)]), \
+                mock.patch.object(study_plan, "_unit_label", lambda u: u.get("label", "unit")):
+            return schedule.schedule_study_sessions(gaps, rows, exams, date(2026, 11, 23))
+
+    def _row(self, cid="c1", name="Macro", past_paper_minutes=0):
+        papers = [{"file": "p.pdf", "label": "Past exam", "date": None,
+                   "tasks": [{"key": "pp", "title": "Past exam 2024", "remaining": past_paper_minutes}]}] \
+            if past_paper_minutes else []
+        return {"cid": cid, "name": name, "backlog": [], "exam_practice": papers, "upcoming": [], "dated": False,
+                "backlog_minutes": 0}
+
+    def test_the_closer_the_exam_the_more_revision(self):
+        from unibot import schedule
+        self.assertEqual([schedule.exam_revision_minutes(d) for d in (0, 3, 4, 7, 10, 14, 21, 22, -1)],
+                         [240, 240, 180, 180, 120, 120, 60, 0, 0])
+
+    def test_a_course_with_an_exam_and_no_past_papers_still_gets_revision(self):
+        plan = self._plan([{"matched_cid": "c1", "days_until": 5, "title": "Macro"}], [self._row()])
+        pieces = [p for s in plan["sessions"] for p in s["pieces"]]
+        self.assertEqual(sum(p["minutes"] for p in pieces), 180)
+        self.assertTrue(all(p["reason"] == "exam prep" for p in pieces))
+        self.assertIn("5 days", pieces[0]["title"])
+
+    def test_past_papers_count_towards_the_revision_time(self):
+        plan = self._plan([{"matched_cid": "c1", "days_until": 5, "title": "Macro"}],
+                          [self._row(past_paper_minutes=120)])
+        pieces = [p for s in plan["sessions"] for p in s["pieces"]]
+        titles = [p["title"] for p in pieces]
+        self.assertEqual(sum(p["minutes"] for p in pieces), 180)  # 120 of papers + 60 of plain revision
+        self.assertTrue(any("Past exam" in t for t in titles))
+        self.assertTrue(any(t.startswith("Revise for the exam") for t in titles))
+
+    def test_enough_past_papers_need_no_extra_revision(self):
+        plan = self._plan([{"matched_cid": "c1", "days_until": 5, "title": "Macro"}],
+                          [self._row(past_paper_minutes=240)])
+        titles = [p["title"] for s in plan["sessions"] for p in s["pieces"]]
+        self.assertFalse(any(t.startswith("Revise for the exam") for t in titles))
+
+    def test_no_exam_no_revision_and_the_nearer_exam_is_scheduled_first(self):
+        plan = self._plan([], [self._row()])
+        self.assertEqual(plan["sessions"], [])
+        rows = [self._row("c1", "Far"), self._row("c2", "Near")]
+        exams = [{"matched_cid": "c1", "days_until": 20, "title": "Far"},
+                 {"matched_cid": "c2", "days_until": 2, "title": "Near"}]
+        plan = self._plan(exams, rows, hours=1)  # one hour: only the more urgent course fits
+        first = plan["sessions"][0]["pieces"][0]
+        self.assertEqual(first["course"], "Near")
+        self.assertGreater(plan["stats"]["needed"]["c2"], plan["stats"]["needed"]["c1"])
+
+
 def _async(function):
     async def runner():
         return function()
