@@ -218,6 +218,12 @@ class SsoFlowMixin:
             self.logger.info("Step %s: URL %s", i, redact_url(curr_url))
 
             if await check_done(curr_url, curr_text):
+                try:
+                    low = curr_text.lower()
+                    self.last_sso_page = {"bytes": len(curr_text), "has_logout": "abmelden" in low or "logout" in low,
+                                          "has_login": "anmelden" in low or "login notwendig" in low}
+                except Exception:
+                    self.last_sso_page = None
                 return curr_url, curr_text
 
             # Identification Logic
