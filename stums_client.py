@@ -161,9 +161,23 @@ def _mark_stums_verified(session, referer: str) -> str:
     return referer
 
 
+# What a browser sends when the student clicks a link inside StuMS. The bot used to send only a
+# User-Agent; since 2026-11-16 StuMS answers such bare requests with "Login notwendig" (HTTP 403).
+STUMS_NAVIGATION_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "de-DE,de;q=0.9,en;q=0.8",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-User": "?1",
+}
+
+
 async def _read_stums_page(session, url: str, referer: str) -> tuple[str, str]:
     """Fetch a StuMS HTML page and reject HTTP errors, SSO redirects and login forms."""
-    async with await session.get(url, allow_redirects=True, headers={"Referer": referer}) as r:
+    async with await session.get(url, allow_redirects=True,
+                                 headers={**STUMS_NAVIGATION_HEADERS, "Referer": referer}) as r:
         text = await r.text()
         status = r.status
         final_url = str(getattr(r, "url", "") or "")

@@ -467,6 +467,42 @@ class StumsSkipsTheWorkerTests(unittest.TestCase):
             self.assertTrue(sess._via_worker(host))
 
 
+class StumsNavigationHeadersTests(unittest.TestCase):
+    def test_pages_are_requested_like_a_browser_click(self):
+        import stums_client
+
+        seen = {}
+
+        class Resp:
+            status = 200
+            url = "https://stums.uni-oldenburg.de/qisserver/x"
+            headers = {}
+
+            async def text(self):
+                return "<html>ok</html>"
+
+            def release(self):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class Sess:
+            async def get(self, url, **kw):
+                seen.update(kw.get("headers") or {})
+                return Resp()
+
+        asyncio.run(stums_client._read_stums_page(Sess(), "https://stums.uni-oldenburg.de/qisserver/x",
+                                                  "https://stums.uni-oldenburg.de/qisserver/start"))
+        self.assertEqual(seen["Sec-Fetch-Mode"], "navigate")
+        self.assertEqual(seen["Sec-Fetch-Site"], "same-origin")
+        self.assertIn("text/html", seen["Accept"])
+        self.assertTrue(seen["Referer"].endswith("/start"))
+
+
 class WorkerUsageTests(unittest.TestCase):
     def setUp(self):
         import studip_session
