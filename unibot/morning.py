@@ -572,6 +572,12 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict, on_delivered=No
                 except Exception:
                     logging.error("Failed to record morning summary delivery for %s", uid, exc_info=True)
 
+            # at most one pinned message, whatever happened to the record of the old one
+            # (lost, or an unpin that failed for good): the chat is cleared right before the pin
+            try:
+                await bot.unpin_all_chat_messages(chat_id=uid)
+            except Exception as e:
+                logging.warning("Could not clear the pins before pinning the morning summary for %s: %s", uid, e)
             try:
                 await bot.pin_chat_message(chat_id=uid, message_id=sent_msg.message_id, disable_notification=True)
                 save_personal_record(uid, PINNED_SUMMARY_RECORD,

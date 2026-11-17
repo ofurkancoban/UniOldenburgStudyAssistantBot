@@ -22,8 +22,9 @@ NOW = datetime(2026, 11, 18, 0, 5, tzinfo=TZ_BERLIN)
 
 
 class _Bot:
-    def __init__(self, fail_unpin=False, unpin_error=None):
+    def __init__(self, fail_unpin=False, unpin_error=None, fail_unpin_all=False):
         self.calls = []
+        self.fail_unpin_all = fail_unpin_all
         self.fail_unpin = fail_unpin
         self.unpin_error = unpin_error
 
@@ -33,6 +34,11 @@ class _Bot:
             raise self.unpin_error
         if self.fail_unpin:
             raise RuntimeError("message to unpin not found")
+
+    async def unpin_all_chat_messages(self, chat_id):
+        self.calls.append(("unpin_all", chat_id))
+        if self.fail_unpin_all:
+            raise RuntimeError("not enough rights")
 
     async def send_message(self, chat_id, text, **kwargs):
         self.calls.append(("send", chat_id))
@@ -116,7 +122,7 @@ class DeliveryOrderTests(unittest.TestCase):
         with mock.patch.object(morning, "lifecycle_state", lambda u: morning.ACTIVE):
             delivered = asyncio.run(morning.deliver_morning_summary(bot, [uid], {"texts": {uid: "Good morning"}}))
         self.assertEqual(delivered, [uid])
-        self.assertEqual([c[0] for c in bot.calls], ["unpin", "send", "pin"])
+        self.assertEqual([c[0] for c in bot.calls], ["unpin", "send", "unpin_all", "pin"])
         record = run_as(uid, _read(lambda: _record(uid)))
         self.assertEqual(record["id"], 500)
         self.assertRegex(record["date"], r"^\d{4}-\d{2}-\d{2}$")
@@ -129,7 +135,24 @@ class DeliveryOrderTests(unittest.TestCase):
         with mock.patch.object(morning, "lifecycle_state", lambda u: morning.ACTIVE):
             delivered = asyncio.run(morning.deliver_morning_summary(bot, [uid], {"texts": {uid: "Good morning"}}))
         self.assertEqual(delivered, [uid])
-        self.assertEqual([c[0] for c in bot.calls], ["unpin", "send", "pin"])
+        self.assertEqual([c[0] for c in bot.calls], ["unpin", "send", "unpin_all", "pin"])
+
+    def test_pins_cannot_pile_up_even_when_the_record_of_the_old_one_is_gone(self):
+        uid = 7760
+        activate_student(uid)  # no record at all: nothing is known about an earlier pin
+        bot = _Bot()
+        with mock.patch.object(morning, "lifecycle_state", lambda u: morning.ACTIVE):
+            asyncio.run(morning.deliver_morning_summary(bot, [uid], {"texts": {uid: "Good morning"}}))
+        self.assertEqual([c[0] for c in bot.calls], ["send", "unpin_all", "pin"])
+
+    def test_a_failed_clear_still_pins_the_new_summary(self):
+        uid = 7761
+        activate_student(uid)
+        bot = _Bot(fail_unpin_all=True)
+        with mock.patch.object(morning, "lifecycle_state", lambda u: morning.ACTIVE):
+            delivered = asyncio.run(morning.deliver_morning_summary(bot, [uid], {"texts": {uid: "Good morning"}}))
+        self.assertEqual(delivered, [uid])
+        self.assertEqual([c[0] for c in bot.calls], ["send", "unpin_all", "pin"])
 
 
 def _read(function):
