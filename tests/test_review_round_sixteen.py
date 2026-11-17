@@ -662,10 +662,14 @@ class UniversityProxyHealthTests(unittest.TestCase):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
-        with mock.patch.dict(os.environ, {"UNI_PROXY_URL": f"socks5://127.0.0.1:{port}"}):
+        # never let a test run the real warp-cli or systemctl: on a server that has them this restarts WARP
+        repair = mock.AsyncMock(return_value=None)
+        with mock.patch.dict(os.environ, {"UNI_PROXY_URL": f"socks5://127.0.0.1:{port}"}), \
+                mock.patch.object(system, "ensure_uni_proxy", repair):
             ok, detail = asyncio.run(system.check_uni_proxy_health())
         self.assertFalse(ok)
         self.assertIn("warp-cli connect", detail)
+        repair.assert_awaited_once()  # one try to bring the proxy back before reporting it down
 
 
 class ProxyRepairTests(unittest.TestCase):
