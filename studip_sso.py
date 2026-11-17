@@ -196,7 +196,7 @@ class SsoFlowMixin:
         # 1. Entry
         async with self._s_get(entry_url, headers={"Referer": referer} if referer else None) as r:
             try:
-                hops = [(urlparse(str(h)).netloc, urlparse(str(h)).path) for h in r.history]
+                hops: list[tuple] = [(urlparse(str(h)).netloc, urlparse(str(h)).path) for h in r.history]
                 hops.append((urlparse(str(r.url)).netloc, urlparse(str(r.url)).path, getattr(r, "status", None)))
                 self.last_sso_chain = hops
                 self.logger.info("SSO entry redirect chain (host, path, status): %s", hops)
@@ -218,12 +218,6 @@ class SsoFlowMixin:
             self.logger.info("Step %s: URL %s", i, redact_url(curr_url))
 
             if await check_done(curr_url, curr_text):
-                try:
-                    low = curr_text.lower()
-                    self.last_sso_page = {"bytes": len(curr_text), "has_logout": "abmelden" in low or "logout" in low,
-                                          "has_login": "anmelden" in low or "login notwendig" in low}
-                except Exception:
-                    self.last_sso_page = None
                 return curr_url, curr_text
 
             # Identification Logic

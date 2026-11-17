@@ -609,6 +609,33 @@ class UniversityProxyTests(unittest.TestCase):
             self.assertFalse(studip_http.uni_proxy_reachable())
 
 
+class QuietLogTests(unittest.TestCase):
+    def test_a_student_without_tasks_is_not_a_warning(self):
+        from unibot import db
+        from tests.testenv import activate_student
+        activate_student(7790)
+        with self.assertNoLogs(level="WARNING"):
+            self.assertEqual(db.get_user_scope(7790).tasks(), [])
+
+    def test_a_really_malformed_task_record_still_warns(self):
+        from unibot import db
+        from tests.testenv import activate_student
+        activate_student(7791)
+        db.get_user_scope(7791).save_private(db.TASKS_KIND, {"not": "a list"})
+        with self.assertLogs(level="WARNING"):
+            self.assertEqual(db.get_user_scope(7791).tasks(), [])
+
+    def test_the_worker_is_not_reported_while_a_university_proxy_replaces_it(self):
+        import os
+        import studip_session
+        with mock.patch.dict(os.environ, {"CLOUDFLARE_WORKER_URL": "https://w.example",
+                                          "UNI_PROXY_URL": "socks5://127.0.0.1:40000"}):
+            self.assertFalse(studip_session.worker_status()["configured"])
+        with mock.patch.dict(os.environ, {"CLOUDFLARE_WORKER_URL": "https://w.example"}):
+            os.environ.pop("UNI_PROXY_URL", None)
+            self.assertTrue(studip_session.worker_status()["configured"])
+
+
 class WorkerUsageTests(unittest.TestCase):
     def setUp(self):
         import studip_session

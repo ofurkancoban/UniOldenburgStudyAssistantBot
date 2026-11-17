@@ -206,7 +206,7 @@ def worker_status() -> dict:
     url = _worker_url()
     now = time.time()
     return {
-        "configured": bool(url),
+        "configured": bool(url) and not uni_proxy_url(),  # a university proxy replaces the Worker
         "down_for": max(0.0, _WORKER_HEALTH["down_until"] - now),
         "failovers": _WORKER_HEALTH.get("failovers", 0),
         "refused_hosts": sorted(h for h, until in _WORKER_REFUSED.items() if until > now),

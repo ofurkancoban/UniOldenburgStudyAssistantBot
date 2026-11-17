@@ -1239,6 +1239,8 @@ class UserScope:
     def tasks(self) -> list:
         _migrate_shared_tasks()
         raw = self.private(TASKS_KIND)
+        if raw is None:
+            return []  # this student has no tasks yet
         if not isinstance(raw, list):
             logging.warning("Ignored a malformed task list for user %s", self.user_id)
             return []

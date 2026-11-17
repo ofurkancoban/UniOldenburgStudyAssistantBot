@@ -299,7 +299,8 @@ async def _send_calendar_reminders(bot):
             failures = _cycle_failures.get()
             if failures is not None:
                 failures.append(f"Calendar reminders for {uid}")
-            logging.warning("Calendar reminders failed for %s; continuing with other users: %s", uid, exc)
+            logging.warning("Calendar reminders failed for %s; continuing with other users: %s %s", uid,
+                            type(exc).__name__, exc)
 
     await asyncio.gather(*(send_one(uid) for uid in _get_active_user_ids()))
 
