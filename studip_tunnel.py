@@ -64,8 +64,8 @@ def _kill(pid: Optional[int]) -> None:
     except OSError:
         try:
             os.kill(pid, 15)
-        except OSError:
-            pass
+        except OSError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 class QuickTunnel:
@@ -85,8 +85,8 @@ class QuickTunnel:
         os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
         try:
             os.chmod(STATE_DIR, 0o700)
-        except OSError:
-            pass
+        except OSError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         self._pid_file = os.path.join(STATE_DIR, f"cloudflared_{self.port}.pid")
         self._log_file = os.path.join(STATE_DIR, f"cloudflared_{self.port}.log")
         self._spawned_at = 0.0
@@ -111,13 +111,13 @@ class QuickTunnel:
             if _pid_alive(pid):
                 logging.info("🌐 Stopping legacy /tmp cloudflared tunnel (PID %s)", pid)
                 _kill(pid)
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError) as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         for path in (legacy_pid, legacy_log):
             try:
                 os.remove(path)
-            except OSError:
-                pass
+            except OSError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     def _read_existing(self) -> tuple[Optional[int], str]:
         pid = None
@@ -133,8 +133,8 @@ class QuickTunnel:
                 matches = URL_RE.findall(_read_text(self._log_file))
                 if matches:
                     url = matches[-1]
-            except OSError:
-                pass
+            except OSError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         return pid, url
 
     async def start(self, timeout: float = 60.0) -> str:

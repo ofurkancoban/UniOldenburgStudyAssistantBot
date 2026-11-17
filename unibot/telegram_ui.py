@@ -331,8 +331,8 @@ async def _show_typing(sender, action=ChatAction.TYPING):
     try:
         chat = sender.chat if hasattr(sender, "chat") else sender.message.chat
         await sender.get_bot().send_chat_action(chat_id=chat.id, action=action)
-    except (TelegramError, AttributeError):
-        pass
+    except (TelegramError, AttributeError) as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 LOADING_ANIMATION_FRAMES = ("⏳", "⌛")
@@ -460,8 +460,8 @@ async def _download_telegram_file(bot, file_id: str) -> Optional[bytes]:
     finally:
         try:
             os.remove(path)
-        except OSError:
-            pass
+        except OSError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 def _split_message(text: str, limit: int = 3800) -> list:

@@ -190,8 +190,8 @@ def current_commit(root: Optional[str] = None) -> Optional[str]:
                 parts = line.split()
                 if len(parts) == 2 and parts[1] == ref:
                     return parts[0]
-    except OSError:
-        pass
+    except OSError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     return None
 
 

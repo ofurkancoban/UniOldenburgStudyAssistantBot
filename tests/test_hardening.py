@@ -20,7 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
 # Tests must never touch the real bot database
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, use_temp_db  # noqa: E402
 use_temp_db()
 
 import studip_session  # noqa: E402
@@ -175,6 +175,7 @@ class BotStateTests(unittest.TestCase):
         self.assertTrue(stale["watch_prev"])  # the stale copy was never written
 
     def test_task_reminder_keeps_tasks_added_meanwhile(self):
+        activate_student(1)  # reminders only go to registered, active students
         past = (datetime.now(studip_utils.TZ_BERLIN) - timedelta(minutes=1)).isoformat()
         self.storage.save_user_tasks(1, [{"id": "t1", "user_id": 1, "text": "Read <ch.3> & notes", "due_time": past}])
         sent = []

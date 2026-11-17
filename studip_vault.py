@@ -112,8 +112,8 @@ def _load_or_create_key_file() -> bytes:
                 os.close(fd)
             try:
                 os.remove(tmp_path)
-            except OSError:
-                pass
+            except OSError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
             raise
         logger.info("Generated a new vault key in %s", KEY_FILE)
         return key
@@ -258,20 +258,20 @@ def write_vault_file(path: str, data: Any, mode: int = 0o600) -> None:
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-            except OSError:
-                pass
+            except OSError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         raise
 
     try:
         os.chmod(tmp_path, mode)
-    except OSError:
-        pass
+    except OSError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     os.replace(tmp_path, path)
     try:
         os.chmod(path, mode)
-    except OSError:
-        pass
+    except OSError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 def read_vault_file(path: str, auto_migrate: bool = True) -> Optional[Any]:
@@ -299,8 +299,8 @@ def read_vault_file(path: str, auto_migrate: bool = True) -> Optional[Any]:
         st = os.stat(path)
         if stat.S_IMODE(st.st_mode) != 0o600:
             needs_chmod = True
-    except OSError:
-        pass
+    except OSError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     if auto_migrate and (is_plain or needs_chmod):
         logger.info("Migrating vault file %s to encrypted at-rest storage with 0600 permissions", path)

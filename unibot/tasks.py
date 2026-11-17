@@ -248,8 +248,8 @@ def _parse_task_due_time(t: str, now: datetime) -> datetime:
                 if (second.astimezone(timezone.utc) > first.astimezone(timezone.utc)
                         and second.astimezone(timezone.utc) >= now_utc):
                     return second
-            except ValueError:
-                pass
+            except ValueError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         # A time already passed today, or skipped by the spring clock change,
         # means the next occurrence is tomorrow.
         next_day = wall_day + timedelta(days=1)
@@ -545,8 +545,8 @@ async def handle_task_suggestion_add(update: Update, context: ContextTypes.DEFAU
     )
     try:
         await query.edit_message_reply_markup(reply_markup=None)
-    except TelegramError:
-        pass
+    except TelegramError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     await query.message.reply_text(confirmation)
 
 
@@ -602,8 +602,8 @@ async def handle_announcement_to_task(update: Update, context: ContextTypes.DEFA
     try:
         await query.edit_message_reply_markup(reply_markup=markup_for(
             user_id, InlineKeyboardMarkup([[InlineKeyboardButton("📲 Forward to WA 📲", callback_data="forward_wa")]])))
-    except TelegramError:
-        pass
+    except TelegramError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     await query.message.reply_text(confirmation)
 
 
@@ -769,8 +769,8 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
             raise
         try:
             await query.edit_message_reply_markup(reply_markup=None)
-        except TelegramError:
-            pass
+        except TelegramError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         if not db.private_context_is_current(user_id):
             return
         await query.message.reply_text(f"✔️ Done: {task['text']}")
@@ -788,8 +788,8 @@ async def handle_task_reminder_action(update: Update, context: ContextTypes.DEFA
         raise
     try:
         await query.edit_message_reply_markup(reply_markup=None)
-    except TelegramError:
-        pass
+    except TelegramError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     if not db.private_context_is_current(user_id):
         return
     await query.message.reply_text(f"⏰ Snoozed - reminding you again at {new_due.strftime('%d.%m.%Y %H:%M')}: {task['text']}")

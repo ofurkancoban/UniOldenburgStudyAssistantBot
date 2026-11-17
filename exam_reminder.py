@@ -718,8 +718,8 @@ async def check_grade_reminders(session, bot, broadcast_fn) -> bool:
                     praise = " 🌟 <i>(Outstanding / Sehr gut!)</i>"
                 elif val_f <= 2.0:
                     praise = " 👏 <i>(Great result / Gut!)</i>"
-            except ValueError:
-                pass
+            except ValueError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
         grade_line = f"🔢 <b>Grade:</b> <b>{html.escape(grade_val)}</b>{praise}\n" if grade_val else ""
         credit_val = entry.get("credit_points")
@@ -844,8 +844,8 @@ async def check_tuition_reminders(session, bot, broadcast_fn, force: bool = Fals
                     due_date = datetime.strptime(due_str, fmt).date()
                     days_left = (due_date - today).days
                     break
-                except ValueError:
-                    pass
+                except ValueError as ignored_error:
+                    logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
         from unibot.preferences import tuition_should_remind
         last_alert_dt = datetime.fromisoformat(last_alert_date).date() if last_alert_date else None

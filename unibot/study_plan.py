@@ -1973,8 +1973,8 @@ async def study_plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if result is None:
             try:
                 await status_msg.delete()
-            except TelegramError:
-                pass
+            except TelegramError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         else:
             await status_msg.edit_text("✅ Study plan ready, see below 👇")
     except Exception as e:

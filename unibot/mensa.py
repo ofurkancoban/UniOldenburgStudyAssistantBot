@@ -1247,8 +1247,8 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query:
         try:
             await query.answer()
-        except TelegramError:
-            pass
+        except TelegramError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     message = update.effective_message
     if not message:

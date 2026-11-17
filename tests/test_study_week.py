@@ -11,7 +11,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import run_handler, use_temp_db  # noqa: E402
+from tests.testenv import activate_student, run_handler, use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
@@ -294,6 +294,8 @@ class WeeklyReportTests(unittest.TestCase):
 
     def test_watcher_sends_on_sunday_evening_once(self):
         from unibot import watcher
+        activate_student(1)
+        activate_student(2)
         sent = []
         bot = mock.MagicMock()
 

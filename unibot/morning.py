@@ -661,8 +661,8 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict, on_delivered=No
         finally:
             try:
                 os.remove(voice_path)
-            except OSError:
-                pass
+            except OSError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     # course alerts held over the quiet hours come right after the summary
     if delivered:
@@ -1001,8 +1001,8 @@ async def _send_voice_to_users(bot, user_ids, text: str):
     finally:
         try:
             os.remove(ogg_path)
-        except OSError:
-            pass
+        except OSError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 async def _try_send_voice(sender, text: str, user_id=None) -> bool:
@@ -1038,8 +1038,8 @@ async def _try_send_voice(sender, text: str, user_id=None) -> bool:
     finally:
         try:
             os.remove(ogg_path)
-        except OSError:
-            pass
+        except OSError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 async def send_daily_plan_voice(sender, events: list, target_date, user_id=None):

@@ -564,8 +564,8 @@ async def handle_stums_doc_download(update: Update, context: ContextTypes.DEFAUL
 
     try:
         await status_msg.delete()
-    except TelegramError:
-        pass
+    except TelegramError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     # Deletion, /stop or an administrator block may happen while the status
     # message is being removed. Recheck immediately before sending the PDF.
@@ -929,8 +929,8 @@ async def exams_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _stop_loading_animation(stop_evt, anim_task)
     try:
         await status_msg.delete()
-    except TelegramError:
-        pass
+    except TelegramError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

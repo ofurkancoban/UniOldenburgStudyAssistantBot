@@ -154,13 +154,13 @@ async def _rate_limited(update: Update, user_id: int) -> bool:
                 await update.callback_query.answer(RATE_WARNING, show_alert=True)
             elif update.effective_message:
                 await update.effective_message.reply_text(RATE_WARNING)
-        except TelegramError:
-            pass
+        except TelegramError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     elif update.callback_query:
         try:
             await update.callback_query.answer()
-        except TelegramError:
-            pass
+        except TelegramError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     return True
 
 
@@ -437,8 +437,8 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         if _gate_reply_due(user.id):
             try:
                 await update.effective_message.reply_text(gate_text, parse_mode="HTML")
-            except TelegramError:
-                pass
+            except TelegramError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         raise ApplicationHandlerStop
 
     logging.warning("⛔ Ignored update from unauthorised user %s", user.id if user else "unknown")
@@ -447,8 +447,8 @@ async def _authorization_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.callback_query.answer("⛔ Access denied. Not authorized.", show_alert=True)
         elif update.effective_message and update.effective_chat and update.effective_chat.type == "private":
             await update.effective_message.reply_text("⛔ Not authorized.")
-    except TelegramError:
-        pass
+    except TelegramError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     raise ApplicationHandlerStop
 
 

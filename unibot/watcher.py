@@ -386,8 +386,8 @@ def _personal_due(uid: int, now: datetime) -> Optional[str]:
     try:
         if float(retry_after) > now.timestamp():
             return None
-    except (TypeError, ValueError):
-        pass
+    except (TypeError, ValueError) as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     done = personal_record(uid, PERSONAL_SLOTS_KEY)
     try:
         registration_open = bool(load_exam_cache(uid).get("notified_open"))

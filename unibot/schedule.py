@@ -152,8 +152,8 @@ async def _run_morning_slot(bot, user_ids, now: datetime, send_time) -> None:
                 now_dt = now.replace(tzinfo=TZ_BERLIN) if now.tzinfo is None else now.astimezone(TZ_BERLIN)
                 if retry_dt > now_dt:
                     return
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         logging.info("🌞 Preparing the %s morning summary for %s student(s)...", slot, len(user_ids))
         try:
             data = await prepare_morning_summary(bot, user_ids)
@@ -828,8 +828,8 @@ def _parse_course_rooms_page(page_html: str) -> dict:
                         y += 2000
                     try:
                         rooms_map[("date", date(y, m, d), start_hm)] = room_name
-                    except ValueError:
-                        pass
+                    except ValueError as ignored_error:
+                        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
                 else:
                     weekday = _parse_weekday(txt)
                     if weekday is not None:
@@ -1094,8 +1094,8 @@ async def send_daily_calendar(sender, events: list, target_date, week_start):
         try:
             await sender.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
             return
-        except TelegramError:
-            pass
+        except TelegramError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     await sender.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
 
@@ -1421,8 +1421,8 @@ async def send_weekly_calendar(sender, events: list, week_start):
         try:
             await sender.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
             return
-        except TelegramError:
-            pass
+        except TelegramError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     await sender.reply_text(text, parse_mode="Markdown", reply_markup=reply_markup)
 
 

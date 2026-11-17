@@ -275,15 +275,15 @@ async def _run_begin_flow(message, user, context: ContextTypes.DEFAULT_TYPE):
         if not is_user_allowed(user.id) or not db.private_context_is_current(user.id):
             try:
                 await temp_message.delete()
-            except TelegramError:
-                pass
+            except TelegramError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
             return
         courses = await list_courses()
         if not is_user_allowed(user.id) or not db.private_context_is_current(user.id):
             try:
                 await temp_message.delete()
-            except TelegramError:
-                pass
+            except TelegramError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
             return
 
         # DELETE TEMPORARY MESSAGE!
@@ -297,8 +297,8 @@ async def _run_begin_flow(message, user, context: ContextTypes.DEFAULT_TYPE):
         if temp_message:
             try:
                 await temp_message.delete()
-            except TelegramError:
-                pass
+            except TelegramError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         await message.reply_text(f"❌ Error: {str(e)}")
 
     finally:
@@ -571,8 +571,8 @@ async def main():
             for uid in ALLOWED_USER_IDS or []:
                 try:
                     await app.bot.delete_my_commands(scope=BotCommandScopeChat(chat_id=uid))
-                except TelegramError:
-                    pass
+                except TelegramError as ignored_error:
+                    logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
             logging.info("🧹 Telegram bot commands and menu list cleared successfully")
         except Exception as exc:
             logging.warning("Could not clear Telegram bot commands: %s", exc)
@@ -612,8 +612,8 @@ async def main():
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
                 loop.add_signal_handler(sig, stop_event.set)
-            except (NotImplementedError, RuntimeError):
-                pass
+            except (NotImplementedError, RuntimeError) as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
         try:
             await stop_event.wait()

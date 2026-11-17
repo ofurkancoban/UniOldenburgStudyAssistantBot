@@ -17,7 +17,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 os.environ["BOT_LOG_FILE"] = os.path.join(tempfile.gettempdir(), "studip_bot_tests.log")
-from tests.testenv import use_temp_db  # noqa: E402
+from tests.testenv import activate_student, use_temp_db  # noqa: E402
 use_temp_db()
 
 from studip_utils import TZ_BERLIN  # noqa: E402
@@ -84,6 +84,7 @@ class DigestTimingTests(unittest.TestCase):
 
 class ActiveStudentsTests(unittest.TestCase):
     def test_only_active_students_get_background_jobs(self):
+        activate_student(1)
         users = [{"telegram_id": 1, "is_active": 1}, {"telegram_id": 2, "is_active": 1},
                  {"telegram_id": 3, "is_active": 1}, {"telegram_id": 4, "is_active": 0}]
         states = {1: auth.ACTIVE, 2: auth.NEEDS_REAUTH, 3: auth.INACTIVE, 4: auth.ACTIVE}

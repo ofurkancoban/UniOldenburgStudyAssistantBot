@@ -46,8 +46,8 @@ def _parse_ann_date(s: str) -> datetime:
     for f in fmts:
         try:
             return datetime.strptime(s, f)
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     # If text comes and contains 2-digit year, rough estimate:
     try:
         parts = re.findall(r"(\d{1,2})[./](\d{1,2})[./](\d{2,4})", s)
@@ -57,8 +57,8 @@ def _parse_ann_date(s: str) -> datetime:
             if y < 100:  # 25 -> 2025 assumption
                 y += 2000
             return datetime(int(y), int(m), int(d))
-    except (ValueError, IndexError):
-        pass
+    except (ValueError, IndexError) as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     return datetime.min
 
 

@@ -923,8 +923,8 @@ async def generate_outfit_tryon_gemini(reference_bytes: bytes, garments: list,
         for p in paths:
             try:
                 os.remove(p)
-            except OSError:
-                pass
+            except OSError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optional[bytes],
@@ -978,8 +978,8 @@ async def generate_outfit_tryon_fashn(reference_bytes: bytes, upper_bytes: Optio
             for p in (person_path, garment_path):
                 try:
                     os.remove(p)
-                except OSError:
-                    pass
+                except OSError as ignored_error:
+                    logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     current = reference_bytes
     applied_any = False
@@ -1079,8 +1079,8 @@ async def generate_outfit_tryon_ootd(reference_bytes: bytes, upper_bytes: Option
         for p in tmp_paths:
             try:
                 os.remove(p)
-            except OSError:
-                pass
+            except OSError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 async def generate_outfit_tryon_flux(reference_bytes: bytes, item_images: list[bytes],
@@ -1198,8 +1198,8 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
     finally:
         try:
             os.remove(ref_path)
-        except OSError:
-            pass
+        except OSError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items: list[dict],

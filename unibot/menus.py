@@ -258,8 +258,8 @@ async def menu_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         # If edit fails (e.g. same text), don't crash
         try:
             await query.edit_message_text(error_msg)
-        except TelegramError:
-            pass
+        except TelegramError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         logging.error("Menu button navigation error: %s", e)
 
 
@@ -554,8 +554,8 @@ async def _status_button_studip_logout(update, context, query):
             # from the signed-in state) on the old message
             text, markup = await build_status_view(user_id)
             await query.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
-    except TelegramError:
-        pass
+    except TelegramError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     await query.message.reply_text(
         "🚪 Logged out from Stud.IP. Saved session cookies and OAuth2 tokens have been cleared.\n"
         "Tap 🔐 Login or use /login whenever you want to sign in again."
@@ -1008,8 +1008,8 @@ async def _selection_nav(update, context, query, data, user_id):
             pct = int((current / total) * 100) if total else 100
             try:
                 await msg.edit_text(f"📦 Preparing ZIP... ({pct}%)")
-            except TelegramError:
-                pass
+            except TelegramError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
         user_sess = get_user_session(user_id)
         try:
@@ -1500,14 +1500,14 @@ async def handle_reply_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 
         try:
             await context.bot.delete_message(chat_id=chat_id, message_id=status_msg.message_id)
-        except TelegramError:
-            pass
+        except TelegramError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     except Exception as e:
         logging.error("Button handler error: %s", e)
         try:
             await sender.reply_text(f"⚠️ An error occurred:\n{e}")
-        except TelegramError:
-            pass
+        except TelegramError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 # ── /start command ────────────────────────────────────────────────────────────

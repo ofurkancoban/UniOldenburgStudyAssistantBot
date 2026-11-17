@@ -575,8 +575,8 @@ async def studip_api_get_all(
         if isinstance(total_raw, (int, str)) and not isinstance(total_raw, bool):
             try:
                 total = int(total_raw)
-            except ValueError:
-                pass
+            except ValueError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         # Some valid collection responses omit pagination metadata. Continue
         # fetching offsets until the API returns an empty page instead of
         # silently treating the unknown total as zero.
@@ -1167,15 +1167,15 @@ def _parse_file_date_v2(modified_text: str | None, modified_iso: str | None):
             # Z, neither of which every strptime format below accepts on 3.10.
             value = modified_iso[:-1] + "+00:00" if modified_iso.endswith(("Z", "z")) else modified_iso
             return datetime.fromisoformat(value)
-        except (ValueError, TypeError):
-            pass
+        except (ValueError, TypeError) as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S%z",
                     "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
                     "%Y-%m-%d"):
             try:
                 return datetime.strptime(modified_iso, fmt)
-            except (ValueError, TypeError):
-                pass
+            except (ValueError, TypeError) as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     # 2. Text fallback
     s = (modified_text or "").strip()
@@ -1209,8 +1209,8 @@ def _parse_file_date_v2(modified_text: str | None, modified_iso: str | None):
         try:
             t = datetime.strptime(s, "%H:%M").time()
             return datetime.combine(now.date(), t)
-        except ValueError:
-            pass
+        except ValueError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     # C) Standard Date Formats
     fmts = (
@@ -1224,8 +1224,8 @@ def _parse_file_date_v2(modified_text: str | None, modified_iso: str | None):
     for f in fmts:
         try:
             return datetime.strptime(s, f)
-        except ValueError:
-            pass
+        except ValueError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     return datetime.min
 

@@ -28,6 +28,7 @@ EVIL = '<a href="https://evil.example/login">Re-login here</a> & <b>'
 
 class AlertEscapingTests(unittest.TestCase):
     def test_message_alert_escapes_sender_subject_and_body(self):
+        activate_student(5)
         bot = mock.MagicMock()
         bot.send_message = mock.AsyncMock()
         old = [{"id": "old"}]
@@ -322,6 +323,7 @@ class EmptyTimetableTests(unittest.TestCase):
 
     def test_one_empty_read_neither_alerts_nor_forgets(self):
         from unibot import schedule
+        activate_student(self.UID)
 
         old = {"s1": {"title": "Math", "weekday": 1, "weekday_name": "Monday", "start": "10:00",
                       "end": "12:00", "location": "A1"}}

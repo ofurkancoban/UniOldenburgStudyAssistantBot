@@ -513,8 +513,8 @@ async def _check_new_announcements_parallel_unlocked(bot, chat_id, silent: bool 
                 corrupt_path = CACHE_PATH + ".corrupt"
                 try:
                     os.replace(CACHE_PATH, corrupt_path)
-                except OSError:
-                    pass
+                except OSError as ignored_error:
+                    logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
                 logging.error("%s was corrupted (%s); moved to %s and starting fresh.", CACHE_PATH, e, corrupt_path)
                 cache = {"seen": [], "history": []}
         # JSON decoding alone does not guarantee the cache has the structure

@@ -246,8 +246,8 @@ def _parse_tooltip_fields(tip_html: str) -> dict:
         for fmt in fmts:
             try:
                 return datetime.strptime(s, fmt)
-            except ValueError:
-                pass
+            except ValueError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         return None
 
     # Text-based fallback

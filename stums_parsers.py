@@ -425,8 +425,8 @@ def _parse_exam_schedule_line(line: str) -> dict:
         if tm:
             try:
                 start_dt = datetime.strptime(f"{date_str} {tm.group(1)} {tm.group(2)}", "%m/%d/%y %I:%M %p")
-            except ValueError:
-                pass
+            except ValueError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
     return {
         "date": date_obj.isoformat() if date_obj else None,
@@ -535,8 +535,8 @@ def compute_transcript_summary(grades: list[dict]) -> dict:
                 if grade_value is not None:
                     weighted_sum += grade_value * credits
                     total_credits += credits
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError) as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         elif status_title == "not passed":
             failed.append({"title": title, "grade": grade_str, "credits": credits})
 

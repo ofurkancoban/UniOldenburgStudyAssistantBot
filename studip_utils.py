@@ -60,8 +60,8 @@ def atomic_write_json(path: str, data: Any, indent: Optional[int] = 2) -> None:
     except BaseException:
         try:
             os.remove(tmp)
-        except OSError:
-            pass
+        except OSError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
         raise
 
 

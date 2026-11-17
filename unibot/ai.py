@@ -211,8 +211,8 @@ async def transcribe_voice_message(ogg_path: str, user_id: Optional[int] = None)
         for path in (ogg_path, wav_path):
             try:
                 os.remove(path)
-            except OSError:
-                pass
+            except OSError as ignored_error:
+                logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 # (timeout_seconds, attempts) for AI calls made where nobody is waiting on
@@ -569,8 +569,8 @@ async def _pcm_to_ogg_voice(pcm_bytes: bytes, sample_rate: int) -> Optional[str]
     finally:
         try:
             os.remove(pcm_path)
-        except OSError:
-            pass
+        except OSError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
 async def generate_outfit_tryon_gwdg(reference_bytes: bytes, garments: list,
@@ -641,8 +641,8 @@ def _extract_json_object(raw: Optional[str]) -> Optional[dict]:
         parsed = json.loads(raw)
         if isinstance(parsed, dict):
             return parsed
-    except (json.JSONDecodeError, TypeError):
-        pass
+    except (json.JSONDecodeError, TypeError) as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
     decoder = json.JSONDecoder()
     for fence in re.finditer(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL):
         found = _first_json_object(decoder, fence.group(1))
