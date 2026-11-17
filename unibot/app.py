@@ -108,6 +108,7 @@ from unibot.mensa import (
     handle_foodpref_remove,
     handle_foodpref_toggle,
     handle_foodpref_unlike,
+    handle_meal_feedback,
     handle_menu_photos_button,
     handle_mensa_location_button,
     handle_menu_preferences_button,
@@ -422,6 +423,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_foodpref_remove, pattern="^foodpref_remove\\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_foodpref_add, pattern=r"^foodpref_add\|(like|avoid)$"))
     app.add_handler(CallbackQueryHandler(handle_foodpref_unlike, pattern=r"^foodpref_unlike\|.*$"))
+    app.add_handler(CallbackQueryHandler(handle_meal_feedback, pattern=r"^meal_fb\|(like|another)$"))
     app.add_handler(CallbackQueryHandler(handle_foodpref_clear_ask, pattern="^foodpref_clear_ask$"))
     app.add_handler(CallbackQueryHandler(handle_foodpref_clear_confirm, pattern="^foodpref_clear_confirm$"))
     app.add_handler(CallbackQueryHandler(handle_foodpref_clear_cancel, pattern="^foodpref_clear_cancel$"))

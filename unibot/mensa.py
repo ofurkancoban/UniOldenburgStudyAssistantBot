@@ -259,13 +259,19 @@ def _recent_picks(user_id: Optional[int], today: date) -> list[dict]:
     return kept
 
 
-def _remember_pick(user_id: Optional[int], dish: str, today: date) -> None:
+FOOD_LAST_PICK_RECORD = "food_last_pick"
+
+
+def _remember_pick(user_id: Optional[int], dish: str, today: date, description: str = "", loc_id: str = "2") -> None:
     if user_id is None or not dish:
         return
     try:
         history = _recent_picks(user_id, today)
         history.append({"date": today.isoformat(), "dish": dish})
         save_personal_record(user_id, FOOD_HISTORY_RECORD, history[-60:])
+        # what the feedback buttons under the recommendation refer to
+        save_personal_record(user_id, FOOD_LAST_PICK_RECORD,
+                             {"dish": dish, "description": description, "loc_id": loc_id, "day": today.isoformat()})
     except Exception:
         logging.warning("Could not save the recommendation history", exc_info=True)
 
@@ -856,8 +862,83 @@ async def build_food_recommendation(loc_id: str = "2", user_id: Optional[int] = 
     reasoning = raw_reasoning.strip()[:500] if isinstance(raw_reasoning, str) and chosen is not None else ""
     reasoning = reasoning or f"I'd recommend the {chosen['name']} today."
 
-    _remember_pick(uid, chosen["name"], today)
+    _remember_pick(uid, chosen["name"], today, chosen.get("description") or "", loc_id)
     return {"dish": chosen["name"], "category": chosen["category"], "reasoning": reasoning, "loc_id": loc_id}
+
+
+# Ingredient words worth learning from a liked dish (the typed synonyms above plus a few more); general
+# dish types such as soup or dessert say too little about taste
+_NOT_LEARNED = {"dessert", "soup", "spicy", "bread", "vegetables", "veggies", "salad"}
+LEARNABLE_INGREDIENTS = ([k for k in FOOD_SYNONYMS if k not in _NOT_LEARNED]
+                         + ["tofu", "falafel", "curry", "couscous", "bulgur", "quinoa", "broccoli", "zucchini",
+                            "eggplant", "pumpkin", "carrot", "beans", "cauliflower", "peppers", "noodles"])
+
+
+def dish_ingredients(dish: str, description: str = "") -> list[str]:
+    """Known ingredients that appear in a dish, without the duplicates that mean the same thing."""
+    text = f"{dish} {description}".lower()
+    found: list[str] = []
+    for word in LEARNABLE_INGREDIENTS:
+        if word in found or not any(_text_has_form(text, f) for f in keyword_forms(word)):
+            continue
+        found.append(word)
+    singular = {"potatoes": "potato", "eggs": "egg", "mushrooms": "mushroom", "noodles": "pasta", "veggies": "vegetables"}
+    unique: list[str] = []
+    for word in found:
+        word = singular.get(word, word)
+        if word not in unique:
+            unique.append(word)
+    return unique
+
+
+def meal_feedback_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("👍 I like it", callback_data="meal_fb|like"),
+                                  InlineKeyboardButton("🔁 Another one", callback_data="meal_fb|another")]])
+
+
+async def handle_meal_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """meal_fb|like teaches the lunch picks the ingredients of the dish just shown; meal_fb|another asks again
+    (the dish just given is held back, so it is a different one)."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not is_user_allowed(user_id):
+        await query.answer("Not authorized.")
+        return
+    action = (query.data or "").split("|", 1)[-1]
+    last = personal_record(user_id, FOOD_LAST_PICK_RECORD)
+    if not isinstance(last, dict) or not last.get("dish"):
+        await query.answer("That recommendation is too old, ask for a new one.", show_alert=True)
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)  # one answer per recommendation
+    except TelegramError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
+    if action == "like":
+        prefs = load_food_preferences(user_id)
+        avoided = set(prefs["avoid_keywords"]) | _avoided_by_codes(prefs["avoid_codes"])
+        new = [w for w in dish_ingredients(last["dish"], last.get("description") or "")
+               if w not in prefs["like_keywords"] and w not in avoided][:3]
+        if new:
+            add_food_words(user_id, "like", ", ".join(new))
+            await query.answer("Noted")
+            await query.message.reply_text(f"👍 Noted, you like {', '.join(new)}. Your lunch picks will lean towards that.")
+        else:
+            await query.answer("Noted")
+            await query.message.reply_text("👍 Glad you like it. I could not tell a new ingredient from it, "
+                                           "you can add what you like under 🍽️ Mensa, Food Preferences.")
+        return
+    await query.answer()
+    result = await build_food_recommendation(last.get("loc_id") or "2", user_id=user_id)
+    if not result:
+        await query.message.reply_text("❌ Couldn't reach the Mensa menu right now, try again in a bit.")
+        return
+    await _deliver_food_recommendation(query.message, result, user_id=user_id)
+
+
+def _avoided_by_codes(codes) -> set:
+    """Typed ingredient words whose official codes the student avoids (pork, fish, egg ...)."""
+    avoided_codes = set(codes)
+    return {word for word, word_codes in FOOD_WORD_CODES.items() if word_codes and set(word_codes) <= avoided_codes}
 
 
 async def _deliver_food_recommendation(sender, result: dict, user_id: Optional[int] = None):
@@ -870,7 +951,8 @@ async def _deliver_food_recommendation(sender, result: dict, user_id: Optional[i
     unavailable, so it's never silently dropped."""
     from unibot.morning import _try_send_voice
     if result["category"] and result["dish"]:
-        await sender.reply_text(f"📍 {_friendly_menu_category_label(result['category'])} - {result['dish']}")
+        await sender.reply_text(f"📍 {_friendly_menu_category_label(result['category'])} - {result['dish']}",
+                                reply_markup=meal_feedback_keyboard())
 
         photo_url = await fetch_dish_photo_url(result["dish"], loc_id=result.get("loc_id") or "2")
         if photo_url:

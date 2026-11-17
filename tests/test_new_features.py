@@ -127,6 +127,84 @@ class DataExportTests(unittest.TestCase):
         self.assertIn("privacy|export", [b.callback_data for row in markup.inline_keyboard for b in row])
 
 
+class MealFeedbackTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        for uid in (7821, 7822, 7823, 7824):
+            activate_student(uid)
+
+    def _press(self, uid, action, delivered=None):
+        from unibot import mensa
+        query = mock.AsyncMock()
+        query.data = f"meal_fb|{action}"
+        query.from_user = types.SimpleNamespace(id=uid)
+        update = types.SimpleNamespace(callback_query=query, effective_user=types.SimpleNamespace(id=uid))
+        with mock.patch.object(mensa, "is_user_allowed", lambda u: True), \
+                mock.patch.object(mensa, "build_food_recommendation",
+                                  mock.AsyncMock(return_value={"dish": "Next dish", "category": "COUNTER ONE",
+                                                               "reasoning": "r", "loc_id": "2"})), \
+                mock.patch.object(mensa, "_deliver_food_recommendation", delivered or mock.AsyncMock()):
+            run_handler(mensa.handle_meal_feedback, update, types.SimpleNamespace(user_data={}))
+        return query
+
+    def _last_pick(self, uid, dish, description=""):
+        from unibot import mensa
+        mensa.save_personal_record(uid, mensa.FOOD_LAST_PICK_RECORD,
+                                   {"dish": dish, "description": description, "loc_id": "2", "day": "2026-11-17"})
+
+    def test_ingredients_are_found_in_a_dish_without_duplicates(self):
+        from unibot import mensa
+        found = mensa.dish_ingredients("Sliced chicken with mushrooms", "rice, tomato sauce")
+        self.assertEqual(set(found), {"chicken", "mushroom", "rice", "tomato"})
+        self.assertEqual(mensa.dish_ingredients("Rosemary potatoes").count("potato"), 1)
+        self.assertEqual(mensa.dish_ingredients("Eintopf"), [])  # "ei" inside a word is not an egg
+
+    def test_the_recommendation_comes_with_both_buttons(self):
+        from unibot import mensa
+        data = [b.callback_data for row in mensa.meal_feedback_keyboard().inline_keyboard for b in row]
+        self.assertEqual(data, ["meal_fb|like", "meal_fb|another"])
+
+    def test_like_teaches_the_ingredients_and_removes_the_buttons(self):
+        from unibot import mensa
+        self._last_pick(7821, "Sliced chicken with mushrooms", "rice")
+        query = self._press(7821, "like")
+        liked = mensa.load_food_preferences(7821)["like_keywords"]
+        self.assertEqual(len(liked), 3)  # at most three words per tap
+        self.assertTrue(set(liked) <= {"chicken", "mushroom", "rice"})
+        query.edit_message_reply_markup.assert_awaited_with(reply_markup=None)
+        self.assertIn("Noted", query.message.reply_text.call_args.args[0])
+
+    def test_like_never_turns_an_avoided_ingredient_into_a_liked_one(self):
+        from unibot import mensa
+        mensa.add_food_words(7822, "avoid", "mushroom, fish")
+        self._last_pick(7822, "Salmon with mushroom sauce", "rice")
+        self._press(7822, "like")
+        prefs = mensa.load_food_preferences(7822)
+        self.assertIn("mushroom", prefs["avoid_keywords"])
+        self.assertNotIn("mushroom", prefs["like_keywords"])
+        self.assertNotIn("fish", prefs["like_keywords"])
+        self.assertIn("rice", prefs["like_keywords"])
+
+    def test_another_asks_again_and_delivers_a_new_pick(self):
+        deliver = mock.AsyncMock()
+        self._last_pick(7823, "Old dish")
+        self._press(7823, "another", delivered=deliver)
+        self.assertEqual(deliver.call_args.args[1]["dish"], "Next dish")
+
+    def test_a_stale_button_says_so_instead_of_failing(self):
+        from unibot import db
+        db.get_user_scope(7824).delete_private("cache." + "food_last_pick")
+        query = self._press(7824, "like")
+        self.assertIn("too old", query.answer.call_args.args[0])
+
+    def test_the_last_pick_is_remembered_with_its_description(self):
+        from unibot import mensa
+        mensa._remember_pick(7824, "Tofu Bowl", date(2026, 11, 17), "tofu, broccoli", "3")
+        record = mensa.personal_record(7824, mensa.FOOD_LAST_PICK_RECORD)
+        self.assertEqual(record["dish"], "Tofu Bowl")
+        self.assertEqual(record["loc_id"], "3")
+
+
 def _async(function):
     async def runner():
         return function()
