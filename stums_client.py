@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 
 from studip_utils import redact_url, tag_attr
 from stums_parsers import (
+    is_stums_login_page,
     _extract_action_params,
     _parse_candidate_units,
     _parse_exam_schedule_line,
@@ -200,8 +201,7 @@ async def _read_stums_page(session, url: str, referer: str) -> tuple[str, str]:
     if final_url and (urlsplit(final_url).hostname or "").lower() != STUMS_HOST:
         session.stums.verified_at = 0.0
         raise StumsSessionExpired("StuMS redirected to the university login")
-    lowered = text.lower()
-    if "login notwendig" in lowered or "loginform" in lowered:
+    if is_stums_login_page(text):
         session.stums.verified_at = 0.0
         raise StumsSessionExpired("StuMS session expired; the page returned a login form")
     return text, final_url
@@ -520,7 +520,7 @@ async def _submit_action(session, soup, page_url: str, action: dict) -> tuple[st
         result_url = str(r.url)
         if r.status != 200:
             raise RuntimeError(f"StuMS action answered HTTP {r.status}")
-    if "loginform" in result_text.lower() or "login notwendig" in result_text.lower():
+    if is_stums_login_page(result_text):
         session.stums.verified_at = 0.0
         raise RuntimeError("StuMS session expired while submitting the action")
     return result_text, result_url
@@ -694,7 +694,7 @@ async def _expand_grades_tree(session, page_url: str, soup: BeautifulSoup) -> Op
         xml_text = await r.text()
         if r.status != 200:
             raise RuntimeError(f"StuMS grades request answered HTTP {r.status}")
-    if "loginform" in xml_text.lower() or "login notwendig" in xml_text.lower():
+    if is_stums_login_page(xml_text):
         session.stums.verified_at = 0.0
         raise RuntimeError("StuMS session expired while expanding grades")
 
@@ -957,7 +957,7 @@ async def get_tuition_status(session) -> dict:
         pay_html = await r2.text()
         if r2.status != 200:
             raise RuntimeError(f"Could not load StuMS payment status (HTTP {r2.status})")
-    if "loginform" in pay_html.lower() or "login notwendig" in pay_html.lower():
+    if is_stums_login_page(pay_html):
         forget_stums_login(session)
         raise RuntimeError("StuMS session expired while loading payment status.")
 

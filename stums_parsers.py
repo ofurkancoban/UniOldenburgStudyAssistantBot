@@ -16,6 +16,18 @@ from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
+_LOGIN_FORM_ID = re.compile(r"(?<![a-z0-9_])loginform")
+
+
+def is_stums_login_page(text: str) -> bool:
+    """Whether a StuMS page is the "Login notwendig" page or a login form.
+
+    Every signed-in page also carries a hidden session timeout dialog (form id
+    sessionTimeoutLoginForm), so a plain "loginform" substring says nothing."""
+    lowered = (text or "").lower()
+    return "login notwendig" in lowered or bool(_LOGIN_FORM_ID.search(lowered))
+
+
 from bs4 import BeautifulSoup
 
 # StuMS shows Berlin wall-clock times without a zone; compare naive to naive

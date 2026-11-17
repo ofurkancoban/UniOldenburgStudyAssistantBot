@@ -503,6 +503,49 @@ class StumsNavigationHeadersTests(unittest.TestCase):
         self.assertTrue(seen["Referer"].endswith("/start"))
 
 
+class StumsLoginPageDetectionTests(unittest.TestCase):
+    SIGNED_IN = ('<html><title>Planner of studies</title><form id="sessionTimeoutLoginForm" action="/x">'
+                 '<input id="sessionTimeoutLoginForm:login"></form></html>')
+
+    def test_the_hidden_session_timeout_dialog_of_a_signed_in_page_is_not_a_login_page(self):
+        from stums_parsers import is_stums_login_page
+        self.assertFalse(is_stums_login_page(self.SIGNED_IN))
+
+    def test_the_real_login_pages_are_still_recognised(self):
+        from stums_parsers import is_stums_login_page
+        self.assertTrue(is_stums_login_page("<title>Login notwendig - Universit\u00e4t Oldenburg</title>"))
+        self.assertTrue(is_stums_login_page('<form id="loginForm" action="/x"></form>'))
+        self.assertTrue(is_stums_login_page('<input name="loginForm:username">'))
+        self.assertFalse(is_stums_login_page(""))
+
+    def test_a_signed_in_page_passes_the_page_reader(self):
+        import stums_client
+
+        class Resp:
+            status = 200
+            url = "https://stums.uni-oldenburg.de/qisserver/x"
+            headers = {}
+
+            async def text(self):
+                return StumsLoginPageDetectionTests.SIGNED_IN
+
+            def release(self):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class Sess:
+            async def get(self, url, **kw):
+                return Resp()
+
+        text, _ = asyncio.run(stums_client._read_stums_page(Sess(), "https://stums.uni-oldenburg.de/qisserver/x", "r"))
+        self.assertIn("Planner of studies", text)
+
+
 class WorkerUsageTests(unittest.TestCase):
     def setUp(self):
         import studip_session

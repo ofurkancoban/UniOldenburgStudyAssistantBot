@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 
 from studip_http import UNSPACED, set_request_priority
 from studip_utils import tag_attr
+from stums_parsers import is_stums_login_page
 
 BASE_URL = "https://elearning.uni-oldenburg.de"
 TZ_BERLIN = ZoneInfo("Europe/Berlin")
@@ -392,7 +393,7 @@ async def get_semester_options(session) -> list:
         html = await r.text()
         if r.status != 200:
             raise EnrollError(f"Could not load the semester list (HTTP {r.status}).")
-    if "loginform" in html.lower() or "login notwendig" in html.lower():
+    if is_stums_login_page(html):
         raise EnrollError("Stud.IP session expired while loading semesters.")
     soup = BeautifulSoup(html, "html.parser")
     select = soup.find("select", attrs={"name": "semester_id"})
@@ -509,7 +510,7 @@ async def _fetch_module_courses(session, verzeichnis_url: str) -> list:
         html = await r.text()
         if r.status != 200:
             raise EnrollError(f"Could not load a module's courses (HTTP {r.status}).")
-    if "loginform" in html.lower() or "login notwendig" in html.lower():
+    if is_stums_login_page(html):
         raise EnrollError("Stud.IP session expired while loading module courses.")
     soup = BeautifulSoup(html, "html.parser")
     tables = soup.find_all("table")
@@ -576,7 +577,7 @@ async def _get_module_course_candidates(session, semester_id: Optional[str] = No
         html = await r.text()
         if r.status != 200:
             raise EnrollError(f"Could not load your modules (HTTP {r.status}).")
-    if "loginform" in html.lower() or "login notwendig" in html.lower():
+    if is_stums_login_page(html):
         raise EnrollError("Stud.IP session expired while fetching your modules")
 
     module_links = _parse_module_links(html)
@@ -722,7 +723,7 @@ async def decline_course(session, cid: str, user_id: Optional[int] = None) -> tu
             return False, f"Could not load the sign-out confirmation (HTTP {resp.status})."
     if not _user_action_is_current(user_id):
         return False, "Sign-out cancelled because your account is no longer active."
-    if "loginform" in html.lower() or "login notwendig" in html.lower():
+    if is_stums_login_page(html):
         return False, "Stud.IP session expired before signing out. Please sign in again."
 
     soup = BeautifulSoup(html, "html.parser")
@@ -763,14 +764,14 @@ async def decline_course(session, cid: str, user_id: Optional[int] = None) -> tu
 
     if status != 200:
         return False, f"Unexpected HTTP status {status} when confirming sign-out."
-    if "loginform" in html2.lower() or "login notwendig" in html2.lower():
+    if is_stums_login_page(html2):
         return False, "Stud.IP session expired before confirming sign-out. Please sign in again."
 
     async with await session.get(f"{BASE_URL}/dispatch.php/my_courses") as r3:
         html3 = await r3.text()
         if r3.status != 200:
             return False, f"Could not verify the sign-out (HTTP {r3.status}); please check your course list manually."
-    if "loginform" in html3.lower() or "login notwendig" in html3.lower():
+    if is_stums_login_page(html3):
         return False, "Could not verify the sign-out because the Stud.IP session expired. Please check your course list manually."
     soup3 = BeautifulSoup(html3, "html.parser")
     still_enrolled = any(
