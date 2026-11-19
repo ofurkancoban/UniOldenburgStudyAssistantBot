@@ -86,6 +86,8 @@ DEFAULTS: dict[str, Any] = {
     "morning_time": "07:00",
     "morning_sections": {key: True for key in MORNING_SECTIONS},
     "outfit": False,
+    "outfit_evening": False,
+    "outfit_midday": True,
     "quiet_hours": {"start": "23:00", "end": "08:00"},
     "delivery_mode": "instant",
     "file_delivery": "card",
@@ -119,7 +121,8 @@ def validate(key: str, value) -> Any:
         if not isinstance(value, str) or value not in choices[key]:
             raise ValueError(f"{key} must be one of {sorted(choices[key])}")
         return value
-    if key in ("watch_previous_semester", "scan_previous_semester", "weekly_study_plan", "outfit"):
+    if key in ("watch_previous_semester", "scan_previous_semester", "weekly_study_plan", "outfit",
+               "outfit_evening", "outfit_midday"):
         if not isinstance(value, bool):
             raise ValueError(f"{key} must be a boolean")
         return value

@@ -14,7 +14,9 @@ import re
 import socket
 import tempfile
 import uuid
-from datetime import datetime
+import time
+from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
@@ -28,6 +30,7 @@ from telegram.ext import ContextTypes
 from studip_utils import TZ_BERLIN, aread_bytes, awrite_bytes, redact_url
 
 from unibot.config import (
+    ADMIN_USER_IDS,
     CLOUDFLARE_ACCOUNT_ID,
     CLOUDFLARE_API_TOKEN,
     CLOUDFLARE_IMAGE_MODEL,
@@ -44,21 +47,29 @@ from unibot.config import (
     OPENROUTER_MODEL,
     OUTFIT_OPENROUTER_MODEL,
 )
-from unibot.preferences import get_pref, set_pref
+from unibot.preferences import get_pref, in_quiet_hours, set_pref
 from unibot import db
 from unibot.storage import (
     add_outfit_likes,
     add_wardrobe_item,
     clear_wardrobe_items,
+    dirty_item_ids,
     get_cached_outfit_today,
     get_days_since_worn,
+    get_outfit_history,
     get_outfit_likes,
+    get_outfit_stats,
+    get_outfit_weather_baseline,
     get_recently_worn_item_ids,
     get_wardrobe_entry,
+    mark_items_clean,
+    mark_outfit_weather_alerted,
     NEVER_WORN_DAYS,
+    record_outfit_stat,
     record_worn_items,
     remove_wardrobe_item,
     save_cached_outfit_today,
+    save_outfit_weather_baseline,
     save_wardrobe_item_descriptions,
     shared_http,
     update_wardrobe_item,
@@ -78,21 +89,22 @@ from unibot.ai import (
     _extract_json_object,
     generate_outfit_tryon_gwdg,
 )
-from unibot.weather import get_weather_snapshot
+from unibot.weather import get_afternoon_outlook, get_weather_snapshot
 
 
 CLOUDFLARE_AI_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}"
 
 
-def outfit_caption(outfit: dict) -> str:
+def outfit_caption(outfit: dict, heading: str = "Today's outfit") -> str:
     """HTML caption for an outfit pick (fresh or cached): just the chosen
     items as a bullet list. Falls back to the description for a cached pick
     saved before item labels were stored. Labels can hold a bare "&"
     ("Jack & Jones"), so they're escaped."""
     labels = outfit.get("item_labels") or [it["label"] for it in outfit.get("chosen_items", [])]
+    note = f"\n\n{html.escape(outfit['laundry_note'])}" if outfit.get("laundry_note") else ""
     if not labels:
-        return f"👔 <b>Today's outfit:</b> {html.escape(outfit['description'])}"
-    return "👔 <b>Today's outfit:</b>\n" + "\n".join(f"• {html.escape(label)}" for label in labels)
+        return f"👔 <b>{heading}:</b> {html.escape(outfit['description'])}{note}"
+    return f"👔 <b>{heading}:</b>\n" + "\n".join(f"• {html.escape(label)}" for label in labels) + note
 
 
 OUTFIT_RECOMMENDATION_SYSTEM_PROMPT = """You are picking a coherent, weather-appropriate outfit for a student from their own wardrobe, using only the candidate items listed (each with an id, type, subtype, color, and warmth level). Follow this layering logic based on today's forecast high temperature and whether rain is expected:
@@ -231,6 +243,25 @@ def _temperature_band(temp_max: Optional[float]) -> str:
     return "hot"
 
 
+def _apply_laundry(items: list[dict], dirty: set) -> tuple[list[dict], str]:
+    """Drop the dirty tops and bottoms from the candidates. If every top (or
+    every bottom) is dirty they all stay, so an outfit is still possible.
+    Returns the candidates and a short note when the clean stock runs low."""
+    clean = [it for it in items if it["id"] not in dirty]
+    notes = []
+    for item_type in ("top", "bottom"):
+        total = [it for it in items if it.get("type") == item_type]
+        left = sum(1 for it in clean if it.get("type") == item_type)
+        if not total or left == len(total):
+            continue
+        if left == 0:
+            clean += total
+            notes.append(f"no clean {item_type}s left, picked from the laundry")
+        elif left <= 1:
+            notes.append(f"{left} clean {item_type} left")
+    return clean, ("🧺 Laundry: " + "; ".join(notes) + ".") if notes else ""
+
+
 def _rotation_rank(item_id: str, days_since_worn: dict, likes: dict) -> float:
     """Lower sorts first: the longer an item has not been worn the better, a
     liked item counts as worn a little longer ago (a tie-breaker only)."""
@@ -351,7 +382,8 @@ def _add_mandatory_shoes_and_headwear(items: list[dict], chosen: list[dict]) -> 
 
 
 async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], recent_ids: Optional[set] = None,
-                                   user_id: Optional[int] = None, day_context: Optional[str] = None) -> Optional[dict]:
+                                   user_id: Optional[int] = None, day_context: Optional[str] = None,
+                                   for_day=None) -> Optional[dict]:
     """Ask the LLM to pick a coherent, temperature-banded outfit from the
     user's cataloged wardrobe items, considering the morning's weather
     snapshot (see get_weather_snapshot) - structural twin of
@@ -373,11 +405,13 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
 
     band = _temperature_band(weather.get("temp_max") if weather else None)
     recent_ids = recent_ids or set()
-    days_since = get_days_since_worn(user_id)
+    for_day = for_day or datetime.now(TZ_BERLIN).date()
+    days_since = get_days_since_worn(user_id, for_day)
     likes = get_outfit_likes(user_id)
     # Work on copies carrying the rotation rank, so the item dicts stored in the
     # wardrobe stay untouched; the rank is dropped again before returning.
     items = [dict(it, _rank=_rotation_rank(it["id"], days_since, likes)) for it in items]
+    items, laundry_note = _apply_laundry(items, dirty_item_ids(user_id, for_day))
 
     def _history_note(item_id: str) -> str:
         note = f" [worn {days_since[item_id]} days ago]" if item_id in days_since else " [not worn recently]"
@@ -421,6 +455,7 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
                         if isinstance(item_id, str) and item_id in by_id]
 
     if not chosen_items:
+        record_outfit_stat("pick_fallback")
         chosen_items = _heuristic_outfit_pick(items, weather, recent_ids)
     if not chosen_items:
         return None
@@ -444,7 +479,8 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
     # Only the LLM pick reasons about colors; the heuristic fallback has no tip.
     raw_color_tip = parsed.get("color_tip") if parsed and isinstance(raw_item_ids, list) and raw_item_ids else None
     color_tip = raw_color_tip.strip()[:300] if isinstance(raw_color_tip, str) else ""
-    return {"chosen_items": chosen_items, "description": description, "color_tip": color_tip}
+    return {"chosen_items": chosen_items, "description": description, "color_tip": color_tip,
+            "laundry_note": laundry_note}
 
 
 def _wardrobe_list_view(user_id) -> tuple:
@@ -460,7 +496,10 @@ def _wardrobe_list_view(user_id) -> tuple:
     keyboard = [[InlineKeyboardButton(f"🗑 {it['label']} ({it['type']}/{it.get('subtype') or '-'})", callback_data=f"wardrobe_remove|{it['id']}")] for it in items]
     keyboard.append([InlineKeyboardButton("📸 Add Clothing Item", callback_data="wardrobe_add_item")])
     if items:
-        keyboard.append([InlineKeyboardButton("✏️ Fix item types", callback_data="wardrobe_edit_list")])
+        keyboard.append([InlineKeyboardButton("✏️ Fix item types", callback_data="wardrobe_edit_list"),
+                         InlineKeyboardButton("🧺 Laundry", callback_data="wardrobe_laundry")])
+        keyboard.append([InlineKeyboardButton("🔎 What's missing?", callback_data="wardrobe_gaps"),
+                         InlineKeyboardButton("📜 History", callback_data="wardrobe_history")])
     if items and entry.get("reference_photo_file_id"):
         keyboard.append([InlineKeyboardButton("👔 Suggest Outfit Now", callback_data="wardrobe_suggest_now")])
     if len(items) > 1:
@@ -565,10 +604,96 @@ def _item_edit_view(user_id, item_id: str) -> Optional[tuple]:
     return text, InlineKeyboardMarkup(rows)
 
 
+def _label_words(label) -> set:
+    return set(re.findall(r"[a-z0-9]+", str(label or "").lower())) - {"and", "the", "with"}
+
+
+def _looks_alike(a: dict, b: dict) -> bool:
+    """Same type, subtype and color, and mostly the same words in the label."""
+    if a.get("type") != b.get("type") or a.get("subtype") != b.get("subtype"):
+        return False
+    if str(a.get("color") or "").lower() != str(b.get("color") or "").lower():
+        return False
+    words_a, words_b = _label_words(a.get("label")), _label_words(b.get("label"))
+    return bool(words_a and words_b) and len(words_a & words_b) / len(words_a | words_b) >= 0.5
+
+
+def find_similar_items(items: list) -> list:
+    """Pairs of items that look like the same garment added twice."""
+    return [(a, b) for i, a in enumerate(items) for b in items[i + 1:] if _looks_alike(a, b)]
+
+
+def wardrobe_gaps(items: list) -> list:
+    """What the wardrobe lacks for the temperature bands the pick uses, plus
+    possible duplicates. Empty when nothing obvious is missing."""
+    def count(item_type, subtype=None):
+        return sum(1 for it in items if it.get("type") == item_type and (subtype is None or it.get("subtype") == subtype))
+
+    gaps = []
+    if not count("bottom", "shorts"):
+        gaps.append("No shorts: on days of 18°C and up the pick uses pants.")
+    if not count("top", "sweater"):
+        gaps.append("No sweater: days under 5°C have no warm layer under the jacket.")
+    if not count("outerwear", "coat"):
+        gaps.append("No coat: days under 12°C rely on a light jacket.")
+    if not count("outerwear", "light_jacket"):
+        gaps.append("No light jacket: mild or rainy days have no outer layer.")
+    if count("top") < 4:
+        gaps.append(f"Only {count('top')} top(s): with washing in between, tops repeat within a few days.")
+    if count("bottom") < 3:
+        gaps.append(f"Only {count('bottom')} bottom(s): with washing in between, bottoms repeat within a few days.")
+    if count("shoes") < 2:
+        gaps.append(f"Only {count('shoes')} pair(s) of shoes.")
+    if not any(it.get("type") == "accessory" and any(kw in str(it.get("label", "")).lower() for kw in _HEADWEAR_KEYWORDS)
+               for it in items):
+        gaps.append("No cap or beanie to finish an outfit.")
+    for a, b in find_similar_items(items):
+        gaps.append(f"Looks alike: {a['label']} and {b['label']} (remove one if it is a duplicate).")
+    return gaps
+
+
+_BACK_ROW = [InlineKeyboardButton("⬅️ Back", callback_data="wardrobe_edit_done")]
+
+
+def _laundry_view(user_id) -> tuple:
+    dirty = dirty_item_ids(user_id)
+    dirty_items = [it for it in get_wardrobe_entry(user_id).get("items", []) if it["id"] in dirty]
+    if not dirty_items:
+        text = ("🧺 <b>Laundry</b>\nNothing is waiting to be washed. Tops and bottoms count as dirty "
+                "from the day after they were in an outfit, and are left out of the picks until you mark them washed.")
+        return text, InlineKeyboardMarkup([_BACK_ROW])
+    rows = [[InlineKeyboardButton(f"🧺 Washed: {it['label'][:40]}", callback_data=f"wardrobe_wash|{it['id']}")]
+            for it in dirty_items[:20]]
+    rows.append([InlineKeyboardButton("✅ All washed", callback_data="wardrobe_wash_all")])
+    rows.append(_BACK_ROW)
+    return f"🧺 <b>Laundry</b>\n{len(dirty_items)} piece(s) are waiting to be washed and are left out of the picks.", InlineKeyboardMarkup(rows)
+
+
+def _gaps_view(user_id) -> tuple:
+    gaps = wardrobe_gaps(get_wardrobe_entry(user_id).get("items", []))
+    body = "\n".join(f"• {html.escape(g)}" for g in gaps) if gaps else "Nothing obvious is missing."
+    return f"🔎 <b>What's missing?</b>\n{body}", InlineKeyboardMarkup([_BACK_ROW])
+
+
+def _history_view(user_id) -> tuple:
+    items = {it["id"]: it for it in get_wardrobe_entry(user_id).get("items", [])}
+    lines = []
+    for date_str, ids in sorted(get_outfit_history(user_id).items(), reverse=True)[:14]:
+        labels = [items[i]["label"] for i in ids if i in items]
+        if labels:
+            lines.append(f"<b>{html.escape(date_str)}</b>: {html.escape(', '.join(labels))}")
+    liked = sorted(((n, items[i]["label"]) for i, n in get_outfit_likes(user_id).items() if i in items), reverse=True)[:3]
+    text = "📜 <b>Outfit history</b>\n" + ("\n".join(lines) if lines else "No outfits yet.")
+    if liked:
+        text += "\n\n👍 Most liked: " + html.escape(", ".join(f"{label} ({n})" for n, label in liked))
+    return text, InlineKeyboardMarkup([_BACK_ROW])
+
+
 async def handle_wardrobe_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """wardrobe_edit_list / wardrobe_edit|<id> / wardrobe_set|<id>|<field>|<value>
-    / wardrobe_edit_done: correct the type, subtype or warmth the vision model
-    guessed for an item."""
+    """The wardrobe sub screens: wardrobe_edit_list / wardrobe_edit|<id> /
+    wardrobe_set|<id>|<field>|<value> correct what the vision model guessed,
+    wardrobe_laundry / wardrobe_wash|<id> / wardrobe_wash_all, wardrobe_gaps
+    and wardrobe_history show the rest, wardrobe_edit_done goes back."""
     query = update.callback_query
     user_id = query.from_user.id
     if not is_user_admin(user_id):
@@ -583,6 +708,18 @@ async def handle_wardrobe_edit(update: Update, context: ContextTypes.DEFAULT_TYP
         view = _wardrobe_list_view(user_id)
     elif parts[0] == "wardrobe_edit_list":
         view = _edit_list_view(user_id)
+    elif parts[0] == "wardrobe_laundry":
+        view = _laundry_view(user_id)
+    elif parts[0] == "wardrobe_wash" and len(parts) == 2:
+        mark_items_clean(user_id, [parts[1]])
+        view = _laundry_view(user_id)
+    elif parts[0] == "wardrobe_wash_all":
+        mark_items_clean(user_id)
+        view = _laundry_view(user_id)
+    elif parts[0] == "wardrobe_gaps":
+        view = _gaps_view(user_id)
+    elif parts[0] == "wardrobe_history":
+        view = _history_view(user_id)
     elif parts[0] == "wardrobe_edit" and len(parts) == 2:
         view = _item_edit_view(user_id, parts[1]) or _edit_list_view(user_id)
     elif parts[0] == "wardrobe_set" and len(parts) == 4:
@@ -659,7 +796,7 @@ async def import_wardrobe_urls(user_id, urls: list) -> dict:
     in the wardrobe). {"added": [labels], "skipped": n, "failed": [(url, why)],
     "stopped": True if personal AI use was switched off midway}."""
     existing = {it.get("image_url") for it in get_wardrobe_entry(user_id).get("items", [])}
-    result: dict = {"added": [], "skipped": 0, "failed": [], "stopped": False}
+    result: dict = {"added": [], "skipped": 0, "failed": [], "stopped": False, "similar": []}
     for url in urls:
         if url in existing:
             result["skipped"] += 1
@@ -676,9 +813,11 @@ async def import_wardrobe_urls(user_id, urls: list) -> dict:
             result["failed"].append((url, "could not tell what it is"))
             continue
         tags["description"] = await describe_wardrobe_item(tags, data, user_id=user_id)
-        add_wardrobe_item(user_id, tags, image_url=url)
+        before = list(get_wardrobe_entry(user_id).get("items", []))
+        new_item = add_wardrobe_item(user_id, tags, image_url=url)
         existing.add(url)
         result["added"].append(tags["label"])
+        result["similar"] += [(new_item["label"], other["label"]) for other in before if _looks_alike(new_item, other)]
     return result
 
 
@@ -730,6 +869,8 @@ async def wardrobe_import_command(update: Update, context: ContextTypes.DEFAULT_
     lines += [f"• {html.escape(label)}" for label in result["added"]]
     if result["skipped"]:
         lines.append(f"Skipped {result['skipped']} already in your wardrobe.")
+    for new_label, other_label in result["similar"]:
+        lines.append(f"↔️ {html.escape(new_label)} looks like {html.escape(other_label)}, remove one if it is a duplicate.")
     for url, why in result["failed"]:
         lines.append(f"⚠️ {html.escape(redact_url(url)[:60])}: {why}")
     if result["stopped"]:
@@ -892,6 +1033,7 @@ async def _run_outfit_request(message, bot, user_id: int, items: list, ref_file_
     save_cached_outfit_today(user_id, outfit["description"], photo_file_id, outfit.get("color_tip", ""),
                              [it["label"] for it in outfit["chosen_items"]],
                              [it["id"] for it in outfit["chosen_items"]])
+    save_outfit_weather_baseline(user_id, weather)
 
 
 async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -987,10 +1129,17 @@ async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.D
 def _outfit_menu_view(user_id: Optional[int] = None) -> tuple:
     """/status's grouped outfit submenu: the daily suggestion toggle,
     the wardrobe list and the reference photo setup in one place."""
-    enabled = bool(get_pref(user_id, "outfit") if isinstance(user_id, int) else False)
-    text = f"👔 <b>Outfit &amp; Wardrobe</b>\n\nDaily Outfit Suggestion: {'✅ On' if enabled else '🔲 Off'}"
+    def flag(key):
+        return bool(get_pref(user_id, key) if isinstance(user_id, int) else False)
+
+    enabled, evening, midday = flag("outfit"), flag("outfit_evening"), flag("outfit_midday")
+    text = (f"👔 <b>Outfit &amp; Wardrobe</b>\n\nDaily Outfit Suggestion: {'✅ On' if enabled else '🔲 Off'}"
+            f"\nEvening preview (20:00): {'✅ On' if evening else '🔲 Off'}"
+            f"\nMidday rain alert: {'✅ On' if midday else '🔲 Off'}")
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{'✅' if enabled else '🔲'} Daily Outfit Suggestion", callback_data="outfit_menu_toggle")],
+        [InlineKeyboardButton(f"{'✅' if evening else '🔲'} Evening preview of tomorrow", callback_data="outfit_menu_evening")],
+        [InlineKeyboardButton(f"{'✅' if midday else '🔲'} Midday rain alert", callback_data="outfit_menu_midday")],
         [InlineKeyboardButton("👔 My Wardrobe", callback_data="wardrobe_menu")],
         [InlineKeyboardButton("🖼️ Set Reference Photo", callback_data="wardrobe_set_reference")],
     ])
@@ -1013,6 +1162,12 @@ async def handle_outfit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
         current = bool(get_pref(user_id, "outfit"))
         new_state = not current
         set_pref(user_id, "outfit", new_state)
+        text, keyboard = _outfit_menu_view(user_id)
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
+        return
+    if (query.data or "") in ("outfit_menu_evening", "outfit_menu_midday"):
+        key = "outfit_evening" if query.data == "outfit_menu_evening" else "outfit_midday"
+        set_pref(user_id, key, not get_pref(user_id, key))
         text, keyboard = _outfit_menu_view(user_id)
         await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
         return
@@ -1538,9 +1693,10 @@ async def generate_outfit_tryon_accessories(reference_bytes: bytes, shoes_item: 
             logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
 
 
-async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items: list[dict],
-                                      user_id: Optional[int] = None) -> Optional[bytes]:
-    """Dress the reference photo in the chosen outfit. First tries the
+async def _tryon_chain(bot, reference_bytes: bytes, chosen_items: list[dict],
+                       user_id: Optional[int], used: list) -> Optional[bytes]:
+    """Dress the reference photo in the chosen outfit; the name of the provider
+    that produced the image is appended to `used`. First tries the
     Gemini model with every visible item in one call (see
     generate_outfit_tryon_gemini), then GWDG's free describe-and-edit
     (see generate_outfit_tryon_gwdg). If both fail, picks one
@@ -1583,11 +1739,13 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
             return None
         image_bytes = await provider(reference_bytes, garments, user_id=user_id)
         if image_bytes:
+            used.append("gemini")
             return image_bytes
     if not personal_ai_allowed(user_id):
         return None
     image_bytes = await generate_outfit_tryon_gwdg(reference_bytes, garments, user_id=user_id)
     if image_bytes:
+        used.append("gwdg")
         return image_bytes
 
     upper_item = next((it for it in reversed(chosen_items) if it.get("type") == "outerwear"), None) \
@@ -1601,19 +1759,23 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
 
     if not personal_ai_allowed(user_id):
         return None
+    provider_name = "fashn"
     image_bytes = await generate_outfit_tryon_fashn(reference_bytes, upper_bytes, lower_bytes, user_id=user_id)
     if not image_bytes:
         if not personal_ai_allowed(user_id):
             return None
+        provider_name = "ootd"
         image_bytes = await generate_outfit_tryon_ootd(reference_bytes, upper_bytes, lower_bytes, user_id=user_id)
     if not image_bytes:
         if not personal_ai_allowed(user_id):
             return None
+        provider_name = "flux"
         image_bytes = await generate_outfit_tryon_flux(
             reference_bytes, [b for b in (upper_bytes, lower_bytes) if b], user_id=user_id
         )
     if not image_bytes:
         return None
+    used.append(provider_name)
 
     if shoes_item or headwear_item:
         if not personal_ai_allowed(user_id):
@@ -1624,3 +1786,118 @@ async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items:
         if accessorized:
             return accessorized
     return image_bytes
+
+
+# ── Scheduled extras: evening preview and midday rain alert ───────────────────
+async def send_evening_outfit_preview(bot, user_id: int) -> bool:
+    """Tomorrow's outfit as text (no image, so no image cost), from tomorrow's
+    forecast and classes. Not recorded as worn: the morning pick is the real one."""
+    if not is_user_admin(user_id) or not get_pref(user_id, "outfit_evening") or not personal_ai_allowed(user_id):
+        return False
+    now = datetime.now(TZ_BERLIN)
+    if in_quiet_hours(user_id, now):
+        return False
+    items = get_wardrobe_entry(user_id).get("items", [])
+    if not items:
+        return False
+    tomorrow = now.date() + timedelta(days=1)
+    weather = await get_weather_snapshot(tomorrow, user_id=user_id)
+    if not weather:
+        return False
+    day_context = await outfit_day_context(user_id, tomorrow)
+    outfit = await pick_outfit_from_wardrobe(items, weather, get_recently_worn_item_ids(user_id), user_id=user_id,
+                                             day_context=day_context, for_day=tomorrow)
+    if not outfit or not db.private_context_is_current(user_id) or not personal_ai_allowed(user_id):
+        return False
+    forecast = (f"{weather.get('emoji', '')} {html.escape(str(weather.get('description', '')))}, "
+                f"{weather['temp_min']:.0f} to {weather['temp_max']:.0f}°C" + (", rain expected" if weather.get("is_wet") else ""))
+    text = (outfit_caption(outfit, "Tomorrow's outfit (preview)") + f"\n\n{forecast.strip()}\n"
+            "The morning pick can differ if the forecast changes.")
+    await bot.send_message(chat_id=user_id, text=text, parse_mode="HTML")
+    return True
+
+
+async def send_midday_weather_alert(bot, user_id: int) -> bool:
+    """Once a day, if the morning forecast was dry but the afternoon turned wet."""
+    if not is_user_admin(user_id) or not get_pref(user_id, "outfit_midday"):
+        return False
+    baseline = get_outfit_weather_baseline(user_id)
+    if not baseline or baseline.get("alerted") or baseline.get("is_wet"):
+        return False
+    now = datetime.now(TZ_BERLIN)
+    if in_quiet_hours(user_id, now):
+        return False
+    outlook = await get_afternoon_outlook(now.date(), user_id=user_id)
+    if not outlook or not outlook["is_wet"] or not db.private_context_is_current(user_id):
+        return False
+    worn = set((get_cached_outfit_today(user_id) or {}).get("item_ids") or [])
+    has_outerwear = any(it["id"] in worn and it.get("type") == "outerwear"
+                        for it in get_wardrobe_entry(user_id).get("items", []))
+    advice = "Your jacket should cover it, an umbrella would not hurt." if has_outerwear else "Take a jacket or an umbrella."
+    await bot.send_message(chat_id=user_id, text=f"🌧 Rain is now expected this afternoon (the morning forecast was dry). {advice}")
+    mark_outfit_weather_alerted(user_id)
+    return True
+
+
+# ── Image provider statistics and alerts ──────────────────────────────────────
+IMAGE_PROVIDER_LABELS = {"gemini": "Nano Banana", "gwdg": "GWDG", "fashn": "FASHN", "ootd": "OOTDiffusion", "flux": "FLUX"}
+IMAGE_COST_USD = {"gemini": 0.08, "fashn": 0.075}  # paid providers, per image (fal.ai)
+IMAGE_ALERT_COOLDOWN_SECONDS = 6 * 3600
+_last_image_alert: float = 0.0
+
+
+async def generate_outfit_tryon_image(bot, reference_bytes: bytes, chosen_items: list[dict],
+                                      user_id: Optional[int] = None) -> Optional[bytes]:
+    """Dress the reference photo in the chosen outfit (see _tryon_chain for the
+    provider order) and count which provider delivered. When every provider
+    failed the administrators are told once in a while, since the outfit then
+    goes out as text only without anyone noticing."""
+    used: list = []
+    result = await _tryon_chain(bot, reference_bytes, chosen_items, user_id, used)
+    if user_id is not None and personal_ai_allowed(user_id):  # a stopped request is not a provider failure
+        if used:
+            record_outfit_stat(used[0])
+        elif result is None:
+            record_outfit_stat("none")
+            await _alert_admins_image_failed(bot)
+    return result
+
+
+async def _alert_admins_image_failed(bot) -> None:
+    global _last_image_alert
+    now = time.monotonic()
+    if _last_image_alert and now - _last_image_alert < IMAGE_ALERT_COOLDOWN_SECONDS:
+        return
+    _last_image_alert = now
+    for admin_id in ADMIN_USER_IDS:
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text="⚠️ Outfit image: every provider failed just now, so the outfit went out as text only. "
+                     "Check the FAL_KEY credit and the GWDG key.",
+            )
+        except TelegramError as ignored_error:
+            logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
+
+
+def outfit_digest_line(today=None) -> Optional[str]:
+    """One line for the daily health digest: which image providers delivered
+    (today and yesterday), failures and fallbacks, and the paid spend of the
+    last 30 days. None while nothing has been counted yet."""
+    stats = get_outfit_stats()
+    if not stats:
+        return None
+    today = today or datetime.now(TZ_BERLIN).date()
+    recent: Counter = Counter()
+    for offset in (0, 1):
+        recent.update(stats.get((today - timedelta(days=offset)).isoformat(), {}))
+    month: Counter = Counter()
+    for offset in range(30):
+        month.update(stats.get((today - timedelta(days=offset)).isoformat(), {}))
+    parts = [f"{n} {IMAGE_PROVIDER_LABELS[name]}" for name, n in recent.items() if name in IMAGE_PROVIDER_LABELS and n]
+    if recent.get("none"):
+        parts.append(f"{recent['none']} failed")
+    if recent.get("pick_fallback"):
+        parts.append(f"{recent['pick_fallback']} pick fallback(s)")
+    cost = sum(month.get(name, 0) * price for name, price in IMAGE_COST_USD.items())
+    return f"👔 Outfit images (today and yesterday): {', '.join(parts) or 'none'}. Paid images, last 30 days: about ${cost:.2f}"

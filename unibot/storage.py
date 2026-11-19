@@ -1020,7 +1020,7 @@ def save_wardrobe_item_descriptions(descriptions: dict, user_id: Optional[int] =
 def update_wardrobe_item(user_id, item_id: str, **fields) -> Optional[dict]:
     """Change the type, subtype or warmth of one item (the caller validates the
     values). Returns the updated item, or None if the id is not in the wardrobe."""
-    allowed = {"type", "subtype", "warmth"}
+    allowed = {"type", "subtype", "warmth", "clean_since"}
     entry = get_wardrobe_entry(user_id)
     for item in entry["items"]:
         if item["id"] == item_id:
@@ -1726,23 +1726,70 @@ def record_worn_items(user_id, item_ids: list) -> None:
 NEVER_WORN_DAYS = WARDROBE_OUTFIT_HISTORY_DAYS + 1  # "not worn within the remembered window"
 
 
-def get_days_since_worn(user_id) -> dict:
-    """{item_id: days since it was last picked} for every item picked within
-    the remembered window; items missing from the result were not worn in it."""
+def get_outfit_history(user_id) -> dict:
+    """{ISO date: [item ids]} of the remembered outfits (the last pick of each day)."""
     history = personal_record(user_id, "outfit_history", {}) or {}
-    today = datetime.now(TZ_BERLIN).date()
-    days: dict = {}
-    for date_str, item_ids in history.items():
+    return {d: ids for d, ids in history.items() if isinstance(d, str) and isinstance(ids, list)}
+
+
+def get_last_worn_dates(user_id) -> dict:
+    """{item_id: the date it was last picked} within the remembered window."""
+    last: dict = {}
+    for date_str, item_ids in get_outfit_history(user_id).items():
         try:
-            age = (today - datetime.fromisoformat(date_str).date()).days
+            day = datetime.fromisoformat(date_str).date()
         except ValueError:
             continue
-        if not isinstance(item_ids, list):
-            continue
         for item_id in item_ids:
-            if item_id not in days or age < days[item_id]:
-                days[item_id] = age
-    return days
+            if item_id not in last or day > last[item_id]:
+                last[item_id] = day
+    return last
+
+
+def get_days_since_worn(user_id, as_of=None) -> dict:
+    """{item_id: days since it was last picked} for every item picked within
+    the remembered window; items missing from the result were not worn in it."""
+    today = as_of or datetime.now(TZ_BERLIN).date()
+    return {item_id: (today - day).days for item_id, day in get_last_worn_dates(user_id).items()}
+
+
+WASHABLE_TYPES = ("top", "bottom")
+
+
+def dirty_item_ids(user_id, as_of=None) -> set:
+    """Tops and bottoms picked on an earlier day and not marked washed since.
+    The pick of the same day does not count, so "Another one" never dirties
+    what was only suggested and replaced."""
+    today = as_of or datetime.now(TZ_BERLIN).date()
+    last = get_last_worn_dates(user_id)
+    dirty = set()
+    for item in get_wardrobe_entry(user_id).get("items", []):
+        worn = last.get(item["id"])
+        if item.get("type") not in WASHABLE_TYPES or worn is None or worn >= today:
+            continue
+        try:
+            washed = datetime.fromisoformat(item["clean_since"]).date() if item.get("clean_since") else None
+        except ValueError:
+            washed = None
+        if washed is None or worn > washed:
+            dirty.add(item["id"])
+    return dirty
+
+
+def mark_items_clean(user_id, item_ids=None) -> int:
+    """Mark items washed today (all dirty ones when `item_ids` is None).
+    Returns how many were marked."""
+    targets = set(item_ids) if item_ids is not None else dirty_item_ids(user_id)
+    entry = get_wardrobe_entry(user_id)
+    today = datetime.now(TZ_BERLIN).date().isoformat()
+    count = 0
+    for item in entry["items"]:
+        if item["id"] in targets:
+            item["clean_since"] = today
+            count += 1
+    if count:
+        _save_wardrobe_entry(user_id, entry)
+    return count
 
 
 def get_outfit_likes(user_id) -> dict:
@@ -1760,3 +1807,48 @@ def add_outfit_likes(user_id, item_ids: list) -> None:
         if item_id in existing:
             likes[item_id] = likes.get(item_id, 0) + 1
     save_personal_record(user_id, "outfit_likes", likes)
+
+
+def save_outfit_weather_baseline(user_id, weather: Optional[dict]) -> None:
+    """What the forecast said when today's outfit went out, for the midday rain check."""
+    if not weather:
+        return
+    save_personal_record(user_id, "outfit_weather_baseline", {
+        "date": datetime.now(TZ_BERLIN).date().isoformat(),
+        "is_wet": bool(weather.get("is_wet")),
+        "alerted": False,
+    })
+
+
+def get_outfit_weather_baseline(user_id) -> Optional[dict]:
+    baseline = personal_record(user_id, "outfit_weather_baseline")
+    if isinstance(baseline, dict) and baseline.get("date") == datetime.now(TZ_BERLIN).date().isoformat():
+        return baseline
+    return None
+
+
+def mark_outfit_weather_alerted(user_id) -> None:
+    baseline = get_outfit_weather_baseline(user_id)
+    if baseline:
+        save_personal_record(user_id, "outfit_weather_baseline", {**baseline, "alerted": True})
+
+
+OUTFIT_STATS_KEEP_DAYS = 35
+
+
+def record_outfit_stat(name: str) -> None:
+    """Count one outfit event (the image provider that worked, "none" when all
+    failed, "pick_fallback" when the text pick fell back to rules) for today.
+    Counts only, no user data, so it lives in the shared cache."""
+    today = datetime.now(TZ_BERLIN).date()
+    stats = dict(load_general_cache().get("outfit_stats") or {})
+    day = dict(stats.get(today.isoformat()) or {})
+    day[name] = day.get(name, 0) + 1
+    stats[today.isoformat()] = day
+    cutoff = (today - timedelta(days=OUTFIT_STATS_KEEP_DAYS)).isoformat()
+    update_general_cache({"outfit_stats": {d: v for d, v in stats.items() if d >= cutoff}})
+
+
+def get_outfit_stats() -> dict:
+    stats = load_general_cache().get("outfit_stats") or {}
+    return stats if isinstance(stats, dict) else {}

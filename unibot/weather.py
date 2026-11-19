@@ -335,6 +335,57 @@ async def get_weather_snapshot(target_date=None, user_id=None) -> Optional[dict]
         return None
 
 
+AFTERNOON_HOURS = range(12, 19)  # 12:00 to 18:59
+AFTERNOON_RAIN_CHANCE = 60  # percent in any single hour that counts as "rain expected"
+
+
+async def get_afternoon_outlook(target_date=None, user_id=None) -> Optional[dict]:
+    """Rain outlook for the afternoon (12:00 to 18:59): {"is_wet", "precip_chance"},
+    or None on any failure. The morning snapshot only looks at 8 to 11, so this
+    is what tells whether a dry-looking morning turned wet later."""
+    target_date = target_date or datetime.now(TZ_BERLIN).date()
+    latitude, longitude = _coords(load_weather_location(user_id))
+    try:
+        async with shared_http() as session:
+            async with session.get(
+                WEATHER_URL,
+                params={
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "hourly": "weathercode,precipitation_probability",
+                    "timezone": "Europe/Berlin",
+                    "forecast_days": 2,
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    logging.warning("get_afternoon_outlook: HTTP %s", resp.status)
+                    return None
+                data = await resp.json()
+        return afternoon_outlook_from_hourly(data["hourly"], target_date.isoformat())
+    except Exception as e:
+        logging.warning("get_afternoon_outlook: failed: %s", e)
+        return None
+
+
+def afternoon_outlook_from_hourly(hourly: dict, target_iso: str) -> Optional[dict]:
+    """The pure part of get_afternoon_outlook (Open-Meteo sends null for missing hours)."""
+    codes, chances = [], []
+    for t, code, chance in zip(hourly["time"], hourly["weathercode"], hourly["precipitation_probability"]):
+        if t.startswith(target_iso) and int(t[11:13]) in AFTERNOON_HOURS:
+            if isinstance(code, (int, float)):
+                codes.append(int(code))
+            if isinstance(chance, (int, float)):
+                chances.append(chance)
+    if not codes and not chances:
+        return None
+    top_chance = max(chances) if chances else 0
+    return {
+        "is_wet": (max(codes) >= WEATHER_WET_CODE_THRESHOLD if codes else False) or top_chance >= AFTERNOON_RAIN_CHANCE,
+        "precip_chance": top_chance,
+    }
+
+
 def build_weather_text_line(weather: dict, escape=None) -> str:
     """Short, deterministic weather + clothing line for the text message -
     LLM-independent, so it's always available even when OpenRouter isn't.

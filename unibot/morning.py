@@ -35,6 +35,7 @@ from unibot.storage import (
     user_tasks,
     record_worn_items,
     save_cached_outfit_today,
+    save_outfit_weather_baseline,
     save_general_cache,
 )
 from unibot.formatting import (
@@ -322,7 +323,7 @@ async def _prepare_outfits(bot, user_ids, weather_of: dict) -> dict:
                     bot, reference_bytes, outfit["chosen_items"], user_id=uid
                 ) if reference_bytes else None
                 if db.private_context_is_current(uid) and get_ai_personal_enabled(uid):
-                    outfits[uid] = {"outfit": outfit, "image_bytes": image_bytes}
+                    outfits[uid] = {"outfit": outfit, "image_bytes": image_bytes, "weather": weather_of.get(uid)}
             except Exception as e:
                 logging.warning("Outfit suggestion failed for %s: %s", uid, e)
     return outfits
@@ -656,6 +657,7 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict, on_delivered=No
                 save_cached_outfit_today(uid, outfit["description"], photo_file_id, outfit.get("color_tip", ""),
                                          [it["label"] for it in outfit["chosen_items"]],
                                          [it["id"] for it in outfit["chosen_items"]])
+                save_outfit_weather_baseline(uid, entry.get("weather"))
             except Exception as e:
                 logging.warning("Outfit suggestion failed for %s: %s", uid, e)
 

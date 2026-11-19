@@ -77,6 +77,7 @@ from unibot.exams import exam_action_cache
 from unibot.study_plan import index_course_files, prune_course_index, run_weekly_study_plan_job
 from unibot.tasks import check_task_reminders
 from unibot.study_week import weekly_report, weekly_report_due
+from unibot.wardrobe import outfit_digest_line, send_evening_outfit_preview, send_midday_weather_alert
 from unibot.canary import run_canary_if_due
 from unibot.system import HEALTH_CHECK_LABELS, ensure_uni_proxy, run_health_checks
 
@@ -640,6 +641,9 @@ async def _send_daily_digest(bot, report_date: str):
     # Log timestamps are the server's naive local time, so compare in that clock.
     lines = daily_digest(datetime.now(), log_paths, previous)
     lines.append(_privacy_digest_line(datetime.now(TZ_BERLIN)))
+    outfit_line = outfit_digest_line()
+    if outfit_line:
+        lines.append(outfit_line)
     registry_line = course_registry.savings_line()
     if registry_line:
         lines.append(registry_line)
@@ -708,6 +712,39 @@ async def _run_weekly_report(bot, now: datetime):
         "last_weekly_report", period, "Weekly report",
         "📊 Sending the weekly reports...", _send_weekly_reports, bot, period,
     )
+
+
+OUTFIT_EVENING_HOURS = range(20, 22)  # the evening preview goes out in this window
+OUTFIT_MIDDAY_HOURS = range(12, 15)  # and the rain check in this one
+
+
+async def _send_outfit_extras(bot, send_one, label: str):
+    """Run one of the optional outfit messages for every signed-in student.
+    Best effort: a failure for one student is logged and does not repeat the
+    messages the others already got."""
+    for account in signed_in_accounts():
+        uid = account.user_id
+        if not is_user_allowed(uid) or lifecycle_state(uid) != ACTIVE:
+            continue
+        try:
+            with acting_as(uid):
+                await send_one(bot, uid)
+        except Exception as e:
+            logging.warning("%s failed for %s: %s", label, uid, e)
+
+
+async def _run_outfit_evening(bot, now: datetime):
+    if now.hour not in OUTFIT_EVENING_HOURS:
+        return
+    await _run_once_per_period("last_outfit_evening", now.date().isoformat(), "Evening outfit preview", "",
+                               _send_outfit_extras, bot, send_evening_outfit_preview, "Evening outfit preview")
+
+
+async def _run_outfit_midday(bot, now: datetime):
+    if now.hour not in OUTFIT_MIDDAY_HOURS:
+        return
+    await _run_once_per_period("last_outfit_midday", now.date().isoformat(), "Midday weather alert", "",
+                               _send_outfit_extras, bot, send_midday_weather_alert, "Midday weather alert")
 
 
 async def _backup_database():
@@ -851,6 +888,8 @@ async def unified_watcher_controller(app):
                 await _run_daily_backup(now)
                 await _run_daily_digest(bot, now)
                 await _run_weekly_report(bot, now)
+                await _run_outfit_midday(bot, now)
+                await _run_outfit_evening(bot, now)
                 await _run_content_watchers(bot, admin_id, cycle_count, now)
                 logging.info("✅ Watcher cycle #%s completed", cycle_count)
                 if not _cycle_failures.get():

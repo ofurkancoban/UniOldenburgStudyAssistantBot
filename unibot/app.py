@@ -435,7 +435,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_foodpref_clear_cancel, pattern="^foodpref_clear_cancel$"))
     app.add_handler(CallbackQueryHandler(handle_toggle_wardrobe_feature, pattern="^toggle_wardrobe_feature$"))
     app.add_handler(CallbackQueryHandler(handle_toggle_weekly_study_plan, pattern="^toggle_weekly_study_plan$"))
-    app.add_handler(CallbackQueryHandler(handle_outfit_menu, pattern="^(outfit_menu|outfit_menu_toggle)$"))
+    app.add_handler(CallbackQueryHandler(handle_outfit_menu, pattern="^(outfit_menu|outfit_menu_toggle|outfit_menu_evening|outfit_menu_midday)$"))
     app.add_handler(CallbackQueryHandler(handle_status_group, pattern=r"^(status_group|status_group_toggle)\|.*$"))
     app.add_handler(CallbackQueryHandler(handle_study_plan_toggle, pattern=r"^sp_plan\|[0-9a-f]{12}\|\d+$"))
     app.add_handler(CallbackQueryHandler(handle_study_block_feedback, pattern=r"^sp_block\|.*$"))
@@ -454,7 +454,7 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_wardrobe_clear_ask, pattern="^wardrobe_clear_ask$"))
     app.add_handler(CallbackQueryHandler(handle_wardrobe_clear_confirm, pattern="^wardrobe_clear_confirm$"))
     app.add_handler(CallbackQueryHandler(handle_wardrobe_clear_cancel, pattern="^wardrobe_clear_cancel$"))
-    app.add_handler(CallbackQueryHandler(handle_wardrobe_edit, pattern=r"^(wardrobe_edit_list|wardrobe_edit_done|wardrobe_edit\|[^|]+|wardrobe_set\|[^|]+\|[^|]+\|[^|]+)$"))
+    app.add_handler(CallbackQueryHandler(handle_wardrobe_edit, pattern=r"^(wardrobe_edit_list|wardrobe_edit_done|wardrobe_laundry|wardrobe_wash_all|wardrobe_gaps|wardrobe_history|wardrobe_edit\|[^|]+|wardrobe_wash\|[^|]+|wardrobe_set\|[^|]+\|[^|]+\|[^|]+)$"))
     app.add_handler(CallbackQueryHandler(handle_outfit_feedback, pattern=r"^outfit_fb\|(like|another)$"))
     app.add_handler(CallbackQueryHandler(handle_selection))
 
