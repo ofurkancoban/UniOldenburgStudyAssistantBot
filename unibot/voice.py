@@ -41,7 +41,7 @@ from unibot.storage import (
 from unibot import db
 from unibot.formatting import _short_id, clean_course_title
 from unibot.telegram_ui import user_data, _download_telegram_file, get_main_keyboard, nav_names
-from unibot.auth import get_user_session, is_user_allowed, login_studip, personal_session
+from unibot.auth import get_user_session, is_user_admin, is_user_allowed, login_studip, personal_session
 from unibot.studip_api import BASE_URL, _normalize_url, list_courses, list_files
 from unibot.ai import _call_openrouter, _extract_json_object, personal_ai_allowed
 from unibot.weather import get_weather_snapshot
@@ -583,7 +583,10 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    await update.message.reply_text("📸 Got a photo - if you want to add it to your wardrobe, go to /status → 👔 My Wardrobe → 📸 Add Clothing Item first.")
+    if is_user_admin(user_id):
+        await update.message.reply_text("📸 Got a photo - if you want to add it to your wardrobe, go to /status → 👔 My Wardrobe → 📸 Add Clothing Item first.")
+    else:
+        await update.message.reply_text("📸 Got a photo, but I can't do anything with it here.")
 
 
 async def handle_voice_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
