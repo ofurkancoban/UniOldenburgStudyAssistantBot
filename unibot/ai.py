@@ -691,7 +691,9 @@ def _extract_json_object(raw: Optional[str]) -> Optional[dict]:
         if isinstance(parsed, dict):
             return parsed
     except (json.JSONDecodeError, TypeError) as ignored_error:
-        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
+        # Expected whenever a model wraps the JSON in prose or a code fence:
+        # the fence and free-text scans below handle it.
+        logging.debug("Response is not bare JSON: %s", ignored_error)
     decoder = json.JSONDecoder()
     for fence in re.finditer(r"```(?:json)?\s*(.*?)```", raw, re.DOTALL):
         found = _first_json_object(decoder, fence.group(1))

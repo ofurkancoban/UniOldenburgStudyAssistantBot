@@ -65,7 +65,13 @@ from unibot.ai import (
 )
 from unibot.weather import build_weather_text_line, get_weather_snapshot
 from unibot.mensa import _friendly_menu_category_label, build_food_recommendation, fetch_dish_photo_url
-from unibot.wardrobe import generate_outfit_tryon_image, outfit_caption, pick_outfit_from_wardrobe
+from unibot.wardrobe import (
+    generate_outfit_tryon_image,
+    outfit_caption,
+    outfit_day_context,
+    outfit_feedback_keyboard,
+    pick_outfit_from_wardrobe,
+)
 from unibot.study_day import WECHLOY, campus_of, switch_warning, tight_campus_switches
 from unibot.schedule import (
     _lunch_menu_highlight,
@@ -304,7 +310,9 @@ async def _prepare_outfits(bot, user_ids, weather_of: dict) -> dict:
                 if not items or not ref_file_id:
                     continue
                 recent_ids = get_recently_worn_item_ids(uid)
-                outfit = await pick_outfit_from_wardrobe(items, weather_of.get(uid), recent_ids, user_id=uid)
+                day_context = await outfit_day_context(uid, datetime.now(TZ_BERLIN).date())
+                outfit = await pick_outfit_from_wardrobe(items, weather_of.get(uid), recent_ids, user_id=uid,
+                                                         day_context=day_context)
                 if not db.private_context_is_current(uid) or not get_ai_personal_enabled(uid) or not outfit:
                     continue
                 reference_bytes = await _download_telegram_file(bot, ref_file_id)
@@ -616,10 +624,12 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict, on_delivered=No
                 cached = get_cached_outfit_today(uid)
                 if cached:
                     caption = outfit_caption(cached)
+                    keyboard = outfit_feedback_keyboard() if cached.get("item_ids") else None
                     if cached.get("photo_file_id"):
-                        await bot.send_photo(chat_id=uid, photo=cached["photo_file_id"], caption=caption, parse_mode="HTML")
+                        await bot.send_photo(chat_id=uid, photo=cached["photo_file_id"], caption=caption, parse_mode="HTML",
+                                             reply_markup=keyboard)
                     else:
-                        await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
+                        await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML", reply_markup=keyboard)
                     if not db.private_context_is_current(uid):
                         continue
                     continue
@@ -630,7 +640,8 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict, on_delivered=No
                 caption = outfit_caption(outfit)
                 photo_file_id = None
                 if entry["image_bytes"]:
-                    sent = await bot.send_photo(chat_id=uid, photo=io.BytesIO(entry["image_bytes"]), caption=caption, parse_mode="HTML")
+                    sent = await bot.send_photo(chat_id=uid, photo=io.BytesIO(entry["image_bytes"]), caption=caption, parse_mode="HTML",
+                                                reply_markup=outfit_feedback_keyboard())
                     if not db.private_context_is_current(uid):
                         continue
                     photo_file_id = sent.photo[-1].file_id if sent.photo else None
@@ -638,11 +649,13 @@ async def deliver_morning_summary(bot, user_ids, prepared: dict, on_delivered=No
                     # Every image provider failed/unavailable - still
                     # deliver the text-only pick rather than nothing, since
                     # the weather-aware reasoning is useful on its own.
-                    await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML")
+                    await bot.send_message(chat_id=uid, text=caption, parse_mode="HTML", reply_markup=outfit_feedback_keyboard())
                     if not db.private_context_is_current(uid):
                         continue
                 record_worn_items(uid, [it["id"] for it in outfit["chosen_items"]])
-                save_cached_outfit_today(uid, outfit["description"], photo_file_id, outfit.get("color_tip", ""), [it["label"] for it in outfit["chosen_items"]])
+                save_cached_outfit_today(uid, outfit["description"], photo_file_id, outfit.get("color_tip", ""),
+                                         [it["label"] for it in outfit["chosen_items"]],
+                                         [it["id"] for it in outfit["chosen_items"]])
             except Exception as e:
                 logging.warning("Outfit suggestion failed for %s: %s", uid, e)
 

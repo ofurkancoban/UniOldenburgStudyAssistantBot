@@ -1017,6 +1017,19 @@ def save_wardrobe_item_descriptions(descriptions: dict, user_id: Optional[int] =
             _save_wardrobe_entry(uid, entry)
 
 
+def update_wardrobe_item(user_id, item_id: str, **fields) -> Optional[dict]:
+    """Change the type, subtype or warmth of one item (the caller validates the
+    values). Returns the updated item, or None if the id is not in the wardrobe."""
+    allowed = {"type", "subtype", "warmth"}
+    entry = get_wardrobe_entry(user_id)
+    for item in entry["items"]:
+        if item["id"] == item_id:
+            item.update({k: v for k, v in fields.items() if k in allowed})
+            _save_wardrobe_entry(user_id, entry)
+            return item
+    return None
+
+
 def remove_wardrobe_item(user_id, item_id: str) -> None:
     entry = get_wardrobe_entry(user_id)
     entry["items"] = [it for it in entry["items"] if it["id"] != item_id]
@@ -1648,7 +1661,7 @@ def set_travel_mode(user_id, mode: str) -> None:
     save_personal_record(user_id, "travel_modes", mode)
 
 
-WARDROBE_OUTFIT_HISTORY_DAYS = 7  # how far back record_worn_items prunes to
+WARDROBE_OUTFIT_HISTORY_DAYS = 21  # how far back record_worn_items prunes to (also the rotation window)
 WARDROBE_RECENT_WORN_DAYS = 2  # how far back get_recently_worn_item_ids looks when deprioritizing repeats
 
 
@@ -1666,13 +1679,15 @@ def get_cached_outfit_today(user_id) -> Optional[dict]:
     return None
 
 
-def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[str], color_tip: str = "", item_labels: Optional[list] = None) -> None:
+def save_cached_outfit_today(user_id, description: str, photo_file_id: Optional[str], color_tip: str = "",
+                             item_labels: Optional[list] = None, item_ids: Optional[list] = None) -> None:
     save_personal_record(user_id, "outfit_today_cache", {
         "date": datetime.now(TZ_BERLIN).date().isoformat(),
         "description": description,
         "color_tip": color_tip,
         "photo_file_id": photo_file_id,
         "item_labels": item_labels or [],
+        "item_ids": item_ids or [],
     })
 
 
@@ -1706,3 +1721,42 @@ def record_worn_items(user_id, item_ids: list) -> None:
         except ValueError:
             del user_history[date_str]
     save_personal_record(user_id, "outfit_history", user_history)
+
+
+NEVER_WORN_DAYS = WARDROBE_OUTFIT_HISTORY_DAYS + 1  # "not worn within the remembered window"
+
+
+def get_days_since_worn(user_id) -> dict:
+    """{item_id: days since it was last picked} for every item picked within
+    the remembered window; items missing from the result were not worn in it."""
+    history = personal_record(user_id, "outfit_history", {}) or {}
+    today = datetime.now(TZ_BERLIN).date()
+    days: dict = {}
+    for date_str, item_ids in history.items():
+        try:
+            age = (today - datetime.fromisoformat(date_str).date()).days
+        except ValueError:
+            continue
+        if not isinstance(item_ids, list):
+            continue
+        for item_id in item_ids:
+            if item_id not in days or age < days[item_id]:
+                days[item_id] = age
+    return days
+
+
+def get_outfit_likes(user_id) -> dict:
+    """{item_id: how many liked outfits it was part of}."""
+    likes = personal_record(user_id, "outfit_likes", {}) or {}
+    return {k: v for k, v in likes.items() if isinstance(k, str) and isinstance(v, int)}
+
+
+def add_outfit_likes(user_id, item_ids: list) -> None:
+    """Count one liked outfit for each of its items, dropping items that are
+    no longer in the wardrobe so the record cannot grow without bound."""
+    existing = {it["id"] for it in get_wardrobe_entry(user_id).get("items", [])}
+    likes = {k: v for k, v in get_outfit_likes(user_id).items() if k in existing}
+    for item_id in item_ids:
+        if item_id in existing:
+            likes[item_id] = likes.get(item_id, 0) + 1
+    save_personal_record(user_id, "outfit_likes", likes)

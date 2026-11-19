@@ -6,18 +6,23 @@ Part of the unibot package (split out of the former single-file studip_bot.py).
 import asyncio
 import html
 import io
+import ipaddress
 import logging
 import os
 import random
+import re
+import socket
 import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 import aiohttp
 import base64
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from studip_utils import TZ_BERLIN, aread_bytes, awrite_bytes, redact_url
@@ -42,14 +47,21 @@ from unibot.config import (
 from unibot.preferences import get_pref, set_pref
 from unibot import db
 from unibot.storage import (
+    add_outfit_likes,
+    add_wardrobe_item,
     clear_wardrobe_items,
     get_cached_outfit_today,
+    get_days_since_worn,
+    get_outfit_likes,
     get_recently_worn_item_ids,
     get_wardrobe_entry,
+    NEVER_WORN_DAYS,
     record_worn_items,
     remove_wardrobe_item,
     save_cached_outfit_today,
+    save_wardrobe_item_descriptions,
     shared_http,
+    update_wardrobe_item,
 )
 from unibot.telegram_ui import (
     user_data,
@@ -58,7 +70,7 @@ from unibot.telegram_ui import (
     _start_loading_animation,
     _stop_loading_animation,
 )
-from unibot.auth import is_user_admin
+from unibot.auth import get_user_session, is_user_admin
 from unibot.ai import (
     _call_gwdg_chat,
     _call_openrouter,
@@ -96,6 +108,7 @@ Among the weather-appropriate options, pick the combination whose colors work be
 - Earth tones (olive, dark green, brown, camel, bordeaux, rust) look good together; a tonal outfit (shades of one color, e.g. dark green trousers + green tee) is fine too.
 - Don't clash warm and cool brights (e.g. bordeaux with bright blue), and avoid near-matches that look like a mistake (e.g. a black top under a slightly different black jacket).
 - Repeat a color: shoes or headwear that echo a color from the top/outerwear tie the outfit together.
+Variety: when several items fit the weather equally well, prefer the ones marked "not worn recently" or worn longest ago over ones worn a few days ago, and treat "[liked before]" as a small tie-breaker only. If a Schedule line is given, use it only as a tie-breaker: a long day away from home or classes on both campuses favour practical layers and comfortable shoes, a day without classes favours the most relaxed option. The weather rules above always win.
 Respond with strict JSON only, no other text: {"item_ids": ["<id>", ...], "reasoning": "<one short sentence, e.g. 'Layering up with the navy hoodie and the coat since it'll be cold and dry, plus the beanie and trainers.'>", "color_tip": "<one short sentence on the colors: why they work together (e.g. 'The olive jacket and olive trainers frame the neutral black tee and light denim.'), or a concrete swap from the list that would match better if the weather forced a weaker combination>"}. Use only ids from the given list."""
 
 
@@ -218,15 +231,22 @@ def _temperature_band(temp_max: Optional[float]) -> str:
     return "hot"
 
 
+def _rotation_rank(item_id: str, days_since_worn: dict, likes: dict) -> float:
+    """Lower sorts first: the longer an item has not been worn the better, a
+    liked item counts as worn a little longer ago (a tie-breaker only)."""
+    return -float(days_since_worn.get(item_id, NEVER_WORN_DAYS)) - 0.5 * min(likes.get(item_id, 0), 6)
+
+
 def _prefer_unworn(pool: list[dict], recent_ids: set) -> list[dict]:
-    """Stable-partition a candidate pool so recently-worn items (see
-    get_recently_worn_item_ids) sort after everything else - the
-    "first match" selection below then naturally avoids repeats when a
-    genuine alternative exists, but still falls back to a recently-worn
-    item rather than nothing when it's the only option in that subtype."""
-    if not recent_ids:
+    """Stable-sort a candidate pool so recently-worn items (see
+    get_recently_worn_item_ids) come after everything else, and within each
+    group the items worn longest ago come first (the "_rank" the picker adds
+    from the wear history). The "first match" selection below then naturally
+    rotates the wardrobe, but still falls back to a recently-worn item rather
+    than nothing when it's the only option in that subtype."""
+    if not recent_ids and not any("_rank" in it for it in pool):
         return pool
-    return [it for it in pool if it["id"] not in recent_ids] + [it for it in pool if it["id"] in recent_ids]
+    return sorted(pool, key=lambda it: (it["id"] in recent_ids, it.get("_rank", 0.0)))
 
 
 def _heuristic_outfit_pick(items: list[dict], weather: Optional[dict], recent_ids: Optional[set] = None) -> list[dict]:
@@ -331,7 +351,7 @@ def _add_mandatory_shoes_and_headwear(items: list[dict], chosen: list[dict]) -> 
 
 
 async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], recent_ids: Optional[set] = None,
-                                   user_id: Optional[int] = None) -> Optional[dict]:
+                                   user_id: Optional[int] = None, day_context: Optional[str] = None) -> Optional[dict]:
     """Ask the LLM to pick a coherent, temperature-banded outfit from the
     user's cataloged wardrobe items, considering the morning's weather
     snapshot (see get_weather_snapshot) - structural twin of
@@ -353,9 +373,20 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
 
     band = _temperature_band(weather.get("temp_max") if weather else None)
     recent_ids = recent_ids or set()
+    days_since = get_days_since_worn(user_id)
+    likes = get_outfit_likes(user_id)
+    # Work on copies carrying the rotation rank, so the item dicts stored in the
+    # wardrobe stay untouched; the rank is dropped again before returning.
+    items = [dict(it, _rank=_rotation_rank(it["id"], days_since, likes)) for it in items]
+
+    def _history_note(item_id: str) -> str:
+        note = f" [worn {days_since[item_id]} days ago]" if item_id in days_since else " [not worn recently]"
+        return note + (" [liked before]" if likes.get(item_id) else "")
+
     lines = [
         f"- id={it['id']}: {it['label']} (type={it['type']}, subtype={it.get('subtype') or 'n/a'}, color={it['color']}, warmth={it['warmth']})"
         + (" [worn in the last couple days, prefer an alternative if one fits]" if it["id"] in recent_ids else "")
+        + _history_note(it["id"])
         for it in items
     ]
     if weather:
@@ -366,7 +397,8 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
     else:
         weather_line = "Weather: no data available today - pick something reasonably versatile (mild band)."
 
-    user_text = f"{weather_line}\n\nWardrobe:\n" + "\n".join(lines)
+    day_line = f"\n{day_context}" if day_context else ""
+    user_text = f"{weather_line}{day_line}\n\nWardrobe:\n" + "\n".join(lines)
     raw = None
     # Free models get rate-limited upstream now and then; the default
     # models are the backup.
@@ -398,6 +430,7 @@ async def pick_outfit_from_wardrobe(items: list[dict], weather: Optional[dict], 
     chosen_items = _add_required_outerwear(items, chosen_items, weather, recent_ids)
     chosen_items = _add_mandatory_shoes_and_headwear(items, chosen_items)
     forced_extras = [it["label"] for it in chosen_items if it["id"] not in pre_ids]
+    chosen_items = [{k: v for k, v in it.items() if k != "_rank"} for it in chosen_items]
 
     raw_reasoning = (parsed or {}).get("reasoning")
     reasoning = raw_reasoning.strip()[:500] if isinstance(raw_reasoning, str) else ""
@@ -426,6 +459,8 @@ def _wardrobe_list_view(user_id) -> tuple:
     text += f"{len(items)} item(s) cataloged.\n" if items else "Nothing added yet.\n"
     keyboard = [[InlineKeyboardButton(f"🗑 {it['label']} ({it['type']}/{it.get('subtype') or '-'})", callback_data=f"wardrobe_remove|{it['id']}")] for it in items]
     keyboard.append([InlineKeyboardButton("📸 Add Clothing Item", callback_data="wardrobe_add_item")])
+    if items:
+        keyboard.append([InlineKeyboardButton("✏️ Fix item types", callback_data="wardrobe_edit_list")])
     if items and entry.get("reference_photo_file_id"):
         keyboard.append([InlineKeyboardButton("👔 Suggest Outfit Now", callback_data="wardrobe_suggest_now")])
     if len(items) > 1:
@@ -496,6 +531,212 @@ async def handle_wardrobe_remove(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
+def _find_item(user_id, item_id: str) -> Optional[dict]:
+    return next((it for it in get_wardrobe_entry(user_id).get("items", []) if it["id"] == item_id), None)
+
+
+def _edit_list_view(user_id) -> tuple:
+    items = get_wardrobe_entry(user_id).get("items", [])
+    rows = [[InlineKeyboardButton(f"✏️ {it['label']} ({it['type']}/{it.get('subtype') or '-'})",
+                                  callback_data=f"wardrobe_edit|{it['id']}")] for it in items]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="wardrobe_edit_done")])
+    return "✏️ <b>Fix item types</b>\nPick the piece that was tagged wrongly.", InlineKeyboardMarkup(rows)
+
+
+def _item_edit_view(user_id, item_id: str) -> Optional[tuple]:
+    item = _find_item(user_id, item_id)
+    if not item:
+        return None
+
+    def mark(current, value):
+        return ("✅ " if current == value else "") + value
+
+    def row(field, values, current):
+        return [InlineKeyboardButton(mark(current, v), callback_data=f"wardrobe_set|{item_id}|{field}|{v}") for v in values]
+
+    text = (f"✏️ <b>{html.escape(item['label'])}</b>\n"
+            f"Type: {item['type']}\nSubtype: {item.get('subtype') or '-'}\nWarmth: {item.get('warmth') or 'medium'}")
+    rows = [row("type", WARDROBE_TYPES[:3], item["type"]), row("type", WARDROBE_TYPES[3:], item["type"])]
+    subtypes = WARDROBE_SUBTYPES.get(item["type"], ())
+    if subtypes:
+        rows.append(row("subtype", subtypes, item.get("subtype")))
+    rows.append(row("warmth", WARDROBE_WARMTH, item.get("warmth") or "medium"))
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="wardrobe_edit_list")])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def handle_wardrobe_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """wardrobe_edit_list / wardrobe_edit|<id> / wardrobe_set|<id>|<field>|<value>
+    / wardrobe_edit_done: correct the type, subtype or warmth the vision model
+    guessed for an item."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not is_user_admin(user_id):
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
+        return
+    await query.answer()
+    if not db.private_context_is_current(user_id):
+        return
+    parts = (query.data or "").split("|")
+    view = None
+    if parts[0] == "wardrobe_edit_done":
+        view = _wardrobe_list_view(user_id)
+    elif parts[0] == "wardrobe_edit_list":
+        view = _edit_list_view(user_id)
+    elif parts[0] == "wardrobe_edit" and len(parts) == 2:
+        view = _item_edit_view(user_id, parts[1]) or _edit_list_view(user_id)
+    elif parts[0] == "wardrobe_set" and len(parts) == 4:
+        _, item_id, field, value = parts
+        item = _find_item(user_id, item_id)
+        if item:
+            changes = None
+            if field == "type" and value in WARDROBE_TYPES:
+                keep = item.get("subtype") if item.get("subtype") in WARDROBE_SUBTYPES[value] else None
+                changes = {"type": value, "subtype": keep}
+            elif field == "subtype" and value in WARDROBE_SUBTYPES.get(item["type"], ()):
+                changes = {"subtype": value}
+            elif field == "warmth" and value in WARDROBE_WARMTH:
+                changes = {"warmth": value}
+            if changes:
+                update_wardrobe_item(user_id, item_id, **changes)
+        view = _item_edit_view(user_id, item_id) or _edit_list_view(user_id)
+    if view is None:
+        return
+    try:
+        await query.edit_message_text(view[0], parse_mode="HTML", reply_markup=view[1])
+    except TelegramError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)  # e.g. nothing changed
+
+
+# ── Importing items from image links ──────────────────────────────────────────
+WARDROBE_IMPORT_LIMIT = 20
+MAX_IMPORT_IMAGE_BYTES = 8 * 1024 * 1024
+_IMPORT_URL_RE = re.compile(r"https?://[^\s<>\"']+")
+
+
+async def _is_public_https_url(url: str) -> bool:
+    """Only https links to hosts that resolve to public addresses: the bot must
+    not be pointed at its own machine or network."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port or 443
+    except ValueError:
+        return False
+    if parts.scheme != "https" or not parts.hostname or parts.username or parts.password:
+        return False
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
+        return bool(infos) and all(ipaddress.ip_address(info[4][0].split("%")[0]).is_global for info in infos)
+    except (OSError, ValueError):
+        return False
+
+
+async def _fetch_public_image(url: str) -> Optional[bytes]:
+    """The image behind a public https link (no redirects, an image content
+    type, at most MAX_IMPORT_IMAGE_BYTES), or None."""
+    if not await _is_public_https_url(url):
+        return None
+    try:
+        async with shared_http() as session:
+            async with session.get(url, allow_redirects=False, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                if resp.status != 200 or not (resp.content_type or "").startswith("image/"):
+                    return None
+                if resp.content_length and resp.content_length > MAX_IMPORT_IMAGE_BYTES:
+                    return None
+                data = bytearray()
+                async for chunk in resp.content.iter_chunked(65536):
+                    data.extend(chunk)
+                    if len(data) > MAX_IMPORT_IMAGE_BYTES:
+                        return None
+                return bytes(data)
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        logging.warning("Wardrobe import download failed for %s: %s", redact_url(url), e)
+        return None
+
+
+async def import_wardrobe_urls(user_id, urls: list) -> dict:
+    """Tag, describe and catalog the images behind `urls` (skipping ones already
+    in the wardrobe). {"added": [labels], "skipped": n, "failed": [(url, why)],
+    "stopped": True if personal AI use was switched off midway}."""
+    existing = {it.get("image_url") for it in get_wardrobe_entry(user_id).get("items", [])}
+    result: dict = {"added": [], "skipped": 0, "failed": [], "stopped": False}
+    for url in urls:
+        if url in existing:
+            result["skipped"] += 1
+            continue
+        if not db.private_context_is_current(user_id) or not personal_ai_allowed(user_id):
+            result["stopped"] = True
+            break
+        data = await _fetch_public_image(url)
+        if not data:
+            result["failed"].append((url, "could not download an image"))
+            continue
+        tags = await tag_wardrobe_item(data, user_id)
+        if not tags:
+            result["failed"].append((url, "could not tell what it is"))
+            continue
+        tags["description"] = await describe_wardrobe_item(tags, data, user_id=user_id)
+        add_wardrobe_item(user_id, tags, image_url=url)
+        existing.add(url)
+        result["added"].append(tags["label"])
+    return result
+
+
+async def backfill_wardrobe_descriptions(user_id, bot=None) -> int:
+    """Write the one-line description for items that have none (items added in
+    bulk), so the GWDG try-on can dress from text. Returns how many were filled."""
+    descriptions: dict = {}
+    for item in get_wardrobe_entry(user_id).get("items", []):
+        if item.get("description") or (item.get("file_id") and bot is None):
+            continue
+        data = await _fetch_wardrobe_item_bytes(bot, item)
+        text = await describe_wardrobe_item(item, data, user_id=user_id) if data else None
+        if text:
+            descriptions[item["id"]] = text
+    if descriptions:
+        save_wardrobe_item_descriptions(descriptions, user_id)
+    return len(descriptions)
+
+
+async def wardrobe_import_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/wardrobe_import <image links>: add clothing items from product photos."""
+    user = update.effective_user
+    if not user or not is_user_admin(user.id):
+        await update.message.reply_text("⛔ This command is restricted to administrators.")
+        return
+    user_id = user.id
+    if not db.private_context_is_current(user_id):
+        return
+    if not personal_ai_allowed(user_id):
+        await update.message.reply_text(
+            "🔒 Clothing photos are sent to an outside AI service for tagging. "
+            "Allow personal data use under /settings → 🔒 Privacy first."
+        )
+        return
+    words = (update.message.text or "").split(None, 1)
+    urls = list(dict.fromkeys(u.rstrip(".,;)") for u in _IMPORT_URL_RE.findall(words[1] if len(words) > 1 else "")))
+    if not urls:
+        await update.message.reply_text(
+            f"📸 Send /wardrobe_import followed by up to {WARDROBE_IMPORT_LIMIT} https links to clothing photos "
+            "(one per line). Each is tagged and added to your wardrobe."
+        )
+        return
+    if len(urls) > WARDROBE_IMPORT_LIMIT:
+        await update.message.reply_text(f"Send at most {WARDROBE_IMPORT_LIMIT} links at a time.")
+        return
+    status_msg = await update.message.reply_text(f"👔 Importing {len(urls)} link(s), this takes a moment...", disable_notification=True)
+    result = await import_wardrobe_urls(user_id, urls)
+    lines = [f"👔 Added {len(result['added'])} item(s)."]
+    lines += [f"• {html.escape(label)}" for label in result["added"]]
+    if result["skipped"]:
+        lines.append(f"Skipped {result['skipped']} already in your wardrobe.")
+    for url, why in result["failed"]:
+        lines.append(f"⚠️ {html.escape(redact_url(url)[:60])}: {why}")
+    if result["stopped"]:
+        lines.append("🔒 Personal AI use was turned off, the import stopped.")
+    await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
+
+
 async def handle_wardrobe_clear_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not is_user_admin(query.from_user.id):
@@ -538,6 +779,121 @@ async def handle_wardrobe_clear_cancel(update: Update, context: ContextTypes.DEF
     await query.edit_message_text(text, parse_mode="HTML", reply_markup=keyboard)
 
 
+def outfit_feedback_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("👍 I like it", callback_data="outfit_fb|like"),
+                                  InlineKeyboardButton("🔁 Another one", callback_data="outfit_fb|another")]])
+
+
+async def outfit_day_context(user_id, day) -> Optional[str]:
+    """One line about the day's classes for the outfit pick: how many, the
+    time span and whether both campuses are involved. Never course names or
+    rooms, since this text goes to an outside AI service. None if the
+    calendar cannot be read."""
+    from unibot.morning import _fetch_today_events  # morning imports this module
+    from unibot.study_day import campus_of
+    try:
+        session = get_user_session(user_id)
+        if not await session.is_logged_in():
+            return None
+        _, today_events, ok = await _fetch_today_events(session, day, user_id=user_id)
+    except Exception as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
+        return None
+    if not ok:
+        return None
+    live = [ev for ev in today_events if not ev.get("is_cancelled")]
+    if not live:
+        return "Schedule: no classes today."
+    times = sorted(t.zfill(5) for ev in live for t in re.findall(r"\b\d{1,2}:\d{2}\b", ev.get("time") or ""))
+    campuses = {c for c in (campus_of(ev.get("location")) for ev in live) if c}
+    line = f"Schedule: {len(live)} class(es)"
+    if times:
+        line += f" between {times[0]} and {times[-1]}"
+    if len(campuses) > 1:
+        line += ", on both campuses"
+    return line + "."
+
+
+async def _outfit_ready(message, user_id) -> Optional[tuple]:
+    """(items, reference photo id) once an outfit can be made, otherwise tell
+    the student what is missing and return None."""
+    if not personal_ai_allowed(user_id):
+        await message.reply_text(
+            "🔒 Outfit suggestions use your wardrobe and reference photo with outside AI services. "
+            "Allow personal data use under /settings → 🔒 Privacy first."
+        )
+        return None
+    entry = get_wardrobe_entry(user_id)
+    items = entry.get("items", [])
+    ref_file_id = entry.get("reference_photo_file_id")
+    if not items:
+        await message.reply_text("👔 Add at least one clothing item first - tap 📸 Add Clothing Item.")
+        return None
+    if not ref_file_id:
+        await message.reply_text("🖼️ Set your reference photo first - tap 🖼️ Set Reference Photo in /status.")
+        return None
+    return items, ref_file_id
+
+
+async def _run_outfit_request(message, bot, user_id: int, items: list, ref_file_id: str, exclude_ids=frozenset()) -> None:
+    """Pick today's outfit, dress the reference photo in it and send it with
+    the like/another buttons. `exclude_ids` are items to steer away from (the
+    outfit that "Another one" replaces)."""
+    await _show_typing(message)
+    status_msg = await message.reply_text("👔 Picking an outfit for you...", disable_notification=True)
+    stop_evt, anim_task = _start_loading_animation(status_msg, "Picking an outfit for you...")
+    try:
+        today = datetime.now(TZ_BERLIN).date()
+        weather = await get_weather_snapshot(today, user_id=user_id)
+        if not db.private_context_is_current(user_id):
+            return
+        if not personal_ai_allowed(user_id):
+            await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
+            return
+        recent_ids = get_recently_worn_item_ids(user_id) | set(exclude_ids)
+        day_context = await outfit_day_context(user_id, today)
+        outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids, user_id=user_id, day_context=day_context)
+        if not db.private_context_is_current(user_id):
+            return
+        if not personal_ai_allowed(user_id):
+            await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
+            return
+    finally:
+        await _stop_loading_animation(stop_evt, anim_task)
+
+    if not outfit:
+        await message.reply_text("❌ Couldn't put together an outfit right now - try again in a bit.")
+        return
+
+    caption = outfit_caption(outfit)
+    reference_bytes = await _download_telegram_file(bot, ref_file_id)
+    if not db.private_context_is_current(user_id):
+        return
+    if not personal_ai_allowed(user_id):
+        await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
+        return
+    image_bytes = await generate_outfit_tryon_image(
+        bot, reference_bytes, outfit["chosen_items"], user_id=user_id
+    ) if reference_bytes else None
+    if not db.private_context_is_current(user_id):
+        return
+    if not personal_ai_allowed(user_id):
+        await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
+        return
+    photo_file_id = None
+    keyboard = outfit_feedback_keyboard()
+    if image_bytes:
+        sent = await message.reply_photo(photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML", reply_markup=keyboard)
+        photo_file_id = sent.photo[-1].file_id if sent.photo else None
+    else:
+        await message.reply_text(caption, parse_mode="HTML", reply_markup=keyboard)
+
+    record_worn_items(user_id, [it["id"] for it in outfit["chosen_items"]])
+    save_cached_outfit_today(user_id, outfit["description"], photo_file_id, outfit.get("color_tip", ""),
+                             [it["label"] for it in outfit["chosen_items"]],
+                             [it["id"] for it in outfit["chosen_items"]])
+
+
 async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle wardrobe_suggest_now callback ("👔 Suggest Outfit Now") - the
     on-demand twin of the morning summary's automatic section (see 4c in
@@ -555,22 +911,10 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
     if not db.private_context_is_current(user_id):
         return
 
-    if not personal_ai_allowed(user_id):
-        await query.message.reply_text(
-            "🔒 Outfit suggestions use your wardrobe and reference photo with outside AI services. "
-            "Allow personal data use under /settings → 🔒 Privacy first."
-        )
+    ready = await _outfit_ready(query.message, user_id)
+    if not ready:
         return
-
-    entry = get_wardrobe_entry(user_id)
-    items = entry.get("items", [])
-    ref_file_id = entry.get("reference_photo_file_id")
-    if not items:
-        await query.message.reply_text("👔 Add at least one clothing item first - tap 📸 Add Clothing Item.")
-        return
-    if not ref_file_id:
-        await query.message.reply_text("🖼️ Set your reference photo first - tap 🖼️ Set Reference Photo in /status.")
-        return
+    items, ref_file_id = ready
 
     # Reuse today's already-generated pick if this is a second trigger the
     # same day (e.g. morning summary already ran) - resending a cached
@@ -579,60 +923,48 @@ async def handle_wardrobe_suggest_now(update: Update, context: ContextTypes.DEFA
     cached = get_cached_outfit_today(user_id)
     if cached:
         caption = outfit_caption(cached)
+        keyboard = outfit_feedback_keyboard() if cached.get("item_ids") else None
         if cached.get("photo_file_id"):
-            await query.message.reply_photo(photo=cached["photo_file_id"], caption=caption, parse_mode="HTML")
+            await query.message.reply_photo(photo=cached["photo_file_id"], caption=caption, parse_mode="HTML", reply_markup=keyboard)
         else:
-            await query.message.reply_text(caption, parse_mode="HTML")
+            await query.message.reply_text(caption, parse_mode="HTML", reply_markup=keyboard)
         return
 
-    await _show_typing(query)
-    status_msg = await query.message.reply_text("👔 Picking an outfit for you...", disable_notification=True)
-    stop_evt, anim_task = _start_loading_animation(status_msg, "Picking an outfit for you...")
+    await _run_outfit_request(query.message, context.bot, user_id, items, ref_file_id)
+
+
+async def handle_outfit_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """outfit_fb|like makes the pieces of today's outfit a little more likely
+    in later picks; outfit_fb|another picks again, steering away from them."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    if not is_user_admin(user_id):
+        await query.answer("⛔ This feature is restricted to administrators.", show_alert=True)
+        return
+    if not db.private_context_is_current(user_id):
+        await query.answer()
+        return
+    action = (query.data or "").split("|", 1)[-1]
+    cached = get_cached_outfit_today(user_id)
+    item_ids = list((cached or {}).get("item_ids") or [])
+    if not item_ids:
+        await query.answer("That outfit is too old, ask for a new one.", show_alert=True)
+        return
     try:
-        weather = await get_weather_snapshot(datetime.now(TZ_BERLIN).date(), user_id=user_id)
-        if not db.private_context_is_current(user_id):
-            return
-        if not personal_ai_allowed(user_id):
-            await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
-            return
-        recent_ids = get_recently_worn_item_ids(user_id)
-        outfit = await pick_outfit_from_wardrobe(items, weather, recent_ids, user_id=user_id)
-        if not db.private_context_is_current(user_id):
-            return
-        if not personal_ai_allowed(user_id):
-            await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
-            return
-    finally:
-        await _stop_loading_animation(stop_evt, anim_task)
-
-    if not outfit:
-        await query.message.reply_text("❌ Couldn't put together an outfit right now - try again in a bit.")
+        await query.edit_message_reply_markup(reply_markup=None)  # one answer per outfit
+    except TelegramError as ignored_error:
+        logging.info("Ignored a failed best-effort step: %s: %s", type(ignored_error).__name__, ignored_error)
+    if action == "like":
+        add_outfit_likes(user_id, item_ids)
+        await query.answer("Noted")
+        await query.message.reply_text("👍 Noted. These pieces will come up a little more often.")
         return
-
-    caption = outfit_caption(outfit)
-    reference_bytes = await _download_telegram_file(context.bot, ref_file_id)
-    if not db.private_context_is_current(user_id):
+    await query.answer()
+    ready = await _outfit_ready(query.message, user_id)
+    if not ready:
         return
-    if not personal_ai_allowed(user_id):
-        await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
-        return
-    image_bytes = await generate_outfit_tryon_image(
-        context.bot, reference_bytes, outfit["chosen_items"], user_id=user_id
-    ) if reference_bytes else None
-    if not db.private_context_is_current(user_id):
-        return
-    if not personal_ai_allowed(user_id):
-        await status_msg.edit_text("🔒 Personal AI use was turned off. The outfit request was stopped.")
-        return
-    photo_file_id = None
-    if image_bytes:
-        sent = await query.message.reply_photo(photo=io.BytesIO(image_bytes), caption=caption, parse_mode="HTML")
-        photo_file_id = sent.photo[-1].file_id if sent.photo else None
-    else:
-        await query.message.reply_text(caption, parse_mode="HTML")
-
-    record_worn_items(user_id, [it["id"] for it in outfit["chosen_items"]])
-    save_cached_outfit_today(user_id, outfit["description"], photo_file_id, outfit.get("color_tip", ""), [it["label"] for it in outfit["chosen_items"]])
+    items, ref_file_id = ready
+    await _run_outfit_request(query.message, context.bot, user_id, items, ref_file_id, exclude_ids=set(item_ids))
 
 
 async def handle_toggle_wardrobe_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -711,26 +1043,30 @@ async def _fetch_wardrobe_item_bytes(bot, item: dict) -> Optional[bytes]:
 TAG_WARDROBE_ITEM_PROMPT = """You're looking at a photo of a single clothing item. Respond with strict JSON only, no other text: {"type": "top|bottom|outerwear|shoes|accessory", "subtype": "<for type=top: t-shirt|shirt|sweater; for type=bottom: pants|shorts; for type=outerwear: light_jacket|coat; otherwise null>", "color": "<main color, 1-2 words>", "warmth": "light|medium|warm", "label": "<short description, e.g. 'navy blue hoodie'>"}."""
 
 
+WARDROBE_TYPES = ("top", "bottom", "outerwear", "shoes", "accessory")
+WARDROBE_SUBTYPES = {
+    "top": ("t-shirt", "shirt", "sweater"),
+    "bottom": ("pants", "shorts"),
+    "outerwear": ("light_jacket", "coat"),
+    "shoes": (),
+    "accessory": (),
+}
+WARDROBE_WARMTH = ("light", "medium", "warm")
+
+
 def _validated_wardrobe_tags(value) -> Optional[dict]:
     """Validate and bound vision-model output before storing it in the
     wardrobe or using it to build Telegram buttons and prompts."""
     if not isinstance(value, dict):
         return None
     item_type = value.get("type")
-    if not isinstance(item_type, str) or item_type not in {"top", "bottom", "outerwear", "shoes", "accessory"}:
+    if not isinstance(item_type, str) or item_type not in WARDROBE_TYPES:
         return None
-    valid_subtypes = {
-        "top": {"t-shirt", "shirt", "sweater"},
-        "bottom": {"pants", "shorts"},
-        "outerwear": {"light_jacket", "coat"},
-        "shoes": set(),
-        "accessory": set(),
-    }
     subtype = value.get("subtype")
-    if not isinstance(subtype, str) or subtype not in valid_subtypes[item_type]:
+    if not isinstance(subtype, str) or subtype not in WARDROBE_SUBTYPES[item_type]:
         subtype = None
     warmth = value.get("warmth")
-    if not isinstance(warmth, str) or warmth not in {"light", "medium", "warm"}:
+    if not isinstance(warmth, str) or warmth not in WARDROBE_WARMTH:
         warmth = "medium"
 
     def short_text(key, limit, fallback=""):

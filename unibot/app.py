@@ -116,16 +116,19 @@ from unibot.mensa import (
     menu_command,
 )
 from unibot.wardrobe import (
+    handle_outfit_feedback,
     handle_outfit_menu,
     handle_toggle_wardrobe_feature,
     handle_wardrobe_add_item,
     handle_wardrobe_clear_ask,
     handle_wardrobe_clear_cancel,
     handle_wardrobe_clear_confirm,
+    handle_wardrobe_edit,
     handle_wardrobe_menu,
     handle_wardrobe_remove,
     handle_wardrobe_set_reference,
     handle_wardrobe_suggest_now,
+    wardrobe_import_command,
 )
 from unibot.schedule import (
     activity_command,
@@ -348,6 +351,7 @@ def register_handlers(app) -> None:
     app.add_handler(CommandHandler("logout", logout_command))
     app.add_handler(CommandHandler("restart", restart_command))
     app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CommandHandler("wardrobe_import", wardrobe_import_command))
     app.add_handler(CommandHandler("invite", invite_command))
     app.add_handler(CommandHandler("broadcast", broadcast_command))
     
@@ -450,6 +454,8 @@ def register_handlers(app) -> None:
     app.add_handler(CallbackQueryHandler(handle_wardrobe_clear_ask, pattern="^wardrobe_clear_ask$"))
     app.add_handler(CallbackQueryHandler(handle_wardrobe_clear_confirm, pattern="^wardrobe_clear_confirm$"))
     app.add_handler(CallbackQueryHandler(handle_wardrobe_clear_cancel, pattern="^wardrobe_clear_cancel$"))
+    app.add_handler(CallbackQueryHandler(handle_wardrobe_edit, pattern=r"^(wardrobe_edit_list|wardrobe_edit_done|wardrobe_edit\|[^|]+|wardrobe_set\|[^|]+\|[^|]+\|[^|]+)$"))
+    app.add_handler(CallbackQueryHandler(handle_outfit_feedback, pattern=r"^outfit_fb\|(like|another)$"))
     app.add_handler(CallbackQueryHandler(handle_selection))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reply_buttons))
